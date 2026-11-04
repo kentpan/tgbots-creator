@@ -171,29 +171,6 @@ jobs:
             echo "✅ LANGUAGE 未配置 → auto"
           fi
 
-      - name: Resolve database file from .env
-        run: |
-          # TGuard 适配⑥: 本地 SQLite 数据库文件路径/名称唯一真源 = .env 的
-          # DATABASE_URI(deploy.config.js 的 database 仅是"是否执行 D1 操作"的
-          # 布尔开关, 不携带路径)。此处解析 .env → 导出 DATABASE_URI_VALUE
-          # (构建期占位统一引用)与 DATABASE_FILENAME。该值仅服务 Node 形态
-          # (node:sqlite); Cloudflare 形态使用 D1 绑定, 与此路径无关。
-          DB_URL=""
-          if [ -f .env ]; then
-            DB_URL=$(grep -E '^\s*DATABASE_URI\s*=' .env | tail -1 | sed 's/^\s*DATABASE_URI\s*=\s*//' | tr -d '\r' | tr -d '"' | tr -d "'" | xargs || true)
-            [ -n "$DB_URL" ] && SRC="仓库 .env 文件"
-          fi
-          if [ -z "$DB_URL" ]; then
-            # .env 缺失/未提交时回落默认库(与本地 prisma/bot-groups.db 同源)
-            DB_URL="file:./prisma/bot-groups.db"
-            SRC="内置默认(.env 未配置)"
-          fi
-          DB_FILENAME=$(echo "$DB_URL" | sed 's/^file://' | awk -F/ '{print $NF}')
-          [ -z "$DB_FILENAME" ] && DB_FILENAME="bot-groups.db"
-          echo "DATABASE_URI_VALUE=$DB_URL" >> $GITHUB_ENV
-          echo "DATABASE_FILENAME=$DB_FILENAME" >> $GITHUB_ENV
-          echo "✅ 数据库文件已解析 | 来源: $SRC | DATABASE_URI=$DB_URL | 文件名: $DB_FILENAME"
-
       - name: Read deploy.config.js
         id: deploy-config
         run: |
@@ -266,6 +243,77 @@ jobs:
             exit 1
           fi
           echo "✅ projectName: ${{ env.PROJECT_NAME }}"
+
+      - name: Resolve database file (.env → d1Name → auto-detect)
+        run: |
+          # TGuard 适配⑥(照抄生产版 v8.9.16 解析链, 修复"解析只拿 URL 不验文件
+          # 存在"导致增量迁移永不生效): 本地 SQLite 数据库文件路径唯一真源 =
+          # .env 的 DATABASE_URI(deploy.config.js 的 database 仅是"是否执行
+          # D1 操作"的布尔开关, 不携带路径)。解析链:
+          #   ① 仓库 .env 的 DATABASE_URI(URL 指向的文件必须真实存在才算命中);
+          #   ② d1Name 拼装: prisma/<d1Name>.db 与下划线变体;
+          #   ③ prisma/*.db 自动探测(最后兑底);
+          #   全部落空 → 仅构建占位值, D1 走 schema-only 回落链路。
+          # 解析出的真实文件(DB_FILE_PATH)是 "Migrate D1 schema" 增量迁移的
+          # 本地侧真源: 文件内含 admin_users 管理员账号/角色/菜单等种子数据 ——
+          # 首次部署全量导入 D1(管理后台可登录), 后续部署纯增量(线上数据保留)。
+          # 该值同时服务 Node 形态(node:sqlite); Cloudflare 形态使用 D1 绑定。
+          DB_URL=""
+          DB_SRC=""
+          DB_FILE_PATH=""
+          if [ -f .env ]; then
+            DB_URL=$(grep -E '^\s*DATABASE_URI\s*=' .env | tail -1 | sed 's/^\s*DATABASE_URI\s*=\s*//' | tr -d '\r' | tr -d '"' | tr -d "'" | xargs || true)
+            [ -n "$DB_URL" ] && DB_SRC=".env DATABASE_URI"
+          fi
+          # ① URL 指向的文件必须真实存在才算命中(否则继续走后续探测)
+          if [ -n "$DB_URL" ]; then
+            URL_PATH=$(echo "$DB_URL" | sed 's/^file://')
+            for cand in "$URL_PATH" "prisma/$(basename "$URL_PATH")" "$(basename "$URL_PATH")"; do
+              if [ -f "$cand" ]; then DB_FILE_PATH="$cand"; break; fi
+            done
+          fi
+          # ② d1Name 拼装(.env 缺失或 URL 未命中真实文件时)
+          if [ -z "$DB_FILE_PATH" ] && [ -n "$D1_NAME" ]; then
+            UN=$(echo "$D1_NAME" | tr '-' '_')
+            for cand in "prisma/${D1_NAME}.db" "prisma/${UN}.db" "${UN}.db"; do
+              if [ -f "$cand" ]; then
+                DB_FILE_PATH="$cand"
+                DB_URL="file:./$cand"
+                DB_SRC="deploy.config.js d1Name 拼装(d1Name=$D1_NAME)"
+                break
+              fi
+            done
+          fi
+          # ③ prisma/*.db 自动探测
+          if [ -z "$DB_FILE_PATH" ]; then
+            GLOB_HIT=$(ls prisma/*.db 2>/dev/null | sort | head -1 || true)
+            if [ -n "$GLOB_HIT" ]; then
+              DB_FILE_PATH="$GLOB_HIT"
+              DB_URL="file:./$GLOB_HIT"
+              DB_SRC="prisma/*.db 自动探测"
+            fi
+          fi
+          if [ -n "$DB_FILE_PATH" ]; then
+            DB_FILENAME=$(basename "$DB_FILE_PATH")
+          else
+            # 全部落空: 导出构建占位值(与本地 prisma/bot-groups.db 命名约定一致), 数据文件视为未携带
+            [ -n "$DB_URL" ] || DB_URL="file:./prisma/bot-groups.db"
+            DB_FILENAME=$(echo "$DB_URL" | sed 's/^file://' | awk -F/ '{print $NF}')
+            [ -z "$DB_FILENAME" ] && DB_FILENAME="bot-groups.db"
+            DB_SRC="${DB_SRC:-内置回落(.env 未配置且未找到数据文件)}"
+          fi
+          echo "DATABASE_URI_VALUE=$DB_URL" >> $GITHUB_ENV
+          echo "DATABASE_FILENAME=$DB_FILENAME" >> $GITHUB_ENV
+          echo "DB_SOURCE=$DB_SRC" >> $GITHUB_ENV
+          if [ -n "$DB_FILE_PATH" ]; then
+            echo "DB_FILE_EXISTS=true" >> $GITHUB_ENV
+            echo "DB_FILE_PATH=$DB_FILE_PATH" >> $GITHUB_ENV
+            echo "✅ 数据库已解析 | 来源: $DB_SRC | DATABASE_URI=$DB_URL | 文件: $DB_FILE_PATH($(du -h "$DB_FILE_PATH" | cut -f1)) → D1 增量 schema 迁移(线上数据保留, 首次安装全量导入含管理员账号)"
+          else
+            echo "DB_FILE_EXISTS=false" >> $GITHUB_ENV
+            echo "DB_FILE_PATH=" >> $GITHUB_ENV
+            echo "⚠️ 仓库未携带数据文件(解析链: .env DATABASE_URI → d1Name=${D1_NAME:-'(未配置)'} 拼装 → prisma/*.db 均未命中) → D1 走 schema-only 回落链路(仅建表, 管理员账号需自行初始化)"
+          fi
 
       - name: Resolve deploy type (pages | workers)
         run: |
@@ -541,13 +589,14 @@ jobs:
             fi
           fi
 
-      - name: Apply D1 schema (idempotent)
-        # TGuard 适配③: TGuard 数据层无 gem-td 式运行时自建表, 沿用本工作流
-        # v8.9.x 的既有机制 —— 仓库 prisma/schema.sql 现场归一为幂等 DDL
-        # (CREATE TABLE/INDEX → IF NOT EXISTS, 剥离 PRAGMA/事务包裹)后经
-        # wrangler d1 execute 应用: 首次部署建表, 对已有库零副作用, 幂等可重跑。
-        # 失败即终止部署(发布成功 = 数据就绪)。
-        if: env.PROXY_PASSTHROUGH != 'true' && env.D1_ID != ''
+      - name: Apply D1 schema (idempotent, fallback)
+        # TGuard 适配③(schema-only 回落链路, 仅"未携带数据文件"时执行):
+        # 仓库 prisma/schema.sql 现场归一为幂等 DDL(CREATE TABLE/INDEX →
+        # IF NOT EXISTS, 剥离 PRAGMA/事务包裹)后经 wrangler d1 execute 应用。
+        # v8.9.14 同源门控: 仓库携带数据文件(DB_FILE_EXISTS=true)时改走下方
+        # "Migrate D1 schema"增量迁移(含管理员账号等种子数据), 本步回落为仅
+        # "未携带数据文件"的项目执行(两链路门控互斥, 不会重复建表)。
+        if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != '' && env.DB_FILE_EXISTS != 'true'
         run: |
           if [ ! -f prisma/schema.sql ]; then
             echo "::error::prisma/schema.sql 不存在(D1 schema 建表唯一真源), 无法保证发布后数据就绪。"
@@ -564,6 +613,168 @@ jobs:
           echo "归一后 schema 语句数: $(grep -c 'CREATE ' /tmp/tguard-d1-schema.sql)"
           npx wrangler d1 execute "$D1_NAME" --remote -y --file /tmp/tguard-d1-schema.sql
           echo "✅ D1 schema 已应用(幂等, 对既有库零副作用): $D1_NAME"
+
+      - name: Migrate D1 schema (additive, data-preserving)
+        # TGuard 适配③(照抄生产版 v8.9.18, 修复"首次部署 D1 只建表无数据 →
+        # 管理后台无管理员账号无法登录"): 仓库携带数据库文件(DB_FILE_EXISTS=true,
+        # TGuard = prisma/bot-groups.db, 内含 admin_users 管理员账号/角色/菜单等
+        # 运行数据, 真源 = .env DATABASE_URI)时执行:
+        #   · 首次安装(D1 无用户表)→ sqlite3 .dump 全量导入(表结构 + 管理员账号
+        #     等种子数据一并上线, 管理后台即可登录);
+        #   · 后续部署 → 两侧 sqlite_master 求差, 只补新表/新列/新索引/触发器/
+        #     视图, 数据一行不动, 永不 DROP/DELETE(线上最新数据不回滚不覆盖);
+        #   · 应用后重新求差核验必须为空, 非空 fail hard(发布成功 = schema 就位)。
+        # 门控与上方 "Apply D1 schema" 互斥: 携带数据文件走本步, 未携带才回落。
+        # 注: TGuard 无独立 seed.sql(种子数据随仓库 db 提供), 补缺循环自然跳过。
+        if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != '' && env.DB_FILE_EXISTS == 'true'
+        run: |
+          cat > /tmp/d1-schema-diff.mjs << 'DIFF_EOF'
+          // 两侧 sqlite_master 清单 → 纯增量 DDL(新表/新列/索引/触发器/视图), 永不 DROP/DELETE/INSERT 数据
+          // 退出码: 0=已一致 3=D1 空(首次安装) 4=计划已生成 1=硬限制需人工迁移
+          import { readFileSync, writeFileSync } from 'node:fs'
+
+          const [localPath, remotePath, outPath] = process.argv.slice(2)
+          const fatal = (msg) => { console.error('::error::' + msg); process.exit(1) }
+
+          // 兼容三形态: sqlite3 -json 行数组 / wrangler 块数组 / wrangler {result:{results}}
+          function load(p) {
+            const j = JSON.parse(readFileSync(p, 'utf8'))
+            const blocks = Array.isArray(j) ? j : (Array.isArray(j?.result) ? j.result : j?.result ? [j.result] : [])
+            return blocks.flatMap((b) => {
+              if (Array.isArray(b?.results)) return b.results
+              return Array.isArray(b) ? b : [b]
+            })
+          }
+
+          // CREATE TABLE 括号体按顶层逗号切段(引号/嵌套括号感知)
+          function topLevelParts(sql) {
+            const parts = []
+            let depth = 0, cur = '', str = null
+            for (let i = 0; i < sql.length; i++) {
+              const c = sql[i]
+              if (str) { cur += c; if (c === str) { if (sql[i + 1] === str) cur += sql[++i]; else str = null } continue }
+              if (c === "'" || c === '"' || c === '`') { str = c; cur += c; continue }
+              if (c === '[') { const j = sql.indexOf(']', i); cur += sql.slice(i, j === -1 ? sql.length : j + 1); if (j !== -1) i = j; continue }
+              if (c === '(') { depth++; if (depth === 1) { cur = ''; continue } }
+              if (c === ')') { depth--; if (depth === 0) { if (cur.trim()) parts.push(cur.trim()); return parts } }
+              if (c === ',' && depth === 1) { if (cur.trim()) parts.push(cur.trim()); cur = ''; continue }
+              if (depth >= 1) cur += c
+            }
+            if (cur.trim()) parts.push(cur.trim())
+            return parts
+          }
+
+          const TABLE_CONSTRAINT = /^(PRIMARY\s+KEY|UNIQUE|CHECK|FOREIGN|CONSTRAINT)\b/i
+          function colInfo(def) {
+            if (TABLE_CONSTRAINT.test(def)) return null
+            const m = def.match(/^"((?:[^"]|"")+)"/) || def.match(/^\[([^\]]+)\]/) || def.match(/^`([^`]+)`/) || def.match(/^([A-Za-z_][A-Za-z0-9_$]*)/)
+            if (!m) return null
+            return { name: m[1] ?? m[2] ?? m[3] ?? m[4], rest: def.slice(m[0].length).trim() }
+          }
+
+          function ifNotExists(sql) {
+            return sql
+              .replace(/^CREATE\s+UNIQUE\s+INDEX\s+/i, 'CREATE UNIQUE INDEX IF NOT EXISTS ')
+              .replace(/^CREATE\s+INDEX\s+/i, 'CREATE INDEX IF NOT EXISTS ')
+              .replace(/^CREATE\s+TRIGGER\s+/i, 'CREATE TRIGGER IF NOT EXISTS ')
+              .replace(/^CREATE\s+VIEW\s+/i, 'CREATE VIEW IF NOT EXISTS ')
+              .replace(/^CREATE\s+TABLE\s+/i, 'CREATE TABLE IF NOT EXISTS ')
+          }
+
+          const local = load(localPath)
+          const remote = load(remotePath)
+          const rTables = new Map(), rOther = new Set()
+          for (const r of remote) {
+            if (r.type === 'table') rTables.set(r.name, r)
+            else rOther.add(r.name)
+          }
+          if (!rTables.size && !rOther.size) {
+            console.error('D1 无任何用户对象 → 首次安装(交回调用方全量导入)')
+            process.exit(3)
+          }
+
+          const stmts = []
+          const warns = []
+          for (const t of local.filter((r) => r.type === 'table')) {
+            if (!rTables.has(t.name)) {
+              stmts.push(ifNotExists(t.sql) + ';')
+              continue
+            }
+            const rCols = new Set(topLevelParts(rTables.get(t.name).sql || '').map((d) => colInfo(d)?.name).filter(Boolean))
+            const lCols = []
+            for (const def of topLevelParts(t.sql || '')) {
+              const info = colInfo(def)
+              if (!info) continue
+              lCols.push(info.name)
+              if (rCols.has(info.name)) continue
+              const bare = info.rest.replace(/'(?:[^']|'')*'/g, "''")
+              if (/\b(PRIMARY\s+KEY|UNIQUE)\b/i.test(bare))
+                fatal(`表 ${t.name} 新增列 ${info.name} 含主键/唯一约束 — SQLite ALTER 无法直接添加, 请人工迁移(建新表搬数据)后重试`)
+              stmts.push(`ALTER TABLE "${t.name}" ADD COLUMN ${def};`)
+            }
+            for (const c of rCols) if (!lCols.includes(c)) warns.push(`D1 表 ${t.name} 有本地 schema 没有的列 ${c} → 保留不动`)
+          }
+          for (const o of local.filter((r) => r.type !== 'table' && r.sql)) {
+            if (!rOther.has(o.name) && !rTables.has(o.name)) stmts.push(ifNotExists(o.sql) + ';')
+          }
+
+          const lNames = new Set(local.filter((r) => r.type === 'table' || r.sql).map((r) => r.name))
+          for (const name of rTables.keys()) if (!lNames.has(name)) warns.push(`D1 多出本地没有的表 ${name} → 数据保留不动`)
+          for (const n of rOther) if (!lNames.has(n)) warns.push(`D1 多出本地没有的 ${n} → 保留不动`)
+
+          for (const w of warns) console.error('  ⚠ ' + w)
+          if (!stmts.length) {
+            console.error('✓ 本地 schema 与 D1 完全一致 → 零写入')
+            process.exit(0)
+          }
+          writeFileSync(outPath, stmts.join('\n') + '\n')
+          console.error(`生成增量 DDL ${stmts.length} 条 → ${outPath}`)
+          process.exit(4)
+          DIFF_EOF
+
+          INV_Q="SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name != '_sync_meta'"
+          sqlite3 -json "$DB_FILE_PATH" "$INV_Q" > /tmp/d1-local-inv.json
+
+          # ① 拉取 D1 现状清单 + ② 计算纯增量迁移计划(数据不动)
+          npx wrangler d1 execute "$D1_NAME" --remote --json --command "$INV_Q" > /tmp/d1-remote-inv.json
+          RC=0
+          node /tmp/d1-schema-diff.mjs /tmp/d1-local-inv.json /tmp/d1-remote-inv.json /tmp/d1-migrate.sql || RC=$?
+          if [ "$RC" -eq 3 ]; then
+            # 首次安装: D1 还是空库 → 全量导入仓库 db(schema + 管理员账号等种子数据,
+            # 此后部署只走增量) —— 管理后台首次部署即可登录的关键
+            echo "D1 无用户表(首次安装) → 全量导入仓库 db(schema + 种子数据含管理员账号)"
+            sqlite3 "$DB_FILE_PATH" .dump | grep -v -E '^PRAGMA|^BEGIN TRANSACTION;|^COMMIT;|^CREATE TABLE _sync_meta|^INSERT INTO _sync_meta' > /tmp/d1-migrate.sql
+            npx wrangler d1 execute "$D1_NAME" --remote -y --file=/tmp/d1-migrate.sql
+          elif [ "$RC" -eq 4 ]; then
+            echo "schema 有增量 → 只应用以下 DDL, 线上数据一行不动:"
+            cat /tmp/d1-migrate.sql
+            npx wrangler d1 execute "$D1_NAME" --remote -y --file=/tmp/d1-migrate.sql
+          elif [ "$RC" -eq 0 ]; then
+            echo "✓ schema 与 D1 完全一致 → 零写入"
+          else
+            exit "$RC"
+          fi
+
+          # ③ 种子设置补缺(INSERT OR IGNORE 幂等: 线上已有数据零触碰; TGuard 无
+          #   seed.sql, 探测不到即跳过 —— 种子数据随仓库 db 在上一步已全量/增量就位)
+          for f in prisma/seed.sql server/seed.sql; do
+            if [ -f "$f" ]; then
+              echo "补缺种子设置: $f"
+              npx wrangler d1 execute "$D1_NAME" --remote --file="$f"
+              break
+            fi
+          done
+
+          # ④ 核验: 重新求差必须为空 —— 表/列/索引全部就位, 否则 fail hard
+          npx wrangler d1 execute "$D1_NAME" --remote --json --command "$INV_Q" > /tmp/d1-verify-inv.json
+          VRC=0
+          node /tmp/d1-schema-diff.mjs /tmp/d1-local-inv.json /tmp/d1-verify-inv.json /tmp/d1-verify.sql || VRC=$?
+          if [ "$VRC" -ne 0 ] || [ -s /tmp/d1-verify.sql ]; then
+            echo "::error::D1 迁移核验失败: 应用后仍有未就位对象(exit=$VRC):"
+            cat /tmp/d1-verify.sql 2>/dev/null || true
+            exit 1
+          fi
+          echo "✓ D1 schema 迁移完成: 表/列/索引全部就位, 线上数据全量保留(管理员账号已就绪)"
 
       # ---- wrangler.toml 动态生成(仓库无需携带静态文件) ----
 
