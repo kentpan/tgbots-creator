@@ -772,17 +772,23 @@ jobs:
           // 预览写入不得污染生产数据(预览按存储降级链路运行)。
           const production = { env_vars: envVars };
           const preview = { env_vars: envVars };
-          // 将 D1/KV/R2 绑定写入项目配置(Pages 高级模式与 Workers 绑定语义一致;
-          // 仅 production —— 见上; 绑定名与 TGuard 数据层约定一致: DATABASE/KV/BUCKET)
+          // 将 D1/KV 绑定写入项目配置(Pages 高级模式与 Workers 绑定语义一致;
+          // 仅 production —— 见上; 绑定名与 TGuard 数据层约定一致: DATABASE/KV)
+          // ⚠⚠ R2 绑定不走此 PATCH(对齐生产验证版 upload/pages-deploy.yml):
+          //   生产版 v2.1.16 的 BACKUP_R2 正常工作, 其 PATCH 同样只注入 D1/KV,
+          //   R2 全靠 wrangler.toml [[r2_buckets]] 随部署生效(生产验证通道)。
+          //   事故记录: 在此 PATCH r2_buckets → HTTP 400 [code:8000022]
+          //   "Invalid R2 bucket name ()" —— Pages API 的 r2_buckets 绑定字段
+          //   语义与 wrangler.toml 不同, 无论写 toml 风格的 {bucket_name} 还是
+          //   download-config 源码反推的 {name} 均无生产验证背书, 一律不写。
+          //   R2 唯一注入通道 = 下方 Generate wrangler.toml 的 [[r2_buckets]]
+          //   (binding=BUCKET, bucket_name=$R2_NAME), 随 wrangler pages deploy 生效。
           if ((process.env.PROXY_PASSTHROUGH || 'false') !== 'true') {
             if (process.env.D1_ID) {
               production.d1_databases = { DATABASE: { id: process.env.D1_ID } };
             }
             if (process.env.KV_ID) {
               production.kv_namespaces = { KV: { namespace_id: process.env.KV_ID } };
-            }
-            if (process.env.R2_NAME) {
-              production.r2_buckets = { BUCKET: { bucket_name: process.env.R2_NAME } };
             }
           }
 
@@ -798,7 +804,7 @@ jobs:
               console.log(`✓ Pages 项目 env_vars 已注入(production+preview): ${names}`);
               if (production.d1_databases) console.log('✓ D1 绑定(DATABASE) 已写入项目配置');
               if (production.kv_namespaces) console.log('✓ KV 绑定(KV) 已写入项目配置');
-              if (production.r2_buckets) console.log('✓ R2 绑定(BUCKET) 已写入项目配置');
+              if (process.env.R2_NAME) console.log('✓ R2 绑定(BUCKET) 不经 PATCH —— 由 wrangler.toml [[r2_buckets]] 随部署生效: ' + process.env.R2_NAME);
             } else {
               console.error('::error::Pages 项目 env_vars 注入失败: HTTP ' + r.status + ' ' + JSON.stringify(j.errors || j));
               process.exit(1);
@@ -864,8 +870,11 @@ jobs:
             const prod = dc.production || {};
             const d1 = prod.d1_databases && prod.d1_databases.DATABASE && prod.d1_databases.DATABASE.id;
             const kv = prod.kv_namespaces && prod.kv_namespaces.KV && prod.kv_namespaces.KV.namespace_id;
-            const r2 = prod.r2_buckets && prod.r2_buckets.BUCKET && prod.r2_buckets.BUCKET.bucket_name;
-            console.log(`[production] 绑定: D1(DATABASE) ${d1 ? '已配置(' + String(d1).slice(0, 8) + '…)' : '未配置'} | KV(KV) ${kv ? '已配置' : '未配置'} | R2(BUCKET) ${r2 ? '已配置' : '未配置'}`);
+            // R2 绑定不 PATCH 进项目配置(生产验证通道 = wrangler.toml 随部署生效),
+            // 此处无法从项目配置回读 —— 校验口径改为"配置了 R2_NAME 即视为走 toml 通道",
+            // 与上方 Configure 步骤同源; 真实性由部署后 /health 冒烟兜底。
+            const r2 = process.env.R2_NAME || '';
+            console.log(`[production] 绑定: D1(DATABASE) ${d1 ? '已配置(' + String(d1).slice(0, 8) + '…)' : '未配置'} | KV(KV) ${kv ? '已配置' : '未配置'} | R2(BUCKET) ${r2 ? '经 wrangler.toml 随部署生效(' + r2 + ')' : '未配置'}`);
             if (failed) {
               console.error('::error::Pages 项目 env_vars 校验未通过 —— 请检查上方 Configure 步骤输出与 CLOUDFLARE_API_TOKEN 的 Pages:Edit 权限。');
               process.exit(1);
