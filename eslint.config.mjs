@@ -19,6 +19,11 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     // React rules
     "react-hooks/exhaustive-deps": "off",
     "react-hooks/purity": "off",
+    // React Compiler 新增规则(eslint-config-next 16 引入): 现存 admin 组件大量
+    // "effect 内同步 setState 初始化"与手动 memoization 模式, 属既有代码风格 ——
+    // 与 exhaustive-deps/purity 同口径关闭, 避免为静音规则而重构生产行为
+    "react-hooks/set-state-in-effect": "off",
+    "react-hooks/preserve-manual-memoization": "off",
     "react/no-unescaped-entities": "off",
     "react/display-name": "off",
     "react/prop-types": "off",
@@ -44,7 +49,7 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "no-useless-escape": "off",
   },
 }, {
-  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills"]
+  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills", "upload/**", "download/**", "pages-adapter/**", "dist-pages/**", ".open-next/**"]
 }];
 
 export default eslintConfig;

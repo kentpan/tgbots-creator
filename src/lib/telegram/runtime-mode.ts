@@ -37,7 +37,12 @@ export function normalizeGlobalTransport(raw: string | undefined | null): Global
 }
 
 export function isEdgeRuntime(): boolean {
-  return process.env.NEXT_RUNTIME === "edge";
+  // v1.1.5: 补充 workerd 判定 —— OpenNext(@opennextjs/cloudflare) 部署下
+  // NEXT_RUNTIME 恒为 "nodejs", 但 Cloudflare Workers/Pages 依旧是无常驻进程的
+  // serverless 环境(无法 30s+ 长轮询), 必须继续走 Webhook。workerd 运行时
+  // navigator.userAgent 固定为 "Cloudflare-Workers"(官方 Runtime API 文档)。
+  if (process.env.NEXT_RUNTIME === "edge") return true;
+  return typeof navigator !== "undefined" && navigator.userAgent === "Cloudflare-Workers";
 }
 
 /**

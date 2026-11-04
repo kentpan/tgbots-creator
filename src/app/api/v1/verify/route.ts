@@ -61,7 +61,7 @@ export async function POST(request: NextRequest) {
     const isApiRequest =
       session.chatId === 0n || (joinRequest !== null && joinRequest.requestType === "api");
 
-    const telegramUser = validateInitData(
+    const telegramUser = await validateInitData(
       typeof body.init_data === "string" ? body.init_data : "",
       config.bot.token,
     );

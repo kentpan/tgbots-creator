@@ -1,0 +1,8 @@
+{
+  "name": "tg-relay",
+  "version": "1.0.8",
+  "private": true,
+  "scripts": {
+    "dev": "bun --hot index.ts"
+  }
+}

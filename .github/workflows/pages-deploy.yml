@@ -1,30 +1,58 @@
 # ============================================================================
-# pages-deploy.yml — 自动部署工作流（push main 即发布）
+# pages-deploy.yml — TGuard Cloudflare 部署工作流(OpenNext + Pages/Workers 双部署类型)
 # ----------------------------------------------------------------------------
-# 部署参数全部收敛于仓库根目录 deploy.config.js（项目名 / D1 名 / KV 名 / R2 桶名）。
-# wrangler.toml 由本工作流按配置动态生成（仓库无需携带），D1 / KV / R2 不存在时
-# 自动创建（KV 可选，失败仅告警不阻塞），并把 GitHub Secret 中的 ADMIN_SECRET
-# 写入 Pages 运行环境。
+# 来源: 生产环境验证过的通用工作流(upload/next-deploy.zip, gem-td 同源 v9.x,
+# npm + Pages/Workers 双部署类型版), 按 TGuard 项目实际情况做如下适配:
+#   ① D1 绑定名 DATABASE(KV=KV / R2=BUCKET, 与 src/database/client.ts、
+#      src/database/bindings.ts 的 globalThis 约定通道一致; gem-td 原版为 DB)
+#   ② 新增 R2 支持(建桶 + wrangler.toml + Pages API 绑定注入) —— TGuard 媒体
+#      存储依赖 R2(gem-td 无 R2); R2 服务未开通([code:10042])时给出明确指引
+#   ③ 新增 "Apply D1 schema" 幂等建表(沿用本工作流 v8.9.x 既有机制: 仓库
+#      prisma/schema.sql 现场归一为 IF NOT EXISTS 后经 wrangler d1 execute 应用,
+#      对已有库零副作用) —— TGuard 数据层无 gem-td 式运行时自建表(initSchema)
+#   ④ 冒烟端点 /api/app-version → /health(TGuard 健康检查路由)
+#   ⑤ secrets 调整: 必填仅 CLOUDFLARE_API_TOKEN; TELEGRAM_WEBHOOK_SECRET 可选注入;
+#      ADMIN_SECRET/JWT_SECRET 降级为可选(历史遗留, TGuard 登录鉴权存于数据库)
+#   ⑥ 数据库文件真源 = .env 的 DATABASE_URI(TGuard 惯例, gem-td 为 DATABASE_URL),
+#      本地 SQLite 路径仅用于 Node 形态; Cloudflare 形态使用 D1 绑定
+#   ⑦ 移除 gem-td 专属的 PROXY_MODE 代理透传适配层步骤(TGuard 无此功能);
+#      PROXY_MODE/LANGUAGE 变量解析保留(未配置时安全回落 false/auto)
+#   ⑧ 移除 Nuxt 分支(TGuard 为纯 Next.js 项目)与 Prisma Client 生成步骤
+#      (TGuard 不使用 Prisma Client, prisma/ 仅存放 schema.sql 与本地库文件)
+#   ⑨ OpenNext 构建补 SKIP_WRANGLER_CONFIG_CHECK=yes —— 当前版本
+#      @opennextjs/cloudflare 要求仓库携带 wrangler.toml, 而本工作流按
+#      deploy.config.js 动态生成(在构建之后的步骤写入), 构建期跳过该校验
 #
-# 全流程：拉代码 → 读配置 → 解析账号 → 装 wrangler → 确保 Pages/D1/KV/R2 存在 →
-#         生成 wrangler.toml → npm ci → @cloudflare/next-on-pages 构建 → 部署
+# 全流程: 拉代码 → 检测框架 → 校验 secrets → 解析 PROXY_MODE/LANGUAGE/数据库文件/
+#         deploy.config.js/部署类型/账号 → npm ci → OpenNext 构建 → 组装 dist-pages
+#         (自研适配层) → 确保 D1/KV/R2 存在 + 幂等 schema → 生成 wrangler.toml →
+#         注入 Pages env_vars(回读校验) → 部署 → /health 冒烟 → 摘要
 #
 # 需要在 GitHub 仓库 Settings → Secrets and variables → Actions 配置:
 #   Secrets(必填):
-#     CLOUDFLARE_API_TOKEN  部署权限（Pages:Edit + D1:Edit + R2:Edit，KV 可选: Workers KV Storage:Edit）
-#     ADMIN_SECRET          管理面板登录密钥（自动注入 Pages 运行环境 Secret）
+#     CLOUDFLARE_API_TOKEN  部署权限(Pages:Edit + D1:Edit + Workers KV Storage:Edit
+#                           + Workers R2 Storage:Edit, 建议含 Account Settings:Read)
 #   Secrets(可选):
-#     ISSUE_APIKEY          旧版单密钥（建议改用管理面板「APIKEY 管理」）
-#     JWT_SECRET            /s/ 加密分享链接密钥（不配置则退回用 ADMIN_SECRET 派生）
-#     CLOUDFLARE_ACCOUNT_ID 账号 ID（单账号 Token 可留空自动探测）
+#     TELEGRAM_WEBHOOK_SECRET  /api/telegram/webhook 校验密钥(与本地 .env 一致)
+#     ADMIN_SECRET / JWT_SECRET 历史遗留(已配置的项目原样保留注入, 不配置不报错)
+#     CLOUDFLARE_ACCOUNT_ID    账号 ID(单账号 Token 可留空自动探测)
+#   Variables(可选):
+#     DEPLOYTYPE               部署类型覆盖(workers|pages; 高于 deploy.config.js deployType)
+#     PROXY_MODE / LANGUAGE    预留(本工作流通用机制, TGuard 未使用)
 # ============================================================================
 
-name: Deploy to Cloudflare Pages
+name: Deploy to Cloudflare
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      project_name:
+        description: '项目名称(留空则读取 deploy.config.js)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -35,55 +63,254 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  WRANGLER_VERSION: '4'
-  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  # OpenNext Cloudflare 适配器构建产物目录(worker.js + assets/; workers 部署入口)
+  OPENNEXT_OUTPUT_DIR: .open-next
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # 运行时密钥(pages 类型经 Pages API 写入项目 env_vars; workers 类型经
+      # wrangler secret put 写入)。TGuard 登录鉴权存于数据库, ADMIN_SECRET/
+      # JWT_SECRET 为历史遗留可选注入; TELEGRAM_WEBHOOK_SECRET 用于 webhook 校验。
+      ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+      JWT_SECRET: ${{ secrets.JWT_SECRET }}
+      TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
     steps:
-      - name: 拉取代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 安装 Node 22
+      - name: Detect framework (Next.js)
+        run: |
+          # TGuard 为纯 Next.js 项目(适配⑧): 按 next.config.js|.ts 判定,
+          # 缺失即报错退出(防止误在非 Next 仓库触发部署)。
+          HAS_NEXT=false
+          for f in next.config.js next.config.ts; do [ -f "$f" ] && HAS_NEXT=true; done
+
+          if [ "$HAS_NEXT" != "true" ]; then
+            echo "::error::未检测到 next.config.js|.ts, 无法判定 Next.js 框架。"
+            exit 1
+          fi
+
+          echo "FRAMEWORK=next" >> $GITHUB_ENV
+          echo "✅ 框架检测完成: next → OpenNext + 自研适配层 编译 → Cloudflare Pages/Workers 部署(按 deployType)"
+
+      - name: Setup Node.js (npm)
         uses: actions/setup-node@v4
         with:
+          # node:sqlite 需要 Node≥22.5; CI 构建期用 22 LTS(运行时为 workerd/nodejs_compat)
           node-version: '22'
 
-      - name: 读取部署配置 deploy.config.js
-        id: cfg
+      - name: Verify required secrets
         run: |
-          set -e
-          OUT=$(node --input-type=module -e "
-            import cfg from './deploy.config.js';
-            const pick = (v) => (v === undefined || v === null ? '' : String(v).trim());
-            if (!pick(cfg.projectName)) { console.error('deploy.config.js 缺少 projectName'); process.exit(1); }
-            console.log('project=' + pick(cfg.projectName));
-            console.log('d1=' + pick(cfg.d1Name));
-            console.log('kv=' + pick(cfg.kvName));
-            console.log('r2=' + pick(cfg.r2Name));
-            console.log('account=' + pick(cfg.accountId));
-          ")
-          echo "$OUT" >> "$GITHUB_OUTPUT"
-          echo "$OUT"
+          # 必填 secret: CLOUDFLARE_API_TOKEN(部署用)。TGuard 登录鉴权存于数据库,
+          # ADMIN_SECRET/JWT_SECRET 不再是必需项(已配置则照常注入, 见后续步骤)。
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error::Missing CLOUDFLARE_API_TOKEN secret."
+            exit 1
+          fi
+          echo "✓ Required secrets present (CLOUDFLARE_API_TOKEN)."
 
-      - name: 解析 Cloudflare 账号 ID
-        # 照抄参考实现（upload/deploy.zip pages-deploy.yml “Resolve Cloudflare account ID”）：
-        # 优先级 CLOUDFLARE_ACCOUNT_ID secret → deploy.config.js accountId → REST 自动探测；
-        # 结果写入 $GITHUB_ENV，后续所有 wrangler/curl 步骤统一使用，避免多账号 Token 歧义。
+      - name: Detect PROXY_MODE (proxy passthrough)
+        # 通用机制保留(适配⑦): TGuard 未使用 PROXY_MODE, 此步骤恒解析为
+        # "未开启"(PROXY_PASSTHROUGH=false), 全部 D1/KV/R2 步骤正常执行。
+        run: |
+          # 优先级: repo Variable > repo Secret > .env 文件; 输出一律脱敏
+          # (apiKey 属敏感值, 配在 Variables 时 GitHub 不自动打码)。
+          RAW=""
+          SRC="未配置(vars/secrets/.env 均无)"
+          VARS_VAL="${{ vars.PROXY_MODE }}"
+          SECRETS_VAL="${{ secrets.PROXY_MODE }}"
+          if [ -n "$VARS_VAL" ]; then
+            RAW="$VARS_VAL"
+            SRC="repo Variable(vars.PROXY_MODE)"
+          elif [ -n "$SECRETS_VAL" ]; then
+            RAW="$SECRETS_VAL"
+            SRC="repo Secret(secrets.PROXY_MODE)"
+          fi
+          if [ -z "$RAW" ] && [ -f .env ]; then
+            RAW=$(grep -E '^\s*PROXY_MODE\s*=' .env | tail -1 | sed 's/^\s*PROXY_MODE\s*=\s*//' | tr -d '\r' | tr -d '"' || true)
+            [ -n "$RAW" ] && SRC="仓库 .env 文件"
+          fi
+          RAW=$(echo "$RAW" | xargs || true)
+          # 脱敏展示: 保留 apiKey 前 12 字符 + @域名, 绝不整值打印
+          mask_proxy() { echo "$1" | sed -E 's/^([^@]{0,12})[^@]*@/\1***@/'; }
+          if [ -n "$RAW" ] && [ "$RAW" != "false" ] && [ "$RAW" != "False" ] && [ "$RAW" != "0" ]; then
+            echo "PROXY_PASSTHROUGH=true" >> $GITHUB_ENV
+            echo "PROXY_MODE_RAW=$RAW" >> $GITHUB_ENV
+            echo "✅ PROXY_MODE 已解析 | 来源: $SRC | 值(脱敏): $(mask_proxy "$RAW")"
+            echo "::notice::代理透传模式开启 → 跳过 D1/KV/R2 与 schema, /api/* 全量经 Functions 透传"
+          else
+            echo "PROXY_PASSTHROUGH=false" >> $GITHUB_ENV
+            echo "✅ PROXY_MODE 未开启 | 来源: $SRC → 本地数据库模式(D1/KV/R2 正常创建)"
+          fi
+
+      - name: Resolve LANGUAGE (site language mode)
+        run: |
+          # 通用机制保留: TGuard 未使用, 未配置时回落 auto。
+          RAW=""
+          SRC="未配置(vars/secrets/.env 均无)"
+          VARS_VAL="${{ vars.LANGUAGE }}"
+          SECRETS_VAL="${{ secrets.LANGUAGE }}"
+          if [ -n "$VARS_VAL" ]; then
+            RAW="$VARS_VAL"
+            SRC="repo Variable(vars.LANGUAGE)"
+          elif [ -n "$SECRETS_VAL" ]; then
+            RAW="$SECRETS_VAL"
+            SRC="repo Secret(secrets.LANGUAGE)"
+          fi
+          if [ -z "$RAW" ] && [ -f .env ]; then
+            RAW=$(grep -E '^\s*LANGUAGE\s*=' .env | tail -1 | sed 's/^\s*LANGUAGE\s*=\s*//' | tr -d '\r' | tr -d '"' || true)
+            [ -n "$RAW" ] && SRC="仓库 .env 文件"
+          fi
+          RAW=$(echo "$RAW" | xargs || true)
+          echo "LANGUAGE_RAW=$RAW" >> $GITHUB_ENV
+          if [ -n "$RAW" ]; then
+            echo "✅ LANGUAGE 已解析 | 来源: $SRC | 值: $RAW"
+          else
+            echo "✅ LANGUAGE 未配置 → auto"
+          fi
+
+      - name: Resolve database file from .env
+        run: |
+          # TGuard 适配⑥: 本地 SQLite 数据库文件路径/名称唯一真源 = .env 的
+          # DATABASE_URI(deploy.config.js 的 database 仅是"是否执行 D1 操作"的
+          # 布尔开关, 不携带路径)。此处解析 .env → 导出 DATABASE_URI_VALUE
+          # (构建期占位统一引用)与 DATABASE_FILENAME。该值仅服务 Node 形态
+          # (node:sqlite); Cloudflare 形态使用 D1 绑定, 与此路径无关。
+          DB_URL=""
+          if [ -f .env ]; then
+            DB_URL=$(grep -E '^\s*DATABASE_URI\s*=' .env | tail -1 | sed 's/^\s*DATABASE_URI\s*=\s*//' | tr -d '\r' | tr -d '"' | tr -d "'" | xargs || true)
+            [ -n "$DB_URL" ] && SRC="仓库 .env 文件"
+          fi
+          if [ -z "$DB_URL" ]; then
+            # .env 缺失/未提交时回落默认库(与本地 prisma/bot-groups.db 同源)
+            DB_URL="file:./prisma/bot-groups.db"
+            SRC="内置默认(.env 未配置)"
+          fi
+          DB_FILENAME=$(echo "$DB_URL" | sed 's/^file://' | awk -F/ '{print $NF}')
+          [ -z "$DB_FILENAME" ] && DB_FILENAME="bot-groups.db"
+          echo "DATABASE_URI_VALUE=$DB_URL" >> $GITHUB_ENV
+          echo "DATABASE_FILENAME=$DB_FILENAME" >> $GITHUB_ENV
+          echo "✅ 数据库文件已解析 | 来源: $SRC | DATABASE_URI=$DB_URL | 文件名: $DB_FILENAME"
+
+      - name: Read deploy.config.js
+        id: deploy-config
+        run: |
+          # 读取 deploy.config.js 配置(ESM export default)。
+          # 内联 data:URL 解析 —— 把文件内容包成 data:text/javascript;base64
+          # 再 import(), Node 强制按 ESM 语义解析, 项目有无 "type":"module" 都能读;
+          # 不依赖任何配套脚本(两件套自包含)。
+          read_cfg() {
+            node -e '
+              const fs = require("node:fs");
+              const field = process.argv[1];
+              const src = fs.readFileSync("deploy.config.js", "utf8");
+              const url = "data:text/javascript;base64," + Buffer.from(src).toString("base64");
+              import(url).then((m) => {
+                const v = m.default && m.default[field];
+                console.log(String(v ?? ""));
+              }).catch((e) => {
+                console.error("::error::解析 deploy.config.js 失败(" + field + "): " + e.message);
+                process.exit(1);
+              });
+            ' "$1"
+          }
+          PROJECT_NAME="${{ inputs.project_name }}"
+          if [ -z "$PROJECT_NAME" ]; then
+            PROJECT_NAME=$(read_cfg projectName)
+          fi
+          D1_NAME=$(read_cfg d1Name)
+          KV_NAME=$(read_cfg kvName)
+          R2_NAME=$(read_cfg r2Name)
+          D1_ID=$(read_cfg d1Id)
+          KV_ID=$(read_cfg kvId)
+          CONFIG_ACCOUNT_ID=$(read_cfg accountId)
+          CONFIG_DEPLOY_TYPE=$(read_cfg deployType)
+
+          # database = 布尔开关(是否执行 D1 数据库操作) —— 本地数据库文件
+          # 路径/名称不在此配置, 唯一真源 = .env 的 DATABASE_URI(见上方步骤)。
+          #   true / 1 / yes / on → 执行全部 D1 步骤(建库/schema 建表/绑定注入);
+          #   false / 0 / no / off / '' / 字段缺失 → 跳过全部 D1 步骤, 仅部署站点代码。
+          #   实现方式: 关闭时清空 D1 名称与 ID → 所有下游步骤(D1 创建、schema
+          #   推送、wrangler.toml D1 段、Pages D1 绑定 PATCH)按"未配置"门控自然跳过。
+          RAW_DB_ORIG=$(read_cfg database | xargs || true)
+          RAW_DB=$(echo "$RAW_DB_ORIG" | tr '[:upper:]' '[:lower:]' | xargs || true)
+          DB_ENABLED="true"
+          case "$RAW_DB" in
+            false|0|no|off|"")
+              DB_ENABLED="false"
+              D1_NAME=""; D1_ID=""
+              echo "::notice::deploy.config.js database 为 false/未配置 → 跳过全部 D1 数据库步骤, 仅部署站点代码"
+              ;;
+            *)
+              echo "✅ database=$RAW_DB_ORIG → D1 已启用(建库/建表/推送 schema)"
+              ;;
+          esac
+
+          echo "DATABASE_ENABLED=$DB_ENABLED" >> $GITHUB_ENV
+          echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
+          echo "D1_NAME=$D1_NAME" >> $GITHUB_ENV
+          echo "KV_NAME=$KV_NAME" >> $GITHUB_ENV
+          echo "R2_NAME=$R2_NAME" >> $GITHUB_ENV
+          echo "D1_ID=$D1_ID" >> $GITHUB_ENV
+          echo "KV_ID=$KV_ID" >> $GITHUB_ENV
+          echo "CONFIG_ACCOUNT_ID=$CONFIG_ACCOUNT_ID" >> $GITHUB_ENV
+          echo "CONFIG_DEPLOY_TYPE=$CONFIG_DEPLOY_TYPE" >> $GITHUB_ENV
+          echo "::notice::配置: project=$PROJECT_NAME, database=${RAW_DB_ORIG:-'(未配置)'}, d1=$D1_NAME, kv=$KV_NAME, r2=$R2_NAME, accountId=$CONFIG_ACCOUNT_ID, deployType=$CONFIG_DEPLOY_TYPE"
+
+      - name: Validate projectName
+        run: |
+          if [ -z "${{ env.PROJECT_NAME }}" ]; then
+            echo "::error::deploy.config.js 中 projectName 为空! 请设置 Cloudflare 项目名称。"
+            exit 1
+          fi
+          echo "✅ projectName: ${{ env.PROJECT_NAME }}"
+
+      - name: Resolve deploy type (pages | workers)
+        run: |
+          # 部署类型解析。优先级: repo Variable DEPLOYTYPE > deploy.config.js deployType > 默认 pages。
+          # 配置了非法值时直接报错退出(部署目标是关键路径, 绝不静默回落到错误目标)。
+          RAW="${{ vars.DEPLOYTYPE }}"
+          # 容错: 去空白 + 大小写归一(WORKERS/Pages 等写法等价生效)
+          RAW=$(echo "$RAW" | tr '[:upper:]' '[:lower:]' | xargs || true)
+          if [ -z "$RAW" ]; then
+            RAW=$(echo "${{ env.CONFIG_DEPLOY_TYPE }}" | tr '[:upper:]' '[:lower:]' | xargs || true)
+          fi
+          if [ -z "$RAW" ]; then
+            RAW="pages"
+            echo "::notice::DEPLOYTYPE 未配置且 deploy.config.js 无 deployType → 默认 pages"
+          fi
+          case "$RAW" in
+            pages)
+              echo "DEPLOY_TYPE=pages" >> $GITHUB_ENV
+              echo "::notice::部署类型 = pages → OpenNext+自研适配层 → Cloudflare Pages"
+              ;;
+            workers)
+              echo "DEPLOY_TYPE=workers" >> $GITHUB_ENV
+              echo "::notice::部署类型 = workers → OpenNext(适配层入口) → Cloudflare Workers(wrangler deploy)"
+              ;;
+            *)
+              echo "::error::非法部署类型 '$RAW'(合法值: pages | workers)。来源: vars.DEPLOYTYPE 或 deploy.config.js deployType。"
+              exit 1
+              ;;
+          esac
+          echo "✅ 部署类型: $RAW"
+
+      - name: Resolve Cloudflare account ID
         env:
           SECRET_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           ACCOUNT_ID="${SECRET_ACCOUNT_ID}"
 
           # 优先级: CLOUDFLARE_ACCOUNT_ID secret -> deploy.config.js accountId -> 自动探测
-          if [ -z "$ACCOUNT_ID" ] && [ -n "${{ steps.cfg.outputs.account }}" ]; then
-            ACCOUNT_ID="${{ steps.cfg.outputs.account }}"
-            echo "使用 deploy.config.js 的 accountId: $ACCOUNT_ID"
+          if [ -z "$ACCOUNT_ID" ] && [ -n "$CONFIG_ACCOUNT_ID" ]; then
+            ACCOUNT_ID="$CONFIG_ACCOUNT_ID"
+            echo "::notice::使用 deploy.config.js 的 accountId: $ACCOUNT_ID"
           fi
 
           if [ -z "$ACCOUNT_ID" ]; then
-            echo "未配置账号 ID, 开始自动探测..."
+            echo "::notice::未配置账号 ID, 开始自动探测..."
 
             # 1) 先检测 TOKEN 是否有效
             VERIFY_OK=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
@@ -92,7 +319,7 @@ jobs:
               echo "::error::CLOUDFLARE_API_TOKEN 无效或校验失败, 请检查 token 是否正确且未过期。"
               exit 1
             fi
-            echo "Token 校验通过"
+            echo "::notice::Token 校验通过"
 
             # 2) 检测 Token 是否有列账号权限, 并获取第一个账号 ID
             ACCOUNTS=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
@@ -110,134 +337,168 @@ jobs:
               echo "::error::接口返回: $ACCOUNTS"
               exit 1
             fi
-            echo "自动探测到账号 ID: $ACCOUNT_ID(建议填入 deploy.config.js 的 accountId 或设置 secret 以加快后续部署)"
+            echo "::notice::自动探测到账号 ID: $ACCOUNT_ID(建议填入 deploy.config.js 的 accountId 或设置 secret 以加快后续部署)"
           fi
 
-          echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
-          echo "最终使用账号 ID: $ACCOUNT_ID"
+          echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
+          echo "::notice::最终使用账号 ID: $ACCOUNT_ID"
 
-      - name: 安装 wrangler
-        run: npm install -g "wrangler@${WRANGLER_VERSION}"
-
-      - name: 确保 Pages 项目存在
-        # 模式对齐参考实现（REST 查重 → 不存在才创建 → 失败 fail hard）。
-        # 严禁 "| grep -v already exists || true" 吞错：创建失败却继续，
-        # 会在最终 deploy 步骤才爆出难懂的错误，白跑一整轮。
-        env:
-          PROJECT: ${{ steps.cfg.outputs.project }}
+      - name: Install dependencies (npm ci)
         run: |
-          CHECK=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/${PROJECT}")
-          CODE=$(echo "$CHECK" | tail -1)
-          BODY=$(echo "$CHECK" | sed '$d')
+          # package-lock.json 已提交 → npm ci 保证 CI 与本地一致(可复现安装);
+          # .npmrc legacy-peer-deps=true 已随仓库提交, 兼容既有 peer 依赖关系
+          npm ci
+        env:
+          # 构建期占位(不连接数据库): 数据库文件路径唯一真源统一引用
+          DATABASE_URI: "${{ env.DATABASE_URI_VALUE }}"
 
-          if [ "$CODE" = "200" ]; then
-            echo "Pages 项目已存在: $PROJECT"
-          elif [ "$CODE" = "404" ]; then
-            echo "创建 Pages 项目: $PROJECT"
-            RESULT=$(npx wrangler pages project create "$PROJECT" --production-branch=main 2>&1 || true)
-            echo "$RESULT"
-            # 不猜 wrangler 输出格式(各版本成功文案不同) —— 创建后 REST 复查, HTTP 200 即真实存在
-            VCODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/${PROJECT}")
-            if [ "$VCODE" = "200" ]; then
-              echo "Pages 项目创建成功(REST 复查通过): $PROJECT"
-            else
-              echo "::error::Pages 项目创建失败(REST 复查 HTTP $VCODE), 请检查 CLOUDFLARE_API_TOKEN 是否含 Cloudflare Pages:Edit 权限"
-              echo "::error::wrangler 返回: $RESULT"
-              exit 1
-            fi
+      # ---- Next.js 专用: OpenNext 适配 + 自研 Pages 高级模式适配层 ----
+
+      - name: Ensure OpenNext toolchain (Next.js)
+        run: |
+          # @opennextjs/cloudflare 与 wrangler 已进入 devDependencies
+          # (wrangler>=4.59.2: workerd PR#5869 修复 Next.js 16.1+ setImmediate 补丁
+          #  与 workerd 只读 node: 模块命名空间的兼容问题, 见 opennextjs issue #1049)。
+          # 此处仅为护栏: 若依赖缺失(旧 lockfile), 临时补装(--no-save, 不改 lock)。
+          # ⚠️ 两个包必须在同一条 npm install 命令里一次装入(实测事故:
+          #    拆两条时第二条会把第一条 --no-save 装入的包当多余包删除)。
+          MISSING=()
+          command -v node_modules/.bin/opennextjs-cloudflare >/dev/null 2>&1 || grep -q '"@opennextjs/cloudflare"' package.json || MISSING+=("@opennextjs/cloudflare")
+          command -v node_modules/.bin/wrangler >/dev/null 2>&1 || grep -q '"wrangler"' package.json || MISSING+=("wrangler")
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            npm install --no-save "${MISSING[@]}"
           else
-            echo "::error::无法查询 Pages 项目(HTTP $CODE), 请检查 CLOUDFLARE_API_TOKEN 是否含 Cloudflare Pages:Edit 权限"
-            echo "::error::API 返回: $BODY"
+            echo "@opennextjs/cloudflare 与 wrangler 均已就绪, 跳过"
+          fi
+
+      - name: Ensure open-next.config.ts
+        run: |
+          # @opennextjs/cloudflare 需要 open-next.config.ts; 仓库已携带
+          # (与生产验证配置同源同值), 缺失时生成最小默认配置兜底。
+          if [ ! -f open-next.config.ts ]; then
+            printf '%s\n' \
+              'import { defineCloudflareConfig } from "@opennextjs/cloudflare";' \
+              '' \
+              'export default defineCloudflareConfig({});' \
+              > open-next.config.ts
+            echo "::notice::已生成默认 open-next.config.ts"
+          else
+            echo "使用仓库中已有的 open-next.config.ts"
+          fi
+
+      - name: Build with OpenNext (Pages/Workers 共用)
+        run: |
+          # opennextjs-cloudflare build:
+          #   1) 执行 next build
+          #   2) 产出 $OPENNEXT_OUTPUT_DIR/worker.js + $OPENNEXT_OUTPUT_DIR/assets/
+          # 两种部署类型(pages/workers)都以此为共同构建起点:
+          #   - pages   → 后续步骤再叠加自研适配层(dist-pages/_worker.js)
+          #   - workers → 以 pages-adapter/worker.ts 为 main(wrangler deploy 时由
+          #     wrangler esbuild 打包, 相对导入 .open-next/worker.js 全树进 bundle)
+          # 快速失败护栏: 本地 bin 必须存在 —— npx 在本地缺 bin 时会静默回落拉取
+          # npm 上同名安全占位包(无 bin), 报出误导性的
+          # "could not determine executable to run"。
+          if [ ! -x node_modules/.bin/opennextjs-cloudflare ]; then
+            echo "::error::opennextjs-cloudflare 本地 bin 缺失(适配器安装未生效), 终止构建以避免 npx 回落拉取安全占位包。"
+            exit 1
+          fi
+          npx opennextjs-cloudflare build
+          if [ ! -f "$OPENNEXT_OUTPUT_DIR/worker.js" ]; then
+            echo "::error::OpenNext 构建产物缺失: $OPENNEXT_OUTPUT_DIR/worker.js"
+            exit 1
+          fi
+          echo "::notice::OpenNext 构建完成: $OPENNEXT_OUTPUT_DIR/worker.js + $OPENNEXT_OUTPUT_DIR/assets/"
+        env:
+          # 当前版本 @opennextjs/cloudflare 在构建期要求仓库携带 wrangler.toml,
+          # 而本工作流按 deploy.config.js 动态生成(在构建之后的步骤写入) → 跳过校验
+          SKIP_WRANGLER_CONFIG_CHECK: 'yes'
+          # 构建期占位环境变量(仅构建机器使用, 不会进入运行时):
+          # - DATABASE_URI: 数据库模块加载需要非空值
+          DATABASE_URI: "${{ env.DATABASE_URI_VALUE }}"
+          # PROXY_MODE / LANGUAGE 构建期注入(通用机制; TGuard 未使用时为空值)
+          PROXY_MODE: "${{ env.PROXY_MODE_RAW }}"
+          LANGUAGE: "${{ env.LANGUAGE_RAW }}"
+
+      - name: Assemble Pages bundle (自研适配层, 仅 deployType=pages)
+        if: env.DEPLOY_TYPE == 'pages'
+        run: |
+          # 仅 pages 部署类型: 自研适配层 → dist-pages/(_worker.js + 静态资源
+          # + _routes.json)。_routes.json 将纯静态路径排除出 worker(CDN 直出,
+          # 规避 Pages 高级模式全量请求进 _worker.js 的额外开销); worker 内
+          # OpenNext 路由另有 ASSETS 兜底(见 pages-adapter/worker.ts)。
+          # Pages 高级模式: wrangler pages deploy 以 dist-pages 为部署目录发布。
+          # workers 部署类型跳过此步(直接以 pages-adapter/worker.ts 为 main 部署)。
+          node scripts/build-pages-adapter.mjs
+          echo "::notice::dist-pages 产物清单(前 12 项):"
+          ls dist-pages | head -12
+          if [ ! -f dist-pages/_worker.js ]; then
+            echo "::error::dist-pages/_worker.js 缺失(适配层组装失败)"
             exit 1
           fi
 
-      - name: 确保 D1 数据库存在并取得 ID
-        # 逻辑照抄参考实现（upload/deploy.zip pages-deploy.yml “Create D1 database (if needed)”）。
-        # ⚠ D1 database_id 是带连字符的 UUID(如 ba48f121-5726-41e8-9466-699efa5c2d83)，
-        # 严禁用 [0-9a-f]{32} 这类“连续 32 位”正则提取 —— 带连字符 UUID 最长连续 hex 段
-        # 仅 12 位, 永远匹配不上(v1.0.3 首发的实际事故, 库建成功但 ID 提取为空导致部署失败)。
-        id: d1
-        if: ${{ steps.cfg.outputs.d1 != '' }}
-        env:
-          D1_NAME: ${{ steps.cfg.outputs.d1 }}
+      # ---- D1 / KV / R2 资源创建(幂等; fail hard, proxy 模式跳过) ----
+
+      - name: Create D1 database (if needed)
+        # 代理透传模式跳过(远端库由代理站维护); 移除 continue-on-error(fail hard)
+        # —— database 配置开启即承诺 D1 就绪, 创建失败却继续 = D1_ID 为空 →
+        # schema/绑定全部跳过 → 线上空库照常发布, 违背"发布成功 = 数据就绪"。
+        if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID == ''
         run: |
-          set -e
           # 先查是否已存在, 避免 "already exists" 报错(--json 输出兼容顶层数组与 {result:[...]} 两种格式)
           EXISTING_D1_ID=$(npx wrangler d1 list --json 2>/dev/null \
             | jq -r --arg n "$D1_NAME" '(if type == "array" then . else (.result // []) end)[] | select(.name == $n) | (.uuid // .id // empty)' \
             || true)
 
           if [ -n "$EXISTING_D1_ID" ]; then
-            DB_ID="$EXISTING_D1_ID"
-            echo "D1 数据库已存在: $D1_NAME (ID: $DB_ID)"
+            echo "D1_ID=$EXISTING_D1_ID" >> $GITHUB_ENV
+            echo "::notice::D1 数据库已存在: $D1_NAME (ID: $EXISTING_D1_ID)"
           else
-            echo "创建 D1 数据库: $D1_NAME"
             RESULT=$(npx wrangler d1 create "$D1_NAME" 2>&1 || true)
             echo "$RESULT"
-            # 不猜 wrangler 输出格式(各版本成功文案/字段不同) —— 创建后重查云端列表拿真实 ID;
-            # 列表查询复用与查重分支相同的 if type == "array" 防御式 jq, 顶层数组/{result:[]} 都兼容
-            DB_ID=$(npx wrangler d1 list --json 2>/dev/null \
-              | jq -r --arg n "$D1_NAME" '(if type == "array" then . else (.result // []) end)[] | select(.name == $n) | (.uuid // .id // empty)' \
-              || true)
-            if [ -z "$DB_ID" ]; then
-              # 兜底: 云端列表未命中时再从 create 输出提取(带连字符 UUID)
-              DB_ID=$(echo "$RESULT" | grep -oP 'database_id"?\s*[=:]\s*"\K[^"]+' | head -1 || echo "")
-            fi
-            if [ -z "$DB_ID" ]; then
-              echo "::error::无法获取 D1 database_id，请检查 CLOUDFLARE_API_TOKEN 是否含 D1:Edit 权限"
-              echo "::error::wrangler 返回: $RESULT"
+            D1_ID_NEW=$(echo "$RESULT" | grep -oP 'database_id\s*=\s*"\K[^"]+' || echo "")
+            if [ -n "$D1_ID_NEW" ]; then
+              echo "D1_ID=$D1_ID_NEW" >> $GITHUB_ENV
+              echo "::notice::创建 D1 数据库成功: $D1_NAME (ID: $D1_ID_NEW)"
+              echo "::notice::请将此 ID 填入 deploy.config.js 的 d1Id 字段"
+            else
+              echo "::error::D1 数据库创建失败, 请检查 CLOUDFLARE_API_TOKEN 是否有 D1 写权限"
               exit 1
             fi
-            echo "创建 D1 数据库成功: $D1_NAME (ID: $DB_ID)"
           fi
-          echo "db_id=${DB_ID}" >> "$GITHUB_OUTPUT"
-          echo "D1 database_id: ${DB_ID}"
 
-      - name: 确保 KV 命名空间存在（可选，失败不阻塞部署）
-        # KV 缓存为可选组件（应用侧自动降级内存实现），创建失败仅 ::warning:: 不 fail hard。
-        # KV REST: GET/POST /accounts/{id}/storage/kv/namespaces，result: [{ id, title }]
-        id: kv
-        if: ${{ steps.cfg.outputs.kv != '' }}
-        env:
-          KV_NAME: ${{ steps.cfg.outputs.kv }}
+      - name: Create KV namespace (if needed)
+        # 代理透传模式跳过; 移除 continue-on-error(fail hard) —— 配置了 kvName
+        # 却创建失败照常发布 = 绑定静默缺失, 运行时降级无告警; 与 D1/schema 口径一致。
+        if: env.PROXY_PASSTHROUGH != 'true' && env.KV_NAME != '' && env.KV_ID == ''
         run: |
+          # 用 Cloudflare REST API 查询(标准响应: { success, result: [{ id, title }] })
           KVLIST=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces")
 
           EXISTING_KV_ID=$(echo "$KVLIST" | jq -r --arg n "$KV_NAME" '(.result // [])[]? | select(.title == $n) | .id // empty' || true)
 
           if [ -n "$EXISTING_KV_ID" ]; then
-            echo "KV 命名空间已存在: $KV_NAME (ID: $EXISTING_KV_ID)"
+            echo "KV_ID=$EXISTING_KV_ID" >> $GITHUB_ENV
+            echo "::notice::KV 命名空间已存在: $KV_NAME (ID: $EXISTING_KV_ID)"
           else
-            echo "创建 KV 命名空间: $KV_NAME"
-            RESULT=$(curl -s -X POST -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"title\":\"$KV_NAME\"}" \
-              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces")
-            EXISTING_KV_ID=$(echo "$RESULT" | jq -r '.result.id // empty' || true)
+            RESULT=$(npx wrangler kv namespace create "$KV_NAME" 2>&1 || true)
+            echo "$RESULT"
+            KV_ID_NEW=$(echo "$RESULT" | grep -oP 'id\s*=\s*"\K[^"]+' | head -1 || echo "")
+            if [ -n "$KV_ID_NEW" ]; then
+              echo "KV_ID=$KV_ID_NEW" >> $GITHUB_ENV
+              echo "::notice::创建 KV 命名空间成功: $KV_NAME (ID: $KV_ID_NEW)"
+            else
+              echo "::error::KV 命名空间创建失败, 请检查 CLOUDFLARE_API_TOKEN 是否有 KV 写权限"
+              exit 1
+            fi
           fi
 
-          if [ -n "$EXISTING_KV_ID" ]; then
-            echo "kv_id=${EXISTING_KV_ID}" >> "$GITHUB_OUTPUT"
-            echo "KV namespace_id: ${EXISTING_KV_ID}"
-          else
-            echo "::warning::KV 命名空间创建失败（可选组件，应用自动降级为内存缓存，不影响部署）"
-            echo "::warning::如需 KV 缓存，请检查 CLOUDFLARE_API_TOKEN 是否含 Workers KV Storage:Edit 权限"
-            echo "API 返回: $KVLIST $RESULT"
-          fi
-
-      - name: 确保 R2 存储桶存在
-        # 模式照抄参考实现 KV 步骤（REST 查重 → 不存在才创建 → 失败 fail hard）。
-        # v1.0.3 实际事故: 旧版 "| grep -v already exists || true" 把创建失败吞掉 →
-        # 桶根本没建成 → 最终 deploy 才报 "R2 bucket not found", 白跑一整轮。
-        # R2 REST 响应: { success, result: { buckets: [{ name, ... }] } }
+      - name: Create R2 bucket (if needed)
+        # TGuard 适配②: R2 媒体存储(gem-td 原版无 R2)。模式照抄 D1/KV 步骤
+        # (REST 查重 → 不存在才创建 → REST 复查, fail hard)。
         # ⚠ [code: 10042] = R2 服务未在账号上开通, 与 Token 权限无关 —— R2 不同于
         #   D1/Pages, 必须先在 Dashboard 手动激活(绑定支付方式)才能调用 R2 API。
-        if: ${{ steps.cfg.outputs.r2 != '' }}
-        env:
-          R2_NAME: ${{ steps.cfg.outputs.r2 }}
+        if: env.PROXY_PASSTHROUGH != 'true' && env.R2_NAME != ''
         run: |
           R2LIST=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets")
@@ -255,9 +516,9 @@ jobs:
             || true)
 
           if [ -n "$EXISTING_R2" ]; then
-            echo "R2 存储桶已存在: $R2_NAME"
+            echo "R2_NAME_CONFIRMED=$EXISTING_R2" >> $GITHUB_ENV
+            echo "::notice::R2 存储桶已存在: $R2_NAME"
           else
-            echo "创建 R2 存储桶: $R2_NAME"
             RESULT=$(npx wrangler r2 bucket create "$R2_NAME" 2>&1 || true)
             echo "$RESULT"
             # 不猜 wrangler 输出格式(v4.155 成功文案是 "✅ Created bucket …", 不含 success 字样,
@@ -267,7 +528,8 @@ jobs:
             R2_OK=$(echo "$R2VERIFY" | jq -r --arg n "$R2_NAME" '(if type == "array" then . else (.result.buckets // []) end)[]? | select(.name == $n) | .name // empty' \
               || true)
             if [ -n "$R2_OK" ]; then
-              echo "R2 存储桶创建成功(REST 复查通过): $R2_NAME"
+              echo "R2_NAME_CONFIRMED=$R2_OK" >> $GITHUB_ENV
+              echo "::notice::R2 存储桶创建成功(REST 复查通过): $R2_NAME"
             elif echo "$RESULT$R2VERIFY" | grep -qE '"code"\s*:\s*10042|[Pp]lease enable R2'; then
               echo "::error::R2 服务未在此 Cloudflare 账号上开通([code: 10042]), 与 Token 权限无关。"
               echo "::error::解决: Cloudflare Dashboard → 左侧 R2 对象存储 → 按提示开通 R2(免费额度 10GB 存储/月, 开通需绑定支付方式), 开通后重跑本工作流。"
@@ -279,98 +541,467 @@ jobs:
             fi
           fi
 
-      - name: 生成 wrangler.toml（动态绑定 D1 / KV / R2）
+      - name: Apply D1 schema (idempotent)
+        # TGuard 适配③: TGuard 数据层无 gem-td 式运行时自建表, 沿用本工作流
+        # v8.9.x 的既有机制 —— 仓库 prisma/schema.sql 现场归一为幂等 DDL
+        # (CREATE TABLE/INDEX → IF NOT EXISTS, 剥离 PRAGMA/事务包裹)后经
+        # wrangler d1 execute 应用: 首次部署建表, 对已有库零副作用, 幂等可重跑。
+        # 失败即终止部署(发布成功 = 数据就绪)。
+        if: env.PROXY_PASSTHROUGH != 'true' && env.D1_ID != ''
         run: |
-          set -e
-          PROJECT="${{ steps.cfg.outputs.project }}"
-          # next-on-pages 产物目录（wrangler pages deploy 未显式传目录时也读这里）
-          {
-            echo "name = \"${PROJECT}\""
-            echo 'compatibility_date = "2025-01-01"'
-            echo 'pages_build_output_dir = ".vercel/output/static"'
-          } > wrangler.toml
-          if [ -n "${{ steps.cfg.outputs.d1 }}" ] && [ -n "${{ steps.d1.outputs.db_id }}" ]; then
-            {
-              echo ''
-              echo '[[d1_databases]]'
-              echo 'binding = "DATABASE"'
-              echo "database_name = \"${{ steps.cfg.outputs.d1 }}\""
-              echo "database_id = \"${{ steps.d1.outputs.db_id }}\""
-            } >> wrangler.toml
-          fi
-          if [ -n "${{ steps.cfg.outputs.kv }}" ] && [ -n "${{ steps.kv.outputs.kv_id }}" ]; then
-            {
-              echo ''
-              echo '[[kv_namespaces]]'
-              echo 'binding = "KV"'
-              echo "id = \"${{ steps.kv.outputs.kv_id }}\""
-            } >> wrangler.toml
-          fi
-          if [ -n "${{ steps.cfg.outputs.r2 }}" ]; then
-            {
-              echo ''
-              echo '[[r2_buckets]]'
-              echo 'binding = "BUCKET"'
-              echo "bucket_name = \"${{ steps.cfg.outputs.r2 }}\""
-            } >> wrangler.toml
-          fi
-          echo '----- 生成的 wrangler.toml -----'
-          cat wrangler.toml
-
-      - name: 写入 ADMIN_SECRET 等运行环境 Secret
-        env:
-          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
-          ISSUE_APIKEY: ${{ secrets.ISSUE_APIKEY }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        run: |
-          set -e
-          PROJECT="${{ steps.cfg.outputs.project }}"
-          if [ -z "$ADMIN_SECRET" ]; then
-            echo "::error::缺少 GitHub Secret ADMIN_SECRET（Settings → Secrets and variables → Actions 配置后重试）"
+          if [ ! -f prisma/schema.sql ]; then
+            echo "::error::prisma/schema.sql 不存在(D1 schema 建表唯一真源), 无法保证发布后数据就绪。"
             exit 1
           fi
-          printf '%s' "$ADMIN_SECRET" | npx wrangler pages secret put ADMIN_SECRET --project-name "$PROJECT"
-          echo 'ADMIN_SECRET 已写入 Pages 运行环境'
+          # 归一为幂等 DDL: ① 建表/建索引语句追加 IF NOT EXISTS ② 剥离 PRAGMA/
+          # BEGIN/COMMIT(D1 execute 逐语句执行, 事务包裹无意义且部分语句不受支持)
+          sed -E \
+            -e 's/^CREATE TABLE /CREATE TABLE IF NOT EXISTS /' \
+            -e 's/^CREATE UNIQUE INDEX /CREATE UNIQUE INDEX IF NOT EXISTS /' \
+            -e 's/^CREATE INDEX /CREATE INDEX IF NOT EXISTS /' \
+            -e '/^(PRAGMA|BEGIN|COMMIT)/d' \
+            prisma/schema.sql > /tmp/tguard-d1-schema.sql
+          echo "归一后 schema 语句数: $(grep -c 'CREATE ' /tmp/tguard-d1-schema.sql)"
+          npx wrangler d1 execute "$D1_NAME" --remote -y --file /tmp/tguard-d1-schema.sql
+          echo "✅ D1 schema 已应用(幂等, 对既有库零副作用): $D1_NAME"
+
+      # ---- wrangler.toml 动态生成(仓库无需携带静态文件) ----
+
+      - name: Generate wrangler.toml (Next.js → Pages)
+        if: env.DEPLOY_TYPE == 'pages'
+        run: |
+          # CI 实际部署使用的 Pages 配置, 完全按 deploy.config.js 动态生成
+          # (项目名/D1/KV/R2/vars) —— 仓库无需携带静态 wrangler.toml。
+          # pages_build_output_dir 指向 dist-pages(高级模式 _worker.js 由
+          # OpenNext 产物 + 自研适配层生成)。
+          # 事实修正(wrangler 4.133.0 源码级核验): `wrangler pages deploy` 对
+          # 已存在项目**不做任何项目配置同步**(upload/deploy 模块全程 0 PATCH/
+          # 0 env_vars 处理) —— 本 toml 的 [vars] 不会同步到项目运行时, 仅为配置
+          # 语义声明; 运行时环境变量的唯一有效注入通道 = 下方 "Configure Pages
+          # project env vars" API PATCH(先 PATCH 后部署, env_vars 在部署创建时
+          # 快照, 时序已保证本次部署生效; deploy 不触碰 vars, 无需 --keep-vars)。
+          cat > wrangler.toml << EOF
+          # 本文件由 CI 自动生成(模板见 .github/workflows/pages-deploy.yml)
+          name = "${PROJECT_NAME}"
+          pages_build_output_dir = "dist-pages"
+          compatibility_date = "2025-05-01"  # >=2025-04-01: workerd 开放 node:sqlite(数据层 Node 形态兜底依赖)
+          compatibility_flags = ["nodejs_compat"]
+          EOF
+
+          if [ -n "$D1_NAME" ] && [ -n "$D1_ID" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[d1_databases]]
+          binding = "DATABASE"
+          database_name = "$D1_NAME"
+          database_id = "$D1_ID"
+          EOF
+            echo "✅ 添加 D1 配置(binding=DATABASE)"
+          fi
+
+          if [ -n "$KV_NAME" ] && [ -n "$KV_ID" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "$KV_ID"
+          EOF
+            echo "✅ 添加 KV 配置(binding=KV)"
+          fi
+
+          if [ -n "$R2_NAME" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[r2_buckets]]
+          binding = "BUCKET"
+          bucket_name = "$R2_NAME"
+          EOF
+            echo "✅ 添加 R2 配置(binding=BUCKET)"
+          fi
+
+          cat >> wrangler.toml << EOF
+
+          [vars]
+          NODE_ENV = "production"
+          LANGUAGE = "${LANGUAGE_RAW:-auto}"
+          PROXY_MODE = "${PROXY_MODE_RAW:-false}"
+          EOF
+
+          # 不整文件 cat(避免把可能的敏感值打进日志), 只展示结构:
+          echo "=== wrangler.toml(结构) ==="
+          grep -vE 'database_id|namespace_id|^id\s*=' wrangler.toml || true
+
+      - name: Generate wrangler.toml (Next.js → Workers)
+        if: env.DEPLOY_TYPE == 'workers'
+        run: |
+          # workers 部署类型的 CI 配置。main = pages-adapter/worker.ts(与 Pages
+          # 形态同一适配层入口): D1/KV/R2 绑定必须经入口 fetch(request, env, ctx)
+          # 同步注入 globalThis(TGuard 约定通道 DATABASE/KV/BUCKET) —— OpenNext
+          # 产物直出时 instrumentation 的 getCloudflareContext 拿不到 ALS 上下文,
+          # 不注入则服务端初始化期读库永远选不上 D1。wrangler 以同一 esbuild
+          # 管线打包该 TS(相对导入 .open-next/worker.js 全树进 bundle)。
+          # OpenNext 产物: .open-next/worker.js(适配层转发目标) + assets/(静态资源托管)。
+          cat > wrangler.toml << EOF
+          # 本文件由 CI 自动生成(模板见 .github/workflows/pages-deploy.yml)
+          name = "${PROJECT_NAME}"
+          main = "pages-adapter/worker.ts"
+          compatibility_date = "2025-05-01"  # >=2025-04-01: workerd 开放 node:sqlite(数据层 Node 形态兜底依赖)
+          compatibility_flags = ["nodejs_compat"]
+          account_id = "${CLOUDFLARE_ACCOUNT_ID}"
+
+          [assets]
+          directory = "${OPENNEXT_OUTPUT_DIR}/assets"
+          binding = "ASSETS"
+          EOF
+
+          if [ -n "$D1_NAME" ] && [ -n "$D1_ID" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[d1_databases]]
+          binding = "DATABASE"
+          database_name = "$D1_NAME"
+          database_id = "$D1_ID"
+          EOF
+            echo "✅ 添加 D1 配置(binding=DATABASE)"
+          fi
+
+          if [ -n "$KV_NAME" ] && [ -n "$KV_ID" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "$KV_ID"
+          EOF
+            echo "✅ 添加 KV 配置(binding=KV)"
+          fi
+
+          if [ -n "$R2_NAME" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[r2_buckets]]
+          binding = "BUCKET"
+          bucket_name = "$R2_NAME"
+          EOF
+            echo "✅ 添加 R2 配置(binding=BUCKET)"
+          fi
+
+          cat >> wrangler.toml << EOF
+
+          [vars]
+          NODE_ENV = "production"
+          LANGUAGE = "${LANGUAGE_RAW:-auto}"
+          PROXY_MODE = "${PROXY_MODE_RAW:-false}"
+          EOF
+
+          # 不整文件 cat(避免把可能的敏感值打进日志), 只展示结构:
+          echo "=== wrangler.toml(结构) ==="
+          grep -vE 'database_id|namespace_id|^id\s*=' wrangler.toml || true
+
+      - name: Ensure Pages project (idempotent, production branch = main)
+        if: env.DEPLOY_TYPE == 'pages'
+        run: |
+          # Pages 项目存在性与生产分支配置: (用 REST API 判断项目是否已存在;
+          # create 返回 already exists(code 8000002)都按"已存在"处理, 保证幂等重跑)
+          GET_RESULT=$(curl -s -w '\n%{http_code}' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/${{ env.PROJECT_NAME }}")
+          HTTP_CODE=$(echo "$GET_RESULT" | tail -1)
+          GET_BODY=$(echo "$GET_RESULT" | sed '$d')
+          echo "GET /pages/projects/${{ env.PROJECT_NAME }} → HTTP $HTTP_CODE"
+          echo "$GET_BODY" | head -c 500; echo
+
+          PROJECT_EXISTS=false
+          if [ "$HTTP_CODE" = "200" ] && echo "$GET_BODY" | grep -q '"success":true'; then
+            PROJECT_EXISTS=true
+            echo "Pages project '${{ env.PROJECT_NAME }}' already exists"
+          fi
+
+          if [ "$PROJECT_EXISTS" != "true" ]; then
+            CREATE_RESULT=$(npx wrangler pages project create "${{ env.PROJECT_NAME }}" --production-branch main 2>&1 || true)
+            echo "$CREATE_RESULT"
+            if echo "$CREATE_RESULT" | grep -qiE 'already exists|8000002'; then
+              echo "create 返回 already exists —— 视为项目已存在, 继续部署"
+            elif echo "$CREATE_RESULT" | grep -q '\[ERROR\]'; then
+              echo "::error::Pages 项目创建失败(非 already exists 原因), 请查看上方 wrangler 输出。"
+              exit 1
+            fi
+          fi
+
+          # 无论新建还是已存在: 强制把 production 分支设为 main, 否则部署会显示为 Preview,
+          # Dashboard 显示 "No production deployment yet"
+          PATCH_RESULT=$(curl -s -X PATCH \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/${{ env.PROJECT_NAME }}" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"production_branch":"main"}')
+          echo "$PATCH_RESULT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);if(j.success){console.log("✓ production_branch 已设为 main")}else{console.error("⚠ 更新 production_branch 失败:",JSON.stringify(j.errors||[]));process.exit(1)}}catch(e){console.error("⚠ 解析 PATCH 响应失败:",s.slice(0,300));process.exit(1)}})'
+
+      - name: Configure Pages project env vars
+        # TGuard 适配②⑤: env_vars 注入 + D1/KV/R2 绑定 PATCH(绑定名 DATABASE/KV/BUCKET)。
+        # ADMIN_SECRET/JWT_SECRET 为历史遗留可选注入(未配置不写入);
+        # TELEGRAM_WEBHOOK_SECRET 可选注入(webhook 校验)。
+        if: env.DEPLOY_TYPE == 'pages'
+        run: |
+          # 此步骤在 deploy 之前执行 —— Pages 的 env_vars 在"部署创建时"快照,
+          # 先注入再部署保证本次部署即生效。
+          # 事实修正(wrangler 4.133.0 源码级核验): `wrangler pages deploy` 本身
+          # 不会删除/覆盖项目 env_vars(upload/deploy 模块全程 0 PATCH/
+          # 0 env_vars 处理; "--keep-vars" 属 Workers 的 `wrangler deploy`)。
+          # 注入结果由下一步 "Verify Pages project env vars" 回读校验作双保险。
+          node - <<'NODE_SCRIPT'
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const projectName = process.env.PROJECT_NAME;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!accountId || !projectName || !token) {
+            console.error('::error::缺少 CLOUDFLARE_ACCOUNT_ID / PROJECT_NAME / CLOUDFLARE_API_TOKEN');
+            process.exit(1);
+          }
+          const plain = (v) => ({ type: 'plain_text', value: v ?? '' });
+          const secret = (v) => ({ type: 'secret_text', value: v ?? '' });
+          const envVars = {
+            NODE_ENV: plain('production'),
+            LANGUAGE: plain(process.env.LANGUAGE_RAW || 'auto'),
+            PROXY_MODE: plain(process.env.PROXY_MODE_RAW || 'false'),
+          };
+          // 可选 secrets(配置了才写入): 历史遗留 ADMIN_SECRET/JWT_SECRET + webhook 校验密钥
+          if (process.env.ADMIN_SECRET) envVars.ADMIN_SECRET = secret(process.env.ADMIN_SECRET);
+          if (process.env.JWT_SECRET) envVars.JWT_SECRET = secret(process.env.JWT_SECRET);
+          if (process.env.TELEGRAM_WEBHOOK_SECRET) envVars.TELEGRAM_WEBHOOK_SECRET = secret(process.env.TELEGRAM_WEBHOOK_SECRET);
+
+          // preview 环境同步注入同一组 env_vars —— 预览部署(<hash>.<project>.
+          // pages.dev 形态)只读 preview 配置。preview 刻意不带 D1/KV/R2 绑定:
+          // 预览写入不得污染生产数据(预览按存储降级链路运行)。
+          const production = { env_vars: envVars };
+          const preview = { env_vars: envVars };
+          // 将 D1/KV/R2 绑定写入项目配置(Pages 高级模式与 Workers 绑定语义一致;
+          // 仅 production —— 见上; 绑定名与 TGuard 数据层约定一致: DATABASE/KV/BUCKET)
+          if ((process.env.PROXY_PASSTHROUGH || 'false') !== 'true') {
+            if (process.env.D1_ID) {
+              production.d1_databases = { DATABASE: { id: process.env.D1_ID } };
+            }
+            if (process.env.KV_ID) {
+              production.kv_namespaces = { KV: { namespace_id: process.env.KV_ID } };
+            }
+            if (process.env.R2_NAME) {
+              production.r2_buckets = { BUCKET: { bucket_name: process.env.R2_NAME } };
+            }
+          }
+
+          const body = JSON.stringify({ deployment_configs: { production, preview } });
+          fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/pages/projects/${projectName}`, {
+            method: 'PATCH',
+            headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body,
+          }).then(async (r) => {
+            const j = await r.json().catch(() => ({}));
+            const names = Object.keys(envVars).join(', ');
+            if (r.ok && j.success) {
+              console.log(`✓ Pages 项目 env_vars 已注入(production+preview): ${names}`);
+              if (production.d1_databases) console.log('✓ D1 绑定(DATABASE) 已写入项目配置');
+              if (production.kv_namespaces) console.log('✓ KV 绑定(KV) 已写入项目配置');
+              if (production.r2_buckets) console.log('✓ R2 绑定(BUCKET) 已写入项目配置');
+            } else {
+              console.error('::error::Pages 项目 env_vars 注入失败: HTTP ' + r.status + ' ' + JSON.stringify(j.errors || j));
+              process.exit(1);
+            }
+          }).catch((e) => { console.error('::error::请求异常: ' + (e && e.message)); process.exit(1); });
+          NODE_SCRIPT
+
+      - name: Verify Pages project env vars (post-PATCH, pre-deploy)
+        if: env.DEPLOY_TYPE == 'pages'
+        run: |
+          # 注入结果回读校验 —— "vars 确实进了项目配置"的用户可见证据
+          # (此前只有 PATCH 自报成功, 无项目侧回读; "Actions 全绿但 vars 实际
+          # 没进去"的事故形态无回读就无从发现)。GET 项目 deployment_configs
+          # 逐键核对 production+preview; 关键键缺失 → 部署前 fail(不等 Smoke
+          # check 事后拦截)。值一律脱敏展示。
+          node - <<'NODE_SCRIPT'
+          (async () => {
+            const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+            const projectName = process.env.PROJECT_NAME;
+            const token = process.env.CLOUDFLARE_API_TOKEN;
+            if (!accountId || !projectName || !token) {
+              console.error('::error::缺少 CLOUDFLARE_ACCOUNT_ID / PROJECT_NAME / CLOUDFLARE_API_TOKEN');
+              process.exit(1);
+            }
+            // 必需键: NODE_ENV; 其余键按"配置了才校验"口径(可选 secrets 未配置即不算缺失)
+            const NEED = ['NODE_ENV'];
+            const OPTIONAL = ['ADMIN_SECRET', 'JWT_SECRET', 'TELEGRAM_WEBHOOK_SECRET'];
+            const mask = (v) => {
+              const s = String(v == null ? '' : v);
+              const at = s.indexOf('@');
+              if (at > 0) return s.slice(0, Math.min(12, at)) + '***' + s.slice(at);
+              return s ? s.slice(0, 4) + '***' : '(空)';
+            };
+            const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/pages/projects/${projectName}`, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            const j = await r.json().catch(() => ({}));
+            if (!r.ok || !j.success) {
+              console.error('::error::读取 Pages 项目配置失败: HTTP ' + r.status + ' ' + JSON.stringify(j.errors || j).slice(0, 300));
+              process.exit(1);
+            }
+            const dc = (j.result && j.result.deployment_configs) || {};
+            let failed = false;
+            for (const envName of ['production', 'preview']) {
+              const vars = (dc[envName] && dc[envName].env_vars) || {};
+              const keys = Object.keys(vars).sort();
+              console.log(`[${envName}] env_vars 键(${keys.length}): ${keys.join(', ') || '(无)'}`);
+              for (const k of NEED) {
+                if (!vars[k]) {
+                  console.error(`::error::[${envName}] 缺少 env_vars.${k}`);
+                  failed = true;
+                }
+              }
+              for (const k of OPTIONAL) {
+                if (process.env[k] && !vars[k]) {
+                  console.error(`::error::[${envName}] 缺少 env_vars.${k}(secret 已配置但未注入成功)`);
+                  failed = true;
+                }
+              }
+              if (vars.PROXY_MODE) console.log(`[${envName}] PROXY_MODE = ${mask(vars.PROXY_MODE.value)}`);
+              if (vars.LANGUAGE) console.log(`[${envName}] LANGUAGE = ${vars.LANGUAGE.value}`);
+            }
+            const prod = dc.production || {};
+            const d1 = prod.d1_databases && prod.d1_databases.DATABASE && prod.d1_databases.DATABASE.id;
+            const kv = prod.kv_namespaces && prod.kv_namespaces.KV && prod.kv_namespaces.KV.namespace_id;
+            const r2 = prod.r2_buckets && prod.r2_buckets.BUCKET && prod.r2_buckets.BUCKET.bucket_name;
+            console.log(`[production] 绑定: D1(DATABASE) ${d1 ? '已配置(' + String(d1).slice(0, 8) + '…)' : '未配置'} | KV(KV) ${kv ? '已配置' : '未配置'} | R2(BUCKET) ${r2 ? '已配置' : '未配置'}`);
+            if (failed) {
+              console.error('::error::Pages 项目 env_vars 校验未通过 —— 请检查上方 Configure 步骤输出与 CLOUDFLARE_API_TOKEN 的 Pages:Edit 权限。');
+              process.exit(1);
+            }
+            console.log('✓ Pages 项目 env_vars 校验通过(production+preview 关键键位齐全)');
+          })().catch((e) => { console.error('::error::校验异常: ' + (e && e.message)); process.exit(1); });
+          NODE_SCRIPT
+
+      # ---- 部署(按 deployType 分支) ----
+      # pages: production 分支 = main, main 分支 push 等价于生产发布。
+      # workers: wrangler deploy 按 wrangler.toml(main/assets) 发布 Worker。
+
+      - name: Deploy to Cloudflare Pages (自研适配产物)
+        if: env.DEPLOY_TYPE == 'pages'
+        run: |
+          # dist-pages = Pages 高级模式部署目录(_worker.js + 静态资源 + _routes.json)
+          # wrangler.toml(pages_build_output_dir=dist-pages) 已含项目名与兼容性配置
+          # 事实修正(源码级核验, wrangler 4.133.0): 不使用 --keep-vars —— 该参数
+          # 只存在于 Workers 的 `wrangler deploy`, pages deploy 的参数表
+          # (project-name/branch/commit-*/skip-caching/no-bundle/
+          # upload-source-maps)根本没有它, yargs 参数校验直接报
+          # "Unknown arguments: keep-vars, keepVars" 拦死整个部署(实测)。
+          # 且 pages deploy 对已存在项目零配置同步(upload/deploy 模块 0 PATCH/
+          # 0 env_vars 处理), 上方 API PATCH 注入的 vars 不需要任何 flag 保护。
+          echo "wrangler 版本: $(npx wrangler --version 2>/dev/null | tail -1)"
+          npx wrangler pages deploy dist-pages \
+            --project-name "${{ env.PROJECT_NAME }}" \
+            --branch main \
+            --commit-dirty | tee /tmp/pages-deploy-out.txt
+          # 抓取本次部署 URL(哈希子域, 即刻可访问)供下一步冒烟验证
+          DEPLOY_URL=$(grep -Eo 'https://[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.pages\.dev' /tmp/pages-deploy-out.txt | tail -1 || true)
+          if [ -z "$DEPLOY_URL" ]; then
+            echo "::error::未能从 wrangler 输出解析部署 URL, 无法执行 /health 冒烟验证。"
+            exit 1
+          fi
+          echo "DEPLOY_URL=$DEPLOY_URL" >> $GITHUB_ENV
+          echo "✓ 本次部署 URL: $DEPLOY_URL"
+
+      - name: Smoke check /health (pages)
+        if: env.DEPLOY_TYPE == 'pages'
+        run: |
+          # 部署后 /health 冒烟验证 —— 拦截"部署快照缺 env_vars / worker 启动失败 /
+          # 路由断裂"类事故(此前无部署后校验, Actions 全绿但线上不可用的形态
+          # 无从发现)。判定口径:
+          #   200 → worker 启动 + 路由健康
+          #   非 200 持续 → ::error 终止(worker 未启动/部署产物残缺)
+          # 另以 /health/detailed 输出诊断信息(数据库检查依赖 D1 数据就绪度,
+          # 仅 ::warning 不阻塞 —— schema 已由前置步骤幂等应用, 空库仅影响
+          # captcha 等业务检查, 不代表部署失败)。
+          # 新部署哈希子域即刻生效, 边缘传播允许秒级抖动 → 重试 6 次间隔 5s。
+          BODY=/tmp/smoke-body; CODE=000
+          for i in 1 2 3 4 5 6; do
+            CODE=$(curl -sS -m 20 -o "$BODY" -w '%{http_code}' "$DEPLOY_URL/health" 2>/dev/null || echo 000)
+            echo "attempt $i: HTTP $CODE $(awk '{print substr($0,1,140)}' "$BODY" 2>/dev/null)"
+            if [ "$CODE" = "200" ]; then
+              echo "✓ /health → 200(worker 启动 + 路由健康)"
+              DDETAIL=$(curl -sS -m 20 -w '\n%{http_code}' "$DEPLOY_URL/health/detailed" 2>/dev/null || echo "")
+              echo "::notice::/health/detailed 诊断(503 属空库业务检查, 非部署失败): ${DDETAIL:-'(请求失败)'}"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::部署后 /health 持续非 200(HTTP $CODE) —— worker 启动或路由异常。"
+          echo "  排查: ① dist-pages/_worker.js 是否生成(Assemble 步骤) ② Pages 项目 env_vars(production)是否注入 ③ 部署日志。"
+          exit 1
+
+      - name: Deploy to Cloudflare Workers (OpenNext 产物)
+        if: env.DEPLOY_TYPE == 'workers'
+        run: |
+          # workers 部署类型: wrangler.toml 已由上方步骤生成:
+          # main = pages-adapter/worker.ts(转发 .open-next/worker.js + 入口层
+          # D1/KV/R2 绑定注入), [assets] directory = .open-next/assets(静态资源
+          # 托管 + ASSETS 绑定)。首次部署即创建 Worker(名称 = PROJECT_NAME);
+          # secrets 顺序见下一步骤注释。
+          npx wrangler deploy
+
+      - name: Configure secrets on Worker (deployType=workers)
+        if: env.DEPLOY_TYPE == 'workers'
+        run: |
+          # Workers 运行期 secrets。顺序说明: `wrangler secret put` 要求 Worker
+          # 已存在, 因此先 deploy(首次 run 创建 Worker), 再写 secrets(写入后
+          # 立即生效)。TGuard 必填 secret 仅 CLOUDFLARE_API_TOKEN(部署用),
+          # 运行期 secrets 全部可选(配置了才写入), 写入后验证。
+          if [ -n "$ADMIN_SECRET" ]; then
+            printf '%s' "$ADMIN_SECRET" | npx wrangler secret put ADMIN_SECRET --name "$PROJECT_NAME"
+          fi
           if [ -n "$JWT_SECRET" ]; then
-            printf '%s' "$JWT_SECRET" | npx wrangler pages secret put JWT_SECRET --project-name "$PROJECT" || true
-            echo 'JWT_SECRET 已写入 Pages 运行环境（/s/ 加密分享）'
+            printf '%s' "$JWT_SECRET" | npx wrangler secret put JWT_SECRET --name "$PROJECT_NAME"
           fi
-          if [ -n "$ISSUE_APIKEY" ]; then
-            printf '%s' "$ISSUE_APIKEY" | npx wrangler pages secret put ISSUE_APIKEY --project-name "$PROJECT" || true
-            echo 'ISSUE_APIKEY 已写入 Pages 运行环境'
+          if [ -n "$TELEGRAM_WEBHOOK_SECRET" ]; then
+            printf '%s' "$TELEGRAM_WEBHOOK_SECRET" | npx wrangler secret put TELEGRAM_WEBHOOK_SECRET --name "$PROJECT_NAME"
+            echo "✓ TELEGRAM_WEBHOOK_SECRET 已注入 Worker secrets"
           fi
 
-      - name: 安装依赖
-        run: npm ci
+          # 验证已配置的 secrets 均写入成功
+          SECRET_LIST=$(npx wrangler secret list --name "$PROJECT_NAME" 2>&1)
+          echo "$SECRET_LIST"
+          for name in ADMIN_SECRET JWT_SECRET TELEGRAM_WEBHOOK_SECRET; do
+            eval val="\$$name"
+            if [ -n "$val" ] && ! echo "$SECRET_LIST" | grep -q "$name"; then
+              echo "::error::$name 未能写入 Worker, 请检查 wrangler secret 输出。"
+              exit 1
+            fi
+          done
+          echo "✓ Secrets configured (已配置项全部写入确认)"
 
-      - name: 注入 Edge Runtime 声明（仅 Pages 构建）
-        # next-on-pages 只支持 Edge Runtime：构建末期校验「所有非静态路由必须显式
-        # export const runtime = 'edge'」，缺失即报
-        # "routes were not configured to run with the Edge Runtime" 并 exit 1。
-        # 本项目双形态部署（本地/沙盒 Node 模式用 node:sqlite，Pages 用 D1，
-        # 见 src/database/client.ts），runtime 声明写死进源码会让本地 dev 的
-        # Edge 模拟沙箱禁用 node:sqlite，摧毁现有功能 —— 因此只在 runner 工作区
-        # 注入（不进 git、不进发布源码），脚本幂等且跳过已有声明。
-        run: node scripts/add-edge-runtime.mjs
-
-      - name: 构建 Next.js（@cloudflare/next-on-pages）
-        # NEXT_ON_PAGES=1：next.config.ts 据此关闭 standalone 输出（与 next-on-pages 不兼容），
-        # 走默认输出，由 next-on-pages 打包为 Cloudflare Pages 产物（.vercel/output/static）。
-        # 这是 Next.js 全栈应用（App Router + API 路由），绝非纯静态站点，
-        # 直接部署 public/ 只会得到空壳 —— 必须先完成 next-on-pages 编译。
-        # npm_config_legacy_peer_deps=true：与根目录 .npmrc 的 legacy-peer-deps=true 等效的环境变量
-        # 双保险 —— npx 临时安装 next-on-pages 时不再自动解析其 peer 依赖
-        # （wrangler@4.157.0 起要求 workers-types@^5，与 next-on-pages@1.x 的 ^4 冲突 → ERESOLVE）。
-        env:
-          NEXT_ON_PAGES: '1'
-          npm_config_legacy_peer_deps: 'true'
+      - name: Deployment summary
+        if: always()
         run: |
-          npx --yes @cloudflare/next-on-pages@1
-          test -f .vercel/output/static/index.html || test -d .vercel/output/static || { echo "::error::next-on-pages 产物缺失"; exit 1; }
-          ls -la .vercel/output/static | head -20
-
-      - name: 部署到 Cloudflare Pages
-        # CLOUDFLARE_ACCOUNT_ID 已由「解析 Cloudflare 账号 ID」步骤写入 $GITHUB_ENV，全 job 生效
-        run: |
-          npx wrangler pages deploy .vercel/output/static --project-name "${{ steps.cfg.outputs.project }}" --branch main --commit-dirty=true
-          echo "部署完成 → https://${{ steps.cfg.outputs.project }}.pages.dev"
+          if [ "${{ env.DEPLOY_TYPE }}" = "workers" ]; then
+            TARGET_DESC="Workers(OpenNext + 适配层入口)"
+          else
+            TARGET_DESC="Pages(OpenNext + 自研适配层)"
+          fi
+          echo "## Cloudflare 部署 ${{ job.status == 'success' && '✅' || '❌' }}($TARGET_DESC)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 配置项 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 框架 | Next.js(OpenNext) |" >> $GITHUB_STEP_SUMMARY
+          echo "| 部署类型 | ${{ env.DEPLOY_TYPE }} |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ env.DEPLOY_TYPE }}" = "pages" ]; then
+            echo "| Pages 项目 | ${{ env.PROJECT_NAME }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| 默认域名 | https://${{ env.PROJECT_NAME }}.pages.dev |" >> $GITHUB_STEP_SUMMARY
+            echo "| 适配层 | dist-pages/_worker.js(Pages 高级模式; OpenNext SSR + D1/KV/R2 绑定注入) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Worker 名称 | ${{ env.PROJECT_NAME }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| 默认域名 | https://${{ env.PROJECT_NAME }}.${{ env.CLOUDFLARE_ACCOUNT_ID }}.workers.dev |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "| 数据库(D1) | ${{ env.DATABASE_ENABLED == 'false' && '关闭(database=false, 仅站点代码)' || (env.D1_NAME || '(未配置)') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| KV 命名空间 | ${{ env.PROXY_PASSTHROUGH == 'true' && '(proxy 模式: 由代理站维护)' || (env.KV_NAME || '(未配置)') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| R2 存储桶 | ${{ env.PROXY_PASSTHROUGH == 'true' && '(proxy 模式: 由代理站维护)' || (env.R2_NAME || '(未配置)') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 本地数据库文件 | ${{ env.DATABASE_URI_VALUE }}(文件: prisma/${{ env.DATABASE_FILENAME }}, 真源=.env DATABASE_URI; 仅 Node 形态) |" >> $GITHUB_STEP_SUMMARY
+          echo "| D1 schema | prisma/schema.sql(幂等 IF NOT EXISTS, 对已有库零副作用) |" >> $GITHUB_STEP_SUMMARY
+          echo "| 触发分支 | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 语言模式 | ${{ env.LANGUAGE_RAW || 'auto' }} |" >> $GITHUB_STEP_SUMMARY
+          # 摘要同时镜像到步骤日志 —— $GITHUB_STEP_SUMMARY 只渲染在运行首页的
+          # "Summary" 标签, 步骤日志本身看起来是空的(易误判为"步骤没执行/没有输出")
+          echo "--- Deployment summary(日志镜像; 完整表格见运行首页 Summary 标签) ---"
+          cat "${GITHUB_STEP_SUMMARY}" || true

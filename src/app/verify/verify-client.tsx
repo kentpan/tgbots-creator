@@ -147,7 +147,7 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl 
 
     if (telegramUserId !== null && telegramUserId !== expectedUserId) {
       // 外部系统（Telegram initData）校验失败 → 进入失败态（合法的 effect 副作用）
-      // eslint-disable-next-line react-hooks/set-state-in-effect
+       
       showError("用户身份验证失败，此验证链接不属于您");
       hapticError();
       setIdentityFailed(true);

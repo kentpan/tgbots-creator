@@ -43,6 +43,8 @@
     "tests",
     "upload",
     "download",
-    "mini-services"
+    "mini-services",
+    "pages-adapter",
+    "dist-pages"
   ]
 }

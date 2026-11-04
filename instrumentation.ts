@@ -3,6 +3,15 @@ export async function register(): Promise<() => Promise<void>> {
     return async () => {};
   }
 
+  // v1.1.5: Cloudflare Workers/Pages(OpenNext + nodejs_compat) 下 NEXT_RUNTIME
+  // 恒为 "nodejs", 但 workerd 是无常驻进程的 serverless 环境 —— 与既有 Edge
+  // 行为保持一致: 不启动 bot 运行时(长轮询)/清理循环/Node 出站代理补丁,
+  // bot 通过 Webhook(/api/telegram/webhook/[botId]) 接收更新。
+  // workerd 运行时 navigator.userAgent 固定为 "Cloudflare-Workers"。
+  if (typeof navigator !== "undefined" && navigator.userAgent === "Cloudflare-Workers") {
+    return async () => {};
+  }
+
   const { loadDotEnv } = await import("@/lib/dotenv");
   loadDotEnv();
 

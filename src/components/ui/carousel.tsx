@@ -96,7 +96,7 @@ function Carousel({
   React.useEffect(() => {
     if (!api) return
     // shadcn/ui 原始样板：onSelect 内部同步组件状态（外部实例事件订阅，保留）
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+     
     onSelect(api)
     api.on("reInit", onSelect)
     api.on("select", onSelect)

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "@/utils/crypto";
 import { config } from "@/config/settings";
 import { createJoinRequest, createVerificationSession } from "@/database/operations";
 import { generateVerificationToken } from "@/utils/crypto";

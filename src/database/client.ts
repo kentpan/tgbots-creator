@@ -1,5 +1,3 @@
-import path from "node:path";
-
 export type SqlParam = string | number | bigint | Uint8Array | null;
 
 export type SqlRow = Record<string, unknown>;
@@ -59,9 +57,13 @@ function resolveD1FromGlobals(): D1DatabaseLike | null {
 }
 
 async function resolveD1FromRequestContext(): Promise<D1DatabaseLike | null> {
+  // v1.1.5: 补充 "@opennextjs/cloudflare"（OpenNext 迁移后的正式包名；
+  // 原 "@opennext/cloudflare" 是不存在的包名, 永远解析失败）。
+  // 请求上下文仅覆盖 handler 内调用; worker 入口层还有 globalThis 注入
+  // (pages-adapter/worker.ts) 作为主路径, 本函数为兜底。
   const requestContextModules = [
     "@cloudflare/next-on-pages",
-    "@opennext/cloudflare",
+    "@opennextjs/cloudflare",
   ];
   for (const moduleName of requestContextModules) {
     try {
@@ -100,6 +102,14 @@ async function resolveDatabaseUri(): Promise<{ file: string; display: string }> 
   if (queryIndex >= 0) target = target.slice(0, queryIndex);
   if (!target) return { file: ":memory:", display: ":memory:" };
   const { getEnvBaseDir } = await import("@/lib/dotenv");
+  // node:path 用动态 import（new Function 逃逸，与下方 node:sqlite 同一范式）：
+  // 本模块在 Edge bundle 中被静态引用，静态 import node:path 会在模块求值时
+  // "Native module not found" 炸构建（2026-11-04 CI 实测）。本函数仅 Node 形态
+  // 分支（node:sqlite 数据库）会执行，Edge 形态走 D1 不会触达。
+  const loadPath = new Function("return import('node:path')") as () => Promise<
+    typeof import("node:path")
+  >;
+  const path = await loadPath();
   const absolute = path.isAbsolute(target) ? target : path.resolve(getEnvBaseDir(), target);
   return { file: absolute, display: absolute };
 }
@@ -109,7 +119,15 @@ let nodeDatabase: NodeSqliteDatabase | null = null;
 async function createNodeDatabase(): Promise<SqlDatabase> {
   const { file, display } = await resolveDatabaseUri();
   if (file !== ":memory:") {
-    const { mkdirSync } = await import("node:fs");
+    // node:fs / node:path 均走 new Function 逃逸（理由同 resolveDatabaseUri，
+    // 避免 Edge bundle 中的 node: 模块引用被求值）
+    const loadPath = new Function("return import('node:path')") as () => Promise<
+      typeof import("node:path")
+    >;
+    const loadFs = new Function("return import('node:fs')") as () => Promise<
+      typeof import("node:fs")
+    >;
+    const [{ mkdirSync }, path] = await Promise.all([loadFs(), loadPath()]);
     mkdirSync(path.dirname(file), { recursive: true });
   }
   const loader = new Function(`return import("node:sqlite")`) as () => Promise<{

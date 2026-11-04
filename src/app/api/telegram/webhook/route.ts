@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "@/utils/crypto";
 import { NextResponse } from "next/server";
 import { config } from "@/config/settings";
 import { createBot } from "@/bot";

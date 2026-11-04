@@ -4,6 +4,11 @@ import { getCaptchaProvider } from "@/captcha/factory";
 import { config } from "@/config/settings";
 import { APP_VERSION } from "@/lib/app-version";
 
+// OpenNext(nodejs 运行时)构建会把无动态 API 的 GET handler 静态预渲染 ——
+// 本接口依赖数据库/captcha 运行时状态, 必须逐请求执行, 禁止构建期烘焙结果
+// (Edge 形态恒动态, 此声明在 Edge 下无行为差异, 仅约束 nodejs 形态)。
+export const dynamic = "force-dynamic";
+
 interface HealthCheck {
   status: string;
   error?: string;

@@ -51,7 +51,9 @@ export function telegramBotClientOptions(): { client: ApiClientOptions } {
     client: {
       apiRoot: telegramApiRoot(),
       // grammY 在 Node 下默认 node-fetch（绕过 globalThis.fetch），必须显式注入代理 fetch
-      fetch: telegramProxyFetch(),
+      // （grammY 的 `typeof fetch` 指向其 shim.node.js 的 node-fetch（含静态属性），
+      // 与全局 DOM fetch 类型不同源，故经 unknown 断言到 grammY 实际声明类型）
+      fetch: telegramProxyFetch() as unknown as NonNullable<ApiClientOptions["fetch"]>,
     },
   };
 }
@@ -81,7 +83,12 @@ function proxyState(): TelegramProxyState {
 }
 
 function isNodeRuntime(): boolean {
-  return process.env.NEXT_RUNTIME !== "edge";
+  // v1.1.5: 补充 workerd 判定 —— OpenNext 部署下 NEXT_RUNTIME 恒为 "nodejs",
+  // 但 Cloudflare Workers/Pages 直连 Telegram API、不使用 Node 出站代理
+  // (undici/agent 补丁仅适用于 Node 形态), 与 Edge 形态同口径。
+  // workerd 运行时 navigator.userAgent 固定为 "Cloudflare-Workers"。
+  if (process.env.NEXT_RUNTIME === "edge") return false;
+  return !(typeof navigator !== "undefined" && navigator.userAgent === "Cloudflare-Workers");
 }
 
 const PROXY_CONFIG_TTL_MS = 15000;
