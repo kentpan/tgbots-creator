@@ -1,0 +1,58 @@
+[bot]
+# Telegram Bot Token (fill this with your actual bot token)
+token = ""
+# Verification timeout in seconds (5 minutes)
+verification_timeout = 300
+# Verification button text
+verification_button_text = "🔐 开始验证"
+# Admin user IDs (array of integers)
+admin_ids = []
+
+[database]
+# TGuard replica uses SQLite via Prisma; these values document the original PostgreSQL deployment
+host = "localhost"
+port = 5432
+name = "tguard"
+user = "postgres"
+password = "password"
+min_size = 1
+max_size = 10
+
+[captcha]
+# Captcha provider: "hcaptcha", "cap", or "turnstile"
+provider = "cap"
+# Verification expire time in minutes
+expire_minutes = 10
+# HTTP timeout for captcha validation
+timeout_seconds = 30
+
+[captcha.hcaptcha]
+# Get these from https://www.hcaptcha.com/
+site_key = ""
+secret_key = ""
+
+[captcha.cap]
+# Cap.js server URL (e.g., "https://api.capjs.dev")
+server_url = "https://api.capjs.dev"
+site_key = "your_cap_site_key"
+secret_key = "your_cap_secret_key"
+
+[captcha.turnstile]
+# Get these from https://developers.cloudflare.com/turnstile/
+site_key = ""
+secret_key = ""
+
+[api]
+# API server settings
+host = "0.0.0.0"
+port = 3000
+# Base URL for Mini Web App (update this with your domain)
+base_url = "http://localhost:3000"
+# Enable external API access
+enable = false
+# API Key for external API authentication (X-API-Key header)
+api_key = ""
+
+[cleanup]
+# Retention period in days for expired sessions and verification records
+retention_days = 30

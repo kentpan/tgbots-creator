@@ -1,0 +1,362 @@
+# ============================================================================
+# pages-deploy.yml — 自动部署工作流（push main 即发布）
+# ----------------------------------------------------------------------------
+# 部署参数全部收敛于仓库根目录 deploy.config.js（项目名 / D1 名 / KV 名 / R2 桶名）。
+# wrangler.toml 由本工作流按配置动态生成（仓库无需携带），D1 / KV / R2 不存在时
+# 自动创建（KV 可选，失败仅告警不阻塞），并把 GitHub Secret 中的 ADMIN_SECRET
+# 写入 Pages 运行环境。
+#
+# 全流程：拉代码 → 读配置 → 解析账号 → 装 wrangler → 确保 Pages/D1/KV/R2 存在 →
+#         生成 wrangler.toml → npm ci → @cloudflare/next-on-pages 构建 → 部署
+#
+# 需要在 GitHub 仓库 Settings → Secrets and variables → Actions 配置:
+#   Secrets(必填):
+#     CLOUDFLARE_API_TOKEN  部署权限（Pages:Edit + D1:Edit + R2:Edit，KV 可选: Workers KV Storage:Edit）
+#     ADMIN_SECRET          管理面板登录密钥（自动注入 Pages 运行环境 Secret）
+#   Secrets(可选):
+#     ISSUE_APIKEY          旧版单密钥（建议改用管理面板「APIKEY 管理」）
+#     JWT_SECRET            /s/ 加密分享链接密钥（不配置则退回用 ADMIN_SECRET 派生）
+#     CLOUDFLARE_ACCOUNT_ID 账号 ID（单账号 Token 可留空自动探测）
+# ============================================================================
+
+name: Deploy to Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: pages-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WRANGLER_VERSION: '4'
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 读取部署配置 deploy.config.js
+        id: cfg
+        run: |
+          set -e
+          OUT=$(node --input-type=module -e "
+            import cfg from './deploy.config.js';
+            const pick = (v) => (v === undefined || v === null ? '' : String(v).trim());
+            if (!pick(cfg.projectName)) { console.error('deploy.config.js 缺少 projectName'); process.exit(1); }
+            console.log('project=' + pick(cfg.projectName));
+            console.log('d1=' + pick(cfg.d1Name));
+            console.log('kv=' + pick(cfg.kvName));
+            console.log('r2=' + pick(cfg.r2Name));
+            console.log('account=' + pick(cfg.accountId));
+          ")
+          echo "$OUT" >> "$GITHUB_OUTPUT"
+          echo "$OUT"
+
+      - name: 解析 Cloudflare 账号 ID
+        # 照抄参考实现（upload/deploy.zip pages-deploy.yml “Resolve Cloudflare account ID”）：
+        # 优先级 CLOUDFLARE_ACCOUNT_ID secret → deploy.config.js accountId → REST 自动探测；
+        # 结果写入 $GITHUB_ENV，后续所有 wrangler/curl 步骤统一使用，避免多账号 Token 歧义。
+        env:
+          SECRET_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          ACCOUNT_ID="${SECRET_ACCOUNT_ID}"
+
+          # 优先级: CLOUDFLARE_ACCOUNT_ID secret -> deploy.config.js accountId -> 自动探测
+          if [ -z "$ACCOUNT_ID" ] && [ -n "${{ steps.cfg.outputs.account }}" ]; then
+            ACCOUNT_ID="${{ steps.cfg.outputs.account }}"
+            echo "使用 deploy.config.js 的 accountId: $ACCOUNT_ID"
+          fi
+
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "未配置账号 ID, 开始自动探测..."
+
+            # 1) 先检测 TOKEN 是否有效
+            VERIFY_OK=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/user/tokens/verify" | grep -o '"success":true' || echo "")
+            if [ -z "$VERIFY_OK" ]; then
+              echo "::error::CLOUDFLARE_API_TOKEN 无效或校验失败, 请检查 token 是否正确且未过期。"
+              exit 1
+            fi
+            echo "Token 校验通过"
+
+            # 2) 检测 Token 是否有列账号权限, 并获取第一个账号 ID
+            ACCOUNTS=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts")
+            ACCOUNTS_OK=$(echo "$ACCOUNTS" | grep -o '"success":true' || echo "")
+            if [ -z "$ACCOUNTS_OK" ]; then
+              echo "::error::Token 无法列出账号(可能缺少 'Account Settings: Read' 权限)。"
+              echo "::error::接口返回: $ACCOUNTS"
+              exit 1
+            fi
+            ACCOUNT_ID=$(echo "$ACCOUNTS" | grep -oP '"id"\s*:\s*"\K[^"]+' | head -1 || echo "")
+
+            if [ -z "$ACCOUNT_ID" ]; then
+              echo "::error::未能从账号列表解析出账号 ID。"
+              echo "::error::接口返回: $ACCOUNTS"
+              exit 1
+            fi
+            echo "自动探测到账号 ID: $ACCOUNT_ID(建议填入 deploy.config.js 的 accountId 或设置 secret 以加快后续部署)"
+          fi
+
+          echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
+          echo "最终使用账号 ID: $ACCOUNT_ID"
+
+      - name: 安装 wrangler
+        run: npm install -g "wrangler@${WRANGLER_VERSION}"
+
+      - name: 确保 Pages 项目存在
+        # 模式对齐参考实现（REST 查重 → 不存在才创建 → 失败 fail hard）。
+        # 严禁 "| grep -v already exists || true" 吞错：创建失败却继续，
+        # 会在最终 deploy 步骤才爆出难懂的错误，白跑一整轮。
+        env:
+          PROJECT: ${{ steps.cfg.outputs.project }}
+        run: |
+          CHECK=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/${PROJECT}")
+          CODE=$(echo "$CHECK" | tail -1)
+          BODY=$(echo "$CHECK" | sed '$d')
+
+          if [ "$CODE" = "200" ]; then
+            echo "Pages 项目已存在: $PROJECT"
+          elif [ "$CODE" = "404" ]; then
+            echo "创建 Pages 项目: $PROJECT"
+            RESULT=$(npx wrangler pages project create "$PROJECT" --production-branch=main 2>&1 || true)
+            echo "$RESULT"
+            # 不猜 wrangler 输出格式(各版本成功文案不同) —— 创建后 REST 复查, HTTP 200 即真实存在
+            VCODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/${PROJECT}")
+            if [ "$VCODE" = "200" ]; then
+              echo "Pages 项目创建成功(REST 复查通过): $PROJECT"
+            else
+              echo "::error::Pages 项目创建失败(REST 复查 HTTP $VCODE), 请检查 CLOUDFLARE_API_TOKEN 是否含 Cloudflare Pages:Edit 权限"
+              echo "::error::wrangler 返回: $RESULT"
+              exit 1
+            fi
+          else
+            echo "::error::无法查询 Pages 项目(HTTP $CODE), 请检查 CLOUDFLARE_API_TOKEN 是否含 Cloudflare Pages:Edit 权限"
+            echo "::error::API 返回: $BODY"
+            exit 1
+          fi
+
+      - name: 确保 D1 数据库存在并取得 ID
+        # 逻辑照抄参考实现（upload/deploy.zip pages-deploy.yml “Create D1 database (if needed)”）。
+        # ⚠ D1 database_id 是带连字符的 UUID(如 ba48f121-5726-41e8-9466-699efa5c2d83)，
+        # 严禁用 [0-9a-f]{32} 这类“连续 32 位”正则提取 —— 带连字符 UUID 最长连续 hex 段
+        # 仅 12 位, 永远匹配不上(v1.0.3 首发的实际事故, 库建成功但 ID 提取为空导致部署失败)。
+        id: d1
+        if: ${{ steps.cfg.outputs.d1 != '' }}
+        env:
+          D1_NAME: ${{ steps.cfg.outputs.d1 }}
+        run: |
+          set -e
+          # 先查是否已存在, 避免 "already exists" 报错(--json 输出兼容顶层数组与 {result:[...]} 两种格式)
+          EXISTING_D1_ID=$(npx wrangler d1 list --json 2>/dev/null \
+            | jq -r --arg n "$D1_NAME" '(if type == "array" then . else (.result // []) end)[] | select(.name == $n) | (.uuid // .id // empty)' \
+            || true)
+
+          if [ -n "$EXISTING_D1_ID" ]; then
+            DB_ID="$EXISTING_D1_ID"
+            echo "D1 数据库已存在: $D1_NAME (ID: $DB_ID)"
+          else
+            echo "创建 D1 数据库: $D1_NAME"
+            RESULT=$(npx wrangler d1 create "$D1_NAME" 2>&1 || true)
+            echo "$RESULT"
+            # 不猜 wrangler 输出格式(各版本成功文案/字段不同) —— 创建后重查云端列表拿真实 ID;
+            # 列表查询复用与查重分支相同的 if type == "array" 防御式 jq, 顶层数组/{result:[]} 都兼容
+            DB_ID=$(npx wrangler d1 list --json 2>/dev/null \
+              | jq -r --arg n "$D1_NAME" '(if type == "array" then . else (.result // []) end)[] | select(.name == $n) | (.uuid // .id // empty)' \
+              || true)
+            if [ -z "$DB_ID" ]; then
+              # 兜底: 云端列表未命中时再从 create 输出提取(带连字符 UUID)
+              DB_ID=$(echo "$RESULT" | grep -oP 'database_id"?\s*[=:]\s*"\K[^"]+' | head -1 || echo "")
+            fi
+            if [ -z "$DB_ID" ]; then
+              echo "::error::无法获取 D1 database_id，请检查 CLOUDFLARE_API_TOKEN 是否含 D1:Edit 权限"
+              echo "::error::wrangler 返回: $RESULT"
+              exit 1
+            fi
+            echo "创建 D1 数据库成功: $D1_NAME (ID: $DB_ID)"
+          fi
+          echo "db_id=${DB_ID}" >> "$GITHUB_OUTPUT"
+          echo "D1 database_id: ${DB_ID}"
+
+      - name: 确保 KV 命名空间存在（可选，失败不阻塞部署）
+        # KV 缓存为可选组件（应用侧自动降级内存实现），创建失败仅 ::warning:: 不 fail hard。
+        # KV REST: GET/POST /accounts/{id}/storage/kv/namespaces，result: [{ id, title }]
+        id: kv
+        if: ${{ steps.cfg.outputs.kv != '' }}
+        env:
+          KV_NAME: ${{ steps.cfg.outputs.kv }}
+        run: |
+          KVLIST=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces")
+
+          EXISTING_KV_ID=$(echo "$KVLIST" | jq -r --arg n "$KV_NAME" '(.result // [])[]? | select(.title == $n) | .id // empty' || true)
+
+          if [ -n "$EXISTING_KV_ID" ]; then
+            echo "KV 命名空间已存在: $KV_NAME (ID: $EXISTING_KV_ID)"
+          else
+            echo "创建 KV 命名空间: $KV_NAME"
+            RESULT=$(curl -s -X POST -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"title\":\"$KV_NAME\"}" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces")
+            EXISTING_KV_ID=$(echo "$RESULT" | jq -r '.result.id // empty' || true)
+          fi
+
+          if [ -n "$EXISTING_KV_ID" ]; then
+            echo "kv_id=${EXISTING_KV_ID}" >> "$GITHUB_OUTPUT"
+            echo "KV namespace_id: ${EXISTING_KV_ID}"
+          else
+            echo "::warning::KV 命名空间创建失败（可选组件，应用自动降级为内存缓存，不影响部署）"
+            echo "::warning::如需 KV 缓存，请检查 CLOUDFLARE_API_TOKEN 是否含 Workers KV Storage:Edit 权限"
+            echo "API 返回: $KVLIST $RESULT"
+          fi
+
+      - name: 确保 R2 存储桶存在
+        # 模式照抄参考实现 KV 步骤（REST 查重 → 不存在才创建 → 失败 fail hard）。
+        # v1.0.3 实际事故: 旧版 "| grep -v already exists || true" 把创建失败吞掉 →
+        # 桶根本没建成 → 最终 deploy 才报 "R2 bucket not found", 白跑一整轮。
+        # R2 REST 响应: { success, result: { buckets: [{ name, ... }] } }
+        # ⚠ [code: 10042] = R2 服务未在账号上开通, 与 Token 权限无关 —— R2 不同于
+        #   D1/Pages, 必须先在 Dashboard 手动激活(绑定支付方式)才能调用 R2 API。
+        if: ${{ steps.cfg.outputs.r2 != '' }}
+        env:
+          R2_NAME: ${{ steps.cfg.outputs.r2 }}
+        run: |
+          R2LIST=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets")
+
+          # R2 服务未开通([code: 10042]): REST 与 wrangler 都会报这个错, 提前拦截给对指引
+          if echo "$R2LIST" | grep -qE '"code"\s*:\s*10042|[Pp]lease enable R2'; then
+            echo "::error::R2 服务未在此 Cloudflare 账号上开通([code: 10042]), 与 Token 权限无关 —— Token 已具备 R2:Edit 时也会报此错。"
+            echo "::error::解决: Cloudflare Dashboard → 左侧 R2 对象存储 → 按提示开通 R2(免费额度 10GB 存储/月, 开通需绑定支付方式), 开通后重跑本工作流。"
+            exit 1
+          fi
+
+          # jq 先判型再取字段(if type == "array"): 顶层数组与 result.buckets 包装两种格式都兼容,
+          # 且不会因对数组取 .result 触发 "Cannot index array with string" 类型错误
+          EXISTING_R2=$(echo "$R2LIST" | jq -r --arg n "$R2_NAME" '(if type == "array" then . else (.result.buckets // []) end)[]? | select(.name == $n) | .name // empty' \
+            || true)
+
+          if [ -n "$EXISTING_R2" ]; then
+            echo "R2 存储桶已存在: $R2_NAME"
+          else
+            echo "创建 R2 存储桶: $R2_NAME"
+            RESULT=$(npx wrangler r2 bucket create "$R2_NAME" 2>&1 || true)
+            echo "$RESULT"
+            # 不猜 wrangler 输出格式(v4.155 成功文案是 "✅ Created bucket …", 不含 success 字样,
+            # 字符串判定必然漏报 —— 实际事故) —— 创建后 REST 复查, 桶真实存在即成功:
+            R2VERIFY=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets")
+            R2_OK=$(echo "$R2VERIFY" | jq -r --arg n "$R2_NAME" '(if type == "array" then . else (.result.buckets // []) end)[]? | select(.name == $n) | .name // empty' \
+              || true)
+            if [ -n "$R2_OK" ]; then
+              echo "R2 存储桶创建成功(REST 复查通过): $R2_NAME"
+            elif echo "$RESULT$R2VERIFY" | grep -qE '"code"\s*:\s*10042|[Pp]lease enable R2'; then
+              echo "::error::R2 服务未在此 Cloudflare 账号上开通([code: 10042]), 与 Token 权限无关。"
+              echo "::error::解决: Cloudflare Dashboard → 左侧 R2 对象存储 → 按提示开通 R2(免费额度 10GB 存储/月, 开通需绑定支付方式), 开通后重跑本工作流。"
+              exit 1
+            else
+              echo "::error::R2 存储桶创建失败, 请检查 CLOUDFLARE_API_TOKEN 是否含 Workers R2 Storage:Edit 权限"
+              echo "::error::wrangler 返回: $RESULT"
+              exit 1
+            fi
+          fi
+
+      - name: 生成 wrangler.toml（动态绑定 D1 / KV / R2）
+        run: |
+          set -e
+          PROJECT="${{ steps.cfg.outputs.project }}"
+          # next-on-pages 产物目录（wrangler pages deploy 未显式传目录时也读这里）
+          {
+            echo "name = \"${PROJECT}\""
+            echo 'compatibility_date = "2025-01-01"'
+            echo 'pages_build_output_dir = ".vercel/output/static"'
+          } > wrangler.toml
+          if [ -n "${{ steps.cfg.outputs.d1 }}" ] && [ -n "${{ steps.d1.outputs.db_id }}" ]; then
+            {
+              echo ''
+              echo '[[d1_databases]]'
+              echo 'binding = "DATABASE"'
+              echo "database_name = \"${{ steps.cfg.outputs.d1 }}\""
+              echo "database_id = \"${{ steps.d1.outputs.db_id }}\""
+            } >> wrangler.toml
+          fi
+          if [ -n "${{ steps.cfg.outputs.kv }}" ] && [ -n "${{ steps.kv.outputs.kv_id }}" ]; then
+            {
+              echo ''
+              echo '[[kv_namespaces]]'
+              echo 'binding = "KV"'
+              echo "id = \"${{ steps.kv.outputs.kv_id }}\""
+            } >> wrangler.toml
+          fi
+          if [ -n "${{ steps.cfg.outputs.r2 }}" ]; then
+            {
+              echo ''
+              echo '[[r2_buckets]]'
+              echo 'binding = "BUCKET"'
+              echo "bucket_name = \"${{ steps.cfg.outputs.r2 }}\""
+            } >> wrangler.toml
+          fi
+          echo '----- 生成的 wrangler.toml -----'
+          cat wrangler.toml
+
+      - name: 写入 ADMIN_SECRET 等运行环境 Secret
+        env:
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          ISSUE_APIKEY: ${{ secrets.ISSUE_APIKEY }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          set -e
+          PROJECT="${{ steps.cfg.outputs.project }}"
+          if [ -z "$ADMIN_SECRET" ]; then
+            echo "::error::缺少 GitHub Secret ADMIN_SECRET（Settings → Secrets and variables → Actions 配置后重试）"
+            exit 1
+          fi
+          printf '%s' "$ADMIN_SECRET" | npx wrangler pages secret put ADMIN_SECRET --project-name "$PROJECT"
+          echo 'ADMIN_SECRET 已写入 Pages 运行环境'
+          if [ -n "$JWT_SECRET" ]; then
+            printf '%s' "$JWT_SECRET" | npx wrangler pages secret put JWT_SECRET --project-name "$PROJECT" || true
+            echo 'JWT_SECRET 已写入 Pages 运行环境（/s/ 加密分享）'
+          fi
+          if [ -n "$ISSUE_APIKEY" ]; then
+            printf '%s' "$ISSUE_APIKEY" | npx wrangler pages secret put ISSUE_APIKEY --project-name "$PROJECT" || true
+            echo 'ISSUE_APIKEY 已写入 Pages 运行环境'
+          fi
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建 Next.js（@cloudflare/next-on-pages）
+        # NEXT_ON_PAGES=1：next.config.ts 据此关闭 standalone 输出（与 next-on-pages 不兼容），
+        # 走默认输出，由 next-on-pages 打包为 Cloudflare Pages 产物（.vercel/output/static）。
+        # 这是 Next.js 全栈应用（App Router + API 路由），绝非纯静态站点，
+        # 直接部署 public/ 只会得到空壳 —— 必须先完成 next-on-pages 编译。
+        env:
+          NEXT_ON_PAGES: '1'
+        run: |
+          npx --yes @cloudflare/next-on-pages@1
+          test -f .vercel/output/static/index.html || test -d .vercel/output/static || { echo "::error::next-on-pages 产物缺失"; exit 1; }
+          ls -la .vercel/output/static | head -20
+
+      - name: 部署到 Cloudflare Pages
+        # CLOUDFLARE_ACCOUNT_ID 已由「解析 Cloudflare 账号 ID」步骤写入 $GITHUB_ENV，全 job 生效
+        run: |
+          npx wrangler pages deploy .vercel/output/static --project-name "${{ steps.cfg.outputs.project }}" --branch main --commit-dirty=true
+          echo "部署完成 → https://${{ steps.cfg.outputs.project }}.pages.dev"
