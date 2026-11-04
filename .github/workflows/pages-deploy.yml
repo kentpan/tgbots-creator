@@ -348,8 +348,12 @@ jobs:
         # 走默认输出，由 next-on-pages 打包为 Cloudflare Pages 产物（.vercel/output/static）。
         # 这是 Next.js 全栈应用（App Router + API 路由），绝非纯静态站点，
         # 直接部署 public/ 只会得到空壳 —— 必须先完成 next-on-pages 编译。
+        # npm_config_legacy_peer_deps=true：与根目录 .npmrc 的 legacy-peer-deps=true 等效的环境变量
+        # 双保险 —— npx 临时安装 next-on-pages 时不再自动解析其 peer 依赖
+        # （wrangler@4.157.0 起要求 workers-types@^5，与 next-on-pages@1.x 的 ^4 冲突 → ERESOLVE）。
         env:
           NEXT_ON_PAGES: '1'
+          npm_config_legacy_peer_deps: 'true'
         run: |
           npx --yes @cloudflare/next-on-pages@1
           test -f .vercel/output/static/index.html || test -d .vercel/output/static || { echo "::error::next-on-pages 产物缺失"; exit 1; }

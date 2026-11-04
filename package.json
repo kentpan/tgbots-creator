@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/ && node scripts/sync-instrumentation.mjs && rm -rf .next/standalone/prisma .next/standalone/.env .next/standalone/.env.production",
+    "build": "next build && node scripts/post-build.mjs",
     "start": "next start",
     "start:standalone": "NODE_ENV=production node .next/standalone/server.js",
     "lint": "eslint .",

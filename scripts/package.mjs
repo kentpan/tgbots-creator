@@ -126,6 +126,7 @@ dumpShippedConfig("db/custom.db");
 // 4. 组装 staging
 const includeRootFiles = [
   ".gitignore",
+  ".npmrc",
   "Caddyfile",
   "README.md",
   "components.json",
