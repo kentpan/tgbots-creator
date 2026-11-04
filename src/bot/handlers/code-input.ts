@@ -23,18 +23,27 @@ async function sendReapplyJoinButton(
   userId: number,
   chatId: string,
 ): Promise<void> {
-  const invite = await ctx.api.createChatInviteLink(chatId, {
-    creates_join_request: true,
-    name: "TGuard 加群验证",
-  });
-  await ctx.api.sendMessage(
-    userId,
-    "本次验证已失效，请点击下方按钮重新申请加群。",
-    {
-      reply_markup: new InlineKeyboard().url("🔄 申请加群", invite.invite_link),
-    },
-  );
-  console.log(`Re-apply join button sent to user ${userId} for chat ${chatId}`);
+  // v1.1.5：通知层失败（用户拉黑 bot / Telegram 瞬时错误）必须兜住并记录详细错误，
+  // 不允许中断调用方后续流程（失效路径的通知也是用户唯一重新入群的入口）
+  try {
+    const invite = await ctx.api.createChatInviteLink(chatId, {
+      creates_join_request: true,
+      name: "TGuard 加群验证",
+    });
+    await ctx.api.sendMessage(
+      userId,
+      "本次验证已失效，请点击下方按钮重新申请加群。",
+      {
+        reply_markup: new InlineKeyboard().url("🔄 申请加群", invite.invite_link),
+      },
+    );
+    console.log(`Re-apply join button sent to user ${userId} for chat ${chatId}`);
+  } catch (error) {
+    console.error(
+      `Failed to send re-apply join button to user ${userId} for chat ${chatId}:`,
+      error,
+    );
+  }
 }
 
 /**
@@ -90,8 +99,18 @@ export async function processCodeAnswer(
     );
   }
 
-  // 验证结果文案一律私聊发送（不用 ctx.reply，避免消息落到输码所在的群聊）
-  await ctx.api.sendMessage(from.id, result.replyText);
+  // 验证结果文案一律私聊发送（不用 ctx.reply，避免消息落到输码所在的群聊）。
+  // v1.1.5：私聊发送失败（用户拉黑 bot / Telegram 侧瞬时错误）必须兜住并记录详细错误——
+  // 通知层失败不允许中断后续「申请加群」按钮发送，也不允许让 webhook 处理以异常收场，
+  // 否则用户看到的现象就是「输入验证码后无任何反应」（v1.1.4 同类反馈根因之一）。
+  try {
+    await ctx.api.sendMessage(from.id, result.replyText);
+  } catch (error) {
+    console.error(
+      `Failed to DM verification result to user ${from.id} (outcome=${result.outcome}):`,
+      error,
+    );
+  }
 
   // 验证失效：紧随失效文案发送「申请加群」按钮（入群申请链接），
   // 把用户输入框的 force_reply 状态替换为可重新发起加群申请的按钮
@@ -108,22 +127,30 @@ export async function processCodeAnswer(
       } catch (error) {
         console.error(`Failed to kick unverified direct-join user ${from.id}:`, error);
       }
-      const invite = await ctx.api.createChatInviteLink(result.reapplyChatId, {
-        creates_join_request: true,
-        name: "TGuard 加群验证",
-      });
-      await ctx.api.sendMessage(
-        from.id,
-        kicked
-          ? "本次验证已失效，你已被移出群组。请点击下方按钮重新申请加群。"
-          : "本次验证已失效，请点击下方按钮重新申请加群。",
-        {
-          reply_markup: new InlineKeyboard().url("🔄 申请加群", invite.invite_link),
-        },
-      );
-      console.log(
-        `Direct-join re-apply button sent to user ${from.id} for chat ${result.reapplyChatId} (kicked=${kicked})`,
-      );
+      // v1.1.5：通知层发送失败兜住并记录，不影响已完成的踢出动作与日志
+      try {
+        const invite = await ctx.api.createChatInviteLink(result.reapplyChatId, {
+          creates_join_request: true,
+          name: "TGuard 加群验证",
+        });
+        await ctx.api.sendMessage(
+          from.id,
+          kicked
+            ? "本次验证已失效，你已被移出群组。请点击下方按钮重新申请加群。"
+            : "本次验证已失效，请点击下方按钮重新申请加群。",
+          {
+            reply_markup: new InlineKeyboard().url("🔄 申请加群", invite.invite_link),
+          },
+        );
+        console.log(
+          `Direct-join re-apply button sent to user ${from.id} for chat ${result.reapplyChatId} (kicked=${kicked})`,
+        );
+      } catch (error) {
+        console.error(
+          `Failed to send direct-join re-apply notice to user ${from.id} for chat ${result.reapplyChatId} (kicked=${kicked}):`,
+          error,
+        );
+      }
     } else {
       await sendReapplyJoinButton(ctx, from.id, result.reapplyChatId);
     }
