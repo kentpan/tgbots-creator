@@ -629,6 +629,14 @@ jobs:
         #     D1 空表盲区(schema 求差一致 → 零写入, 但 admin_users 等种子数据
         #     永远进不去, 管理后台无法登录); 线上已有数据的表永不触碰; 会话/
         #     日志/验证码类运行数据(黑名单)不同步(旧会话上线的安全风险)。
+        #     逐表独立查询(每表一行日志, admin_users 行数直接可见) —— 弃用单发
+        #     23 表 UNION 大查询 + 2>/dev/null: wrangler --json 报错走 stdout
+        #     (实测), 错误 JSON 被当"数据"写进输出文件、stderr 又被丢弃 →
+        #     bash -e 静默 exit 1(CI 实录: 两行 ✓ 后裸 exit 1, 零日志可查)。
+        #   · 管理员账号就绪检测(登录底线, 幂等): 迁移后远端 admin_users 为 0 行
+        #     → 从仓库 db 定向补种(INSERT OR IGNORE, 远端 username 唯一索引防重),
+        #     复查仍为 0 → fail hard —— "初始部署检测管理员表是否有数据"显式闭环:
+        #     宁可发布失败, 不交付登录不了的管理后台。
         # 门控与上方 "Apply D1 schema" 互斥: 携带数据文件走本步, 未携带才回落。
         # 注: TGuard 无独立 seed.sql(种子数据随仓库 db 提供), 补缺循环自然跳过。
         if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != '' && env.DB_FILE_EXISTS == 'true'
@@ -777,32 +785,37 @@ jobs:
           #   远端已有数据(线上运行数据) → 永不触碰; 黑名单(会话/日志/验证码
           #   等运行数据, 防旧会话上线等安全风险) → 一律跳过。
           export DATA_EXCLUDE="admin_sessions operation_logs verify_codes join_requests verification_sessions user_stats xianyu_delivery_logs bot_sessions"
-          TABLES=$(sqlite3 -json "$DB_FILE_PATH" "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'" | jq -r '.[].name')
-          UNION_Q=$(for T in $TABLES; do printf "SELECT '%s' AS t, COUNT(*) AS c FROM \"%s\" UNION ALL " "$T" "$T"; done | sed 's/UNION ALL $//')
-          sqlite3 -json "$DB_FILE_PATH" "$UNION_Q" > /tmp/d1-local-counts.json
-          npx wrangler d1 execute "$D1_NAME" --remote -y --json --command "$UNION_Q" > /tmp/d1-remote-counts.json 2>/dev/null
-          SEED_TABLES=$(node -e '
-            const fs = require("fs");
-            const load = (p) => {
-              let j;
-              try { j = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { return null; }
-              const blocks = Array.isArray(j) ? j : (Array.isArray(j?.result) ? j.result : j?.result ? [j.result] : []);
-              return blocks.flatMap((b) => Array.isArray(b?.results) ? b.results : Array.isArray(b) ? b : [b]);
-            };
-            const lc = load("/tmp/d1-local-counts.json");
-            const rc = load("/tmp/d1-remote-counts.json");
-            if (!lc || !rc) { console.error("::error::数据补缺行数比对失败(本地或远端清单解析为空, wrangler 可能报错) —— fail hard 防误判空表触发全量导入"); process.exit(1); }
-            const exclude = new Set((process.env.DATA_EXCLUDE || "").split(/\s+/).filter(Boolean));
-            const rcMap = new Map(rc.map((r) => [r.t, r.c]));
-            const out = [];
-            for (const r of lc) {
-              if (exclude.has(r.t) || !r.c) continue;
-              if ((rcMap.get(r.t) ?? 0) === 0) out.push(r.t);
-            }
-            console.log(out.join(" "));
-          ')
+          # 行数解析器: 兼容 wrangler --json 三形态; 报错 JSON({"error":...}, 实测
+          # 走 stdout)/空输出 → 返回空串(视为查询失败), 报错原文随 warning 可见
+          PARSE_COUNT='let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);const blocks=Array.isArray(j)?j:(Array.isArray(j&&j.result)?j.result:(j&&j.result?[j.result]:[]));const rows=blocks.flatMap(b=>Array.isArray(b&&b.results)?b.results:[]);const v=rows.map(r=>r.c).find(x=>x!==undefined);process.stdout.write(v===undefined?"":String(v))}catch(e){process.stdout.write("")}})'
+          TABLES=$(sqlite3 "$DB_FILE_PATH" "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name != '_sync_meta' ORDER BY name")
+          SEED_TABLES=""
+          echo "④ 逐表比对本地/远端行数(黑名单跳过; 本地 0 行无种子可导也跳过):"
+          for T in $TABLES; do
+            case " $DATA_EXCLUDE " in
+              *" $T "*) echo "  · $T: 运行数据黑名单 → 跳过"; continue;;
+            esac
+            LC=$(sqlite3 "$DB_FILE_PATH" "SELECT COUNT(*) FROM \"$T\"")
+            if [ "$LC" -eq 0 ]; then
+              echo "  · $T: 本地 0 行(无种子可导) → 跳过"
+              continue
+            fi
+            ROUT=$(npx wrangler d1 execute "$D1_NAME" --remote -y --json --command "SELECT COUNT(*) AS c FROM \"$T\"") \
+              || { echo "::warning::表 $T 远端行数查询失败(本表跳过, 不阻塞): $(printf '%s' "$ROUT" | tr '\n' ' ' | cut -c1-300)"; continue; }
+            RC_C=$(printf '%s' "$ROUT" | node -e "$PARSE_COUNT")
+            if [ -z "$RC_C" ]; then
+              echo "::warning::表 $T 远端行数解析失败(本表跳过, 不阻塞): $(printf '%s' "$ROUT" | tr '\n' ' ' | cut -c1-300)"
+              continue
+            fi
+            if [ "$RC_C" -eq 0 ]; then
+              echo "  · $T: 本地 $LC 行 / 远端 0 行 ← 待补缺"
+              SEED_TABLES="$SEED_TABLES $T"
+            else
+              echo "  · $T: 本地 $LC 行 / 远端 $RC_C 行 → 已就位, 不触碰"
+            fi
+          done
           if [ -n "$SEED_TABLES" ]; then
-            echo "远端空表但本地有数据 → 补缺导入: $SEED_TABLES"
+            echo "④a 远端空表但本地有数据 → 逐表补缺导入:$SEED_TABLES"
             # .dump 全库输出天然保持建表依赖序(roles 先于 admin_users)。⚠ 数据值
             # 可能内含换行/转义引号(JSON 配置等), grep 行级过滤会切断跨行语句
             # (实测踩坑) —— 必须引号感知切分语句后再按目标表过滤:
@@ -822,28 +835,84 @@ jobs:
                 else if (c === ";") { stmts.push(cur.trim()); cur = ""; }
               }
               if (cur.trim()) stmts.push(cur.trim());
-              const set = new Set(process.argv[1].split(/\s+/).filter(Boolean));
               const re = /^INSERT INTO "?([A-Za-z0-9_]+)"?\s/;
-              const out = [];
-              for (const s of stmts) {
-                const m = s.match(re);
-                if (m && set.has(m[1])) out.push(s.replace(/^INSERT INTO /, "INSERT OR IGNORE INTO "));
+              let total = 0; const empty = [];
+              for (const T of process.argv[1].split(/\s+/).filter(Boolean)) {
+                const out = [];
+                for (const s of stmts) {
+                  const m = s.match(re);
+                  if (m && m[1] === T) out.push(s.replace(/^INSERT INTO /, "INSERT OR IGNORE INTO "));
+                }
+                fs.writeFileSync("/tmp/d1-seed-" + T + ".sql", out.join("\n") + (out.length ? "\n" : ""));
+                console.log("  · 提取 " + T + ": " + out.length + " 条 INSERT(OR IGNORE)");
+                total += out.length;
+                if (!out.length) empty.push(T);
               }
-              fs.writeFileSync("/tmp/d1-seed-data.sql", out.join("\n") + "\n");
-              console.log("目标表 INSERT 已提取(引号感知切分): " + out.length + " 条");
-            ' "$SEED_TABLES"
-            N=$(grep -c "^INSERT OR IGNORE" /tmp/d1-seed-data.sql || echo 0)
-            if [ "$N" -eq 0 ]; then
-              echo "::error::待补缺表($SEED_TABLES)未能从 $DB_FILE_PATH 生成任何 INSERT(dump/过滤异常), fail hard"
-              exit 1
-            fi
-            npx wrangler d1 execute "$D1_NAME" --remote -y --file=/tmp/d1-seed-data.sql
-            echo "✅ 空表数据补缺完成: 共导入 $N 行(含管理员账号), 线上已有数据的表零触碰"
+              if (empty.length) { console.error("::error::表 " + empty.join(",") + " 本地行数>0 却未能从 .dump 提取到 INSERT(dump 异常), fail hard"); process.exit(1); }
+              console.log("  共提取 " + total + " 条待导入语句");
+            ' "$SEED_TABLES" || { echo "::error::补缺 INSERT 提取失败, fail hard"; exit 1; }
+            SEED_FAIL=0
+            for T in $SEED_TABLES; do
+              if npx wrangler d1 execute "$D1_NAME" --remote -y --file="/tmp/d1-seed-$T.sql"; then
+                echo "  ✅ $T 补缺完成: $(grep -c '^INSERT OR IGNORE' "/tmp/d1-seed-$T.sql") 行"
+              else
+                echo "::error::$T 补缺导入失败(以报错原文为准)"
+                SEED_FAIL=1
+              fi
+            done
+            if [ "$SEED_FAIL" -ne 0 ]; then exit 1; fi
+            echo "✅ 空表数据补缺完成(含管理员账号), 线上已有数据的表零触碰"
           else
             echo "✓ 无需数据补缺(远端非空表均已就位 / 本地无新种子数据)"
           fi
 
-          # ⑤ 核验: 重新求差必须为空 —— 表/列/索引全部就位, 否则 fail hard
+          # ⑤ 管理员账号就绪检测(登录底线, 幂等): 初始部署检测管理员表是否有
+          #   数据 —— 远端 admin_users COUNT=0 → 从仓库 db 定向补种(INSERT OR
+          #   IGNORE, 远端 username 唯一索引防重), 复查仍为 0 → fail hard:
+          #   宁可发布失败, 也不交付登录不了的管理后台。
+          AC_OUT=$(npx wrangler d1 execute "$D1_NAME" --remote -y --json --command "SELECT COUNT(*) AS c FROM admin_users") \
+            || { echo "::error::admin_users 远端行数查询失败: $(printf '%s' "$AC_OUT" | tr '\n' ' ' | cut -c1-400)"; exit 1; }
+          AC=$(printf '%s' "$AC_OUT" | node -e "$PARSE_COUNT")
+          if [ "$AC" -eq 0 ]; then
+            echo "⚠ 远端 admin_users 为 0 行 → 从仓库 db 定向补种管理员账号"
+            sqlite3 "$DB_FILE_PATH" .dump > /tmp/d1-admin-dump.sql
+            node -e '
+              const fs = require("fs");
+              const raw = fs.readFileSync("/tmp/d1-admin-dump.sql", "utf8");
+              const stmts = [];
+              let cur = "", inStr = false;
+              for (let i = 0; i < raw.length; i++) {
+                const c = raw[i];
+                cur += c;
+                if (inStr) { if (c === "\x27") { if (raw[i + 1] === "\x27") { cur += raw[++i]; } else { inStr = false; } } }
+                else if (c === "\x27") { inStr = true; }
+                else if (c === ";") { stmts.push(cur.trim()); cur = ""; }
+              }
+              if (cur.trim()) stmts.push(cur.trim());
+              const out = [];
+              for (const s of stmts) {
+                if (/^INSERT INTO "?admin_users"?\s/.test(s)) out.push(s.replace(/^INSERT INTO /, "INSERT OR IGNORE INTO "));
+              }
+              if (!out.length) { console.error("::error::仓库 db .dump 未提取到 admin_users INSERT(仓库库本身无管理员账号), fail hard"); process.exit(1); }
+              fs.writeFileSync("/tmp/d1-admin-seed.sql", out.join("\n") + "\n");
+              console.log("  提取 admin_users INSERT " + out.length + " 条(OR IGNORE)");
+            ' || { echo "::error::admin_users 补种语句提取失败"; exit 1; }
+            if ! npx wrangler d1 execute "$D1_NAME" --remote -y --file=/tmp/d1-admin-seed.sql; then
+              echo "::error::admin_users 补种执行失败(以报错原文为准)"
+              exit 1
+            fi
+            AC_OUT=$(npx wrangler d1 execute "$D1_NAME" --remote -y --json --command "SELECT COUNT(*) AS c FROM admin_users") \
+              || { echo "::error::admin_users 复查失败: $(printf '%s' "$AC_OUT" | tr '\n' ' ' | cut -c1-400)"; exit 1; }
+            AC=$(printf '%s' "$AC_OUT" | node -e "$PARSE_COUNT")
+            if [ "$AC" -eq 0 ]; then
+              echo "::error::admin_users 补种后仍为 0 行, fail hard"
+              exit 1
+            fi
+            echo "  ✅ admin_users 补种完成: 现有 $AC 行"
+          fi
+          echo "✓ 管理员账号就绪检测通过: admin_users 共 $AC 行(登录可用)"
+
+          # ⑥ 核验: 重新求差必须为空 —— 表/列/索引全部就位, 否则 fail hard
           npx wrangler d1 execute "$D1_NAME" --remote --json --command "$INV_Q" > /tmp/d1-verify-inv.json
           VRC=0
           node /tmp/d1-schema-diff.mjs /tmp/d1-local-inv.json /tmp/d1-verify-inv.json /tmp/d1-verify.sql || VRC=$?
