@@ -343,6 +343,16 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      - name: 注入 Edge Runtime 声明（仅 Pages 构建）
+        # next-on-pages 只支持 Edge Runtime：构建末期校验「所有非静态路由必须显式
+        # export const runtime = 'edge'」，缺失即报
+        # "routes were not configured to run with the Edge Runtime" 并 exit 1。
+        # 本项目双形态部署（本地/沙盒 Node 模式用 node:sqlite，Pages 用 D1，
+        # 见 src/database/client.ts），runtime 声明写死进源码会让本地 dev 的
+        # Edge 模拟沙箱禁用 node:sqlite，摧毁现有功能 —— 因此只在 runner 工作区
+        # 注入（不进 git、不进发布源码），脚本幂等且跳过已有声明。
+        run: node scripts/add-edge-runtime.mjs
+
       - name: 构建 Next.js（@cloudflare/next-on-pages）
         # NEXT_ON_PAGES=1：next.config.ts 据此关闭 standalone 输出（与 next-on-pages 不兼容），
         # 走默认输出，由 next-on-pages 打包为 Cloudflare Pages 产物（.vercel/output/static）。
