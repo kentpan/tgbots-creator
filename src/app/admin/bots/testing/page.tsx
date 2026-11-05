@@ -76,6 +76,9 @@ export default async function BotTestingPage() {
       chatId: String(link.chatId),
       deployMode: deploy?.deploy_mode ?? null,
       inviteLink: deploy?.invite_link ?? null,
+      // 一键部署时写入的真实群名（Telegram getChat 返回）：group_settings 缺记录时
+      // 仿真屏用它兜底，避免只显示「群组 -100…」占位符
+      chatTitle: deploy?.chat_title ?? null,
     };
   });
 

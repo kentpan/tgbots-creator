@@ -226,7 +226,13 @@ export function TestingClient({
 }: {
   bots: BotOption[];
   relatedBotIds: Record<string, string[]>;
-  botGroupLinks: { botId: string; chatId: string; deployMode: string | null; inviteLink: string | null }[];
+  botGroupLinks: {
+    botId: string;
+    chatId: string;
+    deployMode: string | null;
+    inviteLink: string | null;
+    chatTitle: string | null;
+  }[];
   groups: GroupOption[];
   menuConfigs: Record<string, BotMenuConfig>;
   initialProducts: ProductItem[];
@@ -342,7 +348,17 @@ export function TestingClient({
           : group,
       );
     }
-    const pool = [...merged.values()];
+    // 群名第三回退：一键部署时写入 rights 的真实群名（group_settings 与同步数据都缺标题时）
+    const linkTitleByChat = new Map<string, string>();
+    for (const link of botGroupLinks) {
+      if (!link.chatTitle?.trim() || !relatedIds.has(link.botId)) continue;
+      linkTitleByChat.set(link.chatId, link.chatTitle.trim());
+    }
+    const pool = [...merged.values()].map((group) =>
+      group.chatTitle.trim()
+        ? group
+        : { ...group, chatTitle: linkTitleByChat.get(group.chatId) ?? "" },
+    );
     const visible =
       linkedChatIds.size > 0
         ? pool.filter(

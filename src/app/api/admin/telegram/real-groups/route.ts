@@ -4,6 +4,7 @@ import { headers } from "next/headers";
 import { getBot, listGroupBotAdmins, listGroupSettings } from "@/database/operations";
 import { fetchRealGroups } from "@/services/telegram-sync";
 import { registerTelegramChat } from "@/services/chat-registry";
+import { parseGroupDeployState } from "@/services/group-deploy";
 
 /**
  * 统一「真实群组」获取通道（v1.1.1）：
@@ -37,6 +38,8 @@ interface GroupsPayload {
     bot_username: string | null;
     groups: GroupEntry[];
     stale_chat_ids?: string[];
+    /** 校验过程中的非致命问题（网络失败/权限不足/Webhook 模式等） */
+    warnings?: string[];
     note: string | null;
   };
 }
@@ -72,12 +75,18 @@ export async function GET(request: Request): Promise<NextResponse> {
   const titleByChat = new Map(
     settingsList.map((setting) => [String(setting.chatId), setting.chatTitle ?? ""]),
   );
-  const groups: GroupEntry[] = links.map((link) => ({
-    chat_id: String(link.chatId),
-    chat_title: titleByChat.get(String(link.chatId)) ?? "",
-    source: "cache",
-    is_new: false,
-  }));
+  // 群名回退：group_settings 无记录时用「一键部署」时 Telegram 返回并写入 rights 的 chat_title，
+  // 否则仿真屏只能显示「群组 -100…」占位符（真实群名明明已知）
+  const groups: GroupEntry[] = links.map((link) => {
+    const stored = (titleByChat.get(String(link.chatId)) ?? "").trim();
+    const deployed = parseGroupDeployState(link.rights)?.chat_title?.trim() ?? "";
+    return {
+      chat_id: String(link.chatId),
+      chat_title: stored || deployed,
+      source: "cache",
+      is_new: false,
+    };
+  });
 
   const payload: GroupsPayload = {
     ok: true,
@@ -152,8 +161,11 @@ export async function POST(request: Request): Promise<NextResponse> {
   const notes: string[] = [];
   if (synced.length === 0) {
     notes.push(
-      "未发现机器人所在的群组：把机器人拉进目标群组并设为管理员（管理员可收到全部群消息），在群里发一条消息或重新拉一次机器人，数秒后点「同步真实群组」即可发现。",
+      "数据库中没有任何已登记的群组，且本次未能从 Telegram 发现新群组。把机器人拉进目标群组并设为管理员（管理员可收到全部群消息），在群里发一条消息或重新拉一次机器人（Webhook 会立即登记），数秒后点「同步真实群组」即可发现。",
     );
+  }
+  if (result.warnings.length > 0) {
+    notes.push(`同步诊断：${result.warnings.join("；")}`);
   }
   if (result.staleChatIds.length > 0) {
     notes.push(
@@ -167,6 +179,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       bot_username: result.botUsername,
       groups: synced,
       stale_chat_ids: result.staleChatIds,
+      warnings: result.warnings,
       note: notes.length > 0 ? notes.join(" ") : null,
     },
   });

@@ -199,6 +199,51 @@ function toNativeSignal(signal: unknown): AbortSignal | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// edge/workerd 请求初始化归一
+// ---------------------------------------------------------------------------
+
+/**
+ * hop-by-hop 头：由 HTTP 连接层管理，workerd 的 fetch 不接受调用方设置
+ * （grammY 的 JSON 载荷固定带 connection: keep-alive，直连 edge 时会被拒）。
+ */
+const HOP_BY_HOP_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-connection",
+  "transfer-encoding",
+  "upgrade",
+  "te",
+  "trailer",
+] as const;
+
+function stripHopByHop(headers: Headers): Headers {
+  for (const name of HOP_BY_HOP_HEADERS) headers.delete(name);
+  return headers;
+}
+
+/**
+ * edge/workerd 请求初始化归一（仅非 Node 运行时调用）：
+ * - 剥离 Node 专属字段 agent / compress（workerd 无 Node http 连接池概念，
+ *   grammY 的 baseFetchConfig 仍会塞 Node https.Agent，属无效且易触发
+ *   半开连接复用的 "Network connection lost"）
+ * - signal 桥接为原生 AbortSignal（grammY 用 abort-controller polyfill，
+ *   workerd 只接受原生实例）
+ * - 剥离 hop-by-hop 头
+ */
+export function normalizeEdgeInit(init?: RequestInit): RequestInit | undefined {
+  if (!init) return undefined;
+  const source = init as RequestInit & { agent?: unknown; compress?: unknown };
+  const normalized: RequestInit = { ...source };
+  delete (normalized as { agent?: unknown }).agent;
+  delete (normalized as { compress?: unknown }).compress;
+  const nativeSignal = toNativeSignal(source.signal);
+  if (nativeSignal) normalized.signal = nativeSignal;
+  else delete (normalized as { signal?: AbortSignal }).signal;
+  if (source.headers) normalized.headers = stripHopByHop(new Headers(source.headers));
+  return normalized;
+}
+
+// ---------------------------------------------------------------------------
 // 代理 fetch
 // ---------------------------------------------------------------------------
 
@@ -216,21 +261,25 @@ const globalForPatch = globalThis as unknown as { tguardProxyFetchInstalled?: bo
  */
 export function telegramProxyFetch(): typeof fetch {
   const proxyFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const nodeRuntime = isNodeRuntime();
+    /** 直连透传：edge/workerd 必须先归一 init（Node 专属字段/非原生 signal/hop-by-hop 头） */
+    const passthrough = (): Promise<Response> =>
+      underlying()(input as Request, nodeRuntime ? init : normalizeEdgeInit(init));
     // v2.0.2：非 Node 运行时（edge/workerd）恒直连 —— 代理体系（Basic 鉴权头/
     // undici 连接池）只属于 Node 形态，edge 出站绝不改写到代理前缀
-    if (!isNodeRuntime()) return underlying()(input as Request, init);
+    if (!nodeRuntime) return passthrough();
     // 解析请求 URL（支持 string / URL / Request 三种形态）
     let href: string;
     try {
       href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     } catch {
-      return underlying()(input as Request, init);
+      return passthrough();
     }
     let target: URL;
     try {
       target = new URL(href);
     } catch {
-      return underlying()(input as Request, init);
+      return passthrough();
     }
 
     // 只拦截上游 Bot API
@@ -238,22 +287,22 @@ export function telegramProxyFetch(): typeof fetch {
     try {
       upstream = new URL(telegramUpstreamRoot());
     } catch {
-      return underlying()(input as Request, init);
+      return passthrough();
     }
     if (target.origin !== upstream.origin || !isBotApiPath(target.pathname)) {
-      return underlying()(input as Request, init);
+      return passthrough();
     }
 
     await ensureTelegramProxyConfig();
     const config = proxyState();
     if (!config.enabled || !config.url.trim()) {
-      return underlying()(input as Request, init);
+      return passthrough();
     }
 
     const parts = splitProxyAuth(config.url);
     if (!parts) {
       console.warn("[telegram-proxy] 代理地址不合法，本次请求直连:", config.url);
-      return underlying()(input as Request, init);
+      return passthrough();
     }
 
     const finalUrl =

@@ -1869,6 +1869,33 @@ export async function upsertGroupBotAdmin(input: {
   );
 }
 
+/**
+ * 确保「机器人 ↔ 群组」关联存在（只建关联，绝不改写既有行）。
+ *
+ * rights 列存放一键部署状态（入群申请链接/部署时间）与管理员权限快照，
+ * status 可能被管理端置为非 active —— 由真实同步 / 群消息事件触发的自动登记
+ * 只允许补建关联，不许覆盖这些数据（历史实现用 upsert 覆盖 rights='{}'，
+ * 每次机器人再触发一次登记就把部署状态清空）。
+ */
+export async function ensureGroupBotAdmin(input: {
+  botId: bigint;
+  chatId: bigint;
+  status?: string;
+}): Promise<void> {
+  await executeRun(
+    `INSERT INTO group_bot_admins (bot_id, chat_id, rights, status, created_time, updated_time)
+     VALUES (?, ?, '{}', ?, ?, ?)
+     ON CONFLICT(bot_id, chat_id) DO NOTHING`,
+    [
+      Number(input.botId),
+      Number(input.chatId),
+      input.status ?? "active",
+      dateText(new Date()),
+      dateText(new Date()),
+    ],
+  );
+}
+
 export async function deleteGroupBotAdmin(id: bigint): Promise<boolean> {
   const result = await executeRun(`DELETE FROM group_bot_admins WHERE id = ?`, [Number(id)]);
   return result.changes > 0;

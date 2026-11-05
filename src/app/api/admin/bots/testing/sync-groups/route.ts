@@ -63,19 +63,27 @@ export async function POST(request: Request): Promise<NextResponse> {
   await logOperation(admin, {
     action: "同步真实群组",
     target: bot.name,
-    detail: `getUpdates 发现 ${synced.length} 个真实群组（新增 ${synced.filter((item) => item.is_new).length} 个）`,
+    detail: `发现 ${synced.length} 个真实群组（新增 ${synced.filter((item) => item.is_new).length} 个）`,
     headers: requestHeaders,
   });
+
+  const notes: string[] = [];
+  if (synced.length === 0) {
+    notes.push(
+      "未发现机器人所在的群组：机器人需在群内产生过事件（被加入群组/收到加群申请/群消息），或已在管理端保存过该群组。机器人运行期间收到群事件会自动登记真实群组。",
+    );
+  }
+  if (result.warnings.length > 0) {
+    notes.push(`同步诊断：${result.warnings.join("；")}`);
+  }
 
   return NextResponse.json({
     ok: true,
     data: {
       bot_username: result.botUsername,
       groups: synced,
-      note:
-        synced.length === 0
-          ? "最近更新中未发现群组：机器人需在群内产生过事件（被加入群组/收到加群申请/群消息）。机器人运行期间收到群事件会自动登记真实群组。"
-          : null,
+      warnings: result.warnings,
+      note: notes.length > 0 ? notes.join(" ") : null,
     },
   });
 }

@@ -1,7 +1,7 @@
 import {
+  ensureGroupBotAdmin,
   getGroupSettings,
   listBots,
-  upsertGroupBotAdmin,
   upsertGroupSettings,
 } from "@/database/operations";
 
@@ -50,8 +50,11 @@ export async function registerTelegramChat(input: {
   botToken?: string;
 }): Promise<{ isNew: boolean }> {
   const existing = await getGroupSettings(input.chatId);
+  // 空字符串/纯空白视为「无群名」：upsertGroupSettings 的 COALESCE 只对 NULL 生效，
+  // 传空串会把数据库里已有的真实群名覆盖掉
+  const title = input.chatTitle?.trim() || existing?.chatTitle?.trim() || null;
   await upsertGroupSettings(input.chatId, {
-    chatTitle: input.chatTitle ?? existing?.chatTitle ?? null,
+    chatTitle: title,
     // v1.1.7：新登记群组默认 code_self（自动验证码：机器人私聊发码，
     // 用户回复输入验证码即自动审批 —— 与「一键部署」宣传的主流程一致）；
     // 已有配置的群组原样回传，绝不覆盖
@@ -69,10 +72,11 @@ export async function registerTelegramChat(input: {
   if (input.botToken) {
     const bots = await listBots();
     for (const bot of bots.filter((item) => item.token === input.botToken)) {
-      await upsertGroupBotAdmin({
+      // 只补建关联：rights 里存着一键部署状态（入群申请链接）与管理员权限快照，
+      // 自动登记绝不能覆盖（否则每次群事件都清空部署状态）
+      await ensureGroupBotAdmin({
         botId: bot.id,
         chatId: input.chatId,
-        rights: "{}",
         status: "active",
       });
     }
