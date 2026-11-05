@@ -28,16 +28,16 @@ export function AiUsageTab() {
     }
   }, []);
 
+  // v2.0.3：移除 30s 定时轮询 —— 统计数据低频变化，轮询纯属空转；
+  // 且配合 SelfContainedTabs 懒挂载，本组件仅在用户切到「调用统计」tab 时才挂载并请求
   useEffect(() => {
     void load(days);
-    const timer = setInterval(() => void load(days), 30000);
-    return () => clearInterval(timer);
   }, [days, load]);
 
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <span className="text-sm text-muted-foreground">统计范围</span>
           {[7, 14, 30].map((range) => (
             <button

@@ -1,7 +1,7 @@
 import { session } from "grammy";
 import type { StorageAdapter } from "grammy";
 import { queryAll, queryOne, executeRun } from "@/database/client";
-import { getAppSetting } from "@/database/operations";
+import { getAppSetting, getAllAppSettings } from "@/database/operations";
 import type { BotContext } from "./context";
 
 /**
@@ -708,4 +708,73 @@ export async function listSessionBackendHealth(): Promise<{ backend: SessionStor
     `SELECT scope, COUNT(*) AS total FROM bot_sessions GROUP BY scope`,
   );
   return rows.map((row) => ({ backend: "sqlite" as const, rows: Number(row.total) }));
+}
+
+// ---------------------------------------------------------------------------
+// 公开配置形态（敏感字段打码）—— v2.0.3：设置页 RSC 首屏直传与 GET 路由共用，
+// 页面初始加载不再多发一次 /api/admin/session-storage 请求
+// ---------------------------------------------------------------------------
+
+export interface PublicSessionStorageConfig {
+  backend: string;
+  sqlite_sessions: number;
+  d1: { account_id: string; database_id: string; api_token_masked: string; has_api_token: boolean };
+  r2: {
+    account_id: string;
+    access_key_id: string;
+    secret_masked: string;
+    has_secret: boolean;
+    bucket: string;
+    cdn_url: string;
+  };
+  s3: {
+    endpoint: string;
+    region: string;
+    bucket: string;
+    access_key_id: string;
+    secret_masked: string;
+    has_secret: boolean;
+    path_style: string;
+    cdn_url: string;
+  };
+}
+
+function maskSecret(value: string | undefined): string {
+  return !value ? "" : value.length > 8 ? `${value.slice(0, 4)}****${value.slice(-4)}` : "****";
+}
+
+/** 读取当前会话存储配置（敏感字段打码；纯本地 DB，毫秒级） */
+export async function getPublicSessionStorageConfig(): Promise<PublicSessionStorageConfig> {
+  const stored = await getAllAppSettings();
+  return {
+    backend: stored[SESSION_STORAGE_SETTING_KEY] ?? "memory",
+    sqlite_sessions: await countSqliteSessions(),
+    d1: {
+      account_id: stored[SESSION_STORAGE_D1_KEYS.accountId] ?? "",
+      database_id: stored[SESSION_STORAGE_D1_KEYS.databaseId] ?? "",
+      api_token_masked: maskSecret(stored[SESSION_STORAGE_D1_KEYS.apiToken]),
+      has_api_token: Boolean(stored[SESSION_STORAGE_D1_KEYS.apiToken]),
+    },
+    r2: {
+      account_id: stored[SESSION_STORAGE_R2_KEYS.accountId] ?? "",
+      access_key_id: stored[SESSION_STORAGE_R2_KEYS.accessKeyId] ?? "",
+      secret_masked: maskSecret(stored[SESSION_STORAGE_R2_KEYS.secretAccessKey]),
+      has_secret: Boolean(stored[SESSION_STORAGE_R2_KEYS.secretAccessKey]),
+      bucket: stored[SESSION_STORAGE_R2_KEYS.bucket] ?? "",
+      cdn_url: stored[SESSION_STORAGE_R2_KEYS.cdnUrl] ?? "",
+    },
+    s3: {
+      endpoint: stored[SESSION_STORAGE_S3_KEYS.endpoint] ?? "",
+      region: stored[SESSION_STORAGE_S3_KEYS.region] ?? "",
+      bucket: stored[SESSION_STORAGE_S3_KEYS.bucket] ?? "",
+      access_key_id: stored[SESSION_STORAGE_S3_KEYS.accessKeyId] ?? "",
+      secret_masked: maskSecret(stored[SESSION_STORAGE_S3_KEYS.secretAccessKey]),
+      has_secret: Boolean(stored[SESSION_STORAGE_S3_KEYS.secretAccessKey]),
+      path_style:
+        (stored[SESSION_STORAGE_S3_KEYS.pathStyle] ?? "path") === "virtual_hosted"
+          ? "virtual_hosted"
+          : "path",
+      cdn_url: stored[SESSION_STORAGE_S3_KEYS.cdnUrl] ?? "",
+    },
+  };
 }

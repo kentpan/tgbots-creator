@@ -15,6 +15,7 @@ import { TelegramGlobalCards } from "@/components/admin/telegram-global-cards";
 import { SessionStorageCard } from "@/components/admin/session-storage-card";
 import { backupDatabaseAction, saveSettingsAction } from "./actions";
 import { listDatabaseBackups } from "@/services/database-backup";
+import { getPublicSessionStorageConfig } from "@/bot/session-storage";
 
 export const dynamic = "force-dynamic";
 
@@ -32,10 +33,12 @@ export default async function SettingsPage({
   const admin = await requirePermission("settings:view");
   const params = await searchParams;
 
-  const [stored, dbInfo, backups] = await Promise.all([
+  const [stored, dbInfo, backups, sessionStorageConfig] = await Promise.all([
     getCachedAppSettings(),
     getDatabaseInfo(),
     listDatabaseBackups(),
+    // v2.0.3：RSC 首屏直传会话存储配置，页面初始加载不再多发一次 GET 请求
+    getPublicSessionStorageConfig(),
   ]);
   const kvKind = getKv().kind;
   const storageKind = getStorage().kind;
@@ -173,7 +176,7 @@ export default async function SettingsPage({
       />
 
       {/* BOT 会话数据存储（grammY session 外部存储）：内存 / SQLite / Cloudflare D1 / R2 一键切换 */}
-      <SessionStorageCard />
+      <SessionStorageCard initialConfig={sessionStorageConfig} />
 
       <div className="rounded-xl border bg-card p-6">
         <h2 className="mb-4 text-lg font-semibold">运行参数</h2>

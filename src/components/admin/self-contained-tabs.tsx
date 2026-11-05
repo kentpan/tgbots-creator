@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
 
 /**
  * SelfContainedTabs — 统一的自包含 Tab 切换组件。
@@ -9,6 +9,10 @@ import { useId, useState, type ReactNode } from "react";
  * - 内部自持状态（非受控）或受控（activeKey + onActiveKeyChange 同时传入）
  * - 自带全部样式与无障碍语义（role=tablist/tab/tabpanel + aria）
  * - 零外部依赖（不依赖全局 store / context），可在任意页面直接嵌入
+ * - 懒挂载（v2.0.3）：面板内容仅在首次激活后才渲染（激活过的保持挂载，
+ *   保留表单输入状态）。未激活的面板不渲染 content —— tab 面板里的数据
+ *   加载（fetch/useEffect）只在用户真正切到该 tab 时才发起，页面首屏
+ *   不再为未访问的面板发多余请求（如 AI 统计 tab 的图表数据）。
  *
  * 用途：轮询/Webhook 全局与单项配置、隐私模式全局与单项配置、
  * 从零创建机器人的分步引导（步骤即 Tab，支持外部受控翻步）。
@@ -51,15 +55,18 @@ export function SelfContainedTabs({
   const currentKey = isControlled ? (activeKey as string) : internalKey;
   const current = items.find((item) => item.key === currentKey) ?? items[0];
 
+  // 懒挂载：记录已激活过的面板 key。当前 key 在渲染时乐观纳入（切换即渲染，
+  // 面板内的数据请求立刻发起），随后在 effect 中固化，避免受控模式下
+  // 外部翻步（引导「下一步」）永远不触发面板挂载
+  const [mountedKeys, setMountedKeys] = useState<string[]>(() => [currentKey]);
+  useEffect(() => {
+    setMountedKeys((prev) => (prev.includes(currentKey) ? prev : [...prev, currentKey]));
+  }, [currentKey]);
+
   const select = (key: string): void => {
     if (isControlled) onActiveKeyChange(key);
     else setInternalKey(key);
   };
-
-  // 已激活过的面板保持挂载（保留表单输入状态），未激活过的隐藏
-  const activatedKeysRef = new Set<string>([current?.key ?? ""]);
-  // 简单实现：全部面板都渲染，非激活的用 hidden（表单状态天然保留，面板数量有限无性能问题）
-  void activatedKeysRef;
 
   return (
     <div className={className}>
@@ -109,6 +116,9 @@ export function SelfContainedTabs({
       </div>
       {items.map((item) => {
         const active = item.key === current?.key;
+        // 懒挂载：未激活过的面板只渲染占位骨架（无障碍语义完整，content 不渲染），
+        // 激活过的保持挂载（hidden 切换，表单状态保留）
+        const mounted = mountedKeys.includes(item.key) || item.key === currentKey;
         return (
           <div
             key={item.key}
@@ -119,7 +129,7 @@ export function SelfContainedTabs({
             tabIndex={0}
             className="pt-4 focus:outline-none"
           >
-            {item.content}
+            {mounted ? item.content : null}
           </div>
         );
       })}

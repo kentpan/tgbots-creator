@@ -29,19 +29,37 @@ const botCache = new Map<string, Bot>();
 interface BotMeInfo {
   id: number;
   username: string | null;
+  /** 完整 getMe User（v2.0.3：供 fetch-info 需要能力字段时复用，同 Token 10 分钟内零网络调用） */
+  user: MeUser | null;
   cachedAt: number;
 }
+/** grammY getMe 返回的 User 形态（只取用到的字段，避免引入类型依赖） */
+type MeUser = {
+  id: number;
+  username?: string;
+  first_name?: string;
+  supports_inline_queries?: boolean;
+  can_join_groups?: boolean;
+  can_read_all_group_messages?: boolean;
+  can_connect_to_business?: boolean;
+  has_main_web_app?: boolean;
+};
 const meCache = new Map<string, BotMeInfo>();
 const ME_CACHE_TTL_MS = 10 * 60 * 1000;
 
 export async function getMeCached(
   api: Bot["api"],
   token: string,
-): Promise<{ id: number; username: string | null }> {
+): Promise<{ id: number; username: string | null; user: MeUser | null }> {
   const cached = meCache.get(token);
   if (cached && Date.now() - cached.cachedAt < ME_CACHE_TTL_MS) return cached;
-  const me = await api.getMe();
-  const info: BotMeInfo = { id: Number(me.id), username: me.username ?? null, cachedAt: Date.now() };
+  const me = (await api.getMe()) as MeUser;
+  const info: BotMeInfo = {
+    id: Number(me.id),
+    username: me.username ?? null,
+    user: me,
+    cachedAt: Date.now(),
+  };
   meCache.set(token, info);
   return info;
 }
@@ -178,30 +196,11 @@ interface TgUpdate {
  */
 export async function fetchRealGroups(token: string): Promise<RealGroupsResult> {
   try {
-    const mePayload = await tgRawCall<{
-      ok: boolean;
-      description?: string;
-      result?: { id?: number; username?: string };
-      error_code?: number;
-    }>(token, "getMe");
-    if (!mePayload.ok) {
-      const description = mePayload.description ?? "网络错误";
-      if (mePayload.error_code === 401) {
-        return { ok: false, error: "Bot Token 无效或已被撤销（Telegram 401 Unauthorized）：请到 @BotFather → /mybots → API Token 查看当前 Token，若已撤销请重新生成并在此机器人配置中更新保存。", botUsername: null, chats: [], staleChatIds: [] };
-      }
-      return { ok: false, error: `Telegram API 错误：${description}`, botUsername: null, chats: [], staleChatIds: [] };
-    }
-
-    const botUsername = mePayload.result?.username ?? null;
-    // 机器人自身 Telegram user id：后续 getChatMember 成员身份核验（left/kicked 判定）必需；
-    // getMe 成功响应缺少该字段属协议异常，必须中止同步（不许带默认值继续）
-    const botUser = mePayload.result;
-    if (!botUser || botUser.id === undefined) {
-      throw new Error(
-        `Telegram getMe 响应异常：ok=true 但未返回机器人 id（username=${botUsername ?? "unknown"}），无法核验机器人群成员身份`,
-      );
-    }
-    const botUserId: number = botUser.id;
+    // v2.0.3：机器人 user id 直接取自 Token 前段（Telegram 官方格式 <bot_user_id>:<secret>），
+    // getMe（只为 username）不再阻塞 getChatMember；getMe 与 getUpdates 首轮并行发起，
+    // 总耗时从「getMe→getUpdates→2N 次逐群串行验证」降到两轮并行（约省 2/3+）
+    const tokenBotId = Number(token.split(":")[0]);
+    const tokenBotIdValid = Number.isSafeInteger(tokenBotId) && tokenBotId > 0;
 
     const fetchUpdates = (): Promise<
       { ok: true; updates: TgUpdate[] } | { ok: false; errorCode?: number; description: string }
@@ -229,7 +228,35 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
           : { ok: false, errorCode: payload.error_code, description: payload.description ?? "网络错误" },
       );
 
-    let updatesResult = await fetchUpdates();
+    const [mePayload, firstUpdates] = await Promise.all([
+      tgRawCall<{
+        ok: boolean;
+        description?: string;
+        result?: { id?: number; username?: string };
+        error_code?: number;
+      }>(token, "getMe"),
+      fetchUpdates(),
+    ]);
+    if (!mePayload.ok) {
+      const description = mePayload.description ?? "网络错误";
+      if (mePayload.error_code === 401) {
+        return { ok: false, error: "Bot Token 无效或已被撤销（Telegram 401 Unauthorized）：请到 @BotFather → /mybots → API Token 查看当前 Token，若已撤销请重新生成并在此机器人配置中更新保存。", botUsername: null, chats: [], staleChatIds: [] };
+      }
+      return { ok: false, error: `Telegram API 错误：${description}`, botUsername: null, chats: [], staleChatIds: [] };
+    }
+
+    const botUsername = mePayload.result?.username ?? null;
+    // 机器人自身 Telegram user id：后续 getChatMember 成员身份核验（left/kicked 判定）必需。
+    // Token 前段合法时直接使用；否则回退 getMe.id，且 getMe 成功响应缺少该字段属协议异常，
+    // 必须中止同步（不许带默认值继续）
+    if (!tokenBotIdValid && mePayload.result?.id === undefined) {
+      throw new Error(
+        `Telegram getMe 响应异常：ok=true 但未返回机器人 id（username=${botUsername ?? "unknown"}），无法核验机器人群成员身份`,
+      );
+    }
+    const botUserId: number = tokenBotIdValid ? tokenBotId : Number(mePayload.result!.id);
+
+    let updatesResult = firstUpdates;
     let webhookToRestore: { url: string; allowedUpdates?: string; maxConnections?: number } | null = null;
     let runtimePaused = false;
 
@@ -315,7 +342,6 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
     // 数据库已关联群组（group_bot_admins + group_settings）→ getChat + getChatMember 逐一验证：
     // 机器人仍在群内则用 Telegram 返回的最新群名（真实数据优先）；
     // 确认失效（群不存在 / 成员身份 left/kicked）则移除关联行并标记 stale
-    const staleChatIds: string[] = [];
     const candidateIds = new Set<string>([...chats.keys()].map((id) => String(id)));
     try {
       const tokenBots = (await listBots()).filter((item) => item.token === token);
@@ -330,51 +356,70 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
     }
 
     const api = botByToken(token).api;
-    for (const candidate of candidateIds) {
-      if (chats.has(Number(candidate))) continue;
-      let chatId: bigint;
-      try {
-        chatId = BigInt(candidate);
-      } catch {
-        continue;
-      }
-      // getChat：群是否仍真实存在（仅 Telegram 400 = chat not found 才算确认失效）
-      let chatType: string | undefined;
-      let chatTitle: string | undefined;
-      try {
-        // chat_id 必须传 string：grammY payload 走 JSON.stringify，BigInt 会直接 TypeError
-        const info = await withTelegramTimeout(api.getChat(String(chatId)));
-        chatTitle = (info as { title?: string }).title?.trim();
-        chatType = (info as { type?: string }).type;
-      } catch (error) {
-        if (error instanceof GrammyError && error.error_code === 400) {
-          // Telegram 400（群不存在）：历史关联确认失效 → 移除关联行
-          staleChatIds.push(candidate);
-          const removed = await deleteGroupBotAdminsByChat(chatId);
-          console.info(`[telegram-sync] 群组 ${candidate} 已不存在（Telegram 400 chat not found），已移除失效群组关联（删除 ${removed} 行）`);
-        } else {
-          // 非 400（网络超时 / 429 等）：记录但不误报 stale，绝不删除（防误删）
-          console.warn(`getChat(${candidate}) failed:`, error instanceof Error ? error.message : error);
+    const candidateList = [...candidateIds].filter((id) => !chats.has(Number(id)));
+    // v2.0.3：全部候选群组的 getChat + getChatMember 并行验证（原实现逐群串行 2 次调用，
+    // N 群经代理可达分钟级；现在一轮并发，总耗时 = 单次调用最大值）。
+    // 确认失效的群组先收集，验证完统一移除关联行（DB 写串行，防并发写冲突）
+    const staleList: { candidate: string; reason: "not_found" | "member_left" }[] = [];
+    const verifyResults = await Promise.allSettled(
+      candidateList.map(async (candidate) => {
+        let chatId: bigint;
+        try {
+          chatId = BigInt(candidate);
+        } catch {
+          return;
         }
-        continue;
-      }
-      // getChat 成功（群真实存在）→ 核验机器人成员身份：left/kicked = 机器人已不在群内
-      try {
-        const member = await withTelegramTimeout(api.getChatMember(String(chatId), botUserId));
-        if (member.status === "left" || member.status === "kicked") {
-          staleChatIds.push(candidate);
-          const removed = await deleteGroupBotAdminsByChat(chatId);
-          console.info(`[telegram-sync] 机器人已不在群组 ${candidate}（成员身份 ${member.status}），已移除失效群组关联（删除 ${removed} 行）`);
-          continue;
+        // getChat：群是否仍真实存在（仅 Telegram 400 = chat not found 才算确认失效）
+        let chatType: string | undefined;
+        let chatTitle: string | undefined;
+        try {
+          // chat_id 必须传 string：grammY payload 走 JSON.stringify，BigInt 会直接 TypeError
+          const info = await withTelegramTimeout(api.getChat(String(chatId)));
+          chatTitle = (info as { title?: string }).title?.trim();
+          chatType = (info as { type?: string }).type;
+        } catch (error) {
+          if (error instanceof GrammyError && error.error_code === 400) {
+            // Telegram 400（群不存在）：历史关联确认失效 → 标记移除关联行
+            staleList.push({ candidate, reason: "not_found" });
+          } else {
+            // 非 400（网络超时 / 429 等）：记录但不误报 stale，绝不删除（防误删）
+            console.warn(`getChat(${candidate}) failed:`, error instanceof Error ? error.message : error);
+          }
+          return;
         }
-      } catch (error) {
-        // 成员身份核验失败（网络超时 / 429 / 400 等）：状态不确定，绝不删除（防误删），
-        // 保留 getChat 成功结果的原有处理
-        console.warn(`getChatMember(${candidate}) failed:`, error instanceof Error ? error.message : error);
+        // getChat 成功（群真实存在）→ 核验机器人成员身份：left/kicked = 机器人已不在群内
+        try {
+          const member = await withTelegramTimeout(api.getChatMember(String(chatId), botUserId));
+          if (member.status === "left" || member.status === "kicked") {
+            staleList.push({ candidate, reason: "member_left" });
+            return;
+          }
+        } catch (error) {
+          // 成员身份核验失败（网络超时 / 429 / 400 等）：状态不确定，绝不删除（防误删），
+          // 保留 getChat 成功结果的原有处理
+          console.warn(`getChatMember(${candidate}) failed:`, error instanceof Error ? error.message : error);
+        }
+        if ((chatType === "group" || chatType === "supergroup") && chatTitle) {
+          chats.set(Number(candidate), { chatId: candidate, chatTitle, source: "getchat" });
+        }
+      }),
+    );
+    for (const result of verifyResults) {
+      if (result.status === "rejected") {
+        console.warn("[telegram-sync] 群组验证任务异常（应已内部捕获，此为兜底日志）：", result.reason);
       }
-      if ((chatType === "group" || chatType === "supergroup") && chatTitle) {
-        chats.set(Number(candidate), { chatId: candidate, chatTitle, source: "getchat" });
-      }
+    }
+    const staleChatIds: string[] = [];
+    for (const stale of staleList) {
+      staleChatIds.push(stale.candidate);
+      const removed = await deleteGroupBotAdminsByChat(BigInt(stale.candidate));
+      const reasonText =
+        stale.reason === "not_found"
+          ? "群组已不存在（Telegram 400 chat not found）"
+          : `机器人已不在群组（成员身份 ${stale.reason === "member_left" ? "left/kicked" : "异常"}）`;
+      console.info(
+        `[telegram-sync] ${reasonText}，已移除失效群组关联 ${stale.candidate}（删除 ${removed} 行）`,
+      );
     }
 
     const result: RealChatInfo[] = [...chats.values()].sort((a, b) => Number(a.chatId) - Number(b.chatId));

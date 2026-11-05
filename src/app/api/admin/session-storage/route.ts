@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { headers } from "next/headers";
 import { getCurrentAdmin, hasPermission, logOperation } from "@/lib/auth";
 import {
-  countSqliteSessions,
+  getPublicSessionStorageConfig,
   normalizeSessionBackend,
   testSessionStorage,
   buildStoragePublicUrl,
@@ -11,49 +11,16 @@ import {
   SESSION_STORAGE_R2_KEYS,
   SESSION_STORAGE_S3_KEYS,
 } from "@/bot/session-storage";
-import { getAllAppSettings, setAppSetting } from "@/database/operations";
+import { setAppSetting } from "@/database/operations";
 
-/** 当前会话存储配置（敏感字段打码） */
+/** 当前会话存储配置（敏感字段打码；数据构造与设置页 RSC 直传共用 getPublicSessionStorageConfig） */
 export async function GET(): Promise<NextResponse> {
   const admin = await getCurrentAdmin();
   if (!admin) return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });
   if (!hasPermission(admin, "settings:view")) {
     return NextResponse.json({ ok: false, error: "无权限" }, { status: 403 });
   }
-  const stored = await getAllAppSettings();
-  const mask = (value: string | undefined): string =>
-    !value ? "" : value.length > 8 ? `${value.slice(0, 4)}****${value.slice(-4)}` : "****";
-  return NextResponse.json({
-    ok: true,
-    data: {
-      backend: stored[SESSION_STORAGE_SETTING_KEY] ?? "memory",
-      sqlite_sessions: await countSqliteSessions(),
-      d1: {
-        account_id: stored[SESSION_STORAGE_D1_KEYS.accountId] ?? "",
-        database_id: stored[SESSION_STORAGE_D1_KEYS.databaseId] ?? "",
-        api_token_masked: mask(stored[SESSION_STORAGE_D1_KEYS.apiToken]),
-        has_api_token: Boolean(stored[SESSION_STORAGE_D1_KEYS.apiToken]),
-      },
-      r2: {
-        account_id: stored[SESSION_STORAGE_R2_KEYS.accountId] ?? "",
-        access_key_id: stored[SESSION_STORAGE_R2_KEYS.accessKeyId] ?? "",
-        secret_masked: mask(stored[SESSION_STORAGE_R2_KEYS.secretAccessKey]),
-        has_secret: Boolean(stored[SESSION_STORAGE_R2_KEYS.secretAccessKey]),
-        bucket: stored[SESSION_STORAGE_R2_KEYS.bucket] ?? "",
-        cdn_url: stored[SESSION_STORAGE_R2_KEYS.cdnUrl] ?? "",
-      },
-      s3: {
-        endpoint: stored[SESSION_STORAGE_S3_KEYS.endpoint] ?? "",
-        region: stored[SESSION_STORAGE_S3_KEYS.region] ?? "",
-        bucket: stored[SESSION_STORAGE_S3_KEYS.bucket] ?? "",
-        access_key_id: stored[SESSION_STORAGE_S3_KEYS.accessKeyId] ?? "",
-        secret_masked: mask(stored[SESSION_STORAGE_S3_KEYS.secretAccessKey]),
-        has_secret: Boolean(stored[SESSION_STORAGE_S3_KEYS.secretAccessKey]),
-        path_style: (stored[SESSION_STORAGE_S3_KEYS.pathStyle] ?? "path") === "virtual_hosted" ? "virtual_hosted" : "path",
-        cdn_url: stored[SESSION_STORAGE_S3_KEYS.cdnUrl] ?? "",
-      },
-    },
-  });
+  return NextResponse.json({ ok: true, data: await getPublicSessionStorageConfig() });
 }
 
 interface TestPayload {

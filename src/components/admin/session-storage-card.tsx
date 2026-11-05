@@ -1,29 +1,18 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import type { PublicSessionStorageConfig } from "@/bot/session-storage";
 
 /**
  * BOT 会话存储配置卡片（自包含）：
  * 一键 switch 切换 grammY session 存储后端（内存 / SQLite / Cloudflare D1 / Cloudflare R2），
  * D1/R2 支持 edge binding 自动探测与 REST API 两种接入方式，可对目标后端做连通性测试。
+ *
+ * v2.0.3：首屏配置由设置页 RSC 直传（initialConfig），不再 mount 后额外发
+ * GET /api/admin/session-storage 请求；卡片内的「测试/保存」仍走 POST 接口。
  */
 
-interface StorageConfigState {
-  backend: string;
-  sqlite_sessions: number;
-  d1: { account_id: string; database_id: string; api_token_masked: string; has_api_token: boolean };
-  r2: { account_id: string; access_key_id: string; secret_masked: string; has_secret: boolean; bucket: string; cdn_url: string };
-  s3: {
-    endpoint: string;
-    region: string;
-    bucket: string;
-    access_key_id: string;
-    secret_masked: string;
-    has_secret: boolean;
-    path_style: string;
-    cdn_url: string;
-  };
-}
+type StorageConfigState = PublicSessionStorageConfig;
 
 const BACKENDS = [
   { value: "memory", label: "内存（默认，重启丢失）", icon: "⚡" },
@@ -36,7 +25,7 @@ const BACKENDS = [
 const inputClass =
   "flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none transition focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30";
 
-export function SessionStorageCard() {
+export function SessionStorageCard({ initialConfig }: { initialConfig?: PublicSessionStorageConfig | null }) {
   const [config, setConfig] = useState<StorageConfigState | null>(null);
   const [backend, setBackend] = useState("memory");
   const [d1, setD1] = useState({ account_id: "", database_id: "", api_token: "" });
@@ -54,36 +43,44 @@ export function SessionStorageCard() {
   const [testing, setTesting] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
 
+  /** 应用配置数据到表单状态（RSC 直传与接口拉取共用） */
+  const applyConfig = (data: StorageConfigState): void => {
+    setConfig(data);
+    setBackend(data.backend);
+    setD1((prev) => ({
+      ...prev,
+      account_id: data.d1.account_id,
+      database_id: data.d1.database_id,
+    }));
+    setR2((prev) => ({
+      ...prev,
+      account_id: data.r2.account_id,
+      access_key_id: data.r2.access_key_id,
+      bucket: data.r2.bucket,
+      cdn_url: data.r2.cdn_url ?? "",
+    }));
+    setS3((prev) => ({
+      ...prev,
+      endpoint: data.s3.endpoint || prev.endpoint,
+      region: data.s3.region || prev.region,
+      bucket: data.s3.bucket,
+      access_key_id: data.s3.access_key_id,
+      path_style: data.s3.path_style || prev.path_style,
+      cdn_url: data.s3.cdn_url ?? "",
+    }));
+  };
+
+  // v2.0.3：RSC 已直传首屏配置时不发初始请求（仅保存/测试后的刷新才拉取）
   useEffect(() => {
+    if (initialConfig) {
+      applyConfig(initialConfig);
+      return;
+    }
     void (async () => {
       try {
         const response = await fetch("/api/admin/session-storage");
         const payload = (await response.json()) as { ok: boolean; data?: StorageConfigState };
-        if (payload.ok && payload.data) {
-          setConfig(payload.data);
-          setBackend(payload.data.backend);
-          setD1((prev) => ({
-            ...prev,
-            account_id: payload.data!.d1.account_id,
-            database_id: payload.data!.d1.database_id,
-          }));
-          setR2((prev) => ({
-            ...prev,
-            account_id: payload.data!.r2.account_id,
-            access_key_id: payload.data!.r2.access_key_id,
-            bucket: payload.data!.r2.bucket,
-            cdn_url: payload.data!.r2.cdn_url ?? "",
-          }));
-          setS3((prev) => ({
-            ...prev,
-            endpoint: payload.data!.s3.endpoint || prev.endpoint,
-            region: payload.data!.s3.region || prev.region,
-            bucket: payload.data!.s3.bucket,
-            access_key_id: payload.data!.s3.access_key_id,
-            path_style: payload.data!.s3.path_style || prev.path_style,
-            cdn_url: payload.data!.s3.cdn_url ?? "",
-          }));
-        }
+        if (payload.ok && payload.data) applyConfig(payload.data);
       } catch {
         /* 首次加载失败静默 */
       }

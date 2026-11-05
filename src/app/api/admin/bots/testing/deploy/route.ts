@@ -8,11 +8,12 @@ import { parseGroupDeployState } from "@/services/group-deploy";
 /**
  * 一键部署校验：把仿真屏配置好的加群验证机器人真实部署到指定群组。
  *
- * 自动校验链（全部通过才会生成入群申请链接）：
+ * 自动校验链（v2.0.3：前三步并行，总耗时从串行 3 次之和降到单次最大值）：
  * 1. getMe            —— Bot Token 有效性
  * 2. getChat          —— 群组真实存在且机器人可见
  * 3. getChatMember    —— 机器人是否已在群里 / 是否管理员 / 是否有「邀请用户」权限
- * 4. createChatInviteLink(creates_join_request) —— 生成入群申请链接并保存
+ *                        （机器人 user id 直接取自 Token 前段，无需等待 getMe）
+ * 4. createChatInviteLink(creates_join_request) —— 生成入群申请链接并保存（校验通过后串行执行）
  *
  * Telegram 官方限制：机器人无法通过 API 把自己拉进群、也无法自我提升为管理员，
  * 因此步骤「拉进群」「设为管理员」必须由群管理员在 Telegram 客户端手动完成；
@@ -54,24 +55,33 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   const api = botByToken(bot.token).api;
   try {
-    const me = await withTelegramTimeout(api.getMe());
+    // v2.0.3 优化：原实现 getMe → getChat → getChatMember 三次串行调用（每次经代理 3~13s，
+    // 总耗时可达 40s+）。实际上 getChatMember 需要的机器人 user id 就编码在 Token 前段
+    // （Telegram Bot Token 格式：<bot_user_id>:<secret>，官方文档明确），三个调用互不依赖，
+    // 全部并行发起 —— 总耗时从三次之和降到单次最大值（约省 2/3）。
+    const tokenBotId = Number(bot.token.split(":")[0]);
+    const [meResult, chatResult, memberResult] = await Promise.allSettled([
+      withTelegramTimeout(api.getMe()),
+      withTelegramTimeout(api.getChat(Number(chatId))),
+      withTelegramTimeout(api.getChatMember(Number(chatId), tokenBotId)),
+    ]);
 
+    // Token 有效性（getMe）：失败直接报错（后续校验无意义）
+    if (!meResult || meResult.status === "rejected") {
+      throw meResult?.reason ?? new Error("getMe 失败");
+    }
+    const me = meResult.value;
+
+    // 群信息：失败容忍（大概率机器人不在群，后续 getChatMember 给出准确 stage）
     let chatTitle = `群组 ${chatId}`;
-    try {
-      const chat = await withTelegramTimeout(api.getChat(Number(chatId)));
-      if (chat && chat.type !== "private") {
-        chatTitle = ("title" in chat && chat.title) || chatTitle;
-      }
-    } catch {
-      // getChat 失败大概率是机器人不在群里，后续 getChatMember 会给出准确 stage
+    if (chatResult.status === "fulfilled" && chatResult.value && chatResult.value.type !== "private") {
+      chatTitle = ("title" in chatResult.value && chatResult.value.title) || chatTitle;
     }
 
-    let member: Awaited<ReturnType<typeof api.getChatMember>>;
-    try {
-      member = await withTelegramTimeout(api.getChatMember(Number(chatId), Number(me.id)));
-    } catch (error) {
-      // 机器人不在群 / 群不可见：给出「拉进群」的手动步骤指引
-      const description = error instanceof Error ? error.message : String(error);
+    // 机器人群成员身份：失败 = 机器人不在群/群不可见 → 拉进群指引
+    if (memberResult.status === "rejected") {
+      const description =
+        memberResult.reason instanceof Error ? memberResult.reason.message : String(memberResult.reason);
       return NextResponse.json({
         ok: true,
         stage: "add_bot",
@@ -86,6 +96,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         ],
       });
     }
+    const member = memberResult.value;
     const status = member.status;
 
     if (status === "left" || status === "kicked") {

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentAdmin, hasPermission, logOperation } from "@/lib/auth";
 import { headers } from "next/headers";
-import { getBot, getGroupSettings, listGroupBotAdmins } from "@/database/operations";
+import { getBot, listGroupBotAdmins, listGroupSettings } from "@/database/operations";
 import { fetchRealGroups } from "@/services/telegram-sync";
 import { registerTelegramChat } from "@/services/chat-registry";
 
@@ -67,16 +67,17 @@ export async function GET(request: Request): Promise<NextResponse> {
   const links = (await listGroupBotAdmins()).filter(
     (link) => link.botId === botId && link.status === "active",
   );
-  const groups: GroupEntry[] = [];
-  for (const link of links) {
-    const settings = await getGroupSettings(link.chatId);
-    groups.push({
-      chat_id: String(link.chatId),
-      chat_title: settings?.chatTitle ?? "",
-      source: "cache",
-      is_new: false,
-    });
-  }
+  // v2.0.3：一次取全部群组配置建 Map，消除循环内逐条 getGroupSettings 的 N+1 串行查询
+  const settingsList = await listGroupSettings();
+  const titleByChat = new Map(
+    settingsList.map((setting) => [String(setting.chatId), setting.chatTitle ?? ""]),
+  );
+  const groups: GroupEntry[] = links.map((link) => ({
+    chat_id: String(link.chatId),
+    chat_title: titleByChat.get(String(link.chatId)) ?? "",
+    source: "cache",
+    is_new: false,
+  }));
 
   const payload: GroupsPayload = {
     ok: true,

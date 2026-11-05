@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
-import { Bot } from "grammy";
 import { getCurrentAdmin, hasPermission } from "@/lib/auth";
-import { telegramBotClientOptions } from "@/lib/telegram/transport";
 import { getBot } from "@/database/operations";
+import { botByToken, getMeCached, withTelegramTimeout } from "@/services/telegram-sync";
 
 interface MeInfo {
   id: number;
@@ -48,8 +47,10 @@ export async function POST(request: Request): Promise<NextResponse> {
   }
 
   try {
-    const bot = new Bot(token, telegramBotClientOptions());
-    const me = await bot.api.getMe();
+    // v2.0.3：复用 telegram-sync 的 getMe 缓存（10 分钟）—— 编辑弹窗重复打开同一机器人、
+    // 新建后连续操作同一 Token 时零网络调用；失败不缓存，Token 失效每次真实暴露
+    const bot = botByToken(token);
+    const me = await withTelegramTimeout(getMeCached(bot.api, token)).then((cached) => cached.user!);
     const info: MeInfo = {
       id: me.id,
       username: me.username ?? "",
