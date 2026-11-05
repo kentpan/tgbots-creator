@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { headers } from "next/headers";
-import { Bot } from "grammy";
+import { Bot, GrammyError } from "grammy";
 import { telegramBotClientOptions } from "@/lib/telegram/transport";
 import {
   createBotRecord,
@@ -11,7 +11,9 @@ import {
   deleteGroupBotAdmin,
   getBot,
   getGroupBotAdmin,
+  getGroupSettings,
   upsertGroupBotAdmin,
+  upsertGroupSettings,
   updateBotRecord,
 } from "@/database/operations";
 import { logOperation, requirePermission } from "@/lib/auth";
@@ -25,6 +27,14 @@ import {
   syncBotCommandsToTelegram,
 } from "@/bot/multi-runtime";
 import { registerTelegramChat } from "@/services/chat-registry";
+import {
+  INVALID_TOKEN_GUIDE,
+  PROMOTE_SELF_GUIDE,
+  actualRightsFromMember,
+  findPromoterBot,
+  formatRights,
+} from "@/services/bot-group-admin-sync";
+import { BOT_ADMIN_RIGHT_KEYS, type BotAdminRights } from "@/services/bot-admin-rights";
 
 function botPath(params: Record<string, string>): string {
   const query = new URLSearchParams(params).toString();
@@ -393,19 +403,6 @@ export async function syncBotMenuAction(formData: FormData): Promise<void> {
   redirect(botPath({ saved: "sync" }));
 }
 
-const BOT_ADMIN_RIGHT_KEYS = [
-  "can_manage_chat",
-  "can_change_info",
-  "can_delete_messages",
-  "can_invite_users",
-  "can_restrict_members",
-  "can_pin_messages",
-  "can_manage_video_chats",
-  "can_promote_members",
-] as const;
-
-export type BotAdminRights = Partial<Record<(typeof BOT_ADMIN_RIGHT_KEYS)[number], boolean>>;
-
 export async function setBotGroupAdminAction(formData: FormData): Promise<void> {
   const admin = await requirePermission("groups:manage");
   const botIdRaw = String(formData.get("bot_id") ?? "").trim();
@@ -416,58 +413,200 @@ export async function setBotGroupAdminAction(formData: FormData): Promise<void> 
   const bot = await getBot(BigInt(botIdRaw));
   if (!bot) redirect(groupsPath({ error: "botadmin" }));
 
+  // 用户勾选的目标权限
   const rights: BotAdminRights = {};
   for (const key of BOT_ADMIN_RIGHT_KEYS) {
     rights[key] = formData.get(key) === "1";
   }
+  const requireApproval = formData.get("require_approval") === "1";
 
+  const chatId = BigInt(chatIdRaw);
+  const chatIdNum = Number(chatId);
+  // 保存结果附加提示（真实同步详情/指引），在成功横幅中展示
+  let notice = "";
   try {
-    const handle = await acquireMenuBot(bot.id);
-    if (!handle) redirect(groupsPath({ error: "botadmin" }));
-    const me = await handle.bot.api.getMe();
-    await handle.bot.api.promoteChatMember(Number(chatIdRaw), me.id, rights);
-    await updateBotRecord(bot.id, { username: me.username });
-    await upsertGroupBotAdmin({
-      botId: bot.id,
-      chatId: BigInt(chatIdRaw),
-      rights: JSON.stringify(rights),
+    // v1.2.0：轻量 API 客户端 + 全链路超时 + 并行化。
+    // 原实现经 acquireMenuBot 启动完整轮询 runtime —— 无效 token（401）时启动链路
+    // 卡死重试 20s+，公网网关直接 502；一次性管理操作不需要轮询实例。
+    // v1.2.0：getMe 与 getChat 并行（getChat 仅作审批开关参考，失败不阻塞）——
+    // 代理网关单次调用实测 5~13s，串行三连调把保存拖到 12s+
+    const { botByToken, withTelegramTimeout, getMeCached } = await import("@/services/telegram-sync");
+    const api = botByToken(bot.token).api;
+    const mePromise = withTelegramTimeout(getMeCached(api, bot.token));
+    const tgApprovalNotePromise = (async (): Promise<string> => {
+      // TG 侧审批状态参考（Bot API 无设置/读取审批开关的方法，只能读主邀请链接语义）。
+      // 当前 @grammyjs/types 下 getChat().invite_link 为 string；对象形态（ChatInviteLink）
+      // 做前向兼容探测 —— 两种线格式都不臆造，按真实读取结果给注记
+      try {
+        const chat = await withTelegramTimeout(api.getChat(chatIdNum));
+        const link: unknown = "invite_link" in chat ? chat.invite_link : undefined;
+        if (link && typeof link === "object" && "creates_join_request" in link) {
+          const creates = (link as { creates_join_request?: boolean }).creates_join_request === true;
+          return creates
+            ? "TG 侧主邀请链接为「需审批加入」"
+            : "TG 侧主邀请链接为「直接加入」（全局审批开关需在 TG 客户端群设置→权限→审批新成员 开启）";
+        }
+      } catch {
+        /* getChat 失败不阻塞保存 */
+      }
+      return "";
+    })();
+    const me = await mePromise;
+
+    // 「加群需要管理员审核」开关（v1.1.9）：先落库到 group_settings（保留其它字段不动）
+    const existingSettings = await getGroupSettings(chatId);
+    await upsertGroupSettings(chatId, {
+      chatTitle: existingSettings?.chatTitle ?? null,
+      method: existingSettings?.method ?? "code_self",
+      methodId: existingSettings?.methodId ?? null,
+      timeoutSeconds: existingSettings?.timeoutSeconds,
+      maxAttempts: existingSettings?.maxAttempts,
+      promptText: existingSettings?.promptText,
+      successText: existingSettings?.successText,
+      failureText: existingSettings?.failureText,
+      enabled: existingSettings?.enabled ?? true,
+      privacyMode: existingSettings?.privacyMode ?? true,
+      requireApproval,
     });
+
+    // 读目标 bot 在群里的真实身份状态（真实同步的权威数据源）。
+    // v1.2.0：getChatMember 不等 getChat 注记（两者互不依赖，
+    // 网关单次 5~14s，串行等待会把保存拖到双倍时长）
+    let member: Awaited<ReturnType<typeof api.getChatMember>>;
+    try {
+      member = await withTelegramTimeout(api.getChatMember(chatIdNum, me.id));
+    } catch (error) {
+      // 机器人不在群/群不可见：无法读取也无法提升 → 保存本地配置 + 指引
+      await upsertGroupBotAdmin({ botId: bot.id, chatId, rights: JSON.stringify(rights) });
+      await updateBotRecord(bot.id, { username: me.username });
+      const { describeSyncError } = await import("@/services/telegram-sync");
+      const detail = describeSyncError(error).slice(0, 120);
+      notice = `已保存权限配置，但机器人成员状态读取失败（${detail}）。请确认机器人已在群内并设为管理员：${PROMOTE_SELF_GUIDE}`;
+      const requestHeaders = await headers();
+      await logOperation(admin, {
+        action: "设置群组机器人管理员（本地保存）",
+        target: `${bot.name} → ${chatIdRaw}`,
+        detail: notice,
+        headers: requestHeaders,
+      });
+      revalidatePath("/admin/groups");
+      redirect(groupsPath({ saved: "botadmin", message: notice.slice(0, 200) }));
+    }
+
+    if (member.status === "administrator") {
+      // 已是管理员：以 Telegram 实际权限为准保存（真实同步）
+      const actual = actualRightsFromMember(member);
+      await upsertGroupBotAdmin({ botId: bot.id, chatId, rights: JSON.stringify(actual) });
+      await updateBotRecord(bot.id, { username: me.username });
+      const diffKeys = BOT_ADMIN_RIGHT_KEYS.filter((key) => Boolean(rights[key]) !== Boolean(actual[key]));
+      notice =
+        diffKeys.length > 0
+          ? `机器人已是本群管理员，已同步 Telegram 实际权限：${formatRights(actual)}（勾选与实际不一致${diffKeys.length} 项已按实际为准；Telegram 限制机器人无法修改自己的权限，如需调整请在 TG 客户端修改后重新保存同步）`
+          : "机器人已是本群管理员，勾选权限与 Telegram 实际状态一致（已同步确认）";
+    } else {
+      // 非管理员：优先尝试跨 bot 提升（Bot API 唯一合法自动化路径）
+      const promoter = await findPromoterBot(chatIdNum, bot.id);
+      if (promoter) {
+        await withTelegramTimeout(
+          promoter.api.promoteChatMember(chatIdNum, me.id, {
+          can_manage_chat: rights.can_manage_chat === true,
+          can_change_info: rights.can_change_info === true,
+          can_delete_messages: rights.can_delete_messages === true,
+          can_invite_users: rights.can_invite_users === true,
+          can_restrict_members: rights.can_restrict_members === true,
+          can_pin_messages: rights.can_pin_messages === true,
+          can_manage_video_chats: rights.can_manage_video_chats === true,
+          can_promote_members: rights.can_promote_members === true,
+          }),
+        );
+        // 复查真实状态，以实际权限保存
+        const after = await withTelegramTimeout(promoter.api.getChatMember(chatIdNum, me.id));
+        if (after.status === "administrator") {
+          const actual = actualRightsFromMember(after);
+          await upsertGroupBotAdmin({ botId: bot.id, chatId, rights: JSON.stringify(actual) });
+          notice = `已通过提升者 @${promoter.username ?? "bot"} 真实提升为管理员并同步实际权限：${formatRights(actual)}`;
+        } else {
+          await upsertGroupBotAdmin({ botId: bot.id, chatId, rights: JSON.stringify(rights) });
+          notice = "提升请求已发送，复查显示机器人尚未成为管理员（Telegram 可能延迟），已保存所配权限，稍后可重新保存同步";
+        }
+      } else {
+        await upsertGroupBotAdmin({ botId: bot.id, chatId, rights: JSON.stringify(rights) });
+        await updateBotRecord(bot.id, { username: me.username });
+        notice = `已保存权限配置。${PROMOTE_SELF_GUIDE}`;
+      }
+    }
+
+    // 收口并行中的 getChat 审批注记（此时大概率已完成，不额外增加等待）
+    const tgApprovalNote = await tgApprovalNotePromise;
+
+    if (tgApprovalNote) {
+      notice += `；${tgApprovalNote}`;
+    }
+
     const requestHeaders = await headers();
     await logOperation(admin, {
       action: "设置群组机器人管理员",
       target: `${bot.name} → ${chatIdRaw}`,
+      detail: notice,
       headers: requestHeaders,
     });
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
+    if (error instanceof Error && error.message === "NEXT_REDIRECT") throw error;
+    // Next.js redirect() 抛出的特殊对象带 digest 属性，必须原样上抛
+    const digest = (error as { digest?: string })?.digest;
+    if (typeof digest === "string" && digest.startsWith("NEXT_REDIRECT")) throw error;
+    // v1.2.0：401（Token 失效）与网络超时/不可达给出可读中文，替代原始 GrammyError 描述
+    // （用户此前看到的「Call to 'getMe' failed! (401: Unauthorized)」即此处的原始透传）
+    const { describeSyncError } = await import("@/services/telegram-sync");
+    const detail =
+      error instanceof GrammyError && error.error_code === 401
+        ? INVALID_TOKEN_GUIDE
+        : describeSyncError(error);
     redirect(groupsPath({ error: "botadmin", message: detail.slice(0, 200) }));
   }
   revalidatePath("/admin/groups");
-  redirect(groupsPath({ saved: "botadmin" }));
+  redirect(groupsPath({ saved: "botadmin", message: notice.slice(0, 300) }));
 }
 
-export async function removeBotGroupAdminAction(formData: FormData): Promise<void> {
+export async function removeBotGroupAdminAction(
+  adminIdRaw: string,
+  formData: FormData,
+): Promise<void> {
   const admin = await requirePermission("groups:manage");
-  const idRaw = String(formData.get("id") ?? "").trim();
+  // v1.2.0：主参数经 action.bind(null, adminId) 预绑定（React 官方推荐的传参方式），
+  // 兼容旧版独立小表单的 formData 字段（remove_id / id）
+  const idRaw =
+    String(adminIdRaw ?? "").trim() ||
+    String(formData.get("remove_id") ?? formData.get("id") ?? "").trim();
   if (!idRaw || !/^\d+$/.test(idRaw)) redirect(groupsPath({ error: "botadmin" }));
   const record = await getGroupBotAdmin(BigInt(idRaw));
   if (!record) redirect(groupsPath({ error: "botadmin" }));
   const bot = await getBot(record.botId);
-  if (bot) {
+
+  // Telegram 侧真实撤销（v1.1.9）：机器人无法撤销自己的管理员身份，
+  // 需借助其它「提升者」bot；无提升者时仅移除本地记录并提示手动操作
+  let tgDemoted = false;
+  if (bot && bot.token.trim()) {
     try {
-      const handle = await acquireMenuBot(bot.id);
-      if (handle) {
-        const me = await handle.bot.api.getMe();
-        await handle.bot.api.promoteChatMember(Number(record.chatId), me.id, {
-          can_manage_chat: false,
-          can_change_info: false,
-          can_delete_messages: false,
-          can_invite_users: false,
-          can_restrict_members: false,
-          can_pin_messages: false,
-          can_manage_video_chats: false,
-          can_promote_members: false,
-        });
+      const { botByToken, withTelegramTimeout, getMeCached } = await import("@/services/telegram-sync");
+      const targetApi = botByToken(bot.token).api;
+      const targetMe = await withTelegramTimeout(getMeCached(targetApi, bot.token));
+      const promoter = await findPromoterBot(Number(record.chatId), record.botId);
+      if (promoter) {
+        await withTelegramTimeout(
+          promoter.api.promoteChatMember(Number(record.chatId), targetMe.id, {
+            is_anonymous: false,
+            can_manage_chat: false,
+            can_change_info: false,
+            can_delete_messages: false,
+            can_invite_users: false,
+            can_restrict_members: false,
+            can_pin_messages: false,
+            can_manage_video_chats: false,
+            can_promote_members: false,
+          }),
+        );
+        tgDemoted = true;
       }
     } catch {
       /* best effort demote */
@@ -478,10 +617,16 @@ export async function removeBotGroupAdminAction(formData: FormData): Promise<voi
   await logOperation(admin, {
     action: "移除群组机器人管理员",
     target: bot?.name ?? String(record.botId),
+    detail: tgDemoted ? "已通过提升者 bot 真实撤销 Telegram 管理员身份" : "已移除本地记录（Telegram 侧撤销需在客户端手动操作或接入其它管理员 bot）",
     headers: requestHeaders,
   });
   revalidatePath("/admin/groups");
-  redirect(groupsPath({ saved: "botadmin-removed" }));
+  redirect(
+    groupsPath({
+      saved: "botadmin-removed",
+      message: tgDemoted ? "已真实撤销 Telegram 管理员身份" : "已移除本地记录；Telegram 侧管理员身份需在客户端手动移除",
+    }),
+  );
 }
 
 export async function applyBotProfileAction(formData: FormData): Promise<void> {

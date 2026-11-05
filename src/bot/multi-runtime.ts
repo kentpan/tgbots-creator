@@ -4,7 +4,7 @@ import { autoRetry } from "@grammyjs/auto-retry";
 import { apiThrottler } from "@grammyjs/transformer-throttler";
 import { telegramBotClientOptions } from "@/lib/telegram/transport";
 import {
-  resolveEffectiveTransport,
+  resolveEffectiveTransportWithFallback,
   resolveEffectivePrivacy,
   isEdgeRuntime,
   type EffectiveTransport,
@@ -348,11 +348,17 @@ async function startMenuBot(row: BotRow): Promise<void> {
   const existing = instances.get(Number(row.id));
   if (existing?.running && existing.mode === "polling") return;
 
-  // 解析生效模式与隐私（单项配置 > 全局配置 > auto：Node=轮询 / edge=Webhook）
+  // 解析生效模式与隐私（v2.0.2：单项配置 > 全局配置 > auto=Webhook；
+  // Node 未配置 Webhook Base URL 时回退轮询）
   const { getTelegramRuntimeSettings, applyBotTransport } = await import("@/services/bot-transport");
   const global = await getTelegramRuntimeSettings();
   const profile = parseBotProfile(row.config);
-  const mode = resolveEffectiveTransport(profile.transportMode ?? "inherit", global.transportMode, isEdgeRuntime());
+  const mode = resolveEffectiveTransportWithFallback(
+    profile.transportMode ?? "inherit",
+    global.transportMode,
+    isEdgeRuntime(),
+    Boolean(global.webhookBaseUrl),
+  );
   const effectivePrivacy = resolveEffectivePrivacy(
     profile.privacyModeSetting ?? "inherit",
     profile.privacyMode,

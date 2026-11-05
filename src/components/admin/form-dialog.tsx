@@ -20,6 +20,7 @@ export function FormDialog({
   children,
   contentClassName,
   footerExtra,
+  onOpenChange,
 }: {
   trigger: ReactNode;
   triggerClassName?: string;
@@ -30,12 +31,19 @@ export function FormDialog({
   children: ReactNode;
   contentClassName?: string;
   footerExtra?: ReactNode;
+  /** 弹窗开关变化回调（打开/关闭都通知；调用方可按需懒加载数据，避免页面挂载即发请求） */
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState(false);
 
+  const handleOpenChange = (next: boolean): void => {
+    setOpen(next);
+    onOpenChange?.(next);
+  };
+
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <button type="button" className={triggerClassName}>
           {trigger}
@@ -53,7 +61,7 @@ export function FormDialog({
             setPending(true);
             try {
               await action(formData);
-              setOpen(false);
+              handleOpenChange(false);
             } finally {
               setPending(false);
             }
@@ -67,7 +75,7 @@ export function FormDialog({
             {footerExtra}
             <button
               type="button"
-              onClick={() => setOpen(false)}
+              onClick={() => handleOpenChange(false)}
               className="inline-flex h-10 items-center rounded-md border px-4 text-sm font-medium hover:bg-accent"
             >
               取消

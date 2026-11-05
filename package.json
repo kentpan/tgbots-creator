@@ -1,6 +1,6 @@
 {
   "name": "tgbots-creator",
-  "version": "1.1.5",
+  "version": "2.0.2",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -91,7 +91,6 @@
     "@tailwindcss/postcss": "^4",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "bun-types": "^1.3.4",
     "eslint": "^9",
     "eslint-config-next": "^16.1.1",
     "ioredis": "^6.0.0",
@@ -101,5 +100,10 @@
     "tw-animate-css": "^1.3.5",
     "typescript": "^5",
     "wrangler": "^4.157.0"
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "sharp": true,
+    "workerd@1.20261103.1": true
   }
 }

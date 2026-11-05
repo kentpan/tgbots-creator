@@ -52,7 +52,10 @@ export async function registerTelegramChat(input: {
   const existing = await getGroupSettings(input.chatId);
   await upsertGroupSettings(input.chatId, {
     chatTitle: input.chatTitle ?? existing?.chatTitle ?? null,
-    method: existing?.method ?? "captcha",
+    // v1.1.7：新登记群组默认 code_self（自动验证码：机器人私聊发码，
+    // 用户回复输入验证码即自动审批 —— 与「一键部署」宣传的主流程一致）；
+    // 已有配置的群组原样回传，绝不覆盖
+    method: existing?.method ?? "code_self",
     methodId: existing?.methodId ?? null,
     timeoutSeconds: existing?.timeoutSeconds ?? 300,
     maxAttempts: existing?.maxAttempts ?? 3,

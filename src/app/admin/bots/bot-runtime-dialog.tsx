@@ -7,7 +7,7 @@ import { saveBotRuntimeAction } from "./actions";
 
 /**
  * 机器人「运行配置」弹窗（单项配置）：
- * - Tab 运行模式：跟随全局 / 长轮询 / Webhook（跟随全局时按环境自动：Node=轮询，Edge=Webhook）
+ * - Tab 运行模式：跟随全局 / 长轮询 / Webhook（跟随全局时默认 Webhook；Node 未配置回调地址时回退轮询）
  * - Tab 隐私模式：跟随全局 / 开启 / 关闭（Telegram 侧需在 BotFather /setprivacy 同步）
  * 保存后服务端立即热应用（轮询↔Webhook 自动切换，含 setWebhook/deleteWebhook）。
  */
@@ -47,7 +47,11 @@ export function BotRuntimeDialog({
   const [privacy, setPrivacy] = useState(bot.privacySetting);
 
   const globalModeLabel =
-    global.mode === "auto" ? `自动（${resolved.isEdge ? "Edge→Webhook" : "Node→轮询"}）` : global.mode === "polling" ? "长轮询" : "Webhook";
+    global.mode === "auto"
+      ? `自动（默认 Webhook${resolved.isEdge ? "" : "；未配置回调地址时回退轮询"}）`
+      : global.mode === "polling"
+        ? "长轮询"
+        : "Webhook";
 
   const effectiveTransportLabel =
     transport === "inherit"
@@ -101,13 +105,15 @@ export function BotRuntimeDialog({
                   <button type="button" className={optionCardClass(transport === "polling")} onClick={() => setTransport("polling")}>
                     <div className="text-sm font-medium">长轮询（getUpdates）</div>
                     <div className="text-xs text-muted-foreground">
-                      本进程主动拉取更新；适合本地开发 / VPS 等常驻环境，无需公网 URL
+                      本进程主动经全局代理调用 getUpdates 拉取更新（入站更新由代理链路拉回）；
+                      适合本地开发 / 内网 / VPS 等无法被 Telegram 回调的环境，无需公网 URL
                     </div>
                   </button>
                   <button type="button" className={optionCardClass(transport === "webhook")} onClick={() => setTransport("webhook")}>
                     <div className="text-sm font-medium">Webhook（setWebhook）</div>
                     <div className="text-xs text-muted-foreground">
-                      Telegram 主动推送到公网 HTTPS；serverless / Cloudflare Pages 唯一可用方式
+                      Telegram 主动推送到公网 HTTPS 回调地址（经网关/公网暴露）；
+                      serverless / Cloudflare Pages 唯一可用方式，Node 环境出站调用自动走全局代理
                     </div>
                   </button>
                 </div>

@@ -17,9 +17,34 @@ import {
  * 所有调用均为一次性管理操作，不启动轮询；Bot 实例按 Token 缓存复用。
  */
 
-const REQUEST_TIMEOUT_MS = 15000;
+// v1.2.0：25s —— 代理网关单次尝试上限已放宽到 20s（实测延迟 5~13.5s 波动），
+// 原 15s 总超时会误杀「慢但成功」的网关调用，导致管理端保存报「Telegram API 请求超时」
+const REQUEST_TIMEOUT_MS = 25000;
 
 const botCache = new Map<string, Bot>();
+
+/** getMe 结果缓存（v1.2.0）：机器人 id/username 极少变化，10 分钟内复用。
+ *  管理端保存动作从「getMe+getChatMember 两次串行调用」降到「单次 getChatMember」，
+ *  代理网关单次 5~13s 时收益显著。仅缓存成功结果（401 等失败每次重试，可及时发现 Token 失效） */
+interface BotMeInfo {
+  id: number;
+  username: string | null;
+  cachedAt: number;
+}
+const meCache = new Map<string, BotMeInfo>();
+const ME_CACHE_TTL_MS = 10 * 60 * 1000;
+
+export async function getMeCached(
+  api: Bot["api"],
+  token: string,
+): Promise<{ id: number; username: string | null }> {
+  const cached = meCache.get(token);
+  if (cached && Date.now() - cached.cachedAt < ME_CACHE_TTL_MS) return cached;
+  const me = await api.getMe();
+  const info: BotMeInfo = { id: Number(me.id), username: me.username ?? null, cachedAt: Date.now() };
+  meCache.set(token, info);
+  return info;
+}
 
 export function botByToken(token: string): Bot {
   const cached = botCache.get(token);

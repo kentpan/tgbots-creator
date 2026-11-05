@@ -19,7 +19,8 @@ export async function saveGroupAction(formData: FormData): Promise<void> {
   const chatId = BigInt(chatIdRaw);
 
   const method = String(formData.get("method") ?? "captcha");
-  if (method !== "captcha" && method !== "code_api") {
+  // v1.1.7：新增 code_self（自动验证码：机器人发码，用户输入验证码加群）
+  if (method !== "captcha" && method !== "code_api" && method !== "code_self") {
     redirect("/admin/groups?error=invalid-method");
   }
   const methodIdRaw = String(formData.get("method_id") ?? "").trim();
@@ -34,7 +35,11 @@ export async function saveGroupAction(formData: FormData): Promise<void> {
   await upsertGroupSettings(chatId, {
     chatTitle: String(formData.get("chat_title") ?? "").trim() || null,
     method,
-    methodId: method === "code_api" ? methodId : null,
+    // v2.0.1：选中即落库保留（重开弹窗回显所选），不再非 code_api 时静默置 null。
+    // 绑定方法仅在验证方式=自定义验证码(code_api)时参与验证流程
+    // （chat-member / verification-flow 均有 method===code_api 守卫），
+    // 其他方式下仅作偏好记录，绝不影响验证行为。
+    methodId,
     timeoutSeconds: Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? Math.trunc(timeoutSeconds) : 300,
     maxAttempts: Number.isFinite(maxAttempts) && maxAttempts > 0 ? Math.trunc(maxAttempts) : 3,
     promptText: String(formData.get("prompt_text") ?? "").trim() || undefined,
@@ -48,7 +53,13 @@ export async function saveGroupAction(formData: FormData): Promise<void> {
   await logOperation(admin, {
     action: "保存群组验证配置",
     target: chatIdRaw,
-    detail: `验证方式：${method === "code_api" ? `自定义验证码（方法 #${methodIdRaw}）` : "人机验证码"}`,
+    detail: `验证方式：${
+      method === "code_api"
+        ? `自定义验证码（方法 #${methodIdRaw}）`
+        : method === "code_self"
+          ? "自动验证码（输入验证码加群）"
+          : "人机验证码"
+    }`,
     headers: requestHeaders,
   });
   revalidatePath("/admin/groups");

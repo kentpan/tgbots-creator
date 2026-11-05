@@ -46,7 +46,7 @@ function GroupFormDialog({
       trigger={trigger}
       triggerClassName={triggerClassName}
       title={group ? `编辑群组配置 · ${group.chatTitle ?? group.chatId}` : "新增群组配置"}
-      description="为群组选择验证方式：人机验证码（WebApp）或自定义验证码（外部 API 核验）。"
+      description="为群组选择验证方式：自动验证码（机器人发码，输入验证码加群）、人机验证码（WebApp）或自定义验证码（外部 API 核验）。"
       action={saveGroupAction}
       submitLabel="保存配置"
     >
@@ -86,9 +86,10 @@ function GroupFormDialog({
           <select
             id={`method-${group?.chatId ?? "new"}`}
             name="method"
-            defaultValue={group?.method ?? "captcha"}
+            defaultValue={group?.method ?? "code_self"}
             className={selectClass}
           >
+            <option value="code_self">自动验证码（输入验证码加群）</option>
             <option value="captcha">人机验证码（WebApp）</option>
             <option value="code_api">自定义验证码（外部 API）</option>
           </select>
@@ -139,15 +140,15 @@ function GroupFormDialog({
         </div>
         <div className="space-y-1 md:col-span-2">
           <label className={labelClass} htmlFor={`prompt-${group?.chatId ?? "new"}`}>
-            验证码提示语
+            验证码提示语（支持回车换行，仿真屏与 Telegram APP 中所见即所得）
           </label>
-          <input
+          <textarea
             id={`prompt-${group?.chatId ?? "new"}`}
             name="prompt_text"
-            type="text"
+            rows={4}
             defaultValue={group?.promptText ?? ""}
-            placeholder="🔐 请回复本消息并输入验证码完成验证"
-            className={inputClass}
+            placeholder={"🔐 请回复本消息并输入验证码完成验证\n\n可多行输入，换行在机器人私聊消息中原样展示"}
+            className={`${inputClass} resize-y leading-relaxed`}
           />
         </div>
         <div className="space-y-1">
@@ -245,6 +246,9 @@ export default async function GroupsPage({
       {params.saved && NOTICES[params.saved] ? (
         <div className="rounded-md border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">
           {NOTICES[params.saved]}
+          {params.message ? (
+            <span className="mt-1 block text-xs leading-relaxed text-green-800">{params.message}</span>
+          ) : null}
         </div>
       ) : null}
       {params.error && ERRORS[params.error] ? (
@@ -287,7 +291,9 @@ export default async function GroupsPage({
                       <td className="px-4 py-3 text-sm">
                         {group.method === "code_api"
                           ? `自定义验证码（方法 #${String(group.methodId ?? 0)}）`
-                          : "人机验证码（WebApp）"}
+                          : group.method === "code_self"
+                            ? "自动验证码（输入验证码加群）"
+                            : "人机验证码（WebApp）"}
                       </td>
                       <td className="px-4 py-3 text-sm">{group.timeoutSeconds}</td>
                       <td className="px-4 py-3 text-sm">{group.maxAttempts}</td>
@@ -324,6 +330,7 @@ export default async function GroupsPage({
                           <BotAdminsDialog
                             chatId={chatKey}
                             bots={botOptions}
+                            requireApproval={group.requireApproval}
                             admins={chatAdmins.map((admin) => {
                               let rights: Record<string, boolean> = {};
                               try {
@@ -334,6 +341,7 @@ export default async function GroupsPage({
                               const bot = botNameById.get(String(admin.botId));
                               return {
                                 id: String(admin.id),
+                                botId: String(admin.botId),
                                 botName: bot?.name ?? `机器人 #${String(admin.botId)}`,
                                 botUsername: bot?.username ?? null,
                                 rights,

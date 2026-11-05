@@ -208,6 +208,10 @@ export function TgSimulator({
   joinPhase,
   onRequestJoin,
   view = "group",
+  /** 可选：点击顶部「‹」返回按钮（iOS push 导航返回上一级，由外壳组件传入） */
+  onBack,
+  /** 可选：点击左上角头像 / 右侧三个点 → 打开群组设置（iOS push 导航，由外壳组件传入） */
+  onOpenSettings,
 }: {
   config: BotMenuConfig;
   botName: string;
@@ -230,6 +234,8 @@ export function TgSimulator({
   onRequestJoin?: () => Promise<{ ok: boolean; message: string }>;
   /** 当前聊天视图：group=群组聊天（真实加群界面），private=与机器人的私聊（验证码在此输入，隐私模式，群里看不到）。由父组件控制切换 */
   view?: "group" | "private";
+  onBack?: () => void;
+  onOpenSettings?: () => void;
 }) {
   const history = useRef<string[]>([]);
   const [messages, setMessages] = useState<SimMessage[]>([]);
@@ -482,7 +488,18 @@ export function TgSimulator({
         className="flex items-center gap-3 px-4 py-3"
         style={{ background: "linear-gradient(180deg, rgba(90,130,95,0.35), rgba(90,130,95,0.08))", backdropFilter: "blur(2px)" }}
       >
-        <span className="text-sm text-white/90">‹</span>
+        {onBack ? (
+          <button
+            type="button"
+            onClick={onBack}
+            aria-label="返回群组列表"
+            className="-ml-1 cursor-pointer px-1 text-lg leading-none text-white/90 transition-colors hover:text-white"
+          >
+            ‹
+          </button>
+        ) : (
+          <span className="text-sm text-white/90">‹</span>
+        )}
         {isPrivate ? (
           <>
             <div className="flex h-9 w-9 items-center justify-center rounded-full bg-white/80 text-base font-bold text-[#3390ec]">
@@ -497,9 +514,20 @@ export function TgSimulator({
           </>
         ) : (
           <>
-            <div className="flex h-9 w-9 items-center justify-center rounded-full bg-white/80 text-sm font-bold text-[#4a7a52]">
-              {groupTitle.slice(0, 1)}
-            </div>
+            {onOpenSettings ? (
+              <button
+                type="button"
+                onClick={onOpenSettings}
+                aria-label="打开群组设置"
+                className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-full bg-white/80 text-sm font-bold text-[#4a7a52] transition-transform active:scale-95"
+              >
+                {groupTitle.slice(0, 1)}
+              </button>
+            ) : (
+              <div className="flex h-9 w-9 items-center justify-center rounded-full bg-white/80 text-sm font-bold text-[#4a7a52]">
+                {groupTitle.slice(0, 1)}
+              </div>
+            )}
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-semibold text-white [text-shadow:0_1px_2px_rgba(0,0,0,0.35)]">
                 {groupTitle}
@@ -508,8 +536,24 @@ export function TgSimulator({
             </div>
           </>
         )}
-        <Search className="h-4 w-4 text-white/90" />
-        <MoreVertical className="h-4 w-4 text-white/90" />
+        {onOpenSettings ? (
+          <>
+            <Search className="h-4 w-4 text-white/90" />
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              aria-label="打开群组设置"
+              className="cursor-pointer text-white/90 transition-colors hover:text-white"
+            >
+              <MoreVertical className="h-4 w-4" />
+            </button>
+          </>
+        ) : (
+          <>
+            <Search className="h-4 w-4 text-white/90" />
+            <MoreVertical className="h-4 w-4 text-white/90" />
+          </>
+        )}
       </div>
 
       {!isPrivate ? (

@@ -68,6 +68,21 @@ export function generateVerificationToken(length = 32): string {
   return token;
 }
 
+/**
+ * 入群验证码生成（v1.1.7 code_self 方式：机器人自生成验证码，用户私聊回复输入）。
+ *
+ * 纯数字（手机端输入成本最低），默认 6 位，首位非 0（避免短信式验证码
+ * 常见的「丢前导零」输入困惑）；字符级加密安全随机（randomInt），
+ * 无模偏差，不可预测。
+ */
+export function generateJoinCode(length = 6): string {
+  let code = String(randomInt(1, 10));
+  for (let i = 1; i < length; i++) {
+    code += String(randomInt(0, 10));
+  }
+  return code;
+}
+
 export function generateSessionId(length = 16): string {
   const bytes = new Uint8Array(length);
   for (let i = 0; i < length; i++) {

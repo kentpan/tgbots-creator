@@ -136,14 +136,18 @@ const includeRootFiles = [
   "instrumentation.ts",
   "next-env.d.ts",
   "next.config.ts",
+  "open-next.config.ts",
   "package.json",
   "package-lock.json",
   "postcss.config.mjs",
   "tailwind.config.ts",
   "tsconfig.json",
 ];
-const includeDirs = [".github", "prisma", "public", "scripts", "src"];
+const includeDirs = [".github", "pages-adapter", "prisma", "public", "scripts", "src"];
 const skipNames = new Set(["dev.log", ".package-stage", "node_modules", ".vercel"]);
+// SQLite 运行时伴生文件不入包：WAL checkpoint(TRUNCATE) 后 -wal 已是 0 字节，
+// -shm 是共享内存索引，两者与主 db 文件无关且解压后可能引起误判
+const skipSuffixes = [".db-wal", ".db-shm"];
 
 rmSync(stage, { recursive: true, force: true });
 mkdirSync(stage, { recursive: true });
@@ -157,7 +161,12 @@ for (const d of includeDirs) {
   if (!existsSync(path.join(root, d))) continue;
   cpSync(path.join(root, d), path.join(stage, d), {
     recursive: true,
-    filter: (src) => !skipNames.has(src.split(path.sep).pop() ?? ""),
+    filter: (src) => {
+      const name = src.split(path.sep).pop() ?? "";
+      if (skipNames.has(name)) return false;
+      if (skipSuffixes.some((suffix) => name.endsWith(suffix))) return false;
+      return true;
+    },
   });
 }
 

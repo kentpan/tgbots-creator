@@ -152,6 +152,12 @@ async function ensureMigrations(): Promise<void> {
       `ALTER TABLE "group_settings" ADD COLUMN "privacy_mode" BOOLEAN NOT NULL DEFAULT true`,
     );
   }
+  // 旧库补列：group_settings.require_approval（v1.1.9 加群需要管理员审核，与 TG APP 群设置对应）
+  if (groupCols.length > 0 && !groupCols.some((c) => c.name === "require_approval")) {
+    await executeRun(
+      `ALTER TABLE "group_settings" ADD COLUMN "require_approval" BOOLEAN NOT NULL DEFAULT false`,
+    );
+  }
   // v1.0.8 机器人测试：闲鱼商品 / 发货日志 / 测试验证码
   await executeRun(
     `CREATE TABLE IF NOT EXISTS "xianyu_products" (
@@ -261,7 +267,7 @@ async function ensureMigrations(): Promise<void> {
     `CREATE UNIQUE INDEX IF NOT EXISTS "bot_sessions_scope_key" ON "bot_sessions"("scope", "session_key")`,
   );
   console.log(
-    "Migrations ensured: bots, developer_accounts, group_bot_admins, bot_commands, privacy_mode, xianyu_products, xianyu_delivery_logs, verify_codes, ai_providers, ai_usage_logs, bot_sessions",
+    "Migrations ensured: bots, developer_accounts, group_bot_admins, bot_commands, privacy_mode, require_approval, xianyu_products, xianyu_delivery_logs, verify_codes, ai_providers, ai_usage_logs, bot_sessions",
   );
 }
 

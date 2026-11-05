@@ -51,7 +51,7 @@ do_start() {
   #  - setsid --fork：setsid 进程 fork 出子进程建立新会话后自己退出 → 子进程被 init 收养
   (
     cd "$ROOT" || exit 1
-    setsid --fork nohup bun run dev > "$LOG" 2>&1 < /dev/null &
+    setsid --fork nohup npm run dev > "$LOG" 2>&1 < /dev/null &
   ) &
   disown $! 2>/dev/null || true
 

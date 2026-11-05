@@ -30,7 +30,8 @@ CREATE TABLE "verification_sessions" (
     "completed_time" DATETIME,
     "expires_at" DATETIME NOT NULL,
     "method" TEXT NOT NULL DEFAULT 'captcha',
-    "attempts" INTEGER NOT NULL DEFAULT 0
+    "attempts" INTEGER NOT NULL DEFAULT 0,
+    "expected_code" TEXT
 );
 CREATE TABLE "user_stats" (
     "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
@@ -107,7 +108,7 @@ CREATE TABLE "group_settings" (
     "enabled" BOOLEAN NOT NULL DEFAULT true,
     "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-, "privacy_mode" BOOLEAN NOT NULL DEFAULT true);
+, "privacy_mode" BOOLEAN NOT NULL DEFAULT true, "require_approval" BOOLEAN NOT NULL DEFAULT false);
 CREATE TABLE "verification_methods" (
     "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "name" TEXT NOT NULL,

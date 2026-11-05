@@ -10,11 +10,14 @@ import {
 /**
  * 全局传输模式（轮询/Webhook/自动）与全局隐私模式配置卡片。
  *
- * 权威判定（grammY 官方文档 https://grammy.dev/guide/deployment-types）：
- * - 长轮询：本地开发 / 常驻服务器（无需公网 URL）
- * - Webhook：有 SSL 的服务器 / serverless 与可编程边缘网络
- *   → Cloudflare Pages/Workers 等 edge/serverless 环境没有常驻进程，
- *     无法挂起 getUpdates 长轮询，只能使用 Webhook（自动/edge 下强制）。
+ * v2.0.2 默认策略（grammY 官方 https://grammy.dev/guide/deployment-types）：
+ * - 默认（自动）= Webhook：两种环境统一。配置了 Webhook Base URL 后由 Telegram
+ *   推送更新（入站经公网/网关进来），Node 环境出站 Bot API 调用自动走全局代理；
+ * - Edge / Serverless（Cloudflare Pages 等）没有常驻进程，无法挂起 getUpdates
+ *   长轮询，恒为 Webhook；
+ * - Node 常驻服务且未配置 Webhook Base URL（Telegram 无法推送进来）→ 自动回退
+ *   长轮询：入站更新由 getUpdates 经全局代理拉回，机器人始终在线；
+ * - 显式选择长轮询（无需公网 URL）：入站由 getUpdates 经全局代理拉取。
  *
  * 隐私模式：Telegram 侧由 BotFather /setprivacy 控制（API 无修改入口，
  * getMe.can_read_all_group_messages 反映真实状态）。开启后 bot 收不到群内
@@ -47,7 +50,9 @@ export function TelegramGlobalCards({
   const [pending, startTransition] = useTransition();
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
 
-  const effectiveMode = mode === "auto" ? (isEdge ? "webhook" : "polling") : mode;
+  // 自动模式的预期生效值：默认 Webhook；Node 且未填写回调地址时预期回退轮询
+  // （保存时留空会自动取站点地址，实际以服务端 resolveEffectiveTransportWithFallback 为准）
+  const effectiveMode = mode === "auto" ? (isEdge || baseUrl.trim() ? "webhook" : "polling") : mode;
 
   const saveTransport = (): void => {
     setStatus(null);
@@ -95,9 +100,11 @@ export function TelegramGlobalCards({
               content: (
                 <div className="space-y-3">
                   <p className="text-sm text-muted-foreground">
-                    按运行环境自动选择：<b>Node 常驻服务 → 长轮询</b>（无需公网 URL，启动即收发）；
-                    <b>Edge / Serverless → Webhook</b>（grammY 官方：webhooks 适用于 serverless
-                    平台与可编程边缘网络 —— 无常驻进程，无法长轮询）。
+                    默认 <b>Webhook</b>（两种环境统一）：配置了 Webhook Base URL 后由 Telegram
+                    主动推送更新（入站经公网/网关进来），Node 环境出站 Bot API 调用自动走全局代理，
+                    <b>出入站全部经代理链路</b>；Edge/Serverless（无常驻进程）恒为 Webhook。
+                    Node 常驻服务且未配置 Webhook Base URL 时自动回退长轮询 ——
+                    入站更新由 getUpdates 经全局代理拉回，机器人始终在线。
                   </p>
                   <button type="button" className={primaryBtnClass} disabled={pending} onClick={saveTransport}>
                     {pending ? "保存中…" : "保存“自动”模式"}
@@ -111,8 +118,9 @@ export function TelegramGlobalCards({
               content: (
                 <div className="space-y-3">
                   <p className="text-sm text-muted-foreground">
-                    bot 主动调用 getUpdates 拉取更新（本地开发 / VPS 等常驻环境推荐）。
-                    无需域名与公网 HTTPS；Edge/Serverless 部署时不可用（运行时自动回退 Webhook）。
+                    bot 主动<b>经全局代理</b>调用 getUpdates 拉取更新（入站更新由代理链路拉回，
+                    出站 API 同样走代理）。无需域名与公网 HTTPS，适合本地开发 / 内网 /
+                    无法被 Telegram 回调的环境；Edge/Serverless 部署时不可用（运行时强制 Webhook）。
                     {isEdge ? "⚠️ 当前为 Edge 环境，长轮询不可用，实际生效 Webhook。" : ""}
                   </p>
                   <button type="button" className={primaryBtnClass} disabled={pending} onClick={saveTransport}>
@@ -128,11 +136,12 @@ export function TelegramGlobalCards({
                 <div className="space-y-3">
                   <p className="text-sm text-muted-foreground">
                     Telegram 主动把更新推送到公网 HTTPS 地址（serverless / Cloudflare Pages
-                    的唯一方式）。每个机器人注册
+                    的唯一方式；Node 环境下出站 Bot API 调用自动走系统设置中的全局代理）。
+                    每个机器人注册
                     <code className="mx-1 rounded bg-muted px-1 font-mono text-xs">
                       {"<Base URL>/api/telegram/webhook/<botId>"}
                     </code>
-                    并自动附带独立密钥校验。
+                    并自动附带独立密钥校验。回调地址需 Telegram 服务器可达（公网域名或经网关转发暴露的 HTTPS 地址）。
                   </p>
                   <div className="space-y-1">
                     <label htmlFor="tg-webhook-base" className="block text-sm font-medium">

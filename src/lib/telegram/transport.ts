@@ -6,8 +6,11 @@
  *   Deno 用 Deno.createHttpClient proxy；Node 用 baseFetchConfig.agent + socks/https-proxy-agent）。
  *   标准代理 agent 无法表达「URL 前缀转发」型代理，故本层采用同一扩展点的
  *   client.fetch 注入（ApiClientOptions.fetch，官方文档记载的自定义 fetch 入口）。
- * - 仅 Node 环境启用代理；Cloudflare Pages/Workers（edge/serverless）出站天然可达
- *   Telegram，始终直连（grammY 官方托管文档将 CF Workers 列为一等运行时，无需代理）。
+ * - 仅 Node 环境启用代理；Cloudflare Pages/Workers（edge/serverless）出站恒直连
+ *   （grammY 官方托管文档将 CF Workers 列为一等运行时，无需代理）。
+ *   v2.0.2 修复：此前仅 ensureTelegramProxyConfig 跳过 edge 的配置加载，但
+ *   proxyState 默认 enabled:true，telegramProxyFetch 无 runtime 判断 —— edge 出站
+ *   也会被改写到代理前缀。现在 proxyFetch 入口处非 Node 运行时恒直连透传。
  *
  * apiRoot 恒为上游 Bot API 地址（TELEGRAM_API_ROOT 可覆盖，默认 https://api.telegram.org）。
  * Node 环境访问 api.telegram.org 不通时的代理方案在本层实现（telegramProxyFetch）：
@@ -15,7 +18,9 @@
  *   并注入 Basic 鉴权头（代理地址中的 userinfo；undici 禁止 URL 内嵌凭据，必须走请求头）
  * - 代理开关/地址存于管理后台系统设置（telegram.proxy_enabled / telegram.proxy_url），
  *   Node 环境默认开启内置代理；15s 内存缓存，保存设置立即失效 —— 无需重启
- * - 代理请求网络层失败（超时/断网）自动用新连接重试一次，仍失败回退直连
+ * - 代理请求网络层失败（超时/断网）自动用新连接重试一次，仍失败回退直连；
+ *   直连连续 2 次失败（网络不可达环境）后熔断 10 分钟，期间不再白等直连超时
+ *   （v1.2.0：实测沙箱直连 api.telegram.org 被墙，原实现每次失败路径多等 8s）
  *
  * 接入方式：
  * - grammY：telegramBotClientOptions() 已注入 client.fetch（grammY 在 Node 下默认用
@@ -66,6 +71,10 @@ interface TelegramProxyState {
   enabled: boolean;
   url: string;
   loadedAt: number;
+  /** 直连回退连续失败计数（≥2 触发熔断，10 分钟内不再尝试直连） */
+  directFailCount: number;
+  /** 直连熔断截止时间戳（ms） */
+  directBlockedUntil: number;
 }
 
 const globalForTransport = globalThis as unknown as { tguardTelegramProxy?: TelegramProxyState };
@@ -77,6 +86,8 @@ function proxyState(): TelegramProxyState {
       enabled: true,
       url: DEFAULT_TELEGRAM_PROXY_URL,
       loadedAt: 0,
+      directFailCount: 0,
+      directBlockedUntil: 0,
     };
   }
   return globalForTransport.tguardTelegramProxy;
@@ -205,6 +216,9 @@ const globalForPatch = globalThis as unknown as { tguardProxyFetchInstalled?: bo
  */
 export function telegramProxyFetch(): typeof fetch {
   const proxyFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    // v2.0.2：非 Node 运行时（edge/workerd）恒直连 —— 代理体系（Basic 鉴权头/
+    // undici 连接池）只属于 Node 形态，edge 出站绝不改写到代理前缀
+    if (!isNodeRuntime()) return underlying()(input as Request, init);
     // 解析请求 URL（支持 string / URL / Request 三种形态）
     let href: string;
     try {
@@ -253,11 +267,13 @@ export function telegramProxyFetch(): typeof fetch {
       init?.signal?.aborted === true ||
       (typeof input === "object" && !(input instanceof URL) && input.signal?.aborted === true);
 
-    // v1.1.1 分级超时：getUpdates 长轮询（30s）给 35s；其余调用 12s 硬上限，
-    // 避免代理/直连异常时单次调用无限制挂起把管理端操作拖到几十秒
+    // 分级超时：getUpdates 长轮询（30s）给 35s；其余调用 20s 硬上限。
+    // v1.2.0：实测前缀代理网关延迟波动极大（5~13.5s），原 12s 上限会误杀
+    // 「慢但成功」的网关调用 → 重试+直连回退整条失败链，管理端保存拖到 15s+；
+    // 放宽到 20s 后单次尝试可覆盖绝大多数网关请求
     const method = /\/bot[^/]+\/([A-Za-z0-9_]+)/.exec(target.pathname)?.[1] ?? "";
     const isLongPoll = method === "getUpdates";
-    const attemptTimeoutMs = isLongPoll ? 35000 : 12000;
+    const attemptTimeoutMs = isLongPoll ? 35000 : 20000;
 
     const callViaProxy = async (): Promise<Response> => {
       // 单次尝试超时 + 调用方 signal 合并（任一触发即中止）
@@ -316,6 +332,13 @@ export function telegramProxyFetch(): typeof fetch {
         return await callViaProxy();
       } catch {
         console.warn("[telegram-proxy] 代理请求失败（重试后放弃，回退直连）:", reason);
+        // v1.2.0 直连熔断：直连连续 2 次失败（网络不可达环境）后 10 分钟内
+        // 不再尝试直连回退 —— 避免每次失败路径都白等 8s 直连超时，
+        // 管理端操作的失败反馈从 25s+ 缩短到 20s 级
+        const breaker = proxyState();
+        if (Date.now() < breaker.directBlockedUntil) {
+          throw firstError;
+        }
         const fallbackTimeoutMs = isLongPoll ? 20000 : 8000;
         const fallbackController = new AbortController();
         const fallbackTimer = setTimeout(
@@ -331,7 +354,19 @@ export function telegramProxyFetch(): typeof fetch {
           else fallbackSource.addEventListener("abort", () => fallbackController.abort(fallbackSource.reason), { once: true });
         }
         try {
-          return await underlying()(input as Request, { ...(init ?? {}), signal: fallbackController.signal });
+          const response = await underlying()(input as Request, { ...(init ?? {}), signal: fallbackController.signal });
+          // 直连成功：重置熔断计数（网络恢复后自动回到「代理→直连」全链路）
+          breaker.directFailCount = 0;
+          breaker.directBlockedUntil = 0;
+          return response;
+        } catch (directError) {
+          breaker.directFailCount += 1;
+          if (breaker.directFailCount >= 2) {
+            breaker.directFailCount = 0;
+            breaker.directBlockedUntil = Date.now() + 10 * 60 * 1000;
+            console.warn("[telegram-proxy] 直连连续失败已熔断 10 分钟（期间仅走代理，不再尝试直连回退）");
+          }
+          throw directError;
         } finally {
           clearTimeout(fallbackTimer);
         }

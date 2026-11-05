@@ -1,6 +1,7 @@
 import { headers } from "next/headers";
 import { requirePermission } from "@/lib/auth";
 import {
+  countPendingJoinRequestsByChat,
   listBots,
   listGroupSettings,
   listGroupBotAdmins,
@@ -9,6 +10,7 @@ import {
 import { listXianyuProducts } from "@/database/xianyu-operations";
 import { listVerifyApiKeys } from "@/services/verify-codes";
 import { parseBotMenuConfig } from "@/services/bot-menu";
+import { parseGroupDeployState } from "@/services/group-deploy";
 import type { BotMenuConfig } from "@/services/menu-config";
 import { TestingClient } from "./testing-client";
 
@@ -22,15 +24,17 @@ function maskToken(token: string): string {
 export default async function BotTestingPage() {
   await requirePermission("bots:view");
 
-  const [bots, groups, methods, botAdmins, products, apiKeys, requestHeaders] = await Promise.all([
-    listBots(),
-    listGroupSettings(),
-    listVerificationMethods(),
-    listGroupBotAdmins(),
-    listXianyuProducts(100),
-    listVerifyApiKeys(),
-    headers(),
-  ]);
+  const [bots, groups, methods, botAdmins, products, apiKeys, requestHeaders, pendingByChat] =
+    await Promise.all([
+      listBots(),
+      listGroupSettings(),
+      listVerificationMethods(),
+      listGroupBotAdmins(),
+      listXianyuProducts(100),
+      listVerifyApiKeys(),
+      headers(),
+      countPendingJoinRequestsByChat(),
+    ]);
 
   const proto = requestHeaders.get("x-forwarded-proto") ?? "http";
   const host = requestHeaders.get("host") ?? "localhost:3000";
@@ -60,12 +64,20 @@ export default async function BotTestingPage() {
       group.methodId === null ? null : methodNameById.get(String(group.methodId)) ?? null,
     timeoutSeconds: group.timeoutSeconds,
     maxAttempts: group.maxAttempts,
+    // 仿真屏群组列表数据源：待处理申请数（未读徽章）与配置更新时间（时间列）
+    unread: pendingByChat.get(String(group.chatId)) ?? 0,
+    updatedTime: group.updatedTime.toISOString(),
   }));
 
-  const botGroupLinks = botAdmins.map((link) => ({
-    botId: String(link.botId),
-    chatId: String(link.chatId),
-  }));
+  const botGroupLinks = botAdmins.map((link) => {
+    const deploy = parseGroupDeployState(link.rights);
+    return {
+      botId: String(link.botId),
+      chatId: String(link.chatId),
+      deployMode: deploy?.deploy_mode ?? null,
+      inviteLink: deploy?.invite_link ?? null,
+    };
+  });
 
   const menuConfigs: Record<string, BotMenuConfig> = {};
   for (const bot of bots) {

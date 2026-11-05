@@ -18,7 +18,7 @@
  *     以此识别 OpenNext/workerd 形态并走与 Edge 完全相同的分支：
  *     无 FS 读取、bot 走 Webhook 传输、数据层走 D1/KV/R2 绑定。
  *     构建期（CI Node 22）navigator.userAgent 为 "Node.js/xx" 不会误判；
- *     本地 bun/node dev 同样不命中。
+ *     本地 node dev 同样不命中。
  *  2. requireNodeBuiltin —— 运行时同步获取 Node 内置模块（见下方函数注释）。
  */
 export const isEdgeRuntime =

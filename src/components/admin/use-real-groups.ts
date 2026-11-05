@@ -14,6 +14,8 @@ import { useCallback, useEffect, useState } from "react";
  *   已有数据立即展示；没有数据就展示空态引导手动同步。
  * - 只有用户点击「同步真实群组」按钮才调 POST（sync）实时请求 Telegram
  *   （getUpdates + 数据库关联 + getChat 三源合并），绝不默认自动同步。
+ * - enabled 选项（v2.0.2）：false 时不自动拉取（挂载即请求会造成列表页
+ *   每行弹窗各发一次接口）—— 编辑弹窗等懒加载场景在弹窗真正打开后才置 true。
  */
 
 export interface RealGroup {
@@ -53,8 +55,8 @@ function mapGroups(
   }));
 }
 
-export function useRealGroups(options: { botId: string | null }) {
-  const { botId } = options;
+export function useRealGroups(options: { botId: string | null; enabled?: boolean }) {
+  const { botId, enabled = true } = options;
   const [groups, setGroups] = useState<RealGroup[]>([]);
   /** 读取数据库已登记群组中（GET，不请求 Telegram） */
   const [loading, setLoading] = useState(false);
@@ -141,10 +143,12 @@ export function useRealGroups(options: { botId: string | null }) {
   }, [botId]);
 
   // 切换机器人时重新读取该机器人已登记的群组（只读数据库，不请求 Telegram）
+  // enabled=false 时跳过：由宿主组件在真正需要展示时（如弹窗打开）再启用
   useEffect(() => {
+    if (!enabled) return;
     setNote(null);
     void loadCached();
-  }, [loadCached]);
+  }, [loadCached, enabled]);
 
   return { groups, loading, syncing, note, sync, setGroups, setNote, reload: loadCached };
 }

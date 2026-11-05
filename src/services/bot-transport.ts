@@ -10,7 +10,7 @@ import {
   isEdgeRuntime,
   normalizeGlobalTransport,
   resolveEffectivePrivacy,
-  resolveEffectiveTransport,
+  resolveEffectiveTransportWithFallback,
   type EffectiveTransport,
   type GlobalTransportMode,
   type PrivacySetting,
@@ -50,10 +50,13 @@ export function resolveBotRuntime(
   global: TelegramRuntimeSettings,
 ): BotResolvedRuntime {
   const profile = parseBotProfile(profileRaw);
-  const mode = resolveEffectiveTransport(
+  // v2.0.2：默认 Webhook（出站 API 走全局代理，入站由 Telegram 推送到公网回调地址）；
+  // Node 未配置 Webhook Base URL 时回退轮询（入站 getUpdates 经代理拉取）
+  const mode = resolveEffectiveTransportWithFallback(
     profile.transportMode ?? "inherit",
     global.transportMode,
     isEdgeRuntime(),
+    Boolean(global.webhookBaseUrl),
   );
   const privacy = resolveEffectivePrivacy(
     profile.privacyModeSetting ?? "inherit",

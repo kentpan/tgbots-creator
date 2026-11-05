@@ -43,6 +43,8 @@ export interface VerificationSessionRow {
   expiresAt: Date;
   method: string;
   attempts: number;
+  /** v1.1.7 code_self 方式：机器人自生成、用户需回输的入群验证码（明文，与 verify_codes 卡密表同安全级别）；其他方式为 NULL */
+  expectedCode: string | null;
 }
 
 export interface VerificationStats {
@@ -138,6 +140,8 @@ export interface GroupSettingsRow {
   enabled: boolean;
   /** 加群验证隐私模式：开启时验证码必须回复机器人的验证问题（stateless-question，兼容 Telegram 隐私模式）；关闭时任意文本消息均可触发校验 */
   privacyMode: boolean;
+  /** 加群需要管理员审核（v1.1.9，对应 TG APP 群设置的「审批新成员」）：Bot API 无远程开关，本字段控制本系统生成的部署链接语义与直连入群防线 */
+  requireApproval: boolean;
   createdTime: Date;
   updatedTime: Date;
 }
@@ -235,6 +239,7 @@ function mapSession(row: Record<string, unknown>): VerificationSessionRow {
     expiresAt: toDate(row.expires_at),
     method: (row.method as string) ?? "captcha",
     attempts: toNumber(row.attempts ?? 0),
+    expectedCode: (row.expected_code as string | null) ?? null,
   };
 }
 
@@ -303,6 +308,8 @@ export async function createVerificationSession(input: {
   chatId: bigint;
   expiresAt: Date;
   method?: string;
+  /** v1.1.7 code_self：机器人自生成的入群验证码，随会话落库，输入时本地比对 */
+  expectedCode?: string | null;
 }): Promise<VerificationSessionRow | null> {
   try {
     await executeRun(
@@ -311,8 +318,8 @@ export async function createVerificationSession(input: {
     );
     const result = await executeRun(
       `INSERT INTO verification_sessions
-         (token, user_id, chat_id, captcha_completed, created_time, expires_at, method, attempts)
-       VALUES (?, ?, ?, 0, ?, ?, ?, 0)`,
+         (token, user_id, chat_id, captcha_completed, created_time, expires_at, method, attempts, expected_code)
+       VALUES (?, ?, ?, 0, ?, ?, ?, 0, ?)`,
       [
         input.token,
         Number(input.userId),
@@ -320,6 +327,7 @@ export async function createVerificationSession(input: {
         dateText(new Date()),
         dateText(input.expiresAt),
         input.method ?? "captcha",
+        input.expectedCode ?? null,
       ],
     );
     if (result.changes !== 1) return null;
@@ -749,6 +757,20 @@ export async function listJoinRequests(
   return { rows: rows.map(mapJoinRequest), total };
 }
 
+/** 按群组统计待处理（pending）加群申请数：机器人测试页仿真屏群组列表的未读徽章数据源 */
+export async function countPendingJoinRequestsByChat(): Promise<Map<string, number>> {
+  const rows = await queryAll<{ chat_id: number | bigint; count: number }>(
+    `SELECT chat_id, COUNT(id) AS count FROM join_requests
+     WHERE status = 'pending'
+     GROUP BY chat_id`,
+  );
+  const map = new Map<string, number>();
+  for (const row of rows) {
+    map.set(String(toBigInt(row.chat_id)), toNumber(row.count));
+  }
+  return map;
+}
+
 export interface PendingCodeContext {
   session: VerificationSessionRow;
   joinRequest: JoinRequestRow;
@@ -758,9 +780,11 @@ export interface PendingCodeContext {
 export async function getPendingCodeContext(
   userId: bigint,
 ): Promise<PendingCodeContext | null> {
+  // v1.1.7：同时接受 code_api（外部卡密 API）与 code_self（机器人自生成验证码）会话 ——
+  // 两种方式的用户交互完全一致（私聊回复/输入验证码），仅校验方不同
   const sessionRow = await queryOne<Record<string, unknown>>(
     `SELECT * FROM verification_sessions
-     WHERE user_id = ? AND method = 'code_api' AND captcha_completed = 0 AND expires_at > ?
+     WHERE user_id = ? AND method IN ('code_api', 'code_self') AND captcha_completed = 0 AND expires_at > ?
      ORDER BY created_time DESC LIMIT 1`,
     [Number(userId), dateText(new Date())],
   );
@@ -868,6 +892,7 @@ function mapGroupSettings(row: Record<string, unknown>): GroupSettingsRow {
     failureText: (row.failure_text as string) ?? "❌ 验证码错误，请重试。",
     enabled: toBoolean(row.enabled),
     privacyMode: row.privacy_mode === undefined ? true : toBoolean(row.privacy_mode),
+    requireApproval: row.require_approval === undefined ? false : toBoolean(row.require_approval),
     createdTime: toDate(row.created_time),
     updatedTime: toDate(row.updated_time),
   };
@@ -1308,12 +1333,23 @@ export async function upsertGroupSettings(
     failureText?: string;
     enabled?: boolean;
     privacyMode?: boolean;
+    /** v1.1.9 加群需要管理员审核；undefined = 不改动现有值 */
+    requireApproval?: boolean;
   },
 ): Promise<void> {
+  // requireApproval === undefined 语义为「不改动现有值」。
+  // 该列是 NOT NULL，SQLite 在 INSERT 阶段即校验约束（不会等 COALESCE 兜底），
+  // 因此必须先读出现值（无行则 false），绝不允许绑定 null。
+  let requireApprovalValue = input.requireApproval;
+  if (requireApprovalValue === undefined) {
+    const existing = await getGroupSettings(chatId);
+    requireApprovalValue = existing ? existing.requireApproval : false;
+  }
+
   await executeRun(
     `INSERT INTO group_settings
-       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, created_time, updated_time)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, require_approval, created_time, updated_time)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(chat_id) DO UPDATE SET
        chat_title = COALESCE(excluded.chat_title, group_settings.chat_title),
        method = COALESCE(excluded.method, group_settings.method),
@@ -1325,6 +1361,7 @@ export async function upsertGroupSettings(
        failure_text = COALESCE(excluded.failure_text, group_settings.failure_text),
        enabled = COALESCE(excluded.enabled, group_settings.enabled),
        privacy_mode = COALESCE(excluded.privacy_mode, group_settings.privacy_mode),
+       require_approval = excluded.require_approval,
        updated_time = excluded.updated_time`,
     [
       Number(chatId),
@@ -1338,6 +1375,7 @@ export async function upsertGroupSettings(
       input.failureText ?? "❌ 验证码错误，请重试。",
       input.enabled === false ? 0 : 1,
       input.privacyMode === false ? 0 : 1,
+      requireApprovalValue ? 1 : 0,
       dateText(new Date()),
       dateText(new Date()),
     ],

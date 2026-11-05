@@ -50,11 +50,17 @@ export async function startBotRuntime(): Promise<void> {
     return;
   }
 
-  // 主 bot 传输模式：全局 webhook（或 auto+edge）→ 不轮询，注册 Webhook（路径 /api/telegram/webhook/main）
+  // 主 bot 传输模式（v2.0.2）：默认 Webhook（出站 API 走全局代理，入站由 Telegram
+  // 推送到 /api/telegram/webhook/main）；Node 未配置 Webhook Base URL 时回退轮询
   const { getTelegramRuntimeSettings, applyBotTransport } = await import("@/services/bot-transport");
-  const { resolveEffectiveTransport, isEdgeRuntime } = await import("@/lib/telegram/runtime-mode");
+  const { resolveEffectiveTransportWithFallback, isEdgeRuntime } = await import("@/lib/telegram/runtime-mode");
   const globalSettings = await getTelegramRuntimeSettings();
-  const mainMode = resolveEffectiveTransport("inherit", globalSettings.transportMode, isEdgeRuntime());
+  const mainMode = resolveEffectiveTransportWithFallback(
+    "inherit",
+    globalSettings.transportMode,
+    isEdgeRuntime(),
+    Boolean(globalSettings.webhookBaseUrl),
+  );
   if (mainMode === "webhook") {
     const applied = await applyBotTransport(
       { token: config.bot.token, botId: "main" },

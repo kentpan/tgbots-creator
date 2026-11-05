@@ -1,15 +1,14 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   Check,
   ChevronDown,
   Copy,
   Loader2,
   PackageOpen,
-  PlayCircle,
   RefreshCw,
-  Rocket,
   Truck,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -33,7 +32,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { TgSimulator } from "@/components/admin/tg-simulator";
+import { TgAppSimulator, type AppSimGroup } from "@/components/admin/tg-app-simulator";
 import { useRealGroups } from "@/components/admin/use-real-groups";
 import type { BotMenuConfig } from "@/services/menu-config";
 
@@ -54,6 +53,10 @@ interface GroupOption {
   methodName: string | null;
   timeoutSeconds: number;
   maxAttempts: number;
+  /** 待处理加群申请数（join_requests.status=pending 真实统计，仿真屏未读徽章） */
+  unread: number;
+  /** 群组配置更新时间（ISO，仿真屏列表时间列） */
+  updatedTime: string;
 }
 
 interface ProductItem {
@@ -223,7 +226,7 @@ export function TestingClient({
 }: {
   bots: BotOption[];
   relatedBotIds: Record<string, string[]>;
-  botGroupLinks: { botId: string; chatId: string }[];
+  botGroupLinks: { botId: string; chatId: string; deployMode: string | null; inviteLink: string | null }[];
   groups: GroupOption[];
   menuConfigs: Record<string, BotMenuConfig>;
   initialProducts: ProductItem[];
@@ -236,6 +239,10 @@ export function TestingClient({
   // 模拟加群申请弹窗：验证 API 配置（与导入闲鱼商品弹窗同风格）
   const [joinOpen, setJoinOpen] = useState(false);
   const [joinPrefilling, setJoinPrefilling] = useState(false);
+  // 从哪个群组发起的弹窗（列表项按钮 → 确认配置后自动对该群发起申请）
+  const [pendingJoinChatId, setPendingJoinChatId] = useState<string | null>(null);
+  // 仿真屏创建验证会话成功后递增：驱动 TgAppSimulator push 到群聊界面
+  const [chatOpenRequest, setChatOpenRequest] = useState(0);
   const [joinUrl, setJoinUrl] = useState("https://xianyu.mfzl.cn/api/verify-codes/verify");
   const [joinKey, setJoinKey] = useState("xyk_c4e5615d8bc990e2e5225d332c264eb70011dd69b24d3065");
   const [joinHttpMethod, setJoinHttpMethod] = useState<"GET" | "POST">("POST");
@@ -259,6 +266,13 @@ export function TestingClient({
   const realGroups = useRealGroups({ botId: selectedBotId || null });
   const syncing = realGroups.syncing;
   const syncNote = realGroups.note;
+  const router = useRouter();
+
+  // 仿真屏配置保存后刷新页面数据（服务端重新拉取群组配置/未读数）+ 重载已登记群组
+  const refreshPageData = useCallback((): void => {
+    router.refresh();
+    void realGroups.reload();
+  }, [router, realGroups]);
 
   // 统一 Hook 返回的真实群组 → 测试页 GroupOption 形状（供 availableGroups 合并：配置缺标题时作回退标题，新群组直接追加）
   // 注意：必须定义在 availableGroups 之前（deps 数组引用，避免 TDZ）
@@ -273,14 +287,13 @@ export function TestingClient({
         methodName: null,
         timeoutSeconds: 300,
         maxAttempts: 3,
+        unread: 0,
+        updatedTime: "",
       })),
     [realGroups.groups],
   );
 
-  const [deployOpen, setDeployOpen] = useState(false);
-  const [deploying, setDeploying] = useState(false);
-  const [deployError, setDeployError] = useState<string | null>(null);
-  const [deployLinkCopied, setDeployLinkCopied] = useState(false);
+  const [deployingChatId, setDeployingChatId] = useState<string | null>(null);
   // 弹窗「确认配置」暂存的验证 API 配置，点击「申请加入群组」时随请求保存到群组绑定
   const [pendingJoinConfig, setPendingJoinConfig] = useState<JoinApiConfig | null>(null);
   const [products, setProducts] = useState<ProductItem[]>(initialProducts);
@@ -302,7 +315,6 @@ export function TestingClient({
   const [delivering, setDelivering] = useState(false);
   const [deliverLogs, setDeliverLogs] = useState<DeliveryLogView[]>([]);
   const [latestCode, setLatestCode] = useState<string | null>(null);
-  const [deployResult, setDeployResult] = useState<DeployResult | null>(null);
 
   const selectedBot = bots.find((bot) => bot.id === selectedBotId) ?? null;
 
@@ -347,6 +359,34 @@ export function TestingClient({
     [availableGroups, selectedChatId],
   );
 
+  // 仿真屏群组列表数据源：在 GroupOption 基础上补充部署状态/时间列/未读徽章
+  const appGroups = useMemo<AppSimGroup[]>(
+    () =>
+      availableGroups.map((group) => {
+        const relatedIds = selectedBot ? new Set(relatedBotIds[selectedBot.id] ?? [selectedBot.id]) : null;
+        const deployLink = botGroupLinks.find(
+          (link) =>
+            link.chatId === group.chatId &&
+            (relatedIds ? relatedIds.has(link.botId) : true) &&
+            link.deployMode === "join_request",
+        );
+        return {
+          chatId: group.chatId,
+          chatTitle: group.chatTitle,
+          enabled: group.enabled,
+          method: group.method,
+          methodId: group.methodId,
+          methodName: group.methodName,
+          timeoutSeconds: group.timeoutSeconds,
+          maxAttempts: group.maxAttempts,
+          deployed: Boolean(deployLink),
+          unread: group.unread,
+          updatedTime: group.updatedTime,
+        };
+      }),
+    [availableGroups, botGroupLinks, relatedBotIds, selectedBot],
+  );
+
   const refreshProducts = useCallback(async (): Promise<void> => {
     try {
       const response = await fetch("/api/admin/xianyu/products", { cache: "no-store" });
@@ -358,36 +398,91 @@ export function TestingClient({
   }, []);
 
   // 打开弹窗：拉取群组当前绑定的验证 API 配置预填（无配置时用默认值）
-  const openJoinDialog = useCallback(async () => {
-    setJoinOpen(true);
-    setJoinError(null);
-    if (!activeGroup) return;
-    setJoinPrefilling(true);
-    try {
-      const response = await fetch(
-        `/api/admin/bots/testing/join-request?chat_id=${encodeURIComponent(activeGroup.chatId)}`,
-        { cache: "no-store" },
-      );
-      const payload = (await response.json()) as { ok: boolean; data?: { config?: JoinApiConfig | null } };
-      const config = payload.ok ? payload.data?.config : null;
-      if (config) {
-        setJoinUrl(config.url);
-        setJoinKey(config.api_key);
-        setJoinHttpMethod(config.http_method === "GET" ? "GET" : "POST");
-        setJoinCodeField(config.code_field ?? "code");
-        setJoinSuccessStatus(String(config.success_status ?? 200));
-        setJoinSuccessField(config.success_field ?? "success");
-        setJoinSuccessValue(config.success_value ?? "true");
-        setJoinTimeout(String(config.timeout_seconds ?? 30));
+  const openJoinDialog = useCallback(
+    async (chatId: string): Promise<void> => {
+      setPendingJoinChatId(chatId);
+      setJoinOpen(true);
+      setJoinError(null);
+      setJoinPrefilling(true);
+      try {
+        const response = await fetch(
+          `/api/admin/bots/testing/join-request?chat_id=${encodeURIComponent(chatId)}`,
+          { cache: "no-store" },
+        );
+        const payload = (await response.json()) as { ok: boolean; data?: { config?: JoinApiConfig | null } };
+        const config = payload.ok ? payload.data?.config : null;
+        if (config) {
+          setJoinUrl(config.url);
+          setJoinKey(config.api_key);
+          setJoinHttpMethod(config.http_method === "GET" ? "GET" : "POST");
+          setJoinCodeField(config.code_field ?? "code");
+          setJoinSuccessStatus(String(config.success_status ?? 200));
+          setJoinSuccessField(config.success_field ?? "success");
+          setJoinSuccessValue(config.success_value ?? "true");
+          setJoinTimeout(String(config.timeout_seconds ?? 30));
+        }
+      } catch {
+        /* 预填失败时保留默认值 */
+      } finally {
+        setJoinPrefilling(false);
       }
-    } catch {
-      /* 预填失败时保留默认值 */
-    } finally {
-      setJoinPrefilling(false);
-    }
-  }, [activeGroup]);
+    },
+    [],
+  );
 
-  // 弹窗「完成配置」：校验并暂存验证 API 配置，仿真屏进入真实加群界面（底部「申请加入群组」按钮）
+  // 创建模拟加群申请会话（chatId 参数化，供群聊内按钮 / 列表按钮 / 加群确认面板三个入口共用）
+  const createJoinSession = useCallback(
+    async (
+      chatId: string,
+      apiConfig: JoinApiConfig | null,
+    ): Promise<{ ok: boolean; message: string }> => {
+      try {
+        const response = await fetch("/api/admin/bots/testing/join-request", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            bot_id: selectedBotId,
+            ...(apiConfig ? { api_config: apiConfig } : {}),
+          }),
+        });
+        const payload = (await response.json()) as {
+          ok: boolean;
+          error?: string;
+          data?: Record<string, string>;
+        };
+        if (!payload.ok || !payload.data) {
+          setSession(null);
+          setJoinPhase("idle");
+          setSimView("group");
+          return { ok: false, message: payload.error ?? "申请加入失败" };
+        }
+        setSession({
+          token: payload.data.token,
+          chatId: payload.data.chat_id,
+          chatTitle: payload.data.chat_title,
+          promptText: payload.data.prompt_text,
+          successText: payload.data.success_text,
+          failureText: payload.data.failure_text,
+          maxAttempts: Number(payload.data.max_attempts ?? 3),
+          expiresAt: payload.data.expires_at,
+          methodName: payload.data.method_name,
+        });
+        setLatestCode(null);
+        setJoinPhase("awaiting_code");
+        // 与真实 APP 一致：机器人把验证提示发到买家私聊，仿真屏切换到私聊输入验证码
+        setSimView("private");
+        setSelectedChatId(chatId);
+        setChatOpenRequest((count) => count + 1);
+        return { ok: true, message: "已提交加群申请" };
+      } catch (error) {
+        return { ok: false, message: error instanceof Error ? error.message : "申请加入失败" };
+      }
+    },
+    [selectedBotId],
+  );
+
+  // 弹窗「完成配置」：校验并暂存验证 API 配置；从列表项发起时自动对该群创建申请会话
   const confirmJoinDialog = useCallback(() => {
     const url = joinUrl.trim();
     const apiKey = joinKey.trim();
@@ -400,7 +495,7 @@ export function TestingClient({
       setJoinError("请填写 Bearer API Key");
       return;
     }
-    setPendingJoinConfig({
+    const config: JoinApiConfig = {
       url,
       api_key: apiKey,
       http_method: joinHttpMethod,
@@ -411,58 +506,56 @@ export function TestingClient({
       // 超时可配置（预填取群组绑定配置的现值，无配置时默认 30s）：Cloudflare Pages 等
       // 外部验证接口延迟波动大（实测 1s~25s），硬编码 10s 会频繁误判网络异常
       timeout_seconds: Math.min(Math.max(Number(joinTimeout) || 30, 5), 60),
-    });
+    };
+    setPendingJoinConfig(config);
     setSession(null);
     setLatestCode(null);
     setJoinPhase("idle");
     setSimView("group");
     setJoinOpen(false);
-  }, [joinUrl, joinKey, joinHttpMethod, joinCodeField, joinSuccessStatus, joinSuccessField, joinSuccessValue]);
-
-  // 仿真屏「申请加入群组」：创建加群申请会话（携弹窗配置保存到群组绑定），机器人随即在私聊发送验证提示
-  const handleRequestJoin = useCallback(async (): Promise<{ ok: boolean; message: string }> => {
-    if (!activeGroup) return { ok: false, message: "请先选择机器人和群组" };
-    try {
-      const response = await fetch("/api/admin/bots/testing/join-request", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: activeGroup.chatId,
-          bot_id: selectedBotId,
-          ...(pendingJoinConfig ? { api_config: pendingJoinConfig } : {}),
-        }),
-      });
-      const payload = (await response.json()) as {
-        ok: boolean;
-        error?: string;
-        data?: Record<string, string>;
-      };
-      if (!payload.ok || !payload.data) {
-        setSession(null);
-        setJoinPhase("idle");
-        setSimView("group");
-        return { ok: false, message: payload.error ?? "申请加入失败" };
-      }
-      setSession({
-        token: payload.data.token,
-        chatId: payload.data.chat_id,
-        chatTitle: payload.data.chat_title,
-        promptText: payload.data.prompt_text,
-        successText: payload.data.success_text,
-        failureText: payload.data.failure_text,
-        maxAttempts: Number(payload.data.max_attempts ?? 3),
-        expiresAt: payload.data.expires_at,
-        methodName: payload.data.method_name,
-      });
-      setLatestCode(null);
-      setJoinPhase("awaiting_code");
-      // 与真实 APP 一致：机器人把验证提示发到买家私聊，仿真屏切换到私聊输入验证码
-      setSimView("private");
-      return { ok: true, message: "已提交加群申请" };
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : "申请加入失败" };
+    const targetChatId = pendingJoinChatId;
+    setPendingJoinChatId(null);
+    if (targetChatId) {
+      void createJoinSession(targetChatId, config);
     }
-  }, [activeGroup, pendingJoinConfig, selectedBotId]);
+  }, [
+    joinUrl,
+    joinKey,
+    joinHttpMethod,
+    joinCodeField,
+    joinSuccessStatus,
+    joinSuccessField,
+    joinSuccessValue,
+    joinTimeout,
+    pendingJoinChatId,
+    createJoinSession,
+  ]);
+
+  // 仿真屏群聊内「申请加入群组」按钮：对当前聊天群组发起申请（沿用已有配置）
+  const handleRequestJoin = useCallback(
+    (): Promise<{ ok: boolean; message: string }> =>
+      activeGroup
+        ? createJoinSession(activeGroup.chatId, pendingJoinConfig)
+        : Promise.resolve({ ok: false, message: "请先选择机器人和群组" }),
+    [activeGroup, pendingJoinConfig, createJoinSession],
+  );
+
+  // 仿真屏群组列表「模拟加群申请」按钮：
+  // 已配置验证方式（自动验证码/外部API）的群组直接发起；其余打开配置弹窗（确认后自动发起）
+  const handleRequestJoinForGroup = useCallback(
+    async (chatId: string): Promise<{ ok: boolean; message: string }> => {
+      const group = availableGroups.find((item) => item.chatId === chatId);
+      if (!group) return { ok: false, message: "群组不存在，请先同步真实群组" };
+      const hasCodeConfig =
+        group.method === "code_self" || (group.method === "code_api" && group.methodId);
+      if (hasCodeConfig) {
+        return createJoinSession(chatId, pendingJoinConfig);
+      }
+      await openJoinDialog(chatId);
+      return { ok: true, message: "请在弹窗中完成验证 API 配置" };
+    },
+    [availableGroups, createJoinSession, pendingJoinConfig, openJoinDialog],
+  );
 
   const submitCode = useCallback(
     async (text: string): Promise<{ ok: boolean; text: string; joined?: boolean }> => {
@@ -516,39 +609,51 @@ export function TestingClient({
     [session],
   );
 
-  // 一键部署校验：Token → 已在群 → 管理员 → 邀请权限 → 生成入群申请链接并保存部署状态
-  const runDeploy = useCallback(async (): Promise<void> => {
-    if (!selectedBotId || !activeGroup || deploying) return;
-    setDeploying(true);
-    setDeployError(null);
-    setDeployResult(null);
-    setDeployLinkCopied(false);
-    try {
-      const response = await fetch("/api/admin/bots/testing/deploy", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bot_id: selectedBotId, chat_id: activeGroup.chatId }),
-      });
-      const payload = (await response.json()) as { ok: boolean; error?: string } & DeployResult;
-      if (!payload.ok) {
-        setDeployError(payload.error ?? "部署校验失败");
-        return;
+  // 一键部署（按群组）：Token → 已在群 → 管理员 → 邀请权限 → 生成入群申请链接并保存部署状态
+  // 仿真屏列表项按钮入口；结果（stage/guide/链接）由仿真屏内 iOS 弹层展示
+  const handleDeployForGroup = useCallback(
+    async (
+      chatId: string,
+    ): Promise<{
+      ok: boolean;
+      message: string;
+      stage?: string;
+      guide?: string[];
+      invite_link?: string | null;
+    } | null> => {
+      if (!selectedBotId || deployingChatId) return null;
+      setDeployingChatId(chatId);
+      try {
+        const response = await fetch("/api/admin/bots/testing/deploy", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ bot_id: selectedBotId, chat_id: chatId }),
+        });
+        const payload = (await response.json()) as { ok: boolean; error?: string } & DeployResult;
+        if (!payload.ok) {
+          return { ok: false, message: payload.error ?? "部署校验失败" };
+        }
+        const stageMessages: Record<DeployResult["stage"], string> = {
+          deployed: "部署成功：入群申请链接已生成并保存为该群组的部署状态",
+          add_bot: "机器人还不在群里：请先把机器人拉进群（Telegram 限制：无法由 API 自拉）",
+          promote_admin: "机器人已在群内但还不是管理员：请在群设置中添加为管理员",
+          grant_permission: "机器人已是管理员但缺少「邀请用户 via 链接」权限：请开启后重新部署",
+        };
+        return {
+          ok: true,
+          stage: payload.stage,
+          message: stageMessages[payload.stage] ?? "部署校验完成",
+          guide: payload.guide,
+          invite_link: payload.invite_link ?? null,
+        };
+      } catch (error) {
+        return { ok: false, message: error instanceof Error ? error.message : "部署校验失败" };
+      } finally {
+        setDeployingChatId(null);
       }
-      setDeployResult({
-        stage: payload.stage,
-        bot_username: payload.bot_username,
-        chat_title: payload.chat_title,
-        bot_status: payload.bot_status,
-        invite_link: payload.invite_link,
-        deployed_at: payload.deployed_at,
-        guide: payload.guide,
-      });
-    } catch (error) {
-      setDeployError(error instanceof Error ? error.message : "部署校验失败");
-    } finally {
-      setDeploying(false);
-    }
-  }, [selectedBotId, activeGroup, deploying]);
+    },
+    [selectedBotId, deployingChatId],
+  );
 
   const runImport = useCallback(async () => {
     setImporting(true);
@@ -710,13 +815,14 @@ export function TestingClient({
       <div className="space-y-1">
         <h1 className="text-2xl font-bold">机器人测试</h1>
         <p className="text-sm text-muted-foreground">
-          选择机器人与群组后进行加群验证全流程仿真：左侧导入闲鱼商品并模拟发货获取测试验证码（模拟买家收到的卡密），右侧仿真屏还原真实 APP 加群流程：申请加入群组 → 输入验证码发送 → 验证通过入群，完全复用真实验证管道。
+          右侧仿真屏还原真实 iOS Telegram APP：群组列表展示当前机器人 Token 下的真实群组（点击群组进入群聊，点头像/三个点进入群组设置），
+          搜索框粘贴加群链接可弹出真实加群确认面板；左侧导入闲鱼商品并模拟发货获取测试验证码，完整走通加群验证全链路。
         </p>
       </div>
 
       <div className="flex flex-wrap items-center gap-3 rounded-xl border bg-card p-4">
-        <div className="flex min-w-[220px] flex-col gap-1">
-          <span className="text-xs font-medium text-muted-foreground">机器人（下拉选择已创建的机器人）</span>
+        <div className="flex min-w-[260px] flex-col gap-1">
+          <span className="text-xs font-medium text-muted-foreground">机器人（当前 BOT TOKEN）</span>
           <Select
             value={selectedBotId}
             onValueChange={(value) => {
@@ -725,7 +831,7 @@ export function TestingClient({
               setLatestCode(null);
               setJoinPhase("idle");
               setSimView("group");
-                      }}
+            }}
           >
             <SelectTrigger aria-label="选择机器人" className="w-full">
               <SelectValue placeholder="选择机器人" />
@@ -741,91 +847,18 @@ export function TestingClient({
           </Select>
         </div>
 
-        <div className="flex min-w-[240px] flex-1 flex-col gap-1">
-          <span className="flex items-center justify-between gap-2">
-            <span className="text-xs font-medium text-muted-foreground">
-              群组（该机器人 Token 对应的群组 ID）
-            </span>
-            <span className="flex gap-1.5">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-6 gap-1 px-2 text-xs"
-                onClick={() => void realGroups.sync()}
-                disabled={!selectedBotId || syncing}
-                aria-label="同步真实群组"
-              >
-                {syncing ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
-                同步真实群组
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-6 gap-1 px-2 text-xs"
-                onClick={() => void openJoinDialog()}
-                disabled={!activeGroup}
-                aria-label="模拟加群申请"
-              >
-                <PlayCircle className="h-3 w-3" />
-                {session ? "重新模拟加群申请" : "模拟加群申请"}
-              </Button>
-            </span>
-          </span>
-          {availableGroups.length === 0 ? (
-            <div className="flex h-10 items-center rounded-md border border-dashed px-3 text-sm text-muted-foreground">
-              {syncing
-                ? "正在同步机器人真实所在的群组…"
-                : realGroups.loading
-                  ? "正在读取已登记的群组…"
-                  : "该机器人尚未登记群组：拉进群设为管理员后在群里发一条消息，再点「同步真实群组」手动发现"}
-            </div>
-          ) : (
-            <Select
-              value={activeGroup?.chatId ?? ""}
-              onValueChange={(value) => {
-                setSelectedChatId(value);
-                setSession(null);
-                setLatestCode(null);
-                setJoinPhase("idle");
-                setSimView("group");
-                          }}
-            >
-              <SelectTrigger aria-label="选择群组" className="w-full">
-                <SelectValue placeholder="选择群组" />
-              </SelectTrigger>
-              <SelectContent>
-                {availableGroups.map((group) => (
-                  <SelectItem key={group.chatId} value={group.chatId}>
-                    {group.chatTitle} · {group.chatId}
-                    {group.methodName ? ` · ${group.methodName}` : ""}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          )}
-          {syncNote ? (
-            <p className={`text-xs leading-relaxed ${syncNote.ok ? "text-green-700" : "text-red-600"}`}>
-              {syncNote.ok ? "✓ " : "⚠ "}{syncNote.text}
-            </p>
-          ) : null}
-        </div>
-
-        <div className="flex flex-col justify-end gap-1">
-          <span className="text-xs font-medium text-transparent">操作</span>
+        <div className="flex flex-col gap-1">
+          <span className="text-xs font-medium text-transparent">同步</span>
           <Button
             type="button"
-            onClick={() => {
-              setDeployOpen(true);
-              setDeployError(null);
-            }}
-            disabled={!selectedBotId || !activeGroup}
+            variant="outline"
+            onClick={() => void realGroups.sync()}
+            disabled={!selectedBotId || syncing}
+            aria-label="同步真实群组"
             className="gap-1.5"
-            aria-label="一键部署到真实群组"
           >
-            <Rocket className="h-4 w-4" />
-            一键部署
+            {syncing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            同步真实群组
           </Button>
         </div>
 
@@ -857,6 +890,11 @@ export function TestingClient({
           )}
         </div>
       </div>
+      {syncNote ? (
+        <p className={`text-xs leading-relaxed ${syncNote.ok ? "text-green-700" : "text-red-600"}`}>
+          {syncNote.ok ? "✓ " : "⚠ "}{syncNote.text}
+        </p>
+      ) : null}
 
       <div className="flex flex-1 flex-col gap-4 overflow-hidden lg:flex-row">
         <section
@@ -928,14 +966,14 @@ export function TestingClient({
         >
           {simulatorConfig && selectedBot ? (
             <div className="h-full">
-              <TgSimulator
-                key={`${selectedBot.id}-${activeGroup?.chatId ?? "none"}`}
+              <TgAppSimulator
                 config={simulatorConfig}
                 botName={botName}
-                groupTitle={activeGroup ? activeGroup.chatTitle : `${botName} · 私聊`}
+                botUsername={selectedBot.username}
+                selectedBotId={selectedBot.id}
+                groups={appGroups}
+                activeChatId={activeGroup ? activeGroup.chatId : null}
                 memberCount={activeGroup ? "仿真模式" : "私聊仿真模式"}
-                nodeId="root"
-                onNodeNavigate={() => undefined}
                 systemNote={
                   !activeGroup
                     ? "私聊仿真模式：请先为该机器人的群组配置验证方式"
@@ -961,6 +999,21 @@ export function TestingClient({
                 joinPhase={joinPhase}
                 onRequestJoin={handleRequestJoin}
                 view={simView}
+                onSelectGroup={(chatId) => {
+                  // 进入群聊：重置验证会话（与切换群组同语义）
+                  setSelectedChatId(chatId);
+                  setSession(null);
+                  setLatestCode(null);
+                  setJoinPhase("idle");
+                  setSimView("group");
+                }}
+                onSyncGroups={() => void realGroups.sync()}
+                syncing={syncing}
+                onDeployGroup={handleDeployForGroup}
+                deployingChatId={deployingChatId}
+                onSimulateJoinForGroup={handleRequestJoinForGroup}
+                chatOpenRequest={chatOpenRequest}
+                onSettingsSaved={refreshPageData}
               />
             </div>
           ) : (
@@ -1306,141 +1359,6 @@ export function TestingClient({
         </DialogContent>
       </Dialog>
 
-      {/* 一键部署到真实群组：校验链 + 喂饭级教程 + 入群申请链接 */}
-      <Dialog open={deployOpen} onOpenChange={(open) => { setDeployOpen(open); if (open) setDeployError(null); }}>
-        <DialogContent className="max-h-[86vh] max-w-2xl overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Rocket className="h-4 w-4" />
-              一键部署到真实群组
-            </DialogTitle>
-            <DialogDescription>
-              把仿真屏验证通过的配置真实部署到所选群组：校验 Token → 是否在群 → 管理员 →
-              「邀请用户」权限 → 自动生成入群申请链接并保存为该群组的部署状态。
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="space-y-3">
-            <div className="rounded-lg border bg-muted/40 p-3">
-              <p className="mb-2 text-sm font-medium">部署前置步骤（喂饭版）</p>
-              <ol className="list-decimal space-y-1.5 pl-5 text-xs leading-relaxed text-muted-foreground">
-                <li>
-                  <span className="font-medium text-foreground">创建机器人</span>
-                  （已由后台完成）：Token 已保存在本系统。
-                </li>
-                <li>
-                  <span className="font-medium text-foreground">把机器人拉进真实群组</span>
-                  （手动 10 秒）：群设置 → 添加成员 → 搜索机器人用户名。Telegram
-                  官方限制：机器人无法通过 API 把自己拉进群，必须由群管理员手动添加。
-                </li>
-                <li>
-                  <span className="font-medium text-foreground">设为管理员并勾选权限</span>
-                  （手动 10 秒）：群设置 → 管理员 → 添加管理员 → 勾选
-                  「邀请用户 via 链接」（用于生成入群申请链接和审批入群）。同样无法由 API 自我提升。
-                </li>
-                <li>
-                  <span className="font-medium text-foreground">点击下方「开始部署校验」</span>
-                  （全自动）：四项校验全部通过后，系统自动创建
-                  「入群申请链接」并保存，无需再手动配置任何东西。
-                </li>
-                <li>
-                  <span className="font-medium text-foreground">把邀请链接发给买家</span>：
-                  买家点链接 → 申请入群 → 机器人私聊发送验证提示 → 输入卡密验证码通过 →
-                  自动批准进群。验证码仅机器人与买家可见，不会出现在群里。
-                </li>
-              </ol>
-            </div>
-
-            {deployError ? (
-              <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
-                {deployError}
-              </div>
-            ) : null}
-
-            {deployResult ? (
-              <div className="space-y-2">
-                <div className="flex flex-wrap items-center gap-2 text-sm">
-                  <Badge
-                    variant={deployResult.stage === "deployed" ? "default" : "outline"}
-                    className={
-                      deployResult.stage === "deployed"
-                        ? "gap-1 bg-green-600 hover:bg-green-600"
-                        : "gap-1"
-                    }
-                  >
-                    {deployResult.stage === "deployed" ? <Check className="h-3 w-3" /> : null}
-                    {deployResult.stage === "deployed"
-                      ? "部署成功"
-                      : deployResult.stage === "add_bot"
-                        ? "缺步骤②：机器人不在群里"
-                        : deployResult.stage === "promote_admin"
-                          ? "缺步骤③：还不是管理员"
-                          : "缺权限：未开启「邀请用户 via 链接」"}
-                  </Badge>
-                  <span className="text-muted-foreground">
-                    {deployResult.chat_title}
-                    {deployResult.bot_username ? ` · @${deployResult.bot_username}` : ""}
-                  </span>
-                </div>
-
-                {deployResult.stage === "deployed" && deployResult.invite_link ? (
-                  <div className="space-y-2 rounded-lg border border-green-600/40 bg-green-500/10 p-3">
-                    <p className="text-xs font-medium text-green-700 dark:text-green-400">
-                      入群申请链接（发给买家 / 配置到闲鱼自动发货）
-                    </p>
-                    <div className="flex items-center gap-2">
-                      <code className="min-w-0 flex-1 truncate rounded bg-background px-2 py-1.5 font-mono text-xs">
-                        {deployResult.invite_link}
-                      </code>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        className="h-7 gap-1 px-2 text-xs"
-                        onClick={() => {
-                          void navigator.clipboard.writeText(deployResult.invite_link ?? "");
-                          setDeployLinkCopied(true);
-                          setTimeout(() => setDeployLinkCopied(false), 2000);
-                        }}
-                      >
-                        <Copy className="h-3 w-3" />
-                        {deployLinkCopied ? "已复制" : "复制链接"}
-                      </Button>
-                    </div>
-                  </div>
-                ) : null}
-
-                {deployResult.guide && deployResult.guide.length > 0 ? (
-                  <div className="rounded-lg border bg-muted/40 p-3">
-                    <p className="mb-1.5 text-xs font-medium">下一步操作</p>
-                    <ol className="list-decimal space-y-1 pl-5 text-xs leading-relaxed text-muted-foreground">
-                      {deployResult.guide.map((step, index) => (
-                        <li key={index}>{step}</li>
-                      ))}
-                    </ol>
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-
-          <DialogFooter>
-            <Button
-              type="button"
-              onClick={() => void runDeploy()}
-              disabled={deploying || !selectedBotId || !activeGroup}
-              className="gap-1.5"
-            >
-              {deploying ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
-              {deploying
-                ? "校验中…"
-                : deployResult?.stage === "deployed"
-                  ? "重新部署（刷新链接）"
-                  : "开始部署校验"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

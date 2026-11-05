@@ -9,11 +9,12 @@ import {
   getVerificationMethod,
   rejectJoinRequest,
 } from "@/database/operations";
-import { generateVerificationToken } from "@/utils/crypto";
+import { generateVerificationToken, generateJoinCode } from "@/utils/crypto";
 import { htmlEscape } from "@/utils/html";
 import { utcnow } from "@/utils/time";
 import { InlineKeyboard, type Api } from "grammy";
 import { codeQuestion } from "../verification-question";
+import { CODE_SELF_DEFAULT_PROMPT, sendCodeSelfPrompt } from "../verification-prompt";
 import { registerTelegramChat } from "@/services/chat-registry";
 
 /**
@@ -47,7 +48,7 @@ interface BootstrapResult {
   created: boolean;
   /** 验证提示是否已成功送达用户私聊 */
   promptDelivered: boolean;
-  method: "code_api" | "captcha" | "none";
+  method: "code_api" | "code_self" | "captcha" | "none";
 }
 
 async function bootstrapJoinVerification(
@@ -98,6 +99,15 @@ async function bootstrapJoinVerification(
     }
   }
 
+  // v1.1.7 code_self（输入验证码加群）：机器人自生成验证码 → 私聊发给用户 →
+  // 用户回复输入 → 本地比对（对→approve / 错→decline / 超时→decline），
+  // 无需外部卡密 API 与 WebApp，参考 Telegram 进群答题/对暗号验证方案。
+  const useSelfCode =
+    groupSettings?.enabled !== false &&
+    groupSettings?.method === "code_self" &&
+    !codeApiMethodId;
+  const joinCode = useSelfCode ? generateJoinCode() : null;
+
   const expiresAt = new Date(
     utcnow().getTime() +
       (groupSettings?.timeoutSeconds ?? runtime.verificationTimeout) * 1000,
@@ -107,7 +117,8 @@ async function bootstrapJoinVerification(
     userId: BigInt(user.id),
     chatId: BigInt(chat.id),
     expiresAt,
-    method: codeApiMethodId ? "code_api" : "captcha",
+    method: codeApiMethodId ? "code_api" : useSelfCode ? "code_self" : "captcha",
+    expectedCode: joinCode,
   });
 
   if (!verificationSession) {
@@ -154,6 +165,19 @@ async function bootstrapJoinVerification(
       console.error("Failed to send code verification prompt:", error);
       return { created: true, promptDelivered: false, method: "code_api" };
     }
+  }
+
+  // v1.1.7 code_self 分支：私聊发送自生成的入群验证码（含隐形后缀 + force_reply，
+  // 与 code_api 同一输码通道），验证码随会话落库，输入时本地比对
+  if (useSelfCode && joinCode) {
+    const promptText = groupSettings?.promptText ?? CODE_SELF_DEFAULT_PROMPT;
+    const delivery = await sendCodeSelfPrompt(api, user.id, {
+      promptText,
+      code: joinCode,
+      expiresAt,
+      contextLabel: requestType,
+    });
+    return { created: true, promptDelivered: delivery.delivered, method: "code_self" };
   }
 
   const webAppUrl = `${runtime.baseUrl}/verify?token=${verificationToken}`;

@@ -12,7 +12,7 @@ import {
   upsertGroupSettings,
   type GroupSettingsRow,
 } from "@/database/operations";
-import { generateVerificationToken } from "@/utils/crypto";
+import { generateJoinCode, generateVerificationToken } from "@/utils/crypto";
 import { parseCodeApiConfig, type CodeApiConfig } from "@/services/external-verify";
 
 /** 仿真屏使用的固定模拟用户（与仿真屏模板变量保持一致） */
@@ -151,8 +151,15 @@ export async function POST(request: Request): Promise<NextResponse> {
   }
 
   if (newConfig) {
+    // v2.0.1：method_id 允许在任意验证方式下作为「偏好」落库（弹窗回显），
+    // 仅 method=code_api 时才视为「已绑定」。若不加守卫，code_self 群组
+    // 携带 api_config 模拟加群会误改用户绑定的外部方法（如 #3 核验 API）配置。
     const boundMethodId =
-      settings?.methodId !== null && settings?.methodId !== undefined ? settings.methodId : null;
+      settings?.method === "code_api" &&
+      settings?.methodId !== null &&
+      settings?.methodId !== undefined
+        ? settings.methodId
+        : null;
     const existingMethod =
       boundMethodId !== null
         ? await getVerificationMethod(boundMethodId)
@@ -210,9 +217,73 @@ export async function POST(request: Request): Promise<NextResponse> {
   if (!settings) {
     return NextResponse.json({ ok: false, error: "该群组尚未配置验证设置" }, { status: 404 });
   }
+
+  // v1.1.7：code_self（自动验证码）仿真 —— 与真实 bootstrap（chat-member.ts）一致：
+  // 生成验证码随会话落库，含验证码的完整提示文案回传仿真屏私聊气泡；
+  // 提交校验走同一 evaluateSubmittedCode 管道（本地比对），行为逐字一致
+  if (settings.method === "code_self") {
+    const joinCode = generateJoinCode();
+    const token = generateVerificationToken();
+    const expiresAt = new Date(Date.now() + settings.timeoutSeconds * 1000);
+
+    const joinRequest = await createJoinRequest({
+      userId: SIMULATED_USER_ID,
+      chatId,
+      username: "preview_user",
+      firstName: "预览",
+      lastName: "用户",
+      verificationToken: token,
+      requestType: "simulator",
+    });
+    if (!joinRequest) {
+      return NextResponse.json({ ok: false, error: "创建模拟加群申请失败" }, { status: 500 });
+    }
+    const session = await createVerificationSession({
+      token,
+      userId: SIMULATED_USER_ID,
+      chatId,
+      expiresAt,
+      method: "code_self",
+      expectedCode: joinCode,
+    });
+    if (!session) {
+      return NextResponse.json({ ok: false, error: "创建验证会话失败" }, { status: 500 });
+    }
+    console.log(
+      `Simulator join request created (code_self): user ${SIMULATED_USER_ID} -> chat ${chatId}`,
+    );
+
+    // 提示文案与真实私聊消息（verification-prompt.ts buildCodeSelfPromptHTML）逐字一致（纯文本形态）
+    const minutes = Math.max(1, Math.round(settings.timeoutSeconds / 60));
+    const promptText =
+      `${settings.promptText ?? "🔐 请回复本消息并输入验证码完成验证"}\n\n` +
+      `您的入群验证码：${joinCode}\n\n` +
+      `⏱ 验证码 ${minutes} 分钟内有效，请回复本消息并输入上述验证码完成验证，验证通过后将自动批准入群。请勿把验证码泄露给他人。`;
+
+    return NextResponse.json({
+      ok: true,
+      data: {
+        token,
+        chat_id: String(chatId),
+        chat_title: settings.chatTitle,
+        username: "preview_user",
+        user_id: String(SIMULATED_USER_ID),
+        prompt_text: promptText,
+        success_text: settings.successText,
+        failure_text: settings.failureText,
+        timeout_seconds: settings.timeoutSeconds,
+        max_attempts: settings.maxAttempts,
+        expires_at: expiresAt.toISOString(),
+        method_id: "",
+        method_name: "自动验证码（输入验证码加群）",
+        expected_code: joinCode,
+      },
+    });
+  }
+
   if (settings.method !== "code_api" || settings.methodId === null) {
     return NextResponse.json(
-      { ok: false, error: "该群组未启用外部API验证方式，无法进行验证码仿真" },
+      { ok: false, error: "该群组未启用验证码类验证方式（自动验证码/外部API），无法进行验证码仿真" },
       { status: 400 },
     );
   }

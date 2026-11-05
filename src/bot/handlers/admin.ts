@@ -51,6 +51,18 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
   if (ctx.from && !ctx.from.is_bot) {
     const pending = await getPendingCodeContext(BigInt(ctx.from.id));
     if (pending) {
+      // v1.1.7 code_self：重发含验证码的完整提示（验证码随会话落库，重发同一码，
+      // 与首次发送文案一致）；code_api 仍走原提示（验证码在用户手里/外部系统）
+      if (pending.session.method === "code_self" && pending.session.expectedCode) {
+        const { sendCodeSelfPrompt } = await import("../verification-prompt");
+        await sendCodeSelfPrompt(ctx.api, ctx.from.id, {
+          promptText: pending.settings?.promptText ?? "🔐 请回复本消息并输入验证码完成验证",
+          code: pending.session.expectedCode,
+          expiresAt: pending.session.expiresAt,
+          contextLabel: "/start resend",
+        });
+        return;
+      }
       const promptText = pending.settings?.promptText ?? "🔐 请回复本消息并输入验证码完成验证";
       // 隐私红线（同 code-input.ts）：/start 可能在群里输入，有 pending 会话时
       // 验证提示必须私聊发送；不用 ctx.reply（force_reply 提示会落到当前群聊），

@@ -1,7 +1,7 @@
 /**
  * v1.1.0 增量种子：把 23 条官方内置指令（含详细中文介绍与默认排序）upsert 到现有数据库。
  * 幂等可重复执行；自定义指令不受影响。
- * 运行：bun run seed:commands
+ * 运行：npm run seed:commands
  */
 import { executeRun, getDatabase, queryOne } from "@/database/client";
 import { loadDotEnv } from "@/lib/dotenv";

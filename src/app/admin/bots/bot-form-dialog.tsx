@@ -230,7 +230,9 @@ export function BotFormDialog({
 
   // 已加入的真实群组（v1.1.1）：与「机器人测试」页共用统一获取 Hook + API
   // 打开弹窗只读取数据库已登记群组（零 Telegram 请求）；点「同步真实群组」才实时校验
-  const realGroups = useRealGroups({ botId: bot?.id ?? null });
+  // v2.0.2 懒加载：列表页每行都挂载本弹窗，enabled=false 避免页面打开即发请求
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const realGroups = useRealGroups({ botId: bot?.id ?? null, enabled: dialogOpen });
 
   const fetchMe = useCallback(
     async (tokenOverride?: string): Promise<void> => {
@@ -270,12 +272,14 @@ export function BotFormDialog({
     [bot?.id],
   );
 
-  // 编辑模式：弹窗挂载即自动获取（复用已保存 Token）
+  // 编辑模式：弹窗真正打开时才自动获取（复用已保存 Token；每次打开都重新拉取最新身份）
+  // v2.0.2 修复：此前是“弹窗挂载即获取”，列表页每行的编辑弹窗都没打开也各发一次
+  // /api/admin/bots/fetch-info（真实 getMe 走代理网关），页面加载被拖到 10s+
   useEffect(() => {
-    if (bot?.token) {
+    if (dialogOpen && bot?.token) {
       void fetchMe();
     }
-  }, [bot?.token, fetchMe]);
+  }, [dialogOpen, bot?.token, fetchMe]);
 
   const pluginsJson = JSON.stringify(plugins);
   const aiSupportJson = JSON.stringify(aiSupport);
@@ -359,6 +363,7 @@ export function BotFormDialog({
       action={saveBotAction}
       submitLabel="保存机器人"
       contentClassName="sm:max-w-2xl"
+      onOpenChange={setDialogOpen}
     >
       <input type="hidden" name="id" value={bot?.id ?? ""} />
       <input type="hidden" name="enabled" value={enabled ? "1" : "0"} />
