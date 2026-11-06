@@ -1,3 +1,11 @@
+import { recordRead, recordWrite } from "@/database/d1-metrics";
+import {
+  invalidateAllReadCache,
+  invalidateForWrite,
+  planQueryCache,
+  readThroughCache,
+} from "@/database/read-cache";
+
 export type SqlParam = string | number | bigint | Uint8Array | null;
 
 export type SqlRow = Record<string, unknown>;
@@ -28,9 +36,20 @@ interface NodeSqliteDatabase {
 
 interface D1PreparedStatementLike {
   bind(...params: unknown[]): {
-    all(): Promise<{ results?: unknown[] }>;
-    run(): Promise<{ meta?: { changes?: number; last_row_id?: number } }>;
+    all(): Promise<{ results?: unknown[]; meta?: D1ResultMetaLike }>;
+    run(): Promise<{ meta?: D1ResultMetaLike & { changes?: number; last_row_id?: number } }>;
   };
+}
+
+/**
+ * D1 返回的 meta：`rows_read` / `rows_written` 是 Cloudflare 计费用的真实行数，
+ * 拿它做额度归因比「返回行数」准确得多（全表扫描的 COUNT 返回 1 行但读了 N 行）。
+ */
+interface D1ResultMetaLike {
+  rows_read?: number;
+  rows_written?: number;
+  changes?: number;
+  last_row_id?: number;
 }
 
 interface D1DatabaseLike {
@@ -145,11 +164,15 @@ async function createNodeDatabase(): Promise<SqlDatabase> {
     displayPath: display,
     async all<T extends SqlRow = SqlRow>(sql: string, params: SqlParam[] = []): Promise<T[]> {
       const stmt = db.prepare(sql);
-      return stmt.all(...params) as T[];
+      const rows = stmt.all(...params) as T[];
+      // Node 形态拿不到「扫描行数」，用返回行数近似（本地/自托管无额度限制）
+      recordRead(sql, rows.length);
+      return rows;
     },
     async run(sql: string, params: SqlParam[] = []): Promise<SqlRunResult> {
       const stmt = db.prepare(sql);
       const info = stmt.run(...params);
+      recordWrite(sql, Number(info.changes), 0);
       return {
         changes: Number(info.changes),
         lastInsertRowid: Number(info.lastInsertRowid),
@@ -167,11 +190,21 @@ async function createD1Database(d1: D1DatabaseLike): Promise<SqlDatabase> {
     displayPath: "cloudflare:d1(DATABASE)",
     async all<T extends SqlRow = SqlRow>(sql: string, params: SqlParam[] = []): Promise<T[]> {
       const result = await d1.prepare(sql).bind(...params).all();
-      return (result.results ?? []) as T[];
+      const rows = (result.results ?? []) as T[];
+      // 计费口径 = rows_read（扫描行数），不是返回行数 —— 归因必须用它，
+      // 否则 COUNT(*) 这类「返回 1 行、扫 10 万行」的查询会被严重低估。
+      const meta = result.meta ?? {};
+      recordRead(sql, typeof meta.rows_read === "number" ? meta.rows_read : rows.length);
+      return rows;
     },
     async run(sql: string, params: SqlParam[] = []): Promise<SqlRunResult> {
       const result = await d1.prepare(sql).bind(...params).run();
       const meta = result.meta ?? {};
+      recordWrite(
+        sql,
+        Number(meta.rows_written ?? meta.changes ?? 0),
+        Number(meta.rows_read ?? 0),
+      );
       return {
         changes: Number(meta.changes ?? 0),
         lastInsertRowid: Number(meta.last_row_id ?? 0),
@@ -205,8 +238,15 @@ export async function queryAll<T extends SqlRow = SqlRow>(
   sql: string,
   params: SqlParam[] = [],
 ): Promise<T[]> {
-  const db = await getDatabase();
-  return db.all<T>(sql, params);
+  // v2.2.0 D1 额度保护：配置类表（bots/group_settings/menus/...）走 TTL 读缓存，
+  // 命中即零 D1 读。未命中或非白名单表（join_requests / verification_sessions）
+  // 照常直读，正确性不受影响。
+  const plan = planQueryCache(sql, params);
+  const load = async (): Promise<T[]> => {
+    const db = await getDatabase();
+    return db.all<T>(sql, params);
+  };
+  return plan ? readThroughCache<T[]>(plan, load) : load();
 }
 
 export async function queryOne<T extends SqlRow = SqlRow>(
@@ -219,12 +259,16 @@ export async function queryOne<T extends SqlRow = SqlRow>(
 
 export async function executeRun(sql: string, params: SqlParam[] = []): Promise<SqlRunResult> {
   const db = await getDatabase();
-  return db.run(sql, params);
+  const result = await db.run(sql, params);
+  // 写后精确失效：只清掉读过被写表的缓存条目（同 isolate 内立即可见）
+  invalidateForWrite(sql);
+  return result;
 }
 
 export async function executeScript(sql: string): Promise<void> {
   const db = await getDatabase();
   await db.exec(sql);
+  invalidateAllReadCache();
 }
 
 export async function getDatabaseInfo(): Promise<{

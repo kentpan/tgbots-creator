@@ -6,6 +6,7 @@ import type { BotContext } from "./context";
 import { mainMenu } from "./menus";
 import { handleJoinRequest, handleChatMemberUpdate } from "./handlers/chat-member";
 import { handleCodeInput } from "./handlers/code-input";
+import { handleVerificationCallback } from "./handlers/verify-callback";
 import { codeQuestion } from "./verification-question";
 import { registerBuiltinCommandHandlers } from "./handlers/builtin-commands";
 import { registerAiSupport, type AiSupportConfig } from "./handlers/ai-support";
@@ -115,6 +116,9 @@ export async function createBot(
 
   // 直连入群防线（v1.1.3）：普通邀请链接/被拉入群直接进来的成员 → 私聊补验证，超时/失败踢出
   bot.on("chat_member", handleChatMemberUpdate);
+
+  // 群内 4 选 1 验证按钮（v2.1.0）：callback_data 前缀 vg:，其他 callback 交还后续中间件
+  bot.on("callback_query:data", handleVerificationCallback);
 
   bot.on("message:text", handleCodeInput);
 

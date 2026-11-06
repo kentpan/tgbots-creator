@@ -3,10 +3,18 @@ import { describeTelegramError } from "./approval";
 import { parseGroupDeployState } from "./group-deploy";
 import { tgRawCall, telegramBotClientOptions } from "@/lib/telegram/transport";
 import {
+  TRANSPORT_SETTING_KEYS,
+  botWebhookSecret,
+  botWebhookUrl,
+  isEdgeRuntime,
+} from "@/lib/telegram/runtime-mode";
+import {
   deleteGroupBotAdminsByChat,
+  getAppSetting,
   listBots,
   listGroupBotAdmins,
   listGroupSettings,
+  type BotRow,
 } from "@/database/operations";
 
 /**
@@ -253,6 +261,35 @@ interface TgUpdate {
   chat_member?: { chat: TgChat };
 }
 
+interface TgWebhookInfo {
+  url?: string;
+  has_custom_certificate?: boolean;
+  pending_update_count?: number;
+  last_error_date?: number;
+  last_error_message?: string;
+  max_connections?: number;
+  allowed_updates?: string[];
+}
+
+/**
+ * getUpdates 参数。allowed_updates 会持久覆盖此前的声明（v1.1.3 修复）：
+ * 必须包含 callback_query，否则同步之后机器人内联按钮回调将收不到。
+ */
+const UPDATES_QUERY = {
+  limit: 100,
+  allowed_updates: JSON.stringify([
+    "message",
+    "channel_post",
+    "callback_query",
+    "my_chat_member",
+    "chat_join_request",
+    "chat_member",
+  ]),
+} as const;
+
+/** 积压更新重放上限：Cloudflare 单请求执行时间有限，超出部分提示用户再点一次同步 */
+const MAX_REPLAY_UPDATES = 30;
+
 /**
  * 拉取 bot token 真实所在的群组（三源合并）。
  *
@@ -323,57 +360,92 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
 
     const chats = new Map<string, RealChatInfo>();
 
-    // —— 源①：getUpdates（仅「无 Webhook」时可行）——
-    // Webhook 激活期 Telegram 直接拒绝 getUpdates（409）；而「删 Webhook → 拉取 → 重建」
-    // 会打断线上机器人收信：重建时若漏掉 secret_token，本应用回调入口的密钥校验会 401
-    // 拒绝全部更新（机器人从此收不到任何消息，群组再也无法自动登记）。所以这里绝不
-    // 改动已注册的 Webhook —— 线上（edge 恒 Webhook）走源②③。
-    const hook = await callBotApi<{ url?: string }>(token, "getWebhookInfo");
-    const webhookUrl = (hook.payload?.result?.url ?? "").trim();
+    // —— Token 下的机器人条目：Webhook 密钥派生与更新重放都依赖 botId ——
+    let tokenBots: BotRow[] = [];
+    try {
+      tokenBots = (await listBots()).filter((item) => item.token === token);
+    } catch (error) {
+      console.error("[telegram-sync] 读取机器人列表失败:", error);
+      warnings.push(`读取机器人列表失败：${describeSyncError(error)}`);
+    }
+
+    // —— Webhook 现状：线上 edge 唯一的入站通道（加群申请/入群事件都从这里来）——
+    const hook = await callBotApi<TgWebhookInfo>(token, "getWebhookInfo");
+    const webhook: TgWebhookInfo = hook.payload?.ok === true ? (hook.payload.result ?? {}) : {};
     if (hook.payload === null) {
-      warnings.push(`读取 Webhook 状态失败（${hook.transportError}），本次跳过 getUpdates 发现`);
+      warnings.push(`读取 Webhook 状态失败（${hook.transportError}）`);
     } else if (hook.payload.ok !== true) {
       warnings.push(
-        `读取 Webhook 状态失败（${hook.payload.error_code ?? "?"} ${hook.payload.description ?? "未知错误"}），本次跳过 getUpdates 发现`,
+        `读取 Webhook 状态失败（${hook.payload.error_code ?? "?"} ${hook.payload.description ?? "未知错误"}）`,
       );
-    } else if (webhookUrl) {
+    }
+    const webhookUrl = (webhook.url ?? "").trim();
+    if (webhook.last_error_message?.trim()) {
       warnings.push(
-        "机器人运行在 Webhook 模式：Telegram 不保留可拉取的更新队列，本次改用「数据库已登记群组 + 实时校验」发现群组",
+        `Webhook 最近投递失败：${webhook.last_error_message.trim()}${
+          webhook.pending_update_count ? `（积压 ${webhook.pending_update_count} 条更新）` : ""
+        }`,
       );
-    } else {
-      const updates = await pullUpdates(token, warnings);
-      const collect = (chat: TgChat | undefined): void => {
-        if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) return;
-        const title = chat.title?.trim();
-        if (!title) return;
-        chats.set(String(chat.id), { chatId: String(chat.id), chatTitle: title, source: "updates" });
-      };
-      for (const update of updates) {
-        collect(update.message?.chat);
-        collect(update.channel_post?.chat);
-        collect(update.my_chat_member?.chat);
-        collect(update.chat_join_request?.chat);
-        collect(update.chat_member?.chat);
+    }
+    if (webhookUrl) {
+      // 域名漂移诊断：换过域名/部署地址后 Webhook 仍指向旧主机 → 更新全部推给旧站点，机器人静默
+      try {
+        const configuredBase = ((await getAppSetting(TRANSPORT_SETTING_KEYS.webhookBaseUrl)) ?? "").trim();
+        const configuredHost = configuredBase ? new URL(configuredBase).host : "";
+        const actualHost = new URL(webhookUrl).host;
+        if (configuredHost && configuredHost !== actualHost) {
+          warnings.push(
+            `Webhook 指向 ${actualHost}，与系统设置中的 Base URL（${configuredHost}）不一致：请在「系统设置 → 传输模式」重新保存一次指向当前站点`,
+          );
+        }
+      } catch (error) {
+        console.error("[telegram-sync] 校验 Webhook 域名与配置失败:", error);
       }
     }
 
+    // —— 源①：更新队列 ——
+    // 新群组只在「机器人被拉进群」那一刻的 my_chat_member 更新里可见（Telegram 没有
+    // 列出全部会话的接口）。Webhook 激活期 getUpdates 恒 409，所以这里临时摘除 Webhook
+    // 拉取积压更新，随后立即用「派生密钥」重建 —— 顺带修好历史上 secret 丢失导致
+    // 回调 401、机器人彻底哑掉的现场；拉到的更新再重放给机器人实例，加群申请不会被吞咽。
+    const updates = await harvestUpdates({ token, webhook, webhookUrl, tokenBots, warnings });
+    const collect = (chat: TgChat | undefined): void => {
+      if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) return;
+      const title = chat.title?.trim();
+      if (!title) return;
+      chats.set(String(chat.id), { chatId: String(chat.id), chatTitle: title, source: "updates" });
+    };
+    for (const update of updates) {
+      collect(update.message?.chat);
+      collect(update.channel_post?.chat);
+      collect(update.my_chat_member?.chat);
+      collect(update.chat_join_request?.chat);
+      collect(update.chat_member?.chat);
+    }
+    await replayUpdates(updates, webhookUrl, tokenBots, warnings);
+
     // —— 源②：数据库已登记群组 ——
-    // group_bot_admins（同 Token 全部机器人条目）+ group_settings（管理端保存过的群组）。
-    // 群名回退优先级：group_settings.chat_title > 部署时写入 rights 的 chat_title（Telegram 真实返回）
+    // 两类候选必须区分开（否则会用本机器人的视角误删别的机器人的关联）：
+    //   linkedIds   = group_bot_admins 中「本 Token 的机器人条目」关联的群 → 校验失败即确认失效
+    //   settingsOnly= group_settings 里其它群 → 只用来补群名，Telegram 说「查不到」不代表群失效
     const dbTitles = new Map<string, string>();
+    const linkedIds = new Set<string>();
     const candidateIds = new Set<string>(chats.keys());
     try {
-      const tokenBots = (await listBots()).filter((item) => item.token === token);
       const tokenBotIds = new Set(tokenBots.map((item) => String(item.id)));
       const [links, settings] = await Promise.all([listGroupBotAdmins(), listGroupSettings()]);
       for (const setting of settings) {
+        const chatId = String(setting.chatId);
         const title = setting.chatTitle?.trim();
-        if (title) dbTitles.set(String(setting.chatId), title);
-        candidateIds.add(String(setting.chatId));
+        if (title) dbTitles.set(chatId, title);
+        candidateIds.add(chatId);
       }
       for (const link of links) {
         const chatId = String(link.chatId);
-        if (link.status === "active" && tokenBotIds.has(String(link.botId))) candidateIds.add(chatId);
+        if (link.status === "active" && tokenBotIds.has(String(link.botId))) {
+          candidateIds.add(chatId);
+          linkedIds.add(chatId);
+        }
         if (dbTitles.has(chatId)) continue;
         const deployedTitle = parseGroupDeployState(link.rights)?.chat_title?.trim();
         if (deployedTitle) dbTitles.set(chatId, deployedTitle);
@@ -384,39 +456,51 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
     }
 
     // —— 源③：getChat + getChatMember 实时校验（并发 4，规避 edge 单请求 6 连接上限）——
-    // 机器人仍在群内 → 用 Telegram 返回的最新群名；
-    // 确认失效（400 群不存在 / 成员身份 left|kicked）→ 移除关联行并归入 stale；
-    // 其余失败（网络 / 429 / 权限）→ 保留数据库记录（source=cache）+ warnings，绝不静默丢弃
+    // linked（本 Token 机器人关联的群）：机器人仍在群内 → 用 Telegram 返回的最新群名；
+    //   确认失效（400 群不存在 / 成员身份 left|kicked）→ 移除关联行并归入 stale；
+    //   其余失败（网络 / 429 / 权限）→ 保留数据库记录（source=cache）+ warnings，绝不静默丢弃
+    // settingsOnly（别的机器人/手工登记的群）：只用来给群名兜底；本机器人查不到不算失效，
+    //   更不允许据此删除关联行（历史实现会用它误删其它机器人的群）
     const staleList: { candidate: string; reason: "not_found" | "member_left" }[] = [];
     const verifyTargets = [...candidateIds].filter((id) => !chats.has(id));
     await runWithConcurrency(verifyTargets, 4, async (candidate) => {
       const knownTitle = dbTitles.get(candidate) ?? "";
       const label = knownTitle || candidate;
+      const linked = linkedIds.has(candidate);
       const keepFromCache = (title: string): void => {
-        if (title) chats.set(candidate, { chatId: candidate, chatTitle: title, source: "cache" });
+        if (linked && title) chats.set(candidate, { chatId: candidate, chatTitle: title, source: "cache" });
       };
 
       const chat = await callBotApi<{ id?: number; type?: string; title?: string }>(token, "getChat", {
         chat_id: candidate,
       });
       if (chat.payload === null) {
-        warnings.push(`群组「${label}」校验失败（${chat.transportError}），已按数据库记录保留`);
-        keepFromCache(knownTitle);
+        if (linked) {
+          warnings.push(`群组「${label}」校验失败（${chat.transportError}），已按数据库记录保留`);
+          keepFromCache(knownTitle);
+        } else {
+          console.warn(`[telegram-sync] 群组 ${candidate}（未关联本 Token）校验失败：${chat.transportError}`);
+        }
         return;
       }
       if (chat.payload.ok !== true) {
         const description = chat.payload.description ?? "未知错误";
-        if (
-          chat.payload.error_code === 400 &&
-          /not found|chat_id is empty|invalid chat id/i.test(description)
-        ) {
-          staleList.push({ candidate, reason: "not_found" });
+        const notFound = chat.payload.error_code === 400 && /not found|chat_id is empty|invalid chat id/i.test(description);
+        if (notFound) {
+          if (linked) staleList.push({ candidate, reason: "not_found" });
+          else console.info(`[telegram-sync] 群组 ${candidate} 本机器人不可见（非本 Token 关联群），跳过`);
           return;
         }
-        warnings.push(
-          `群组「${label}」读取失败（${chat.payload.error_code ?? "?"} ${description}），已按数据库记录保留`,
-        );
-        keepFromCache(knownTitle);
+        if (linked) {
+          warnings.push(
+            `群组「${label}」读取失败（${chat.payload.error_code ?? "?"} ${description}），已按数据库记录保留`,
+          );
+          keepFromCache(knownTitle);
+        } else {
+          console.warn(
+            `[telegram-sync] 群组 ${candidate}（未关联本 Token）读取失败：${chat.payload.error_code ?? "?"} ${description}`,
+          );
+        }
         return;
       }
 
@@ -429,33 +513,44 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
         user_id: botUserId,
       });
       if (member.payload === null) {
-        warnings.push(`群组「${label}」成员身份核验失败（${member.transportError}），已按数据库记录保留`);
-        keepFromCache(chatTitle);
+        if (linked) {
+          warnings.push(`群组「${label}」成员身份核验失败（${member.transportError}），已按数据库记录保留`);
+          keepFromCache(chatTitle);
+        }
         return;
       }
       if (member.payload.ok !== true) {
         const description = member.payload.description ?? "未知错误";
-        if (member.payload.error_code === 400 && /member not found|user not found/i.test(description)) {
-          staleList.push({ candidate, reason: "member_left" });
+        const leftGroup = member.payload.error_code === 400 && /member not found|user not found/i.test(description);
+        if (leftGroup) {
+          if (linked) staleList.push({ candidate, reason: "member_left" });
+          else console.info(`[telegram-sync] 群组 ${candidate} 本机器人不是成员（非本 Token 关联群），跳过`);
           return;
         }
-        warnings.push(
-          `群组「${label}」成员身份核验失败（${member.payload.error_code ?? "?"} ${description}），已按数据库记录保留`,
-        );
-        keepFromCache(chatTitle);
+        if (linked) {
+          warnings.push(
+            `群组「${label}」成员身份核验失败（${member.payload.error_code ?? "?"} ${description}），已按数据库记录保留`,
+          );
+          keepFromCache(chatTitle);
+        } else {
+          console.warn(
+            `[telegram-sync] 群组 ${candidate}（未关联本 Token）成员核验失败：${member.payload.error_code ?? "?"} ${description}`,
+          );
+        }
         return;
       }
 
       const status = member.payload.result?.status ?? "";
       if (status === "left" || status === "kicked") {
-        staleList.push({ candidate, reason: "member_left" });
+        if (linked) staleList.push({ candidate, reason: "member_left" });
+        else console.info(`[telegram-sync] 群组 ${candidate} 本机器人状态 ${status}（非本 Token 关联群），跳过`);
         return;
       }
       if ((chatType === "group" || chatType === "supergroup") && chatTitle) {
         chats.set(candidate, { chatId: candidate, chatTitle, source: "getchat" });
-      } else if (chatTitle) {
+      } else if (chatTitle && linked) {
         chats.set(candidate, { chatId: candidate, chatTitle, source: "cache" });
-      } else {
+      } else if (!chatTitle) {
         warnings.push(`群组 ${candidate} 无法读取群名（type=${chatType ?? "unknown"}）`);
       }
     });
@@ -494,26 +589,190 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
   }
 }
 
+/** 本应用注册的 Webhook 形态：<base>/api/telegram/webhook 或 <base>/api/telegram/webhook/<botId> */
+const MANAGED_WEBHOOK_PATTERN = /\/api\/telegram\/webhook(?:\/([^/?#]+))?$/;
+
+/** 从 Webhook 地址解析 botId 段（旧版无 botId 的地址返回空串） */
+function webhookPathBotId(url: string): string {
+  return MANAGED_WEBHOOK_PATTERN.exec(url)?.[1] ?? "";
+}
+
 /**
- * 拉取待处理更新（仅在无 Webhook 时调用）。
- * 409 只可能是「本应用自己的轮询实例正在消费」—— 暂停轮询 → 拉取 → 恢复，
- * 恢复失败必须显式报错（否则机器人静默离线）。
+ * edge 形态下补回缺失的 Webhook（无 Base URL 无法回调，直接提示去系统设置配置）。
+ * Node 形态不调用本函数 —— 那里轮询才是主通道，挂 Webhook 反而会打断 getUpdates。
+ */
+async function restoreMissingWebhook(
+  token: string,
+  tokenBots: BotRow[],
+  warnings: string[],
+): Promise<void> {
+  const botIdText = tokenBots[0] ? String(tokenBots[0].id) : "";
+  if (!botIdText) {
+    warnings.push("机器人条目缺失（Token 未登记在 bots 表），无法重建 Webhook");
+    return;
+  }
+  const base = ((await getAppSetting(TRANSPORT_SETTING_KEYS.webhookBaseUrl)) ?? "").trim();
+  if (!/^https:\/\/.+/.test(base)) {
+    warnings.push(
+      "机器人当前没有 Webhook，且系统设置里未配置 https 的 Webhook Base URL —— edge 环境收不到任何更新，请先到「系统设置 → 传输模式」保存站点地址",
+    );
+    return;
+  }
+  const url = botWebhookUrl(base, botIdText);
+  const registered = await callBotApi<boolean>(token, "setWebhook", {
+    url,
+    secret_token: botWebhookSecret(botIdText, token),
+    allowed_updates: UPDATES_QUERY.allowed_updates,
+    drop_pending_updates: "false",
+  });
+  if (registered.payload?.ok === true) {
+    console.info(`[telegram-sync] 已补建 Webhook：${url}`);
+    warnings.push(`机器人原先没有 Webhook（收不到任何更新），已按系统设置补建：${url}`);
+  } else {
+    const detail = registered.payload
+      ? `${registered.payload.error_code ?? "?"} ${registered.payload.description ?? ""}`
+      : registered.transportError;
+    console.error(`[telegram-sync] 补建 Webhook 失败（${url}）: ${detail}`);
+    warnings.push(`⚠️ 补建 Webhook 失败（${detail}），机器人仍收不到更新`);
+  }
+}
+
+/**
+ * 拉取待处理更新（源①）。三种现场：
+ * - 无 Webhook：直接 getUpdates；409 = 本应用轮询实例正在消费 → 暂停轮询 → 拉取 → 恢复
+ * - 本应用 Webhook：临时 deleteWebhook → getUpdates → **带 secret_token 重建**（自愈历史丢失）
+ * - 外部 Webhook：不碰（改动别人的推送链路会直接打断线上机器人），仅提示
+ *
+ * 调用方拿到更新后必须重放（replayUpdates），否则被 getUpdates 确认掉的加群申请
+ * 就再也不会投递到 Webhook，等于把用户的申请吃掉了。
+ */
+async function harvestUpdates(params: {
+  token: string;
+  webhook: TgWebhookInfo;
+  webhookUrl: string;
+  tokenBots: BotRow[];
+  warnings: string[];
+}): Promise<TgUpdate[]> {
+  const { token, webhook, webhookUrl, tokenBots, warnings } = params;
+  if (!webhookUrl) {
+    const updates = await pullUpdates(token, warnings);
+    // edge 无常驻进程，没有 Webhook 等于机器人彻底离线（收不到加群申请/入群事件）：
+    // 用系统设置里的 Base URL 把 Webhook 补回来，否则「同步」永远只能看到数据库里的旧群
+    if (isEdgeRuntime()) await restoreMissingWebhook(token, tokenBots, warnings);
+    return updates;
+  }
+
+  if (!MANAGED_WEBHOOK_PATTERN.test(webhookUrl)) {
+    warnings.push(`机器人的 Webhook 指向外部地址（${webhookUrl}），为避免打断线上推送，本次不接管更新队列`);
+    return [];
+  }
+
+  const botIdFromUrl = webhookPathBotId(webhookUrl);
+  const secretBotId = botIdFromUrl || (tokenBots[0] ? String(tokenBots[0].id) : "");
+  const secret = secretBotId ? botWebhookSecret(secretBotId, token) : "";
+
+  const removed = await callBotApi<boolean>(token, "deleteWebhook", { drop_pending_updates: "false" });
+  if (removed.payload?.ok !== true) {
+    warnings.push(
+      `临时摘除 Webhook 失败（${removed.payload ? `${removed.payload.error_code ?? "?"} ${removed.payload.description ?? ""}` : removed.transportError}），本次无法发现新群组`,
+    );
+    return [];
+  }
+
+  let updates: TgUpdate[] = [];
+  try {
+    const pulled = await callBotApi<TgUpdate[]>(token, "getUpdates", UPDATES_QUERY);
+    if (pulled.payload?.ok === true) {
+      updates = pulled.payload.result ?? [];
+    } else {
+      warnings.push(
+        `getUpdates 失败（${pulled.payload ? `${pulled.payload.error_code ?? "?"} ${pulled.payload.description ?? ""}` : pulled.transportError}），本次无法发现新群组`,
+      );
+    }
+  } finally {
+    // 必须带 secret_token 重建：这是回调入口密钥校验的唯一来源，漏掉等于让机器人静音
+    const restored = await callBotApi<boolean>(token, "setWebhook", {
+      url: webhookUrl,
+      secret_token: secret || undefined,
+      allowed_updates: webhook.allowed_updates?.length
+        ? JSON.stringify(webhook.allowed_updates)
+        : UPDATES_QUERY.allowed_updates,
+      max_connections: webhook.max_connections,
+      drop_pending_updates: "false",
+    });
+    if (restored.payload?.ok !== true) {
+      const detail = restored.payload
+        ? `${restored.payload.error_code ?? "?"} ${restored.payload.description ?? ""}`
+        : restored.transportError;
+      console.error(`[telegram-sync] 重建 Webhook 失败（${webhookUrl}）: ${detail}`);
+      warnings.push(`⚠️ 重建 Webhook 失败（${detail}），机器人将收不到推送，请立即到系统设置重新保存传输模式`);
+    } else if (!secret) {
+      console.error(`[telegram-sync] 无法推导 Webhook 密钥（botId=${secretBotId || "unknown"}）`);
+      warnings.push("⚠️ 未能确定机器人 ID，Webhook 已按无密钥重建，回调可能被密钥校验拒绝");
+    } else {
+      console.info(`[telegram-sync] Webhook 已用派生密钥重建：${webhookUrl}`);
+    }
+  }
+  return updates;
+}
+
+/**
+ * 把 getUpdates 拉到的更新重放进机器人实例（含加群申请/入群事件）。
+ * getUpdates 会确认并消费这些更新，不重放就等于丢弃 —— 用户申请入群将永远得不到响应。
+ */
+async function replayUpdates(
+  updates: TgUpdate[],
+  webhookUrl: string,
+  tokenBots: BotRow[],
+  warnings: string[],
+): Promise<void> {
+  if (updates.length === 0) return;
+  const botIdFromUrl = webhookPathBotId(webhookUrl);
+  const target = tokenBots.find((item) => String(item.id) === botIdFromUrl) ?? tokenBots[0];
+  if (!target) {
+    warnings.push(`机器人条目缺失（Token 未登记在 bots 表），${updates.length} 条积压更新未处理`);
+    return;
+  }
+  const batch = updates.slice(0, MAX_REPLAY_UPDATES);
+  if (updates.length > batch.length) {
+    warnings.push(
+      `积压更新 ${updates.length} 条，本次只重放前 ${batch.length} 条，请稍后再点一次「同步真实群组」处理剩余`,
+    );
+  }
+  try {
+    const { acquireMenuBot } = await import("@/bot/multi-runtime");
+    const handle = await acquireMenuBot(target.id);
+    if (!handle) {
+      warnings.push("无法初始化机器人实例，积压更新未处理");
+      return;
+    }
+    if (!handle.bot.isInited()) await handle.bot.init();
+    let failed = 0;
+    for (const update of batch) {
+      try {
+        await handle.bot.handleUpdate(update as Parameters<typeof handle.bot.handleUpdate>[0]);
+      } catch (error) {
+        failed += 1;
+        console.error(`[telegram-sync] 重放更新 ${update.update_id} 失败:`, error);
+      }
+    }
+    if (failed > 0) {
+      warnings.push(`积压更新重放失败 ${failed}/${batch.length} 条（详见服务端日志）`);
+    } else {
+      console.info(`[telegram-sync] 已重放 ${batch.length} 条积压更新`);
+    }
+  } catch (error) {
+    console.error("[telegram-sync] 重放积压更新异常:", error);
+    warnings.push(`积压更新重放异常：${describeSyncError(error)}`);
+  }
+}
+
+/**
+ * 无 Webhook 时的 getUpdates：409 只可能是「本应用自己的轮询实例正在消费」——
+ * 暂停轮询 → 拉取 → 恢复，恢复失败必须显式报错（否则机器人静默离线）。
  */
 async function pullUpdates(token: string, warnings: string[]): Promise<TgUpdate[]> {
-  const query = {
-    limit: 100,
-    // getUpdates 的 allowed_updates 会持久覆盖此前的声明（v1.1.3 修复）：
-    // 必须包含 callback_query，否则同步之后机器人内联按钮回调将收不到
-    allowed_updates: JSON.stringify([
-      "message",
-      "channel_post",
-      "callback_query",
-      "my_chat_member",
-      "chat_join_request",
-      "chat_member",
-    ]),
-  };
-  const first = await callBotApi<TgUpdate[]>(token, "getUpdates", query);
+  const first = await callBotApi<TgUpdate[]>(token, "getUpdates", UPDATES_QUERY);
   if (first.payload === null) {
     warnings.push(`getUpdates 失败（${first.transportError}），本次跳过更新发现`);
     return [];
@@ -528,7 +787,7 @@ async function pullUpdates(token: string, warnings: string[]): Promise<TgUpdate[
 
   await pauseBotRuntimeForSync();
   try {
-    const retry = await callBotApi<TgUpdate[]>(token, "getUpdates", query);
+    const retry = await callBotApi<TgUpdate[]>(token, "getUpdates", UPDATES_QUERY);
     if (retry.payload?.ok === true) return retry.payload.result ?? [];
     warnings.push(
       `getUpdates 在暂停本地轮询后仍失败（${retry.payload?.error_code ?? "?"} ${retry.payload?.description ?? retry.transportError ?? "未知错误"}）`,

@@ -212,6 +212,8 @@ export function TgSimulator({
   onBack,
   /** 可选：点击左上角头像 / 右侧三个点 → 打开群组设置（iOS push 导航，由外壳组件传入） */
   onOpenSettings,
+  verifyPrompt,
+  onVerifyOption,
 }: {
   config: BotMenuConfig;
   botName: string;
@@ -236,6 +238,13 @@ export function TgSimulator({
   view?: "group" | "private";
   onBack?: () => void;
   onOpenSettings?: () => void;
+  /**
+   * 群内验证气泡（v2.1.0）：群内渠道下渲染在群聊消息流里的机器人验证消息。
+   * options = 4 选 1 候选数字（自动验证码）；url = 网页验证地址（人机验证 / 外部 API 卡密）。
+   */
+  verifyPrompt?: { text: string; options?: string[] | null; url?: string | null } | null;
+  /** 点击候选数字按钮：父组件提交校验，结果作为机器人气泡追加到群聊 */
+  onVerifyOption?: (code: string) => Promise<{ ok: boolean; text: string; joined?: boolean }>;
 }) {
   const history = useRef<string[]>([]);
   const [messages, setMessages] = useState<SimMessage[]>([]);
@@ -244,6 +253,7 @@ export function TgSimulator({
   const [input, setInput] = useState("");
   const [pressed, setPressed] = useState<string | null>(null);
   const [requestingJoin, setRequestingJoin] = useState(false);
+  const [verifyingOption, setVerifyingOption] = useState(false);
   const nextId = useRef(1);
   const scrollRef = useRef<HTMLDivElement>(null);
   const menuMessageRef = useRef<HTMLDivElement>(null);
@@ -479,9 +489,48 @@ export function TgSimulator({
     }
   };
 
+  /** 群内 4 选 1 数字按钮：提交校验，结果（错误剩余次数 / 通过欢迎）作为机器人气泡追加到群聊 */
+  const handleVerifyOptionClick = async (code: string): Promise<void> => {
+    if (!onVerifyOption || verifyingOption) return;
+    setVerifyingOption(true);
+    const loadingId = nextId.current;
+    appendStream("group", {
+      from: "bot",
+      sender: botName,
+      content: { type: "text", text: "", mediaUrl: "", items: [] },
+      loading: true,
+    });
+    try {
+      const result = await onVerifyOption(code);
+      patchStream("group", loadingId, {
+        loading: false,
+        content: {
+          type: "text",
+          text: result.ok ? result.text : `⚠️ ${result.text}`,
+          mediaUrl: "",
+          items: [],
+        },
+      });
+      if (result.ok && result.joined) {
+        appendStream("group", {
+          from: "system",
+          sender: "system",
+          content: { type: "text", text: "验证通过，你已加入群组", mediaUrl: "", items: [] },
+        });
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      patchStream("group", loadingId, {
+        loading: false,
+        content: { type: "text", text: `⚠️ ${detail}`, mediaUrl: "", items: [] },
+      });
+    } finally {
+      setVerifyingOption(false);
+    }
+  };
+
   const totalButtons = currentNode.rows.reduce((sum, row) => sum + row.buttons.length, 0);
   const isRoot = nodeId === "root";
-
   return (
     <div className="flex h-full min-h-[560px] flex-col overflow-hidden rounded-[2rem] border-8 border-[#0c0d10] shadow-2xl">
       <div
@@ -622,6 +671,57 @@ export function TgSimulator({
           </div>
         ) : null}
 
+        {/* 群内验证气泡（v2.1.0）：mention + 倒计时 + 4 选 1 数字按钮 / 网页验证按钮 */}
+        {!isPrivate && verifyPrompt ? (
+          <div className="flex max-w-[86%] flex-col items-start">
+            <div className="w-full rounded-2xl rounded-bl-md border-l-4 border-[#3390ec] bg-white px-3 py-2 shadow-sm">
+              <p className="mb-0.5 text-sm font-semibold" style={{ color: nameColor(botName) }}>
+                {botName}
+              </p>
+              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-[#0f0f0f]">
+                {verifyPrompt.text}
+              </p>
+            </div>
+            {verifyPrompt.options && verifyPrompt.options.length > 0 ? (
+              <div className="mt-[2px] w-full space-y-[2px]">
+                {[0, 1].map((rowIndex) => {
+                  const row = verifyPrompt.options!.slice(rowIndex * 2, rowIndex * 2 + 2);
+                  if (row.length === 0) return null;
+                  return (
+                    <div key={rowIndex} className="flex gap-[2px]">
+                      {row.map((code) => (
+                        <button
+                          key={code}
+                          type="button"
+                          disabled={verifyingOption}
+                          onClick={() => void handleVerifyOptionClick(code)}
+                          className="min-w-0 flex-1 rounded-lg bg-[#e8ebe3]/55 px-2 py-2.5 text-center text-base font-semibold tracking-widest text-[#1c1e21] transition-colors hover:bg-[#eef1e9]/70 active:bg-black/15 disabled:opacity-60"
+                          style={{ backdropFilter: "blur(3px)", WebkitBackdropFilter: "blur(3px)" }}
+                        >
+                          {code}
+                        </button>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+            {verifyPrompt.url ? (
+              <div className="mt-[2px] w-full">
+                <button
+                  type="button"
+                  onClick={() => window.open(verifyPrompt.url!, "_blank", "noopener")}
+                  className="w-full rounded-lg bg-[#e8ebe3]/55 px-2 py-2.5 text-center text-sm text-[#1c1e21] transition-colors hover:bg-[#eef1e9]/70 active:bg-black/15"
+                  style={{ backdropFilter: "blur(3px)", WebkitBackdropFilter: "blur(3px)" }}
+                >
+                  🔐 打开验证页面（在网页输入，群友看不见）
+                </button>
+              </div>
+            ) : null}
+            <p className="mt-0.5 text-sm text-[#3b4a54]/70">{clock}</p>
+          </div>
+        ) : null}
+
         {(isPrivate ? dmMessages : messages).map((message) => {
           if (message.from === "system") {
             return (
@@ -708,9 +808,11 @@ export function TgSimulator({
               }}
               placeholder={
                 joinPhase === "awaiting_code"
-                  ? sending
-                    ? "验证中..."
-                    : "输入验证码，点击右侧发送按钮..."
+                  ? verifyPrompt
+                    ? "群聊内不能发送验证码，请用上方按钮 / 验证页面"
+                    : sending
+                      ? "验证中..."
+                      : "输入验证码，点击右侧发送按钮..."
                   : onUserSend
                     ? sending
                       ? "发送中..."

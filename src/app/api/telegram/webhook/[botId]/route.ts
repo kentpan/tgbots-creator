@@ -4,6 +4,7 @@ import { getBot } from "@/database/operations";
 import { config } from "@/config/settings";
 import { acquireMenuBot } from "@/bot/multi-runtime";
 import { botWebhookSecret } from "@/lib/telegram/runtime-mode";
+import { runHousekeepingIfDue } from "@/services/housekeeping";
 
 /**
  * 按机器人 Webhook 回调入口：POST /api/telegram/webhook/<botId>
@@ -39,6 +40,13 @@ export async function POST(
   const a = Buffer.from(expected);
   const b = Buffer.from(provided ?? "");
   if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    // Telegram 侧配置的 secret 与本应用派生值不一致（典型：历史同步流程重建 Webhook 时
+    // 漏传 secret_token）→ 本条更新被拒收，但 Telegram 会继续排队重试。
+    // 管理端点一次「同步真实群组」会用派生密钥重建 Webhook 并把积压更新重放回来。
+    console.error(
+      `[webhook] 密钥校验失败 bot=${botId}：Telegram 未携带密钥或密钥不匹配${provided ? "" : "（请求头缺失）"}；` +
+        "若持续出现，请在「机器人测试 → 同步真实群组」触发一次 Webhook 自愈重建",
+    );
     return NextResponse.json({ detail: "Webhook 密钥校验失败" }, { status: 401 });
   }
 
@@ -75,6 +83,14 @@ export async function POST(
     }
   } catch (error) {
     console.error(`Error handling Telegram webhook update (bot=${botId}):`, error);
+  }
+
+  // v2.2.0：边缘侧机会式归档（1 小时最多一次，未到期时零 IO 直接返回）。
+  // 表体积是 D1 扫描行成本的第一放大器 —— 必须有人在 Cloudflare 上负责瘦身。
+  try {
+    await runHousekeepingIfDue();
+  } catch (error) {
+    console.warn("[webhook] housekeeping skipped:", error);
   }
 
   return NextResponse.json({ ok: true });

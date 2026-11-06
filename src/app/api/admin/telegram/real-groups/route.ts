@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentAdmin, hasPermission, logOperation } from "@/lib/auth";
 import { headers } from "next/headers";
-import { getBot, listGroupBotAdmins, listGroupSettings } from "@/database/operations";
+import { getBot, listBots, listGroupBotAdmins, listGroupSettings } from "@/database/operations";
 import { fetchRealGroups } from "@/services/telegram-sync";
 import { registerTelegramChat } from "@/services/chat-registry";
 import { parseGroupDeployState } from "@/services/group-deploy";
@@ -67,8 +67,14 @@ export async function GET(request: Request): Promise<NextResponse> {
     return NextResponse.json({ ok: false, error: "机器人不存在" }, { status: 404 });
   }
 
+  // 同 Token 的机器人条目共用同一台 Telegram 机器人（也是同一个 Webhook），
+  // 群组必须按 Token 聚合，否则「加群验证机器人」登记的群在「交付机器人」页面上会消失
+  const tokenBotIds = new Set(
+    (await listBots()).filter((item) => item.token === bot.token).map((item) => String(item.id)),
+  );
+  tokenBotIds.add(String(botId));
   const links = (await listGroupBotAdmins()).filter(
-    (link) => link.botId === botId && link.status === "active",
+    (link) => tokenBotIds.has(String(link.botId)) && link.status === "active",
   );
   // v2.0.3：一次取全部群组配置建 Map，消除循环内逐条 getGroupSettings 的 N+1 串行查询
   const settingsList = await listGroupSettings();
@@ -77,16 +83,16 @@ export async function GET(request: Request): Promise<NextResponse> {
   );
   // 群名回退：group_settings 无记录时用「一键部署」时 Telegram 返回并写入 rights 的 chat_title，
   // 否则仿真屏只能显示「群组 -100…」占位符（真实群名明明已知）
-  const groups: GroupEntry[] = links.map((link) => {
-    const stored = (titleByChat.get(String(link.chatId)) ?? "").trim();
+  const seen = new Set<string>();
+  const groups: GroupEntry[] = [];
+  for (const link of links) {
+    const chatId = String(link.chatId);
+    if (seen.has(chatId)) continue;
+    seen.add(chatId);
+    const stored = (titleByChat.get(chatId) ?? "").trim();
     const deployed = parseGroupDeployState(link.rights)?.chat_title?.trim() ?? "";
-    return {
-      chat_id: String(link.chatId),
-      chat_title: stored || deployed,
-      source: "cache",
-      is_new: false,
-    };
-  });
+    groups.push({ chat_id: chatId, chat_title: stored || deployed, source: "cache", is_new: false });
+  }
 
   const payload: GroupsPayload = {
     ok: true,

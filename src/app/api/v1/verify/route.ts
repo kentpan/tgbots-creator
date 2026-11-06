@@ -9,6 +9,7 @@ import {
   isSessionExpired,
 } from "@/database/operations";
 import { autoApproveUser } from "@/services/approval";
+import { completeGroupJoinVerification } from "@/services/group-verification";
 import { getClientIp } from "@/utils/client-info";
 import { validateInitData } from "@/utils/telegram";
 
@@ -58,8 +59,14 @@ export async function POST(request: NextRequest) {
     }
 
     const joinRequest = await getJoinRequestByToken(token);
+    // v2.1.0：群内渠道的验证页从群内 URL 按钮打开（普通浏览器/内置浏览器，没有 Telegram
+    // initData），身份校验退化为「持有 32 位随机 token 即视为本人」——与会话里的 user_id
+    // 对齐后批准，不接受请求体指定他人身份。
+    const isGroupChannelSession = session.channel === "group";
     const isApiRequest =
-      session.chatId === 0n || (joinRequest !== null && joinRequest.requestType === "api");
+      session.chatId === 0n ||
+      isGroupChannelSession ||
+      (joinRequest !== null && joinRequest.requestType === "api");
 
     const telegramUser = await validateInitData(
       typeof body.init_data === "string" ? body.init_data : "",
@@ -115,6 +122,20 @@ export async function POST(request: NextRequest) {
       }
       console.log(`Verification completed for API request (no chat): ${token.slice(0, 8)}...`);
       return NextResponse.json({ success: true, message: "✅ 验证成功！" });
+    }
+
+    // 群内渠道（v2.1.0）：人机验证通过 → 落库批准 + 解禁 + 删除群内提示 + 群内欢迎。
+    // 不能走 autoApproveUser（bootstrap 已自动批准入群，重复 approveChatJoinRequest 会 400）
+    if (isGroupChannelSession && joinRequest && joinRequest.requestType !== "simulator") {
+      const completion = await completeGroupJoinVerification(token);
+      if (!completion.success) {
+        console.warn(`Group-channel captcha completion failed: ${completion.error}`);
+      }
+      return NextResponse.json({
+        success: true,
+        message: "✅ 验证成功！",
+        redirect_url: "tg://",
+      });
     }
 
     const approvalResult = await autoApproveUser(token);

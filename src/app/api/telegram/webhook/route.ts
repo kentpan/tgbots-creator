@@ -2,6 +2,7 @@ import { timingSafeEqual } from "@/utils/crypto";
 import { NextResponse } from "next/server";
 import { config } from "@/config/settings";
 import { createBot } from "@/bot";
+import { runHousekeepingIfDue } from "@/services/housekeeping";
 
 const globalForWebhook = globalThis as unknown as {
   botGroupsWebhookBot?: Awaited<ReturnType<typeof createBot>>;
@@ -42,6 +43,13 @@ export async function POST(request: Request) {
     await bot.handleUpdate(update as Parameters<typeof bot.handleUpdate>[0]);
   } catch (error) {
     console.error("Error handling Telegram update:", error);
+  }
+
+  // v2.2.0：边缘侧机会式归档（1 小时最多一次，未到期零 IO）
+  try {
+    await runHousekeepingIfDue();
+  } catch (error) {
+    console.warn("[webhook] housekeeping skipped:", error);
   }
 
   return NextResponse.json({ ok: true });

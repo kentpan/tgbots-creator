@@ -16,6 +16,11 @@ import {
 } from "@/database/operations";
 import { parseCodeApiConfig, verifyCodeExternally } from "./external-verify";
 import { autoApproveUser, completeDirectJoinVerification } from "./approval";
+import {
+  completeGroupJoinVerification,
+  failGroupVerification,
+  resolveSessionChannel,
+} from "./group-verification";
 
 export type CodeCheckOutcome =
   | "success"
@@ -25,7 +30,9 @@ export type CodeCheckOutcome =
   | "no_pending"
   | "session_stale"
   | "method_missing"
-  | "bad_config";
+  | "bad_config"
+  /** 群内验证渠道下收到的群聊明文文本：硬性拦截，不校验、不回复、不产生任何群消息 */
+  | "ignored";
 
 export interface PendingContext {
   session: VerificationSessionRow;
@@ -51,6 +58,8 @@ export interface CodeCheckResult {
   reapplyChatId?: string | null;
   /** 加群申请来源（telegram=入群申请链接 / direct=直连入群 / simulator=仿真）：失效后动作不同 */
   joinRequestType?: string;
+  /** 本次会话的验证渠道（group=群内验证，结果需在群内收口；dm=私聊验证） */
+  channel?: "group" | "dm";
 }
 
 export interface CodeCheckInput {
@@ -85,6 +94,7 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
   }
 
   const { session, joinRequest, settings } = pending;
+  const channel: "group" | "dm" = resolveSessionChannel(session, settings);
 
   // v1.1.7：校验方按会话方式二选一 ——
   // · code_self（输入验证码加群）：机器人自生成的验证码随会话落库，本地恒定时间比对；
@@ -158,23 +168,38 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
     const maxAttempts = settings?.maxAttempts ?? 3;
     const remaining = Math.max(0, maxAttempts - attempts);
     if (remaining <= 0) {
-      await expireVerificationSession(session.token);
-      await rejectJoinRequest(session.token);
-      if (joinRequest.requestType === "telegram" && joinRequest.chatId !== 0n) {
-        try {
-          const { dismissJoinRequest } = await import("./approval");
-          await dismissJoinRequest(joinRequest.chatId, joinRequest.userId);
-        } catch (error) {
-          console.warn("Failed to dismiss join request after max attempts:", error);
+      const failureLine = `${settings?.failureText ?? "❌ 验证码错误，请重试。"}\n错误原因：${verdict.reason}\n尝试次数已达上限，本次验证已失效，请重新申请加群。`;
+      if (channel === "group" && joinRequest.requestType !== "simulator") {
+        // 群内渠道：用户此刻已在群内（bootstrap 阶段已自动批准入群），
+        // 失效动作必须是「删提示 + 群内告知 + 踢出」，而不是拒绝尚未处理的加群申请
+        await failGroupVerification({
+          chatId: joinRequest.chatId,
+          userId: joinRequest.userId,
+          token: session.token,
+          requestType: joinRequest.requestType,
+          reason: verdict.reason,
+          notifyDm: false,
+        });
+      } else {
+        await expireVerificationSession(session.token);
+        await rejectJoinRequest(session.token);
+        if (joinRequest.requestType === "telegram" && joinRequest.chatId !== 0n) {
+          try {
+            const { dismissJoinRequest } = await import("./approval");
+            await dismissJoinRequest(joinRequest.chatId, joinRequest.userId);
+          } catch (error) {
+            console.warn("Failed to dismiss join request after max attempts:", error);
+          }
         }
       }
       return {
         outcome: "failed_expired",
-        replyText: `${settings?.failureText ?? "❌ 验证码错误，请重试。"}\n错误原因：${verdict.reason}\n尝试次数已达上限，本次验证已失效，请重新申请加群。`,
+        replyText: failureLine,
         reason: verdict.reason,
         remaining: 0,
         reapplyChatId: joinRequest.chatId !== 0n ? joinRequest.chatId.toString() : null,
         joinRequestType: joinRequest.requestType,
+        channel,
       };
     }
     return {
@@ -182,6 +207,7 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
       replyText: `${settings?.failureText ?? "❌ 验证码错误，请重试。"}\n错误原因：${verdict.reason}\n剩余尝试次数：${remaining}`,
       reason: verdict.reason,
       remaining,
+      channel,
     };
   }
 
@@ -204,6 +230,15 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
       ? "仿真环境：已直接批准加群申请（跳过 Telegram API 调用）"
       : "仿真环境：加群申请状态更新失败";
     console.log(`Simulator join request auto-approved for token ${session.token.slice(0, 8)}...`);
+  } else if (channel === "group") {
+    // 群内渠道（v2.1.0）：用户已在群内，落库批准 + 解禁 + 删除群内验证提示 + 群内欢迎。
+    // 绝不调用 approveChatJoinRequest —— bootstrap 已自动批准，重复批准会返回 400。
+    const completion = await completeGroupJoinVerification(session.token);
+    approved = completion.success;
+    if (!completion.success) {
+      approvalNote = completion.error;
+      console.warn(`Group verification completion failed: ${completion.error}`);
+    }
   } else if (joinRequest.requestType === "direct") {
     // 直连入群路径（v1.1.3）：用户已物理在群内，无需 Telegram 审批，落库标记通过 + 私聊祝贺
     const completion = await completeDirectJoinVerification(session.token);
@@ -226,6 +261,7 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
     replyText: settings?.successText ?? "✅ 验证成功，欢迎加入！",
     approved,
     approvalNote,
+    channel,
   };
 }
 

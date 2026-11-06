@@ -6,6 +6,7 @@ import {
   kickUnverifiedMember,
   notifyVerificationExpired,
 } from "@/services/approval";
+import { failGroupVerification } from "@/services/group-verification";
 
 export const CLEANUP_INTERVAL_SECONDS = 60;
 export const PURGE_INTERVAL_SECONDS = 24 * 60 * 60;
@@ -14,6 +15,27 @@ export async function cleanupAndDismissExpiredRequests(): Promise<void> {
   try {
     const expiredTargets = await cleanupExpiredSessions();
     for (const target of expiredTargets) {
+      // v2.1.0 群内渠道：用户已在群内（bootstrap 自动批准），超时动作必须是
+      // 「删群内提示 + 群内告知 + 踢出」——而不是拒绝一条早已被批准的加群申请
+      if (target.channel === "group") {
+        try {
+          await failGroupVerification({
+            chatId: target.chatId,
+            userId: target.userId,
+            token: target.token,
+            requestType: target.requestType,
+            reason: "验证超时",
+            notifyDm: true,
+          });
+        } catch (error) {
+          console.warn(
+            `Group-channel expiry handling failed for user ${target.userId} (chat ${target.chatId}):`,
+            error,
+          );
+        }
+        continue;
+      }
+
       let groupActionOk = false;
       try {
         if (target.requestType === "direct") {

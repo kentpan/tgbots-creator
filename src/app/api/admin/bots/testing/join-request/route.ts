@@ -14,6 +14,7 @@ import {
 } from "@/database/operations";
 import { generateJoinCode, generateVerificationToken } from "@/utils/crypto";
 import { parseCodeApiConfig, type CodeApiConfig } from "@/services/external-verify";
+import { buildGroupPromptPlainText, buildOptionCodes } from "@/services/group-verification";
 
 /** 仿真屏使用的固定模拟用户（与仿真屏模板变量保持一致） */
 export const SIMULATED_USER_ID = 777000n;
@@ -145,7 +146,6 @@ export async function POST(request: Request): Promise<NextResponse> {
   }
 
   let settings: GroupSettingsRow | null = await getGroupSettings(chatId);
-
   if (settings && !settings.enabled) {
     return NextResponse.json({ ok: false, error: "该群组验证已停用" }, { status: 400 });
   }
@@ -218,13 +218,18 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.json({ ok: false, error: "该群组尚未配置验证设置" }, { status: 404 });
   }
 
+  // v2.1.0 验证渠道：group=群内验证（默认真实流程）/ dm=私聊验证（旧版仿真行为）
+  const channel: "group" | "dm" = settings.verifyChannel === "dm" ? "dm" : "group";
+  const origin = new URL(request.url).origin;
+
   // v1.1.7：code_self（自动验证码）仿真 —— 与真实 bootstrap（chat-member.ts）一致：
-  // 生成验证码随会话落库，含验证码的完整提示文案回传仿真屏私聊气泡；
-  // 提交校验走同一 evaluateSubmittedCode 管道（本地比对），行为逐字一致
+  // 生成验证码随会话落库；群内渠道下再生成 4 选 1 候选按钮（含正确码），
+  // 提交校验走同一 evaluateSubmittedCode 管道，行为逐字一致
   if (settings.method === "code_self") {
     const joinCode = generateJoinCode();
     const token = generateVerificationToken();
     const expiresAt = new Date(Date.now() + settings.timeoutSeconds * 1000);
+    const optionCodes = channel === "group" ? buildOptionCodes(joinCode) : null;
 
     const joinRequest = await createJoinRequest({
       userId: SIMULATED_USER_ID,
@@ -245,12 +250,14 @@ export async function POST(request: Request): Promise<NextResponse> {
       expiresAt,
       method: "code_self",
       expectedCode: joinCode,
+      channel,
+      optionCodes,
     });
     if (!session) {
       return NextResponse.json({ ok: false, error: "创建验证会话失败" }, { status: 500 });
     }
     console.log(
-      `Simulator join request created (code_self): user ${SIMULATED_USER_ID} -> chat ${chatId}`,
+      `Simulator join request created (code_self, channel=${channel}): user ${SIMULATED_USER_ID} -> chat ${chatId}`,
     );
 
     // 提示文案与真实私聊消息（verification-prompt.ts buildCodeSelfPromptHTML）逐字一致（纯文本形态）
@@ -259,6 +266,19 @@ export async function POST(request: Request): Promise<NextResponse> {
       `${settings.promptText ?? "🔐 请回复本消息并输入验证码完成验证"}\n\n` +
       `您的入群验证码：${joinCode}\n\n` +
       `⏱ 验证码 ${minutes} 分钟内有效，请回复本消息并输入上述验证码完成验证，验证通过后将自动批准入群。请勿把验证码泄露给他人。`;
+
+    const groupPromptText =
+      channel === "group"
+        ? buildGroupPromptPlainText({
+            chatId,
+            userId: SIMULATED_USER_ID,
+            displayName: "预览 用户",
+            chatTitle: settings.chatTitle,
+            method: "code_self",
+            expiresAt,
+            optionCodes,
+          })
+        : null;
 
     return NextResponse.json({
       ok: true,
@@ -277,6 +297,10 @@ export async function POST(request: Request): Promise<NextResponse> {
         method_id: "",
         method_name: "自动验证码（输入验证码加群）",
         expected_code: joinCode,
+        verify_channel: channel,
+        option_codes: optionCodes,
+        group_prompt_text: groupPromptText,
+        verify_url: null,
       },
     });
   }
@@ -314,15 +338,19 @@ export async function POST(request: Request): Promise<NextResponse> {
     chatId,
     expiresAt,
     method: "code_api",
+    channel,
   });
   if (!session) {
     return NextResponse.json({ ok: false, error: "创建验证会话失败" }, { status: 500 });
   }
 
-  console.log(`Simulator join request created: user ${SIMULATED_USER_ID} -> chat ${chatId}`);
+  console.log(
+    `Simulator join request created (code_api, channel=${channel}): user ${SIMULATED_USER_ID} -> chat ${chatId}`,
+  );
 
-  // 隐私红线（v1.1.3）：仿真动作一律只停留在仿真屏，绝不真实发送到群组 ——
-  // 验证提示/结果只会通过机器人私聊发送给真实用户，群组内不允许出现验证消息。
+  // 隐私红线：仿真动作一律只停留在仿真屏，绝不真实发送到群组；
+  // 群内渠道的「群内验证消息」由仿真屏按 group_prompt_text + verify_url 渲染气泡。
+  const verifyUrl = channel === "group" ? `${origin}/verify?token=${token}` : null;
 
   return NextResponse.json({
     ok: true,
@@ -340,6 +368,21 @@ export async function POST(request: Request): Promise<NextResponse> {
       expires_at: expiresAt.toISOString(),
       method_id: String(settings.methodId),
       method_name: method.name,
+      verify_channel: channel,
+      option_codes: null,
+      group_prompt_text:
+        channel === "group"
+          ? buildGroupPromptPlainText({
+              chatId,
+              userId: SIMULATED_USER_ID,
+              displayName: "预览 用户",
+              chatTitle: settings.chatTitle,
+              method: "code_api",
+              expiresAt,
+              optionCodes: null,
+            })
+          : null,
+      verify_url: verifyUrl,
     },
   });
 }

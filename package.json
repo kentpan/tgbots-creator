@@ -11,7 +11,9 @@
     "db:init": "tsx scripts/db-init.ts",
     "seed:commands": "tsx scripts/seed-builtin-commands.ts",
     "db:export": "tsx scripts/export-schema.ts > prisma/schema.sql",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:group-verify": "tsx scripts/test-group-verify-flow.ts",
+    "test:d1-quota": "tsx scripts/test-d1-quota.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

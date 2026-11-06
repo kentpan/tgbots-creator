@@ -192,6 +192,26 @@ function GroupFormDialog({
         defaultChecked={group ? group.privacyMode : true}
         id={`privacy-${group?.chatId ?? "new"}`}
       />
+      {/* v2.1.0 验证渠道：默认群内验证（真实流程），可切回旧版私聊验证 */}
+      <div className="space-y-1">
+        <label className={labelClass} htmlFor={`channel-${group?.chatId ?? "new"}`}>
+          验证渠道
+        </label>
+        <select
+          id={`channel-${group?.chatId ?? "new"}`}
+          name="verify_channel"
+          defaultValue={group?.verifyChannel ?? "group"}
+          className={inputClass}
+        >
+          <option value="group">群内验证（默认）：自动批准进群 → 禁言 → 群内验证消息</option>
+          <option value="dm">私聊验证：验证提示与结果全部走私聊，群内不出现验证消息</option>
+        </select>
+        <p className="text-xs text-muted-foreground">
+          群内验证下：人机验证 / 外部 API 卡密通过群内按钮打开网页输码（群友看不到输入内容）；
+          自动验证码在群内给 4 选 1 数字按钮；群聊中的明文验证码会被机器人忽略并删除。
+          超时或失败会删除群内提示、群内告知并移出群组（可重新申请）。
+        </p>
+      </div>
     </FormDialog>
   );
 }

@@ -61,8 +61,11 @@ export function getBot(context?: BotResolutionContext): Bot {
  * 2. 无绑定 / token 为空 → 回落主 bot getBot()（保持旧行为兼容）；
  * 3. 主 bot 也无 token → getBot() 抛出带场景/chatId/userId 的错误（禁止吞错、禁止静默跳过）。
  */
-async function resolveBotForChat(scenario: string, chatId: bigint, userId: bigint): Promise<Bot> {
-  const binding = await getActiveBotForChat(chatId);
+export async function resolveBotForChat(
+  scenario: string,
+  chatId: bigint,
+  userId: bigint,
+): Promise<Bot> {  const binding = await getActiveBotForChat(chatId);
   const boundToken = binding?.token.trim() ?? "";
   if (binding && boundToken) {
     const { botByToken } = await import("./telegram-sync");

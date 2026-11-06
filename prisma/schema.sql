@@ -32,7 +32,7 @@ CREATE TABLE "verification_sessions" (
     "method" TEXT NOT NULL DEFAULT 'captcha',
     "attempts" INTEGER NOT NULL DEFAULT 0,
     "expected_code" TEXT
-);
+, "channel" TEXT NOT NULL DEFAULT 'dm', "group_message_id" INTEGER, "option_codes" TEXT);
 CREATE TABLE "user_stats" (
     "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "user_id" BIGINT NOT NULL,
@@ -108,7 +108,7 @@ CREATE TABLE "group_settings" (
     "enabled" BOOLEAN NOT NULL DEFAULT true,
     "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-, "privacy_mode" BOOLEAN NOT NULL DEFAULT true, "require_approval" BOOLEAN NOT NULL DEFAULT false);
+, "privacy_mode" BOOLEAN NOT NULL DEFAULT true, "require_approval" BOOLEAN NOT NULL DEFAULT false, "verify_channel" TEXT NOT NULL DEFAULT 'group');
 CREATE TABLE "verification_methods" (
     "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "name" TEXT NOT NULL,
@@ -251,6 +251,12 @@ CREATE TABLE "bot_sessions" (
       "value" TEXT NOT NULL DEFAULT '{}',
       "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+-- v2.2.0 D1 免费额度保护：加群申请状态计数器（增量维护，替代全表 GROUP BY）
+CREATE TABLE "stats_counters" (
+      "name" TEXT NOT NULL PRIMARY KEY,
+      "value" INTEGER NOT NULL DEFAULT 0,
+      "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
 CREATE UNIQUE INDEX "admin_users_username_key" ON "admin_users"("username");
 CREATE UNIQUE INDEX "bot_commands_type_name_key" ON "bot_commands"("type", "name");
 CREATE UNIQUE INDEX "bot_sessions_scope_key" ON "bot_sessions"("scope", "session_key");
@@ -276,4 +282,22 @@ CREATE UNIQUE INDEX "user_stats_user_id_key" ON "user_stats"("user_id");
 CREATE UNIQUE INDEX "verification_methods_name_key" ON "verification_methods"("name");
 CREATE UNIQUE INDEX "verification_sessions_token_key" ON "verification_sessions"("token");
 CREATE UNIQUE INDEX "verify_codes_code_key" ON "verify_codes"("code");
+-- ── v2.2.0 D1 读取额度优化：补齐缺失索引 ────────────────────────────────
+-- 1) 加群申请列表分页 ORDER BY request_time DESC（旧库无索引 → 每次全表扫 + 排序）
+--    复合 (request_time, status) 同时服务「今日统计」的当天范围扫描。
+CREATE INDEX "idx_join_requests_request_time_status" ON "join_requests"("request_time", "status");
+-- 2) 按「群 + 状态」查 pending（群内验证防重复 bootstrap、群组页未读徽章）
+CREATE INDEX "idx_join_requests_chat_status" ON "join_requests"("chat_id", "status");
+-- 3) 按「用户 + 状态」查最近申请
+CREATE INDEX "idx_join_requests_user_status" ON "join_requests"("user_id", "status");
+-- 4) 过期会话清理 WHERE expires_at < ? AND captcha_completed = 0（旧库无索引 → 每分钟全表扫）
+CREATE INDEX "idx_verification_sessions_expires_at" ON "verification_sessions"("expires_at");
+-- 5) 归档删除 WHERE created_time < ?
+CREATE INDEX "idx_verification_sessions_created_time" ON "verification_sessions"("created_time");
+-- 6) 会话按「用户 + 群」定位（群内验证 bootstrap 去重）
+CREATE INDEX "idx_verification_sessions_user_chat" ON "verification_sessions"("user_id", "chat_id");
+-- 7) 群维度会话查询
+CREATE INDEX "idx_verification_sessions_chat_id" ON "verification_sessions"("chat_id");
+-- 8) 群组↔机器人关联按群反查
+CREATE INDEX "idx_group_bot_admins_chat_id" ON "group_bot_admins"("chat_id");
 COMMIT;

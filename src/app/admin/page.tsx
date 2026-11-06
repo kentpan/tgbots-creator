@@ -3,6 +3,7 @@ import {
   getDatabaseInfo,
 } from "@/database/client";
 import { getKv, getStorage } from "@/database/bindings";
+import { getD1Usage } from "@/database/d1-metrics";
 import {
   getGlobalStats,
   listJoinRequests,
@@ -46,6 +47,15 @@ export default async function AdminDashboardPage({
 
   const kvKind = getKv().kind;
   const storageKind = getStorage().kind;
+  // v2.2.0：D1 免费额度（500 万行读/天）用量看板 —— 事故后一眼可见「还剩多少」
+  const d1Usage = getD1Usage();
+  const readPercent = Math.min(100, d1Usage.readPercent);
+  const usageTone =
+    readPercent >= 80
+      ? "text-red-600"
+      : readPercent >= 60
+        ? "text-amber-600"
+        : "text-muted-foreground";
 
   const cards = [
     { label: "总验证请求", value: stats?.total_requests ?? 0, icon: "📈" },
@@ -161,6 +171,53 @@ export default async function AdminDashboardPage({
                   {(stats?.today_approval_rate ?? 0).toFixed(1)}%
                 </span>
               </div>
+            </div>
+          </div>
+
+          <div className="rounded-xl border bg-card p-4">
+            <h2 className="mb-3 text-sm font-semibold">D1 读取额度（本实例）</h2>
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">今日已读</span>
+                <span className={`font-medium ${usageTone}`}>
+                  {d1Usage.rowsRead.toLocaleString()} 行
+                </span>
+              </div>
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                <div
+                  className={`h-full ${readPercent >= 80 ? "bg-red-500" : readPercent >= 60 ? "bg-amber-500" : "bg-emerald-500"}`}
+                  style={{ width: `${readPercent}%` }}
+                />
+              </div>
+              <div className="flex justify-between text-sm text-muted-foreground">
+                <span>免费额度占比</span>
+                <span>
+                  {readPercent.toFixed(2)}% / 上限{" "}
+                  {Math.round(d1Usage.readLimitFree / 10_000)} 万行
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">今日已写</span>
+                <span className="font-medium">
+                  {d1Usage.rowsWritten.toLocaleString()} 行
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">读缓存命中率</span>
+                <span className="font-medium">{d1Usage.cacheHitRate.toFixed(1)}%</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">省电模式</span>
+                <span className="font-medium">
+                  {d1Usage.frugalMode ? "已开启（缓存 TTL ×6）" : "未开启"}
+                </span>
+              </div>
+              <p className="pt-1 text-sm text-muted-foreground">
+                计量为 isolate 维度，仅供归因；完整排行见{" "}
+                <Link href="/api/admin/diagnostics/d1" className="text-primary hover:underline">
+                  /api/admin/diagnostics/d1
+                </Link>
+              </p>
             </div>
           </div>
 

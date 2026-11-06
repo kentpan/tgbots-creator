@@ -47,6 +47,13 @@ export async function saveGroupAction(formData: FormData): Promise<void> {
     failureText: String(formData.get("failure_text") ?? "").trim() || undefined,
     enabled: formData.get("enabled") === "1",
     privacyMode: formData.get("privacy_mode") !== "0",
+    // v2.1.0 验证渠道：表单未提供时保持现值（undefined = 不改动）
+    verifyChannel:
+      String(formData.get("verify_channel") ?? "").trim() === "dm"
+        ? "dm"
+        : String(formData.get("verify_channel") ?? "").trim() === "group"
+          ? "group"
+          : undefined,
   });
 
   const requestHeaders = await headers();
