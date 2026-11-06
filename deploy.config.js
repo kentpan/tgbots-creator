@@ -87,7 +87,12 @@ export default deployConfig;
 
 // GitHub Actions 所需 secrets(在仓库 Settings → Secrets and variables → Actions 配置):
 //   CLOUDFLARE_API_TOKEN     — 必填, 部署权限(需 Pages:Edit + D1:Edit + Workers KV Storage:Edit
-//                              + Workers R2 Storage:Edit + Account Settings:Read)
+//                              + Workers R2 Storage:Edit + Account Settings:Read
+//                              + Account Analytics:Read[可选, Dashboard D1 用量指标])
+//                              本 token 同时作为运行时默认值 TG_D1_API_TOKEN 注入(v2.0.7):
+//                              系统设置 → BOT 数据存储的外部存储 D1 配置(account_id /
+//                              database_id / api_token)在未配置字段自动回退到部署默认值,
+//                              已保存的配置不受影响。
 //   CLOUDFLARE_ACCOUNT_ID    — 可选, 账号 ID(单账号 Token 可留空自动探测)
 //   TELEGRAM_WEBHOOK_SECRET  — 可选, /api/telegram/webhook 校验密钥(与本地 .env 一致)
 //   ADMIN_SECRET / JWT_SECRET — 可选(历史遗留; TGuard 登录鉴权存于数据库, 不依赖这两个 secret,

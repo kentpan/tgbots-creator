@@ -1203,18 +1203,6 @@ jobs:
             // 必需键: NODE_ENV; 其余键按"配置了才校验"口径(可选 secrets 未配置即不算缺失)
             const NEED = ['NODE_ENV'];
             const OPTIONAL = ['ADMIN_SECRET', 'JWT_SECRET', 'TELEGRAM_WEBHOOK_SECRET'];
-            // v2.0.7 D1 默认值三键: 源值分别在 CLOUDFLARE_ACCOUNT_ID / D1_ID / CLOUDFLARE_API_TOKEN
-            const DEFAULTS_EXPECTED = {
-              TG_D1_ACCOUNT_ID: Boolean(process.env.CLOUDFLARE_ACCOUNT_ID),
-              TG_D1_DATABASE_ID: Boolean(process.env.D1_ID),
-              TG_D1_API_TOKEN: Boolean(process.env.CLOUDFLARE_API_TOKEN),
-            };
-            for (const [k, configured] of Object.entries(DEFAULTS_EXPECTED)) {
-              if (configured && !vars[k]) {
-                console.error(`::error::[${envName}] 缺少 env_vars.${k}(D1 默认值注入失败)`);
-                failed = true;
-              }
-            }
             const mask = (v) => {
               const s = String(v == null ? '' : v);
               const at = s.indexOf('@');
@@ -1244,6 +1232,21 @@ jobs:
               for (const k of OPTIONAL) {
                 if (process.env[k] && !vars[k]) {
                   console.error(`::error::[${envName}] 缺少 env_vars.${k}(secret 已配置但未注入成功)`);
+                  failed = true;
+                }
+              }
+              // v2.0.7 D1 默认值三键: 源值分别在 CLOUDFLARE_ACCOUNT_ID / D1_ID / CLOUDFLARE_API_TOKEN
+              // (PATCH 侧 TG_D1_API_TOKEN 无条件注入; TG_D1_ACCOUNT_ID/TG_D1_DATABASE_ID 配置了才注入)
+              // ⚠ 此块必须在 per-env 循环内(vars/envName 在此才可见), v2.0.8 曾误置于循环外
+              //   导致 ReferenceError: vars is not defined, 部署 0 秒中断(2026-11-06 事故)。
+              const DEFAULTS_EXPECTED = {
+                TG_D1_ACCOUNT_ID: Boolean(process.env.CLOUDFLARE_ACCOUNT_ID),
+                TG_D1_DATABASE_ID: Boolean(process.env.D1_ID),
+                TG_D1_API_TOKEN: Boolean(process.env.CLOUDFLARE_API_TOKEN),
+              };
+              for (const [k, configured] of Object.entries(DEFAULTS_EXPECTED)) {
+                if (configured && !vars[k]) {
+                  console.error(`::error::[${envName}] 缺少 env_vars.${k}(D1 默认值注入失败)`);
                   failed = true;
                 }
               }
