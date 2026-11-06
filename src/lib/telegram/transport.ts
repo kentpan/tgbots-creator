@@ -22,6 +22,21 @@
  *   直连连续 2 次失败（网络不可达环境）后熔断 10 分钟，期间不再白等直连超时
  *   （v1.2.0：实测沙箱直连 api.telegram.org 被墙，原实现每次失败路径多等 8s）
  *
+ * v2.0.4 edge（Cloudflare Pages/Workers workerd）出站加固：
+ * - grammY 的 node 平台层（out/platform.node.js）会给每次 fetch 注入 Node 专属
+ *   init（agent: node:https.Agent / compress / duplex），shim.node.js 又以
+ *   abort-controller npm polyfill 构造 signal —— 这些对象经 workerd 原生 fetch
+ *   转发属于未定义行为（实测本地 wrangler 可容忍，线上边缘 workerd 版本更新、
+ *   校验更严，出现过「Network connection lost.」级别的直连失败）。
+ *   因此 edge 路径对 init 做**白名单重建**：仅保留 method/headers/body，
+ *   signal 一律经 toNativeSignal 桥接为原生 AbortSignal。
+ * - edge 回退链：直连 →（失败）→ 系统设置代理（开启且配置了地址时）→（失败）→
+ *   直连重试一次（全新连接）。直连仍是 edge 的默认与首选（v2.0.2 语义不变），
+ *   代理只在直连网络层失败后作为救命通道出现。
+ * - 失败诊断：整条链路的每次尝试（路径/耗时/错误消息）附着到最终抛出的错误
+ *   （tgOutbound 字段），describeSyncError 会将其转成人话附在管理端错误信息里，
+ *   线上不再只剩一句「网络不可达」。
+ *
  * 接入方式：
  * - grammY：telegramBotClientOptions() 已注入 client.fetch（grammY 在 Node 下默认用
  *   node-fetch，不经过 globalThis.fetch，必须显式注入）
@@ -105,9 +120,10 @@ function isNodeRuntime(): boolean {
 const PROXY_CONFIG_TTL_MS = 15000;
 let proxyRefreshInFlight: Promise<void> | null = null;
 
-/** 从系统设置刷新代理配置（15s 节流 + 并发去重；DB 不可用时保持默认/上次值） */
+/** 从系统设置刷新代理配置（15s 节流 + 并发去重；DB 不可用时保持默认/上次值）。
+ *  v2.0.4：edge 也允许读取 —— edge 直连失败后的代理回退通道需要同一份配置；
+ *  DB 读取失败时保持默认值（内置代理），不影响直连主路径 */
 export async function ensureTelegramProxyConfig(): Promise<void> {
-  if (!isNodeRuntime()) return;
   const current = proxyState();
   if (Date.now() - current.loadedAt < PROXY_CONFIG_TTL_MS) return;
   if (proxyRefreshInFlight) return proxyRefreshInFlight;
@@ -199,51 +215,6 @@ function toNativeSignal(signal: unknown): AbortSignal | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// edge/workerd 请求初始化归一
-// ---------------------------------------------------------------------------
-
-/**
- * hop-by-hop 头：由 HTTP 连接层管理，workerd 的 fetch 不接受调用方设置
- * （grammY 的 JSON 载荷固定带 connection: keep-alive，直连 edge 时会被拒）。
- */
-const HOP_BY_HOP_HEADERS = [
-  "connection",
-  "keep-alive",
-  "proxy-connection",
-  "transfer-encoding",
-  "upgrade",
-  "te",
-  "trailer",
-] as const;
-
-function stripHopByHop(headers: Headers): Headers {
-  for (const name of HOP_BY_HOP_HEADERS) headers.delete(name);
-  return headers;
-}
-
-/**
- * edge/workerd 请求初始化归一（仅非 Node 运行时调用）：
- * - 剥离 Node 专属字段 agent / compress（workerd 无 Node http 连接池概念，
- *   grammY 的 baseFetchConfig 仍会塞 Node https.Agent，属无效且易触发
- *   半开连接复用的 "Network connection lost"）
- * - signal 桥接为原生 AbortSignal（grammY 用 abort-controller polyfill，
- *   workerd 只接受原生实例）
- * - 剥离 hop-by-hop 头
- */
-export function normalizeEdgeInit(init?: RequestInit): RequestInit | undefined {
-  if (!init) return undefined;
-  const source = init as RequestInit & { agent?: unknown; compress?: unknown };
-  const normalized: RequestInit = { ...source };
-  delete (normalized as { agent?: unknown }).agent;
-  delete (normalized as { compress?: unknown }).compress;
-  const nativeSignal = toNativeSignal(source.signal);
-  if (nativeSignal) normalized.signal = nativeSignal;
-  else delete (normalized as { signal?: AbortSignal }).signal;
-  if (source.headers) normalized.headers = stripHopByHop(new Headers(source.headers));
-  return normalized;
-}
-
-// ---------------------------------------------------------------------------
 // 代理 fetch
 // ---------------------------------------------------------------------------
 
@@ -255,31 +226,224 @@ function underlying(): typeof fetch {
 
 const globalForPatch = globalThis as unknown as { tguardProxyFetchInstalled?: boolean };
 
+// ---------------------------------------------------------------------------
+// 出站诊断（v2.0.4）：每次出站尝试（直连/代理）的路径、耗时与错误消息，
+// 附着到最终抛出的错误对象（tgOutbound 字段），供 describeSyncError 透出
+// ---------------------------------------------------------------------------
+
+export interface TgOutboundAttempt {
+  /** direct=直连；proxy=系统设置代理；direct-retry=直连重试（全新连接） */
+  path: "direct" | "proxy" | "direct-retry";
+  ms: number;
+  /** 网络层错误消息（不含 token，可安全透出） */
+  error?: string;
+}
+
+export interface TgOutboundDiagnostics {
+  runtime: "node" | "edge/workerd";
+  userAgent: string | null;
+  /** 上游 API origin（不含 token，可安全透出） */
+  targetOrigin: string;
+  attempts: TgOutboundAttempt[];
+  elapsedMs: number;
+}
+
+type TgOutboundErrorLike = { tgOutbound?: TgOutboundDiagnostics };
+
+function outboundErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message || error.name;
+  return String(error);
+}
+
+function attachOutboundDiagnostics(
+  error: unknown,
+  diagnostics: Omit<TgOutboundDiagnostics, "elapsedMs"> & { elapsedMs: number },
+): void {
+  if (error && typeof error === "object") {
+    try {
+      (error as TgOutboundErrorLike).tgOutbound = diagnostics;
+    } catch {
+      // 只读错误对象（极罕见）：诊断丢失不影响主错误抛出
+    }
+  }
+}
+
+/** 解析出站目标 origin（诊断用；解析失败返回 "unknown"，绝不包含 token） */
+function outboundTargetOrigin(input: RequestInfo | URL): string {
+  try {
+    const href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    return new URL(href).origin;
+  } catch {
+    return "unknown";
+  }
+}
+
+/** 尝试类型与超时：getUpdates 长轮询（30s 上游）给 35s，其余 20s */
+function attemptTimeoutMsFor(href: string): number {
+  const method = /\/bot[^/]+\/([A-Za-z0-9_]+)/.exec(new URL(href).pathname)?.[1] ?? "";
+  return method === "getUpdates" ? 35000 : 20000;
+}
+
+/** 把调用方 signal 桥接到本次尝试的 AbortController（任一触发即中止本次请求） */
+function linkSourceSignal(
+  sourceSignal: AbortSignal | undefined,
+  controller: AbortController,
+  reason?: unknown,
+): void {
+  if (!sourceSignal) return;
+  if (sourceSignal.aborted) {
+    controller.abort(reason ?? sourceSignal.reason);
+    return;
+  }
+  sourceSignal.addEventListener("abort", () => controller.abort(reason ?? sourceSignal.reason), {
+    once: true,
+  });
+}
+
+/**
+ * edge（workerd）出站：直连 → 代理回退 → 直连重试。
+ *
+ * init 白名单重建的原因（v2.0.4）：grammY node 平台层注入的 agent（node:https.Agent）、
+ * compress、duplex 与 abort-controller polyfill signal 在 workerd 原生 fetch 上属于
+ * 未定义行为（本地 wrangler 容忍 ≠ 线上边缘 workerd 容忍）。白名单只保留
+ * method/headers/body，signal 经 toNativeSignal 桥接为原生 AbortSignal。
+ */
+async function edgeTelegramFetch(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+): Promise<Response> {
+  const startedAt = Date.now();
+  const runtime = "edge/workerd" as const;
+  const userAgent = typeof navigator !== "undefined" ? navigator.userAgent ?? null : null;
+  const targetOrigin = outboundTargetOrigin(input);
+  const attempts: TgOutboundAttempt[] = [];
+
+  // 调用方 signal（grammY 传入的可能是 polyfill）→ 原生 signal，一次桥接多处复用
+  const sourceSignal = toNativeSignal(init?.signal);
+  // init 白名单重建一次，全程复用（method/headers/body 均来自调用方或 Request 原语）
+  const sanitized = buildEdgeSanitizedInit(input, init);
+  const requestHref =
+    typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+
+  /** 单次尝试：独立超时 + 调用方 signal 联动 */
+  const attempt = async (path: TgOutboundAttempt["path"], url: string, attemptInit: RequestInit): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(new Error(`请求超时（${attemptTimeoutMsFor(url) / 1000}s，${path}）`)),
+      attemptTimeoutMsFor(url),
+    );
+    if (typeof timer === "object" && timer && "unref" in timer) {
+      (timer as { unref: () => void }).unref();
+    }
+    linkSourceSignal(sourceSignal, controller);
+    try {
+      return await underlying()(url, { ...attemptInit, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  // ① 直连（edge 默认传输：直连优先，v2.0.2 语义不变）
+  const directStartedAt = Date.now();
+  try {
+    return await attempt("direct", requestHref, sanitized);
+  } catch (directError) {
+    attempts.push({ path: "direct", ms: Date.now() - directStartedAt, error: outboundErrorMessage(directError) });
+    if (sourceSignal?.aborted) throw directError; // 调用方主动取消：不再回退
+  }
+
+  // ② 代理回退：仅当目标为上游 Bot API 且系统设置开启代理并配置了地址
+  const proxyStartedAt = Date.now();
+  try {
+    const rewrite = await resolveEdgeProxyRewrite(input);
+    if (rewrite) {
+      const headers = new Headers(sanitized.headers ?? undefined);
+      if (rewrite.authHeader) headers.set("Authorization", rewrite.authHeader);
+      return await attempt("proxy", rewrite.url, { ...sanitized, headers });
+    }
+  } catch (proxyError) {
+    attempts.push({ path: "proxy", ms: Date.now() - proxyStartedAt, error: outboundErrorMessage(proxyError) });
+  }
+
+  // ③ 直连重试一次（全新连接 —— workerd/网关空闲时半关 keep-alive 连接，
+  //    复用半开连接会立即失败，换新连接即可恢复；实测呈「成功/失败交替」规律）
+  const retryStartedAt = Date.now();
+  try {
+    return await attempt("direct-retry", requestHref, sanitized);
+  } catch (retryError) {
+    attempts.push({ path: "direct-retry", ms: Date.now() - retryStartedAt, error: outboundErrorMessage(retryError) });
+    const error = retryError instanceof Error ? retryError : new Error(String(retryError));
+    attachOutboundDiagnostics(error, { runtime, userAgent, targetOrigin, attempts, elapsedMs: Date.now() - startedAt });
+    throw error;
+  }
+}
+
+/** edge init 白名单重建：剥离 agent/compress/duplex 等 Node 专属字段，桥接原生 signal */
+function buildEdgeSanitizedInit(input: RequestInfo | URL, init: RequestInit | undefined): RequestInit {
+  const request = typeof input === "object" && !(input instanceof URL) ? (input as Request) : null;
+  const method = init?.method ?? request?.method ?? "GET";
+  const explicitBody = init && init.body !== undefined && init.body !== null;
+  const sanitized: RequestInit = {
+    method,
+    headers: init?.headers ?? request?.headers ?? undefined,
+    signal: undefined, // 由各 attempt 统一注入 attemptController.signal
+  };
+  if (explicitBody) sanitized.body = init.body;
+  return sanitized;
+}
+
+/** edge 代理回退地址解析：仅上游 Bot API 请求且系统设置开启代理时返回改写地址 */
+async function resolveEdgeProxyRewrite(
+  input: RequestInfo | URL,
+): Promise<{ url: string; authHeader: string | null } | null> {
+  let href: string;
+  try {
+    href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  } catch {
+    return null;
+  }
+  let target: URL;
+  let upstream: URL;
+  try {
+    target = new URL(href);
+    upstream = new URL(telegramUpstreamRoot());
+  } catch {
+    return null;
+  }
+  if (target.origin !== upstream.origin || !isBotApiPath(target.pathname)) return null;
+
+  await ensureTelegramProxyConfig();
+  const config = proxyState();
+  if (!config.enabled || !config.url.trim()) return null;
+  const parts = splitProxyAuth(config.url);
+  if (!parts) return null;
+  return {
+    url: applyProxyPrefix(parts.cleanPrefix, telegramUpstreamRoot()) + target.pathname + target.search,
+    authHeader: parts.authHeader,
+  };
+}
+
 /**
  * Telegram 代理 fetch：改写上游 Bot API 请求到代理前缀并注入 Basic 鉴权，
  * 网络层失败自动回退直连；非上游请求原样透传。幂等可复用。
  */
 export function telegramProxyFetch(): typeof fetch {
   const proxyFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const nodeRuntime = isNodeRuntime();
-    /** 直连透传：edge/workerd 必须先归一 init（Node 专属字段/非原生 signal/hop-by-hop 头） */
-    const passthrough = (): Promise<Response> =>
-      underlying()(input as Request, nodeRuntime ? init : normalizeEdgeInit(init));
-    // v2.0.2：非 Node 运行时（edge/workerd）恒直连 —— 代理体系（Basic 鉴权头/
-    // undici 连接池）只属于 Node 形态，edge 出站绝不改写到代理前缀
-    if (!nodeRuntime) return passthrough();
+    // v2.0.4：edge/workerd 出站 —— init 白名单重建 + 直连→代理→直连重试回退链
+    // （直连恒为默认与首选；代理仅作直连网络层失败后的救命通道）
+    if (!isNodeRuntime()) return edgeTelegramFetch(input, init);
     // 解析请求 URL（支持 string / URL / Request 三种形态）
     let href: string;
     try {
       href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     } catch {
-      return passthrough();
+      return underlying()(input as Request, init);
     }
     let target: URL;
     try {
       target = new URL(href);
     } catch {
-      return passthrough();
+      return underlying()(input as Request, init);
     }
 
     // 只拦截上游 Bot API
@@ -287,22 +451,22 @@ export function telegramProxyFetch(): typeof fetch {
     try {
       upstream = new URL(telegramUpstreamRoot());
     } catch {
-      return passthrough();
+      return underlying()(input as Request, init);
     }
     if (target.origin !== upstream.origin || !isBotApiPath(target.pathname)) {
-      return passthrough();
+      return underlying()(input as Request, init);
     }
 
     await ensureTelegramProxyConfig();
     const config = proxyState();
     if (!config.enabled || !config.url.trim()) {
-      return passthrough();
+      return underlying()(input as Request, init);
     }
 
     const parts = splitProxyAuth(config.url);
     if (!parts) {
       console.warn("[telegram-proxy] 代理地址不合法，本次请求直连:", config.url);
-      return passthrough();
+      return underlying()(input as Request, init);
     }
 
     const finalUrl =
@@ -315,6 +479,19 @@ export function telegramProxyFetch(): typeof fetch {
     const aborted =
       init?.signal?.aborted === true ||
       (typeof input === "object" && !(input instanceof URL) && input.signal?.aborted === true);
+
+    // v2.0.4 出站诊断：整条失败链（代理→代理重试→直连）逐次记录，附到最终抛出的错误
+    const diagStartedAt = Date.now();
+    const diagAttempts: TgOutboundAttempt[] = [];
+    const attachDiag = (error: unknown): void => {
+      attachOutboundDiagnostics(error, {
+        runtime: "node",
+        userAgent: typeof navigator !== "undefined" ? navigator.userAgent ?? null : null,
+        targetOrigin: target.origin,
+        attempts: diagAttempts,
+        elapsedMs: Date.now() - diagStartedAt,
+      });
+    };
 
     // 分级超时：getUpdates 长轮询（30s）给 35s；其余调用 20s 硬上限。
     // v1.2.0：实测前缀代理网关延迟波动极大（5~13.5s），原 12s 上限会误杀
@@ -371,7 +548,11 @@ export function telegramProxyFetch(): typeof fetch {
     try {
       return await callViaProxy();
     } catch (firstError) {
-      if (aborted) throw firstError;
+      diagAttempts.push({ path: "proxy", ms: Date.now() - diagStartedAt, error: outboundErrorMessage(firstError) });
+      if (aborted) {
+        attachDiag(firstError);
+        throw firstError;
+      }
       const reason = firstError instanceof Error ? firstError.message : String(firstError);
       // 网络层失败先用全新连接重试一次（前缀代理/CF Workers 会在空闲时半关 keep-alive
       // 连接，undici 连接池复用半开连接会立即 ECONNRESET —— 换新连接即可成功，
@@ -379,13 +560,15 @@ export function telegramProxyFetch(): typeof fetch {
       // getUpdates 长轮询限 20s，避免直连不可达环境长时间挂起 grammY 调用）。
       try {
         return await callViaProxy();
-      } catch {
+      } catch (retryError) {
+        diagAttempts.push({ path: "proxy", ms: Date.now() - diagStartedAt, error: outboundErrorMessage(retryError) });
         console.warn("[telegram-proxy] 代理请求失败（重试后放弃，回退直连）:", reason);
         // v1.2.0 直连熔断：直连连续 2 次失败（网络不可达环境）后 10 分钟内
         // 不再尝试直连回退 —— 避免每次失败路径都白等 8s 直连超时，
         // 管理端操作的失败反馈从 25s+ 缩短到 20s 级
         const breaker = proxyState();
         if (Date.now() < breaker.directBlockedUntil) {
+          attachDiag(firstError);
           throw firstError;
         }
         const fallbackTimeoutMs = isLongPoll ? 20000 : 8000;
@@ -409,12 +592,14 @@ export function telegramProxyFetch(): typeof fetch {
           breaker.directBlockedUntil = 0;
           return response;
         } catch (directError) {
+          diagAttempts.push({ path: "direct", ms: Date.now() - diagStartedAt, error: outboundErrorMessage(directError) });
           breaker.directFailCount += 1;
           if (breaker.directFailCount >= 2) {
             breaker.directFailCount = 0;
             breaker.directBlockedUntil = Date.now() + 10 * 60 * 1000;
             console.warn("[telegram-proxy] 直连连续失败已熔断 10 分钟（期间仅走代理，不再尝试直连回退）");
           }
+          attachDiag(directError);
           throw directError;
         } finally {
           clearTimeout(fallbackTimer);

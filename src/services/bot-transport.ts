@@ -1,4 +1,4 @@
-import { getAppSetting } from "@/database/operations";
+import { getCachedAppSettings } from "@/database/operations";
 import {
   DEFAULT_GLOBAL_PRIVACY,
   DEFAULT_GLOBAL_TRANSPORT,
@@ -25,15 +25,16 @@ export interface TelegramRuntimeSettings {
 }
 
 export async function getTelegramRuntimeSettings(): Promise<TelegramRuntimeSettings> {
-  const [modeRaw, baseUrlRaw, privacyRaw] = await Promise.all([
-    getAppSetting(TRANSPORT_SETTING_KEYS.mode),
-    getAppSetting(TRANSPORT_SETTING_KEYS.webhookBaseUrl),
-    getAppSetting(PRIVACY_SETTING_KEY),
-  ]);
+  // v2.0.6 D1 优化：原先 3 次 getAppSetting 直读（每 isolate 回收后首条 webhook
+  // 都会触发）改为 1 次全量缓存读（120s TTL + 进程内 memo + KV），读行降为 ≈ 0
+  const stored = await getCachedAppSettings();
   return {
-    transportMode: normalizeGlobalTransport(modeRaw ?? undefined),
-    webhookBaseUrl: (baseUrlRaw ?? "").trim(),
-    privacyEnabled: privacyRaw === null || privacyRaw === undefined ? DEFAULT_GLOBAL_PRIVACY : privacyRaw !== "false",
+    transportMode: normalizeGlobalTransport(stored[TRANSPORT_SETTING_KEYS.mode] || undefined),
+    webhookBaseUrl: (stored[TRANSPORT_SETTING_KEYS.webhookBaseUrl] ?? "").trim(),
+    privacyEnabled:
+      stored[PRIVACY_SETTING_KEY] === undefined
+        ? DEFAULT_GLOBAL_PRIVACY
+        : stored[PRIVACY_SETTING_KEY] !== "false",
   };
 }
 
@@ -124,8 +125,11 @@ export async function applyGlobalTransportToAll(): Promise<void> {
 
 /** 全局隐私模式设置值 */
 export async function getGlobalPrivacyEnabled(): Promise<boolean> {
-  const raw = await getAppSetting(PRIVACY_SETTING_KEY);
-  return raw === null || raw === undefined ? DEFAULT_GLOBAL_PRIVACY : raw !== "false";
+  // v2.0.6 D1 优化：直读改缓存全量读
+  const stored = await getCachedAppSettings();
+  return stored[PRIVACY_SETTING_KEY] === undefined
+    ? DEFAULT_GLOBAL_PRIVACY
+    : stored[PRIVACY_SETTING_KEY] !== "false";
 }
 
 export function parsePrivacySetting(raw: string | undefined): PrivacySetting {

@@ -1,12 +1,15 @@
 import { InlineKeyboard } from "grammy";
 import type { BotContext } from "../context";
-import { getPendingCodeContext } from "@/database/operations";
+import {
+  getGroupSettings,
+  getPendingCodeContext,
+  resolveVerificationChannel,
+} from "@/database/operations";
 import {
   evaluateSubmittedCode,
   type CodeCheckResult,
 } from "@/services/verification-flow";
 import { kickUnverifiedMember } from "@/services/approval";
-import { resolveSessionChannel } from "@/services/group-verification";
 
 /** 网络波动、服务端即将重试时立即私聊发送给用户的提示文案 */
 const NETWORK_RETRY_NOTICE = "🌐 网络波动，正在重试...";
@@ -72,25 +75,17 @@ export async function processCodeAnswer(
     return null;
   }
 
-  // v2.1.0 群内渠道硬性拦截（唯一收口点，覆盖 stateless-question 与宽松文本两条入口）：
-  // 群聊里的明文验证码一律不校验、不回复，并尽力删除该消息 ——
-  // 保证「其他群成员看不到输入的验证码」这个前提条件不被任何路径绕过。
-  const chat = ctx.chat;
-  if (chat !== undefined && chat.type !== "private") {
-    const pendingForChat = preloaded ?? (await getPendingCodeContext(BigInt(from.id)));
-    if (pendingForChat && resolveSessionChannel(pendingForChat.session, pendingForChat.settings) === "group") {
-      if (ctx.message?.message_id) {
-        await ctx.api.deleteMessage(chat.id, ctx.message.message_id).catch((error: unknown) => {
-          console.warn(
-            "[group-verify] 群聊明文验证码消息删除失败（需「删除消息」权限）:",
-            error instanceof Error ? error.message : error,
-          );
-        });
-      }
+  // v2.0.5 群内验证模式前提条件：群聊内禁止明文输码（回复消息全员可见）。
+  // 群内验证的输入只发生在验证网页（URL 按钮）或 4 选 1 callback 里；
+  // 用户私聊（DM）输码不受限 —— 私聊内容群友本就不可见，作为兼容通道保留。
+  if (ctx.chat && ctx.chat.type !== "private") {
+    const chatSettings = await getGroupSettings(BigInt(ctx.chat.id));
+    if (chatSettings?.verificationChannel === "group") {
       console.log(
-        `[group-verify] 已拦截群聊明文输码: user=${from.id} chat=${chat.id}（群内验证请使用按钮/验证页面）`,
+        `Blocked plain-text code input in group ${ctx.chat.id} (verification_channel=group): ` +
+          `user ${from.id} must use the in-group button/web page`,
       );
-      return { outcome: "ignored", replyText: "" };
+      return null;
     }
   }
 
@@ -106,11 +101,7 @@ export async function processCodeAnswer(
 
   // no_pending：非验证会话中的普通消息，交还后续中间件处理。
   // stateless-question 路径（回复验证提示）据此走「失效反馈」分支，见 verification-question.ts
-  // ignored：群内渠道的群聊明文文本已拦截（上面已删除消息并记日志），不发送任何回复
   if (result.outcome === "no_pending" && !result.replyText) {
-    return result;
-  }
-  if (result.outcome === "ignored") {
     return result;
   }
 
@@ -199,6 +190,14 @@ export async function processCodeAnswer(
  * v1.1.4 修复「私聊第二次输码无响应」：Telegram 隐私模式只作用于群聊，
  * 私聊消息 bot 本来就全部可达 —— 私聊里的任何文本（无需手动回复验证消息）
  * 都直接进入验证码校验，不再被「必须回复」条件静默忽略。
+ *
+ * v2.0.6 D1 读行额度优化（关键）：本 handler 注册在 message:text 上 —— 机器人
+ * 收到的每一条文本消息都会走到这里。原先每条消息都先打一次
+ * getPendingCodeContext（verification_sessions 索引查询），但群内验证模式
+ * （默认渠道）下群聊文本输码被明令禁止（输码只发生在网页/4选1按钮），
+ * 这次查询纯属浪费 —— 群活跃时每条消息白打一次 D1。
+ * 现改为：群聊消息先查群设置（300s KV 缓存 + 进程内 memo，命中时不打 D1），
+ * 群内验证模式直接跳过会话查询；仅私聊模式（dm）群组/私聊消息才查会话。
  */
 export async function handleCodeInput(
   ctx: BotContext,
@@ -215,33 +214,19 @@ export async function handleCodeInput(
     return;
   }
 
+  // 群内验证模式短路（v2.0.6）：群聊 + group 渠道 → 文本输码永不生效，
+  // 不必查询该用户是否挂着待验证会话（省掉每条群消息 1 次 D1 会话查询）
+  if (ctx.chat && ctx.chat.type !== "private") {
+    const chatSettings = await getGroupSettings(BigInt(ctx.chat.id));
+    if (resolveVerificationChannel(chatSettings) === "group") {
+      await next();
+      return;
+    }
+  }
+
   const pending = await getPendingCodeContext(BigInt(from.id));
   if (!pending) {
     await next();
-    return;
-  }
-
-  // v2.1.0 群内渠道硬性拦截（前提条件）：验证在群内进行时，群聊里的任何明文文本
-  // 一律不当作验证码处理 —— 其他群成员绝不可能看到别人输入的验证码。
-  // 同时尽力删除该条消息（机器人需「删除消息」权限），避免验证码明文留在群里。
-  const chat = ctx.chat;
-  if (
-    resolveSessionChannel(pending.session, pending.settings) === "group" &&
-    chat !== undefined &&
-    chat.type !== "private"
-  ) {
-    const messageId = ctx.message?.message_id;
-    if (messageId) {
-      await ctx.api.deleteMessage(chat.id, messageId).catch((error: unknown) => {
-        console.warn(
-          "[group-verify] 群聊明文验证码消息删除失败（需「删除消息」权限）:",
-          error instanceof Error ? error.message : error,
-        );
-      });
-    }
-    console.log(
-      `[group-verify] 已拦截群聊明文输码: user=${from.id} chat=${chat.id}（群内验证请使用按钮/验证页面）`,
-    );
     return;
   }
 

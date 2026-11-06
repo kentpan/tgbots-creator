@@ -69,16 +69,14 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   const refreshed = await getVerificationSession(token);
 
-  // 仿真动作一律只停留在仿真屏，绝不真实发送到群组、也绝不真实调用批准入群接口。
-  // v2.1.0：群内渠道的结果（删提示/解禁/踢出）同样只做数据层判定，不触发真实 Telegram 动作。
+  // 隐私红线（v1.1.3）：仿真动作一律只停留在仿真屏，绝不真实发送到群组、
+  // 也绝不真实调用批准入群接口 —— 群组内不允许出现验证消息。
 
   return NextResponse.json({
     ok: true,
     data: {
       outcome: result.outcome,
       replyText: result.replyText,
-      /** v2.1.0 验证渠道：group=群内（结果留在群聊气泡）/ dm=私聊 */
-      channel: result.channel ?? pending.session.channel,
       reason: result.reason ?? null,
       remaining: result.remaining ?? null,
       approved: result.approved ?? false,

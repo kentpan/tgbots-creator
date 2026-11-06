@@ -240,8 +240,6 @@ export function TgAppSimulator({
   onSimulateJoinForGroup,
   chatOpenRequest,
   onSettingsSaved,
-  verifyPrompt,
-  onVerifyOption,
 }: {
   config: BotMenuConfig;
   botName: string;
@@ -269,13 +267,6 @@ export function TgAppSimulator({
   chatOpenRequest: number;
   /** 群组设置保存成功后由父组件刷新列表数据（router.refresh + realGroups 重载） */
   onSettingsSaved: () => void;
-  /**
-   * v2.1.0 群内验证气泡：群内渠道下由父组件注入（正文 + 4 选 1 候选码 / 网页验证按钮），
-   * 渲染在群聊消息流里；私聊渠道为 null（改用 promptMessage 走私聊视图）。
-   */
-  verifyPrompt?: { text: string; options?: string[] | null; url?: string | null } | null;
-  /** 点击群内 4 选 1 数字按钮：提交校验，结果作为机器人气泡追加到群聊 */
-  onVerifyOption?: (code: string) => Promise<{ ok: boolean; text: string; joined?: boolean }>;
 }) {
   const clock = useSyncExternalStore(subscribeClock, getClockSnapshot, getServerClockSnapshot);
 
@@ -419,8 +410,7 @@ export function TgAppSimulator({
     failure_text: "",
     enabled: true,
     privacy_mode: true,
-    // v2.1.0 验证渠道：group=群内验证（默认真实流程）/ dm=私聊验证（旧版行为）
-    verify_channel: "group" as "group" | "dm",
+    verification_channel: "group" as "group" | "dm",
   });
 
   const loadGroupSettings = useCallback(async (chatId: string): Promise<void> => {
@@ -445,7 +435,7 @@ export function TgAppSimulator({
             failure_text: string;
             enabled: boolean;
             privacy_mode: boolean;
-            verify_channel?: string;
+            verification_channel?: string;
           } | null;
           methods: { id: string; name: string; enabled: boolean }[];
         };
@@ -471,7 +461,8 @@ export function TgAppSimulator({
         failure_text: settings?.failure_text ?? "",
         enabled: settings?.enabled ?? true,
         privacy_mode: settings?.privacy_mode ?? true,
-        verify_channel: settings?.verify_channel === "dm" ? "dm" : "group",
+        verification_channel:
+          settings?.verification_channel === "dm" ? "dm" : "group",
       });
     } catch (error) {
       showFlash(false, error instanceof Error ? error.message : "读取群组配置失败");
@@ -501,7 +492,7 @@ export function TgAppSimulator({
           failure_text: form.failure_text,
           enabled: form.enabled,
           privacy_mode: form.privacy_mode,
-          verify_channel: form.verify_channel,
+          verification_channel: form.verification_channel,
         }),
       });
       const payload = await readJson<{ ok: boolean; error?: string }>(response);
@@ -818,8 +809,6 @@ export function TgAppSimulator({
       view={view}
       onBack={pop}
       onOpenSettings={() => push("settings")}
-      verifyPrompt={verifyPrompt}
-      onVerifyOption={onVerifyOption}
     />
   );
 
@@ -889,6 +878,33 @@ export function TgAppSimulator({
                 />
               </div>
               <div className="border-t border-black/[0.06] px-4 py-2.5">
+                <p className="mb-2 text-[17px] text-black">验证渠道</p>
+                <div className="flex rounded-lg bg-black/[0.05] p-0.5">
+                  {([
+                    { value: "group", label: "群内验证" },
+                    { value: "dm", label: "私聊验证" },
+                  ] as const).map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => setForm((prev) => ({ ...prev, verification_channel: option.value }))}
+                      className={`flex-1 rounded-[7px] py-1.5 text-[13px] font-medium transition-all ${
+                        form.verification_channel === option.value
+                          ? "bg-white text-black shadow-sm"
+                          : "text-[#8e8e93]"
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-1.5 text-[12px] leading-relaxed text-[#8e8e93]">
+                  {form.verification_channel === "group"
+                    ? "申请后自动进群，在群内点击按钮完成验证（输入内容其他成员不可见），超时未验证移出群组"
+                    : "验证提示通过机器人私聊发送（用户须先启动机器人），群内零消息"}
+                </p>
+              </div>
+              <div className="border-t border-black/[0.06] px-4 py-2.5">
                 <p className="mb-2 text-[17px] text-black">验证方式</p>
                 <div className="flex rounded-lg bg-black/[0.05] p-0.5">
                   {[
@@ -928,36 +944,6 @@ export function TgAppSimulator({
                   </select>
                 </div>
               ) : null}
-              {/* v2.1.0 验证渠道：群内验证（默认真实流程） / 私聊验证（旧版行为） */}
-              <div className="border-t border-black/[0.06] px-4 py-2.5">
-                <p className="mb-2 text-[17px] text-black">
-                  验证渠道
-                  <span className="mt-0.5 block text-[12px] leading-snug text-[#8e8e93]">
-                    {form.verify_channel === "group"
-                      ? "自动批准进群 → 禁言 → 群内验证（其他成员看不到输入的验证码）"
-                      : "验证提示与结果全部走私聊，群内不出现任何验证消息"}
-                  </span>
-                </p>
-                <div className="flex rounded-lg bg-black/[0.05] p-0.5">
-                  {[
-                    { value: "group" as const, label: "群内验证" },
-                    { value: "dm" as const, label: "私聊验证" },
-                  ].map((option) => (
-                    <button
-                      key={option.value}
-                      type="button"
-                      onClick={() => setForm((prev) => ({ ...prev, verify_channel: option.value }))}
-                      className={`flex-1 rounded-[7px] py-1.5 text-[13px] font-medium transition-all ${
-                        form.verify_channel === option.value
-                          ? "bg-white text-black shadow-sm"
-                          : "text-[#8e8e93]"
-                      }`}
-                    >
-                      {option.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
               <div className="flex items-center justify-between border-t border-black/[0.06] px-4 py-2.5">
                 <span className="text-[17px] text-black">验证超时（秒）</span>
                 <input

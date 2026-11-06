@@ -20,6 +20,8 @@ interface VerifyClientProps {
   expectedUserId: number;
   captchaConfig: CaptchaConfig;
   apiBaseUrl: string;
+  /** 验证会话方式（v2.0.5）：code_api/code_self 时网页提供验证码输入框（群内验证主通道） */
+  method: string;
 }
 
 interface TgMessage {
@@ -29,7 +31,7 @@ interface TgMessage {
   text: string;
 }
 
-export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl }: VerifyClientProps) {
+export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl, method }: VerifyClientProps) {
   const captchaResponseRef = useRef<string | null>(null);
   const submittingRef = useRef(false);
   const hcaptchaContainerRef = useRef<HTMLDivElement | null>(null);
@@ -39,6 +41,10 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl 
 
   const [identityFailed, setIdentityFailed] = useState(false);
   const [message, setMessage] = useState<TgMessage | null>(null);
+  // v2.0.5 网页输码模式（code_api/code_self 会话）：验证码输入框 + 提交按钮
+  const codeMode = method === "code_api" || method === "code_self";
+  const [codeInput, setCodeInput] = useState("");
+  const [codeSubmitting, setCodeSubmitting] = useState(false);
 
   const showMessage = useCallback((text: string, icon: string, cardClass: string, textClass: string) => {
     setMessage({ icon, cardClass, textClass, text });
@@ -142,6 +148,7 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl 
   });
 
   useEffect(() => {
+    if (codeMode) return; // 网页输码模式不加载任何人机验证组件
     const tg = getTg();
     const telegramUserId = tg?.initDataUnsafe?.user?.id ?? null;
 
@@ -183,6 +190,7 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl 
   }, [showError]);
 
   useEffect(() => {
+    if (codeMode) return; // 网页输码模式不加载任何人机验证组件
     if (captchaConfig.provider === "hcaptcha") {
       const timer = setInterval(() => {
         if (window.hcaptcha && hcaptchaContainerRef.current) {
@@ -278,14 +286,29 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl 
 
       return () => clearInterval(timer);
     }
-  }, [captchaConfig, handleCaptchaError, handleCaptchaSolved, showError]);
+  }, [captchaConfig, handleCaptchaError, handleCaptchaSolved, showError, codeMode]);
+
+  /** 网页输码提交（code_api/code_self 会话）：复用同一 POST /api/v1/verify 通道 */
+  const submitCode = useCallback(async () => {
+    if (codeSubmitting) return;
+    const code = codeInput.trim();
+    if (!code) {
+      showError("请输入验证码");
+      hapticError();
+      return;
+    }
+    setCodeSubmitting(true);
+    captchaResponseRef.current = code;
+    await submitVerification();
+    setCodeSubmitting(false);
+  }, [codeInput, codeSubmitting, showError, submitVerification]);
 
   return (
     <div className="tg-page min-h-screen flex flex-col">
-      {captchaConfig.provider === "hcaptcha" && (
+      {!codeMode && captchaConfig.provider === "hcaptcha" && (
         <Script src="https://js.hcaptcha.com/1/api.js" strategy="afterInteractive" />
       )}
-      {captchaConfig.provider === "cap" && (
+      {!codeMode && captchaConfig.provider === "cap" && (
         <Script
           src="https://cdn.jsdelivr.net/npm/@cap.js/widget@0.1.58/cap.min.js"
           strategy="afterInteractive"
@@ -293,7 +316,7 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl 
           crossOrigin="anonymous"
         />
       )}
-      {captchaConfig.provider === "turnstile" && (
+      {!codeMode && captchaConfig.provider === "turnstile" && (
         <Script
           src="https://challenges.cloudflare.com/turnstile/v0/api.js"
           strategy="afterInteractive"
@@ -304,41 +327,77 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl 
         <div className="tg-card">
           <div className="text-center mb-8">
             <div className="text-6xl mb-4">🔐</div>
-            <h1 className="text-2xl font-bold mb-2 text-fg">人机验证</h1>
-            <p className="text-fg-secondary">请完成下方的人机验证</p>
+            <h1 className="text-2xl font-bold mb-2 text-fg">
+              {codeMode ? "入群验证" : "人机验证"}
+            </h1>
+            <p className="text-fg-secondary">
+              {codeMode ? "请输入验证码完成入群验证" : "请完成下方的人机验证"}
+            </p>
           </div>
 
           <div className="space-y-6" id="verificationContainer">
-            <div className="flex justify-center">
-              {identityFailed ? (
-                <div className="text-center text-red-600">❌ 用户身份验证失败</div>
-              ) : (
-                <>
-                  {captchaConfig.provider === "hcaptcha" && (
-                    <div
-                      id="hcaptcha-container"
-                      ref={hcaptchaContainerRef}
-                      className="tg-captcha-container"
-                    />
-                  )}
-                  {captchaConfig.provider === "cap" && (
-                    <cap-widget
-                      ref={capWidgetRef}
-                      data-cap-api-endpoint={captchaConfig.endpoint ?? ""}
-                      data-cap-lang="zh-cn"
-                      id="cap-widget"
-                    />
-                  )}
-                  {captchaConfig.provider === "turnstile" && (
-                    <div
-                      id="turnstile-container"
-                      ref={turnstileContainerRef}
-                      className="tg-captcha-container"
-                    />
-                  )}
-                </>
-              )}
-            </div>
+            {codeMode ? (
+              <div className="space-y-4">
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  value={codeInput}
+                  onChange={(event) => setCodeInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void submitCode();
+                    }
+                  }}
+                  placeholder="输入验证码"
+                  aria-label="验证码"
+                  className="w-full rounded-xl border border-black/10 bg-white px-4 py-3 text-center text-2xl tracking-[0.3em] text-black outline-none focus:border-black/30"
+                />
+                <button
+                  type="button"
+                  onClick={() => void submitCode()}
+                  disabled={codeSubmitting}
+                  className="w-full rounded-xl bg-black py-3 text-[16px] font-medium text-white transition-opacity disabled:opacity-60"
+                >
+                  {codeSubmitting ? "验证中..." : "提交验证"}
+                </button>
+                <p className="text-center text-sm text-fg-hint">
+                  🔒 验证码仅机器人可见，群内其他成员不可见
+                </p>
+              </div>
+            ) : (
+              <div className="flex justify-center">
+                {identityFailed ? (
+                  <div className="text-center text-red-600">❌ 用户身份验证失败</div>
+                ) : (
+                  <>
+                    {captchaConfig.provider === "hcaptcha" && (
+                      <div
+                        id="hcaptcha-container"
+                        ref={hcaptchaContainerRef}
+                        className="tg-captcha-container"
+                      />
+                    )}
+                    {captchaConfig.provider === "cap" && (
+                      <cap-widget
+                        ref={capWidgetRef}
+                        data-cap-api-endpoint={captchaConfig.endpoint ?? ""}
+                        data-cap-lang="zh-cn"
+                        id="cap-widget"
+                      />
+                    )}
+                    {captchaConfig.provider === "turnstile" && (
+                      <div
+                        id="turnstile-container"
+                        ref={turnstileContainerRef}
+                        className="tg-captcha-container"
+                      />
+                    )}
+                  </>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="mt-6 text-center">

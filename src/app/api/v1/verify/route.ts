@@ -4,12 +4,13 @@ import { getCaptchaProvider } from "@/captcha/factory";
 import {
   approveJoinRequest,
   completeVerification,
+  getGroupSettings,
   getJoinRequestByToken,
   getVerificationSession,
   isSessionExpired,
 } from "@/database/operations";
-import { autoApproveUser } from "@/services/approval";
-import { completeGroupJoinVerification } from "@/services/group-verification";
+import { autoApproveUser, completeGroupVerification } from "@/services/approval";
+import { evaluateSubmittedCode } from "@/services/verification-flow";
 import { getClientIp } from "@/utils/client-info";
 import { validateInitData } from "@/utils/telegram";
 
@@ -59,14 +60,15 @@ export async function POST(request: NextRequest) {
     }
 
     const joinRequest = await getJoinRequestByToken(token);
-    // v2.1.0：群内渠道的验证页从群内 URL 按钮打开（普通浏览器/内置浏览器，没有 Telegram
-    // initData），身份校验退化为「持有 32 位随机 token 即视为本人」——与会话里的 user_id
-    // 对齐后批准，不接受请求体指定他人身份。
-    const isGroupChannelSession = session.channel === "group";
     const isApiRequest =
-      session.chatId === 0n ||
-      isGroupChannelSession ||
-      (joinRequest !== null && joinRequest.requestType === "api");
+      session.chatId === 0n || (joinRequest !== null && joinRequest.requestType === "api");
+
+    // v2.0.5 群内验证：URL 按钮在群内以浏览器打开（无 Telegram WebApp initData），
+    // 持有 token 本身即身份凭据（链接仅出现在目标用户参与的群内，且 32 位随机不可猜测）；
+    // code_api 还需在页面输入有效卡密，captcha 为纯人机验证 —— 代打风险与群验证 bot 通行做法一致。
+    const groupChannel =
+      session.chatId !== 0n &&
+      (await getGroupSettings(session.chatId))?.verificationChannel === "group";
 
     const telegramUser = await validateInitData(
       typeof body.init_data === "string" ? body.init_data : "",
@@ -78,6 +80,9 @@ export async function POST(request: NextRequest) {
     if (telegramUser) {
       claimedUserId = telegramUser.id;
       identityOk = claimedUserId === Number(session.userId);
+    } else if (groupChannel) {
+      claimedUserId = null;
+      identityOk = true;
     } else if (!isApiRequest) {
       claimedUserId = null;
       identityOk = false;
@@ -95,6 +100,32 @@ export async function POST(request: NextRequest) {
 
     const clientIp = getClientIp(request);
     const userAgent = request.headers.get("user-agent");
+
+    // v2.0.5 网页输码通道（群内验证 code_api 主通道）：会话方式为 code_api/code_self 时，
+    // captcha_response 携带的是用户输入的验证码，走统一校验管道 evaluateSubmittedCode
+    // （外部卡密 API / 本地比对、尝试次数、失效后群内踢出/解禁/删提示全部复用）。
+    if (session.method === "code_api" || session.method === "code_self") {
+      if (!joinRequest || joinRequest.status !== "pending") {
+        return httpError(400, "验证已失效，请重新申请加群");
+      }
+      const settings = await getGroupSettings(session.chatId);
+      const result = await evaluateSubmittedCode({
+        userId: session.userId,
+        username: null,
+        code: captchaResponse,
+        preloaded: { session, joinRequest, settings },
+      });
+      if (result.outcome === "success") {
+        console.log(`Web code verification succeeded: ${token.slice(0, 8)}...`);
+        return NextResponse.json({
+          success: true,
+          message: result.replyText || "✅ 验证成功！",
+          redirect_url: "tg://",
+        });
+      }
+      const status = result.outcome === "network_error" ? 502 : 400;
+      return httpError(status, result.replyText || "验证失败，请重试");
+    }
 
     const captchaProvider = await getCaptchaProvider();
     const verificationResult = await captchaProvider.verify(captchaResponse, clientIp, userAgent);
@@ -124,13 +155,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: true, message: "✅ 验证成功！" });
     }
 
-    // 群内渠道（v2.1.0）：人机验证通过 → 落库批准 + 解禁 + 删除群内提示 + 群内欢迎。
-    // 不能走 autoApproveUser（bootstrap 已自动批准入群，重复 approveChatJoinRequest 会 400）
-    if (isGroupChannelSession && joinRequest && joinRequest.requestType !== "simulator") {
-      const completion = await completeGroupJoinVerification(token);
+    // v2.0.5 群内验证完成入口：落库批准 + 解禁 + 删除群内验证提示 + 群内欢迎
+    if (groupChannel) {
+      const completion = await completeGroupVerification(token);
       if (!completion.success) {
-        console.warn(`Group-channel captcha completion failed: ${completion.error}`);
+        console.warn(`Group completion after web captcha failed: ${completion.error}`);
+        return NextResponse.json({ success: true, message: "✅ 验证成功！" });
       }
+      console.log(`User group-verified successfully: ${token.slice(0, 8)}...`);
       return NextResponse.json({
         success: true,
         message: "✅ 验证成功！",

@@ -54,7 +54,7 @@ export async function GET(request: Request): Promise<NextResponse> {
             failure_text: settings.failureText,
             enabled: settings.enabled,
             privacy_mode: settings.privacyMode,
-            verify_channel: settings.verifyChannel,
+            verification_channel: settings.verificationChannel,
           }
         : null,
       methods: methods.map((method) => ({
@@ -88,8 +88,7 @@ export async function PUT(request: Request): Promise<NextResponse> {
     failure_text?: string;
     enabled?: boolean;
     privacy_mode?: boolean;
-    /** v2.1.0 验证渠道：group=群内验证（默认） / dm=私聊验证 */
-    verify_channel?: string;
+    verification_channel?: string;
   };
   try {
     payload = (await request.json()) as typeof payload;
@@ -129,14 +128,6 @@ export async function PUT(request: Request): Promise<NextResponse> {
   const existing = await getGroupSettings(chatId);
   const timeoutSeconds = Number(payload.timeout_seconds ?? existing?.timeoutSeconds ?? 300);
   const maxAttempts = Number(payload.max_attempts ?? existing?.maxAttempts ?? 3);
-  // v2.1.0 验证渠道：只接受 group / dm；未传时保留现值（默认 group = 群内验证）
-  const verifyChannelRaw = String(payload.verify_channel ?? existing?.verifyChannel ?? "group").trim();
-  if (verifyChannelRaw !== "group" && verifyChannelRaw !== "dm") {
-    return NextResponse.json(
-      { ok: false, error: "验证渠道不合法（group=群内验证 / dm=私聊验证）" },
-      { status: 400 },
-    );
-  }
 
   await upsertGroupSettings(chatId, {
     // 群名与群组管理页同源可编辑：未传时保留现值，避免被清空
@@ -166,7 +157,12 @@ export async function PUT(request: Request): Promise<NextResponse> {
         : String(payload.failure_text ?? "").trim() || undefined,
     enabled: payload.enabled ?? existing?.enabled ?? true,
     privacyMode: payload.privacy_mode ?? existing?.privacyMode ?? true,
-    verifyChannel: verifyChannelRaw,
+    verificationChannel:
+      payload.verification_channel === "dm"
+        ? "dm"
+        : payload.verification_channel === "group"
+          ? "group"
+          : existing?.verificationChannel,
   });
 
   const requestHeaders = await headers();
@@ -179,7 +175,7 @@ export async function PUT(request: Request): Promise<NextResponse> {
         : method === "code_self"
           ? "自动验证码（输入验证码加群）"
           : "人机验证码"
-    }；验证渠道：${verifyChannelRaw === "dm" ? "私聊验证" : "群内验证"}`,
+    }`,
     headers: requestHeaders,
   });
 
@@ -199,7 +195,7 @@ export async function PUT(request: Request): Promise<NextResponse> {
           failure_text: settings.failureText,
           enabled: settings.enabled,
           privacy_mode: settings.privacyMode,
-          verify_channel: settings.verifyChannel,
+          verification_channel: settings.verificationChannel,
         }
       : null,
   });

@@ -1,7 +1,8 @@
 import {
-  ensureGroupBotAdmin,
+  getGroupBotAdminByBotAndChat,
   getGroupSettings,
   listBots,
+  upsertGroupBotAdmin,
   upsertGroupSettings,
 } from "@/database/operations";
 
@@ -49,34 +50,49 @@ export async function registerTelegramChat(input: {
   /** 登记时用于关联机器人（该 Token 下的全部机器人条目都会建立链接） */
   botToken?: string;
 }): Promise<{ isNew: boolean }> {
+  // v2.0.6 D1 写额度优化（写放大 + 缓存失效死循环治理）：
+  // Workers isolate 空闲 ~30s 回收 → registeredChatKeys 清空 → 每次冷启动
+  // 都执行 upsertGroupSettings（写）+ invalidateCache（清群设置缓存），
+  // 导致「下一条消息缓存必 miss → SELECT * FROM group_settings 全表」的
+  // 死循环放大（读写双向烧额度）。现改为无变化跳过写：
+  // - 已有配置且群名未变 → 跳过 upsertGroupSettings（配置列由 existing 原样回传，
+  //   本来就是 no-op，跳过不改变任何语义）；
+  // - bot 绑定已存在且 active → 跳过 upsertGroupBotAdmin。
   const existing = await getGroupSettings(input.chatId);
-  // 空字符串/纯空白视为「无群名」：upsertGroupSettings 的 COALESCE 只对 NULL 生效，
-  // 传空串会把数据库里已有的真实群名覆盖掉
-  const title = input.chatTitle?.trim() || existing?.chatTitle?.trim() || null;
-  await upsertGroupSettings(input.chatId, {
-    chatTitle: title,
-    // v1.1.7：新登记群组默认 code_self（自动验证码：机器人私聊发码，
-    // 用户回复输入验证码即自动审批 —— 与「一键部署」宣传的主流程一致）；
-    // 已有配置的群组原样回传，绝不覆盖
-    method: existing?.method ?? "code_self",
-    methodId: existing?.methodId ?? null,
-    timeoutSeconds: existing?.timeoutSeconds ?? 300,
-    maxAttempts: existing?.maxAttempts ?? 3,
-    promptText: existing?.promptText ?? "🔐 请回复本消息并输入验证码完成验证",
-    successText: existing?.successText ?? "✅ 验证成功，欢迎加入！",
-    failureText: existing?.failureText ?? "❌ 验证码错误，请重试。",
-    enabled: existing?.enabled ?? true,
-    privacyMode: existing?.privacyMode ?? true,
-  });
+  const titleUnchanged =
+    (input.chatTitle ?? null) === (existing?.chatTitle ?? null);
+  if (!existing || !titleUnchanged) {
+    await upsertGroupSettings(input.chatId, {
+      chatTitle: input.chatTitle ?? existing?.chatTitle ?? null,
+      // v1.1.7：新登记群组默认 code_self（自动验证码：机器人私聊发码，
+      // 用户回复输入验证码即自动审批 —— 与「一键部署」宣传的主流程一致）；
+      // 已有配置的群组原样回传，绝不覆盖
+      method: existing?.method ?? "code_self",
+      methodId: existing?.methodId ?? null,
+      timeoutSeconds: existing?.timeoutSeconds ?? 300,
+      maxAttempts: existing?.maxAttempts ?? 3,
+      promptText: existing?.promptText ?? "🔐 请回复本消息并输入验证码完成验证",
+      successText: existing?.successText ?? "✅ 验证成功，欢迎加入！",
+      failureText: existing?.failureText ?? "❌ 验证码错误，请重试。",
+      enabled: existing?.enabled ?? true,
+      privacyMode: existing?.privacyMode ?? true,
+    });
+  }
+  // 注意：bot 绑定检查不随群设置写入跳过 —— 新增 bot 条目共用群组时
+  // （群设置已存在但缺该 bot 的绑定），绑定仍需补齐；
+  // getGroupBotAdminByBotAndChat 是 (bot_id, chat_id) 唯一索引点查，成本极低。
 
   if (input.botToken) {
     const bots = await listBots();
     for (const bot of bots.filter((item) => item.token === input.botToken)) {
-      // 只补建关联：rights 里存着一键部署状态（入群申请链接）与管理员权限快照，
-      // 自动登记绝不能覆盖（否则每次群事件都清空部署状态）
-      await ensureGroupBotAdmin({
+      const binding = await getGroupBotAdminByBotAndChat(bot.id, input.chatId);
+      if (binding && binding.status === "active") {
+        continue;
+      }
+      await upsertGroupBotAdmin({
         botId: bot.id,
         chatId: input.chatId,
+        rights: "{}",
         status: "active",
       });
     }

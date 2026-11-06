@@ -1,16 +1,15 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { getCaptchaProvider } from "@/captcha/factory";
-import { getGroupSettings, getVerificationSession, isSessionExpired } from "@/database/operations";
+import { getVerificationSession, isSessionExpired } from "@/database/operations";
 import { WebAppLoader } from "@/components/tg/web-app-loader";
 import { VerifyClient, type CaptchaConfig } from "./verify-client";
-import { CodeVerifyClient } from "./code-verify-client";
 import { CompletedState, ErrorState, ExpiredState } from "./states";
 
 export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
-  title: "入群验证",
+  title: "人机验证",
 };
 
 interface VerifyPageProps {
@@ -20,15 +19,13 @@ interface VerifyPageProps {
 type VerifyView =
   | { kind: "notfound" }
   | { kind: "expired" }
-  | { kind: "completed"; inGroup: boolean }
-  | { kind: "verify"; token: string; expectedUserId: number; captchaConfig: CaptchaConfig }
+  | { kind: "completed" }
   | {
-      kind: "code";
+      kind: "verify";
       token: string;
-      methodLabel: string;
-      expiresInSeconds: number;
-      chatTitle: string | null;
-      maxAttempts: number;
+      expectedUserId: number;
+      captchaConfig: CaptchaConfig;
+      method: string;
     }
   | { kind: "error" };
 
@@ -45,22 +42,7 @@ export default async function VerifyPage({ searchParams }: VerifyPageProps) {
       } else if (isSessionExpired(session)) {
         view = { kind: "expired" };
       } else if (session.captchaCompleted) {
-        view = { kind: "completed", inGroup: session.channel === "group" };
-      } else if (session.method === "code_api" || session.method === "code_self") {
-        // v2.1.0：群内验证的「不泄露给其他群成员」输码通道 —— 验证码只在网页里输入
-        const settings = await getGroupSettings(session.chatId);
-        view = {
-          kind: "code",
-          token,
-          methodLabel:
-            session.method === "code_self" ? "自动验证码" : "外部 API 卡密 / 验证码",
-          expiresInSeconds: Math.max(
-            0,
-            Math.floor((session.expiresAt.getTime() - Date.now()) / 1000),
-          ),
-          chatTitle: settings?.chatTitle ?? null,
-          maxAttempts: settings?.maxAttempts ?? 3,
-        };
+        view = { kind: "completed" };
       } else {
         const captchaProvider = await getCaptchaProvider();
         const captchaConfig = captchaProvider.getFrontendConfig() as unknown as CaptchaConfig;
@@ -69,6 +51,7 @@ export default async function VerifyPage({ searchParams }: VerifyPageProps) {
           token,
           expectedUserId: Number(session.userId),
           captchaConfig,
+          method: session.method,
         };
       }
     }
@@ -92,26 +75,7 @@ export default async function VerifyPage({ searchParams }: VerifyPageProps) {
       return (
         <>
           <WebAppLoader />
-          <CompletedState
-            message={
-              view.inGroup
-                ? "您已完成验证，可以返回群组聊天了"
-                : "您已完成验证，请等待管理员审核"
-            }
-          />
-        </>
-      );
-    case "code":
-      return (
-        <>
-          <WebAppLoader />
-          <CodeVerifyClient
-            token={view.token}
-            methodLabel={view.methodLabel}
-            expiresInSeconds={view.expiresInSeconds}
-            chatTitle={view.chatTitle}
-            maxAttempts={view.maxAttempts}
-          />
+          <CompletedState message="您已完成验证，请等待管理员审核" />
         </>
       );
     case "verify":
@@ -123,6 +87,7 @@ export default async function VerifyPage({ searchParams }: VerifyPageProps) {
             expectedUserId={view.expectedUserId}
             captchaConfig={view.captchaConfig}
             apiBaseUrl=""
+            method={view.method}
           />
         </>
       );

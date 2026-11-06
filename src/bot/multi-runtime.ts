@@ -24,8 +24,8 @@ import { registerBuiltinCommandHandlers } from "./handlers/builtin-commands";
 import { buildSessionMiddleware } from "./session-storage";
 import { registerChatTracking } from "./chat-tracking";
 import { handleJoinRequest, handleChatMemberUpdate } from "./handlers/chat-member";
+import { handleVerificationChoice } from "./handlers/group-verification";
 import { handleCodeInput } from "./handlers/code-input";
-import { handleVerificationCallback } from "./handlers/verify-callback";
 import type { BotContext } from "./context";
 import { config } from "@/config/settings";
 import { POLLING_ALLOWED_UPDATES } from "@/lib/telegram/runtime-mode";
@@ -254,15 +254,15 @@ async function registerBotCapabilities(
 ): Promise<() => Promise<void>> {
   const privacyMode = effectivePrivacy;
 
-  // 加群验证入口：收到真实加群申请 → 创建验证会话并私聊发验证码/验证链接
+  // 加群验证入口：收到真实加群申请 → 群内验证（默认）/私聊验证创建验证会话
   //（v1.1.1 修复：multi-runtime 此前完全缺失该 handler，机器人管理创建的验证机器人无法验证）
   bot.on("chat_join_request", handleJoinRequest);
 
   // 直连入群防线（v1.1.3）：普通邀请链接/被拉入群直接进来的成员 → 补验证，超时/失败踢出
   bot.on("chat_member", handleChatMemberUpdate);
 
-  // 群内 4 选 1 验证按钮（v2.1.0）：callback_data 前缀 vg:，其他 callback 交还菜单插件/后续中间件
-  bot.on("callback_query:data", handleVerificationCallback);
+  // 群内验证 4 选 1 点选回调（v2.0.5）：非本模块 callback 原样放行后续中间件（菜单等）
+  bot.on("callback_query:data", handleVerificationChoice);
 
   // 加群验证：无状态问题（回复验证问题消息，隐私模式兼容）
   bot.use(codeQuestion.middleware());
@@ -549,14 +549,12 @@ export interface MenuBotHandle {
 }
 
 export async function acquireMenuBot(botId: bigint): Promise<MenuBotHandle | null> {
-  // v2.2.0：先查进程内注册表 —— webhook 热路径每条更新都会调用本函数，
-  // 命中时应该 0 次数据库读；旧实现先 getBot() 再查表，白读一行。
+  const row = await getBot(botId);
+  if (!row) return null;
   const running = registry().get(Number(botId));
   if (running) {
     return { bot: running.bot };
   }
-  const row = await getBot(botId);
-  if (!row) return null;
   const menuConfig = parseBotMenuConfig(row.menuConfig);
   const instance = await createMenuBot(row, menuConfig, "polling");
   // 兑底实例必须具备完整能力（验证/指令/输码通道），否则 webhook 更新静默落空。

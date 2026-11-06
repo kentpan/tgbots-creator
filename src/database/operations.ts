@@ -4,15 +4,25 @@ import {
   queryOne,
   type SqlParam,
 } from "@/database/client";
-import { cachedJson, invalidateCache } from "@/database/bindings";
-import { cachedAggregate } from "@/database/read-cache";
 import {
-  addCounterDelta,
-  bumpJoinRequestInserted,
-  bumpJoinRequestTransition,
-  ensureJoinRequestCounters,
-  readJoinRequestCounters,
-} from "@/database/stats-counters";
+  cachedJson,
+  invalidateCache,
+  invalidateMemo,
+  invalidateMemoByPrefix,
+  memoTtl,
+} from "@/database/bindings";
+
+/**
+ * v2.0.6 D1 读行额度优化：热配置缓存 TTL 常量。
+ * Workers isolate 空闲 ~30s 即回收，回收后冷启动若每次直读 D1，
+ * 消息间隔较长的群组会「每条消息都冷启动」→ 读行成倍放大；
+ * 60s 进程内缓存把冷启动成本收敛为每 isolate 每 60s 一次。
+ * 配置变更（管理后台保存）走对应写路径的 invalidateMemo，本 isolate 立即生效，
+ * 其他 isolate 最迟 60s 追平 —— 对 bot 配置/指令库/运行时设置完全可接受。
+ */
+const BOT_ROW_CACHE_MS = 60_000;
+const BOT_LIST_CACHE_MS = 60_000;
+const BOT_COMMANDS_CACHE_MS = 60_000;
 
 export const RequestStatus = {
   PENDING: "pending",
@@ -54,14 +64,10 @@ export interface VerificationSessionRow {
   /** v1.1.7 code_self 方式：机器人自生成、用户需回输的入群验证码（明文，与 verify_codes 卡密表同安全级别）；其他方式为 NULL */
   expectedCode: string | null;
   /**
-   * 验证渠道快照（v2.1.0）：group = 群内验证（禁言/群消息/按钮）、dm = 旧版私聊验证。
-   * 会话创建时固化，管理端中途改配置不影响进行中的会话。
+   * v2.0.5 群内验证模式：验证提示消息在群内的 message_id（群内发送成功后回写）。
+   * 验证通过/失败/超时后用于删除该消息，保持群内整洁；私聊模式恒为 NULL。
    */
-  channel: string;
-  /** 群内验证消息 message_id（通过/失败时删除该提示；dm 渠道为 NULL） */
-  groupMessageId: number | null;
-  /** code_self 群内 4 选 1 候选数字（JSON 数组字符串，含唯一正确码） */
-  optionCodes: string[] | null;
+  promptMessageId: number | null;
 }
 
 export interface VerificationStats {
@@ -160,12 +166,12 @@ export interface GroupSettingsRow {
   /** 加群需要管理员审核（v1.1.9，对应 TG APP 群设置的「审批新成员」）：Bot API 无远程开关，本字段控制本系统生成的部署链接语义与直连入群防线 */
   requireApproval: boolean;
   /**
-   * 验证渠道（v2.1.0）：
-   * - group（默认）：真实群组流程 —— 自动批准入群 → 立即禁言 → 群内发验证消息
-   *   （mention + 倒计时 + 按钮）→ 通过则解禁/删提示/群内欢迎，失败或超时则踢出；
-   * - dm：旧版私聊流程（验证提示/结果全部走私聊，群内零消息），逐字保留。
+   * 加群验证渠道（v2.0.5）：
+   * - "group"（默认）：群内验证 —— 用户先进群（入群申请自动批准），机器人在群内发送
+   *   验证消息（验证码走网页输入/按钮点选，输入内容其他成员不可见），验证通过前禁言；
+   * - "dm"：私聊验证（v1.1.3 旧行为）—— 验证提示/结果全部私聊发送，群内零消息。
    */
-  verifyChannel: string;
+  verificationChannel: "group" | "dm";
   createdTime: Date;
   updatedTime: Date;
 }
@@ -264,26 +270,11 @@ function mapSession(row: Record<string, unknown>): VerificationSessionRow {
     method: (row.method as string) ?? "captcha",
     attempts: toNumber(row.attempts ?? 0),
     expectedCode: (row.expected_code as string | null) ?? null,
-    channel: (row.channel as string | null)?.trim() === "group" ? "group" : "dm",
-    groupMessageId:
-      row.group_message_id === null || row.group_message_id === undefined
+    promptMessageId:
+      row.prompt_message_id === undefined || row.prompt_message_id === null
         ? null
-        : toNumber(row.group_message_id),
-    optionCodes: parseOptionCodes(row.option_codes),
+        : toNumber(row.prompt_message_id),
   };
-}
-
-/** option_codes 列（JSON 字符串数组）→ string[]；容错：脏数据一律视为无候选码 */
-function parseOptionCodes(raw: unknown): string[] | null {
-  if (typeof raw !== "string" || !raw.trim()) return null;
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return null;
-    const codes = parsed.filter((item): item is string => typeof item === "string" && item.trim() !== "");
-    return codes.length > 0 ? codes : null;
-  } catch {
-    return null;
-  }
 }
 
 export async function createJoinRequest(
@@ -338,10 +329,6 @@ export async function createJoinRequest(
       ],
     );
     if (result.changes !== 1) return null;
-    // v2.2.0：计数器增量（pending +1），替代看板/菜单里的全表 GROUP BY
-    await bumpJoinRequestInserted(1).catch((error) => {
-      console.warn("bumpJoinRequestInserted failed:", error);
-    });
     return await getJoinRequestByToken(input.verificationToken);
   } catch (error) {
     console.error("Error creating join request:", error);
@@ -357,10 +344,6 @@ export async function createVerificationSession(input: {
   method?: string;
   /** v1.1.7 code_self：机器人自生成的入群验证码，随会话落库，输入时本地比对 */
   expectedCode?: string | null;
-  /** v2.1.0 验证渠道：group=群内验证 / dm=私聊验证（缺省 dm，保持旧会话语义） */
-  channel?: "group" | "dm";
-  /** v2.1.0 code_self 群内 4 选 1 候选数字（含正确码） */
-  optionCodes?: string[] | null;
 }): Promise<VerificationSessionRow | null> {
   try {
     await executeRun(
@@ -369,8 +352,8 @@ export async function createVerificationSession(input: {
     );
     const result = await executeRun(
       `INSERT INTO verification_sessions
-         (token, user_id, chat_id, captcha_completed, created_time, expires_at, method, attempts, expected_code, channel, option_codes)
-       VALUES (?, ?, ?, 0, ?, ?, ?, 0, ?, ?, ?)`,
+         (token, user_id, chat_id, captcha_completed, created_time, expires_at, method, attempts, expected_code)
+       VALUES (?, ?, ?, 0, ?, ?, ?, 0, ?)`,
       [
         input.token,
         Number(input.userId),
@@ -379,8 +362,6 @@ export async function createVerificationSession(input: {
         dateText(input.expiresAt),
         input.method ?? "captcha",
         input.expectedCode ?? null,
-        input.channel ?? "dm",
-        input.optionCodes && input.optionCodes.length > 0 ? JSON.stringify(input.optionCodes) : null,
       ],
     );
     if (result.changes !== 1) return null;
@@ -388,21 +369,6 @@ export async function createVerificationSession(input: {
   } catch (error) {
     console.error("Error creating verification session:", error);
     return null;
-  }
-}
-
-/** 记录群内验证消息的 message_id（发送成功后回写；删除提示时据此定位） */
-export async function setSessionGroupMessageId(
-  token: string,
-  messageId: number | null,
-): Promise<void> {
-  try {
-    await executeRun(
-      `UPDATE verification_sessions SET group_message_id = ? WHERE token = ?`,
-      [messageId === null ? null : Number(messageId), token],
-    );
-  } catch (error) {
-    console.error("Error saving group message id:", error);
   }
 }
 
@@ -485,54 +451,34 @@ export async function approveJoinRequest(
   token: string,
   adminId?: bigint | null,
 ): Promise<boolean> {
-  return transitionJoinRequestStatus(token, RequestStatus.APPROVED, adminId);
+  try {
+    await executeRun(
+      `UPDATE join_requests
+       SET status = ?, processed_time = ?, admin_id = ?
+       WHERE verification_token = ?`,
+      [RequestStatus.APPROVED, dateText(new Date()), adminId === undefined || adminId === null ? null : Number(adminId), token],
+    );
+    return true;
+  } catch (error) {
+    console.error("Error approving join request:", error);
+    return false;
+  }
 }
 
 export async function rejectJoinRequest(
   token: string,
   adminId?: bigint | null,
 ): Promise<boolean> {
-  return transitionJoinRequestStatus(token, RequestStatus.REJECTED, adminId);
-}
-
-/**
- * 状态迁移统一入口（v2.2.0）。
- *
- * - 只在状态**真的发生变化**时才写计数器（用 UPDATE 的 changes 判定），
- *   重复调用/幂等重试不会把计数打歪。
- * - 同时更新 processed_time / admin_id，保持旧语义（approve 也会刷新这两个字段）。
- */
-async function transitionJoinRequestStatus(
-  token: string,
-  nextStatus: string,
-  adminId?: bigint | null,
-): Promise<boolean> {
   try {
-    const current = await queryOne<{ status: string }>(
-      `SELECT status FROM join_requests WHERE verification_token = ?`,
-      [token],
-    );
-    if (!current) return false;
-    const previous = String(current.status);
     await executeRun(
       `UPDATE join_requests
        SET status = ?, processed_time = ?, admin_id = ?
        WHERE verification_token = ?`,
-      [
-        nextStatus,
-        dateText(new Date()),
-        adminId === undefined || adminId === null ? null : Number(adminId),
-        token,
-      ],
+      [RequestStatus.REJECTED, dateText(new Date()), adminId === undefined || adminId === null ? null : Number(adminId), token],
     );
-    if (previous !== nextStatus) {
-      await bumpJoinRequestTransition(previous, nextStatus, 1).catch((error) => {
-        console.warn("bumpJoinRequestTransition failed:", error);
-      });
-    }
     return true;
   } catch (error) {
-    console.error(`Error setting join request status to ${nextStatus}:`, error);
+    console.error("Error rejecting join request:", error);
     return false;
   }
 }
@@ -602,11 +548,7 @@ export async function getVerificationStats(
   chatId: bigint,
 ): Promise<VerificationStats> {
   try {
-    // v2.2.0：按群统计走 120s 聚合缓存 —— 群组管理页/机器人菜单会反复拉，
-    // 每次都全量扫该群的申请行（D1 按扫描行计费）是不可接受的。
-    const grouped = await cachedAggregate(`stats:chat:${String(chatId)}`, 120, () =>
-      groupStatusCounts("chat_id = ?", [Number(chatId)]),
-    );
+    const grouped = await groupStatusCounts("chat_id = ?", [Number(chatId)]);
     const base = buildStatusStats(grouped);
     return {
       ...base,
@@ -626,39 +568,9 @@ export async function getVerificationStats(
   }
 }
 
-/**
- * 全局统计（v2.2.0 重写）。
- *
- * 旧实现每次调用都跑两条 `GROUP BY status` 全表聚合：表越大越贵，D1 免费版
- * 按扫描行计费，看板/机器人菜单刷新几十次就能吃满 500 万行。
- *
- * 新实现：
- * - 累计值读 stats_counters（8 行小表，增量维护）；
- * - 今日值用 request_time 索引做当天范围扫描（只碰当天几十行）；
- * - 计数器不可用（D1 未迁移）时回落到聚合结果 + 5 分钟缓存，最坏也只是慢，不会更贵。
- */
 export async function getGlobalStats(): Promise<GlobalVerificationStats | null> {
   try {
-    let base: Pick<VerificationStats, "total_requests" | "approved" | "rejected" | "pending" | "expired">;
-    let counterTotal: number | null = null;
-
-    let counters: Awaited<ReturnType<typeof readJoinRequestCounters>> = null;
-    try {
-      await ensureJoinRequestCounters();
-      counters = await readJoinRequestCounters();
-    } catch (error) {
-      console.warn("计数器不可用，统计回落为 GROUP BY:", error);
-    }
-
-    if (counters) {
-      base = buildStatusStats(
-        Object.entries(counters.byStatus).map(([status, count]) => ({ status, count })),
-      );
-      counterTotal = counters.total;
-    } else {
-      const grouped = await cachedAggregate("stats:group-status", 300, () => groupStatusCounts());
-      base = buildStatusStats(grouped);
-    }
+    const grouped = await groupStatusCounts();
 
     const now = new Date();
     const todayStart = new Date(
@@ -666,21 +578,18 @@ export async function getGlobalStats(): Promise<GlobalVerificationStats | null> 
     );
     const todayEnd = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
 
-    const todayGrouped = await cachedAggregate("stats:today", 60, () =>
-      groupStatusCounts("request_time >= ? AND request_time < ?", [
-        dateText(todayStart),
-        dateText(todayEnd),
-      ]),
-    );
+    const todayGrouped = await groupStatusCounts("request_time >= ? AND request_time < ?", [
+      dateText(todayStart),
+      dateText(todayEnd),
+    ]);
 
-    const total = counterTotal ?? base.total_requests;
-    const approved = base.approved;
+    const base = buildStatusStats(grouped);
     const today = buildStatusStats(todayGrouped);
 
     return {
       ...base,
-      total_requests: total,
-      approval_rate: total > 0 ? (approved / total) * 100 : 0,
+      approval_rate:
+        base.total_requests > 0 ? (base.approved / base.total_requests) * 100 : 0,
       today_total: today.total_requests,
       today_approved: today.approved,
       today_approval_rate:
@@ -700,7 +609,9 @@ export async function cleanupExpiredSessions(): Promise<ExpiredSessionTarget[]> 
     // 若不设批次上限，生产环境积压会撑爆 SQLite 999 绑定变量上限，
     // 整个清理循环（含新过期会话的处理）随之整体失效。
     // 取新弃旧：新过期会话必须及时处理；极老的积压行仅停留 pending（无功能影响，
-    // 验证判定以 isSessionExpired 为准），由下方修复②保证其状态合法性。
+    // 验证判定以 isSessionExpired 为准），由 purgeStaleRecords 的修复②保证其状态合法性。
+    // v2.0.6 D1 优化：expires_at 索引（idx_verification_sessions_expires）使本查询
+    // 从全表扫描变为索引范围扫描（无过期会话时读行 ≈ 0）。
     const expiredSessions = await queryAll<{ token: string }>(
       `SELECT token FROM verification_sessions
        WHERE expires_at < ? AND captcha_completed = 0
@@ -710,30 +621,10 @@ export async function cleanupExpiredSessions(): Promise<ExpiredSessionTarget[]> 
     const tokens = expiredSessions.map((row) => row.token);
 
     if (tokens.length === 0) {
+      // v2.0.6 D1 优化：无过期会话时直接返回 —— 历史 v1.1.4 修复②的脏状态修复
+      // UPDATE（join_requests 全表扫描）移入 purgeStaleRecords（每日一次），
+      // 不再随清理循环每 60s 扫一遍 join_requests（1440 次/天 × 全表行数）。
       return [];
-    }
-
-    // v1.1.4 修复②（历史脏数据自愈）：旧版下方 UPDATE 的绑定参数整体错位，把
-    // tokens[0]（某个过期会话的 32 位 token）写进了 join_requests.status
-    // （2026-11-03 实证：id=18/20 status 变成 qHOhAQOD… 串）。凡不属于
-    // 合法状态枚举的行都是该 bug 的确定性产物——对应会话必然已过期未完成，
-    // 统一修复为 expired。幂等，每轮清理先执行。
-    const dirtyFix = await executeRun(
-      `UPDATE join_requests SET status = ?
-       WHERE status IS NOT NULL AND status NOT IN (?, ?, ?, ?)`,
-      [
-        RequestStatus.EXPIRED,
-        RequestStatus.PENDING,
-        RequestStatus.APPROVED,
-        RequestStatus.REJECTED,
-        RequestStatus.EXPIRED,
-      ],
-    );
-    if (dirtyFix.changes > 0) {
-      // 来源状态未知（脏数据），只加不减，避免计数出现负值
-      await bumpJoinRequestTransition(null, RequestStatus.EXPIRED, dirtyFix.changes).catch(
-        (error) => console.warn("dirty status counter bump failed:", error),
-      );
     }
 
     const placeholders = tokens.map(() => "?").join(", ");
@@ -741,20 +632,16 @@ export async function cleanupExpiredSessions(): Promise<ExpiredSessionTarget[]> 
       chat_id: number;
       user_id: number;
       request_type: string;
-      token: string;
-      channel: string | null;
-      group_message_id: number | null;
+      verification_token: string;
     }>(
-      `SELECT j.chat_id AS chat_id, j.user_id AS user_id, j.request_type AS request_type,
-              j.verification_token AS token, s.channel AS channel, s.group_message_id AS group_message_id
-       FROM join_requests j
-       JOIN verification_sessions s ON s.token = j.verification_token
-       WHERE j.verification_token IN (${placeholders}) AND j.status = ?`,
+      `SELECT chat_id, user_id, request_type, verification_token FROM join_requests
+       WHERE verification_token IN (${placeholders}) AND status = ?`,
       [...tokens, RequestStatus.PENDING],
     );
 
     // telegram = 需拒绝 Telegram 侧加群申请；direct = 直连入群，需踢出未验证成员；
-    // simulator 等其他类型不动作（与既有行为一致）
+    // simulator 等其他类型不动作（与既有行为一致）。
+    // v2.0.5：target 携带 token —— 群内验证模式超时踢人前需按 token 删除群内验证提示消息。
     const toProcess: ExpiredSessionTarget[] = pendingRequests
       .filter((row) => Number(row.chat_id) !== 0)
       .filter((row) => row.request_type === "telegram" || row.request_type === "direct")
@@ -762,13 +649,7 @@ export async function cleanupExpiredSessions(): Promise<ExpiredSessionTarget[]> 
         chatId: toBigInt(row.chat_id),
         userId: toBigInt(row.user_id),
         requestType: row.request_type,
-        token: row.token,
-        // v2.1.0：群内渠道的会话过期后必须删群内提示 + 群内告知 + 踢出
-        channel: row.channel === "group" ? "group" : "dm",
-        groupMessageId:
-          row.group_message_id === null || row.group_message_id === undefined
-            ? null
-            : toNumber(row.group_message_id),
+        token: row.verification_token,
       }));
 
     // v1.1.4 修复③（原 bug 本体）：占位符顺序为 SET status=? / IN(...)/ AND status=?，
@@ -777,17 +658,10 @@ export async function cleanupExpiredSessions(): Promise<ExpiredSessionTarget[]> 
     // 单 token 轮次 WHERE 永不匹配（目标每 60s 重复通知），多 token 轮次则把
     // token 串写入 status（数据污染）。修复后本批 pending 申请一次性置为 expired，
     // 下一轮 target SELECT（要求 status=pending）不再命中，通知严格一次性。
-    const expiredUpdate = await executeRun(
+    await executeRun(
       `UPDATE join_requests SET status = ? WHERE verification_token IN (${placeholders}) AND status = ?`,
       [RequestStatus.EXPIRED, ...tokens, RequestStatus.PENDING],
     );
-    if (expiredUpdate.changes > 0) {
-      await bumpJoinRequestTransition(
-        RequestStatus.PENDING,
-        RequestStatus.EXPIRED,
-        expiredUpdate.changes,
-      ).catch((error) => console.warn("expired counter bump failed:", error));
-    }
 
     return toProcess;
   } catch (error) {
@@ -796,17 +670,13 @@ export async function cleanupExpiredSessions(): Promise<ExpiredSessionTarget[]> 
   }
 }
 
-/** 过期会话的后续动作目标（v1.1.3：携带申请类型，direct 类型需踢出未验证成员） */
+/** 过期会话的后续动作目标（v1.1.3：携带申请类型，direct 类型需踢出未验证成员；v2.0.5：携带 token，群内模式超时需删群内验证提示消息） */
 export interface ExpiredSessionTarget {
   chatId: bigint;
   userId: bigint;
   requestType: string;
-  /** v2.1.0：会话 token（群内渠道删除验证提示时用于回查/落库） */
+  /** 关联验证会话 token（v2.0.5） */
   token: string;
-  /** v2.1.0：验证渠道快照（group=群内验证，需删提示+群内告知+踢出） */
-  channel: "group" | "dm";
-  /** v2.1.0：群内验证消息 message_id（dm 渠道为 null） */
-  groupMessageId: number | null;
 }
 
 /**
@@ -841,8 +711,58 @@ export async function expirePendingSessionsForUserChat(
   }
 }
 
-/** 单批删除行数：D1 单次语句写行数有上限，分批复删不会把单条语句撑爆 */
-const PURGE_BATCH_SIZE = 400;
+/**
+ * 群内验证渠道判定（v2.0.5）：未配置/无群组设置时默认群内验证（"group"），
+ * 仅显式配置为 "dm" 才走私聊验证旧行为。
+ */
+export function resolveVerificationChannel(
+  settings: { verificationChannel?: "group" | "dm" } | null | undefined,
+): "group" | "dm" {
+  return settings?.verificationChannel === "dm" ? "dm" : "group";
+}
+
+/**
+ * 回写群内验证提示消息的 message_id（v2.0.5 群内验证模式）。
+ * 验证提示在群内发送成功后调用；验证通过/失败/超时后按该 id 删除消息。
+ */
+export async function setSessionPromptMessage(
+  token: string,
+  messageId: number | null,
+): Promise<void> {
+  try {
+    await executeRun(
+      `UPDATE verification_sessions SET prompt_message_id = ? WHERE token = ?`,
+      [messageId === null ? null : Number(messageId), token],
+    );
+  } catch (error) {
+    console.error("Error setting session prompt message id:", error);
+  }
+}
+
+/**
+ * 查询用户在群组内当前未完成的验证会话（未过期且加群申请仍 pending）。
+ * v2.0.5 幂等守卫：入群申请批准后的 chat_member 事件、重复的加群事件
+ * 不再重复创建会话/重复发送群内验证提示。
+ */
+export async function getPendingSessionForUserChat(
+  userId: bigint,
+  chatId: bigint,
+): Promise<VerificationSessionRow | null> {
+  try {
+    const row = await queryOne<Record<string, unknown>>(
+      `SELECT s.* FROM verification_sessions s
+       JOIN join_requests j ON j.verification_token = s.token
+       WHERE s.user_id = ? AND s.chat_id = ? AND s.captcha_completed = 0 AND s.expires_at > ?
+         AND j.status = ?
+       ORDER BY s.created_time DESC LIMIT 1`,
+      [Number(userId), Number(chatId), dateText(new Date()), RequestStatus.PENDING],
+    );
+    return row ? mapSession(row) : null;
+  } catch (error) {
+    console.error("Error getting pending session for user/chat:", error);
+    return null;
+  }
+}
 
 export async function purgeStaleRecords(
   retentionDays = 30,
@@ -853,70 +773,40 @@ export async function purgeStaleRecords(
   try {
     const cutoff = dateText(new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000));
 
-    // v2.2.0：删除前先按状态聚合待删行（走 request_time 索引，只碰老数据），
-    // 用于同步扣减计数器 —— 否则计数器会随着归档越飘越高。
-    let staleByStatus: { status: string; count: number }[] = [];
-    try {
-      staleByStatus = await queryAll<{ status: string; count: number }>(
-        `SELECT status, COUNT(id) AS count FROM join_requests
-         WHERE request_time < ? GROUP BY status`,
-        [cutoff],
-      );
-    } catch (error) {
-      console.warn("purge: 预统计待删申请失败（计数器可能轻微偏高）:", error);
-    }
-
-    const sessions = await deleteInBatches(
-      "verification_sessions",
-      "created_time",
-      cutoff,
+    const sessions = await executeRun(
+      `DELETE FROM verification_sessions WHERE created_time < ?`,
+      [cutoff],
     );
-    const joinRequests = await deleteInBatches("join_requests", "request_time", cutoff);
+    const joinRequests = await executeRun(
+      `DELETE FROM join_requests WHERE request_time < ?`,
+      [cutoff],
+    );
 
-    if (joinRequests > 0) {
-      await applyPurgeCounterDelta(staleByStatus, joinRequests).catch((error) =>
-        console.warn("purge counter delta failed:", error),
-      );
-    }
+    // v1.1.4 修复②（历史脏数据自愈）：旧版清理 UPDATE 绑定参数整体错位，把
+    // tokens[0]（某个过期会话的 32 位 token）写进了 join_requests.status
+    // （2026-11-03 实证：id=18/20 status 变成 qHOhAQOD… 串）。凡不属于
+    // 合法状态枚举的行都是该 bug 的确定性产物——对应会话必然已过期未完成，
+    // 统一修复为 expired。幂等。
+    // v2.0.6 D1 优化：本修复 UPDATE 从 cleanupExpiredSessions（每 60s 全表扫描
+    // join_requests × 1440 次/天）移入本函数（每日一次），配合
+    // idx_join_requests_status 索引扫描成本可控。
+    await executeRun(
+      `UPDATE join_requests SET status = ?
+       WHERE status IS NOT NULL AND status NOT IN (?, ?, ?, ?)`,
+      [
+        RequestStatus.EXPIRED,
+        RequestStatus.PENDING,
+        RequestStatus.APPROVED,
+        RequestStatus.REJECTED,
+        RequestStatus.EXPIRED,
+      ],
+    );
 
-    return { sessions, join_requests: joinRequests };
+    return { sessions: sessions.changes, join_requests: joinRequests.changes };
   } catch (error) {
     console.error("Error purging stale records:", error);
     return { sessions: 0, join_requests: 0 };
   }
-}
-
-/** 归档删除后按状态扣减计数器（total 与 status 同步减少） */
-async function applyPurgeCounterDelta(
-  staleByStatus: { status: string; count: number }[],
-  totalDeleted: number,
-): Promise<void> {
-  if (totalDeleted <= 0) return;
-  for (const row of staleByStatus) {
-    const count = Number(row.count) || 0;
-    if (count > 0) await addCounterDelta(String(row.status), -count);
-  }
-  await addCounterDelta(null, -totalDeleted);
-}
-
-/** 分批删除：`DELETE ... WHERE rowid IN (SELECT rowid ... LIMIT n)` 循环到删净 */
-async function deleteInBatches(
-  table: "verification_sessions" | "join_requests",
-  timeColumn: "created_time" | "request_time",
-  cutoff: string,
-): Promise<number> {
-  let deleted = 0;
-  for (let round = 0; round < 50; round += 1) {
-    const result = await executeRun(
-      `DELETE FROM ${table} WHERE rowid IN (
-         SELECT rowid FROM ${table} WHERE ${timeColumn} < ? LIMIT ${PURGE_BATCH_SIZE}
-       )`,
-      [cutoff],
-    );
-    deleted += result.changes;
-    if (result.changes < PURGE_BATCH_SIZE) break;
-  }
-  return deleted;
 }
 
 export interface JoinRequestListFilters {
@@ -954,16 +844,11 @@ export async function listJoinRequests(
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  // v2.2.0：总条数走 60s 聚合缓存。`COUNT(id)` 在 D1 上是按扫描行计费的，
-  // 分页翻页/刷新一次就全表扫一遍 —— 缓存后同一筛选条件下最多 1 分钟扫一次。
-  const countKey = `count:join_requests:${where}:${params.join("|")}`;
-  const total = await cachedAggregate(countKey, 60, async () => {
-    const totalRow = await queryOne<{ count: number }>(
-      `SELECT COUNT(id) AS count FROM join_requests ${where}`,
-      params,
-    );
-    return toNumber(totalRow?.count ?? 0);
-  });
+  const totalRow = await queryOne<{ count: number }>(
+    `SELECT COUNT(id) AS count FROM join_requests ${where}`,
+    params,
+  );
+  const total = toNumber(totalRow?.count ?? 0);
   const rows = await queryAll<Record<string, unknown>>(
     `SELECT * FROM join_requests ${where}
      ORDER BY request_time DESC LIMIT ? OFFSET ?`,
@@ -974,20 +859,16 @@ export async function listJoinRequests(
 
 /** 按群组统计待处理（pending）加群申请数：机器人测试页仿真屏群组列表的未读徽章数据源 */
 export async function countPendingJoinRequestsByChat(): Promise<Map<string, number>> {
-  // v2.2.0：30s 聚合缓存（仿真屏/测试页刷新频繁，且该查询要按 status 全扫 pending 行）
-  const entries = await cachedAggregate<[string, number][]>(
-    "count:pending_by_chat",
-    30,
-    async () => {
-      const rows = await queryAll<{ chat_id: number | bigint; count: number }>(
-        `SELECT chat_id, COUNT(id) AS count FROM join_requests
-         WHERE status = 'pending'
-         GROUP BY chat_id`,
-      );
-      return rows.map((row) => [String(toBigInt(row.chat_id)), toNumber(row.count)] as [string, number]);
-    },
+  const rows = await queryAll<{ chat_id: number | bigint; count: number }>(
+    `SELECT chat_id, COUNT(id) AS count FROM join_requests
+     WHERE status = 'pending'
+     GROUP BY chat_id`,
   );
-  return new Map(entries);
+  const map = new Map<string, number>();
+  for (const row of rows) {
+    map.set(String(toBigInt(row.chat_id)), toNumber(row.count));
+  }
+  return map;
 }
 
 export interface PendingCodeContext {
@@ -1013,24 +894,6 @@ export async function getPendingCodeContext(
   if (!joinRequest || joinRequest.status !== RequestStatus.PENDING) return null;
   const settings = await getGroupSettings(session.chatId);
   return { session, joinRequest, settings };
-}
-
-/**
- * 用户在某群组里是否已有待验证会话（v2.1.0 防重复 bootstrap）。
- * 群内渠道下「自动批准 + 禁言」会额外触发 chat_member（restricted）事件，
- * 若不加守卫会对同一用户重复建会话、重复发验证提示。
- */
-export async function getPendingSessionForUserChat(
-  userId: bigint,
-  chatId: bigint,
-): Promise<VerificationSessionRow | null> {
-  const row = await queryOne<Record<string, unknown>>(
-    `SELECT * FROM verification_sessions
-     WHERE user_id = ? AND chat_id = ? AND captcha_completed = 0 AND expires_at > ?
-     ORDER BY created_time DESC LIMIT 1`,
-    [Number(userId), Number(chatId), dateText(new Date())],
-  );
-  return row ? mapSession(row) : null;
 }
 
 /** 用户最近一条验证会话及其加群申请（不限状态，v1.1.4） */
@@ -1130,8 +993,7 @@ function mapGroupSettings(row: Record<string, unknown>): GroupSettingsRow {
     enabled: toBoolean(row.enabled),
     privacyMode: row.privacy_mode === undefined ? true : toBoolean(row.privacy_mode),
     requireApproval: row.require_approval === undefined ? false : toBoolean(row.require_approval),
-    // 缺列（旧库未迁移）时按 group 处理：群内验证是默认真实流程
-    verifyChannel: (row.verify_channel as string | null)?.trim() === "dm" ? "dm" : "group",
+    verificationChannel: row.verification_channel === "dm" ? "dm" : "group",
     createdTime: toDate(row.created_time),
     updatedTime: toDate(row.updated_time),
   };
@@ -1514,7 +1376,11 @@ export async function deleteMenu(id: bigint): Promise<boolean> {
 }
 
 const GROUP_SETTINGS_CACHE_KEY = "group-settings";
-const GROUP_SETTINGS_CACHE_TTL_SECONDS = 30;
+// v2.0.6：30s → 300s。写路径（upsertGroupSettings/deleteGroupSettings/验证方式变更）
+// 已 invalidateCache（KV delete + 本 isolate memo 清理），变更最大延迟 = 其他 isolate 300s
+// 追平 —— 群验证配置低频变更，完全可接受；读行成本却随 miss 率线性下降
+// （cache miss = SELECT * FROM group_settings 全表）。
+const GROUP_SETTINGS_CACHE_TTL_SECONDS = 300;
 
 type GroupSettingsCache = Record<string, GroupSettingsRow | null>;
 
@@ -1574,30 +1440,28 @@ export async function upsertGroupSettings(
     privacyMode?: boolean;
     /** v1.1.9 加群需要管理员审核；undefined = 不改动现有值 */
     requireApproval?: boolean;
-    /** v2.1.0 验证渠道（group 群内 / dm 私聊）；undefined = 不改动现有值 */
-    verifyChannel?: string;
+    /** v2.0.5 验证渠道（group=群内验证 / dm=私聊验证）；undefined = 不改动现有值 */
+    verificationChannel?: "group" | "dm";
   },
 ): Promise<void> {
-  // requireApproval === undefined 语义为「不改动现有值」。
-  // 该列是 NOT NULL，SQLite 在 INSERT 阶段即校验约束（不会等 COALESCE 兜底），
-  // 因此必须先读出现值（无行则 false），绝不允许绑定 null。
+  // requireApproval / verificationChannel === undefined 语义为「不改动现有值」。
+  // 两列都是 NOT NULL，SQLite 在 INSERT 阶段即校验约束（不会等 COALESCE 兕底），
+  // 因此必须先读出现值（无行则取各自默认），绝不允许绑定 null。
   let requireApprovalValue = input.requireApproval;
-  // verify_channel 同理：NOT NULL 列，undefined 时必须读现值（无行则 group）
-  let verifyChannelValue = input.verifyChannel;
-  if (requireApprovalValue === undefined || verifyChannelValue === undefined) {
+  let verificationChannelValue = input.verificationChannel;
+  if (requireApprovalValue === undefined || verificationChannelValue === undefined) {
     const existing = await getGroupSettings(chatId);
     if (requireApprovalValue === undefined) {
       requireApprovalValue = existing ? existing.requireApproval : false;
     }
-    if (verifyChannelValue === undefined) {
-      verifyChannelValue = existing ? existing.verifyChannel : "group";
+    if (verificationChannelValue === undefined) {
+      verificationChannelValue = existing ? existing.verificationChannel : "group";
     }
   }
-  const verifyChannel = verifyChannelValue === "dm" ? "dm" : "group";
 
   await executeRun(
     `INSERT INTO group_settings
-       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, require_approval, verify_channel, created_time, updated_time)
+       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, require_approval, verification_channel, created_time, updated_time)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(chat_id) DO UPDATE SET
        chat_title = COALESCE(excluded.chat_title, group_settings.chat_title),
@@ -1611,7 +1475,7 @@ export async function upsertGroupSettings(
        enabled = COALESCE(excluded.enabled, group_settings.enabled),
        privacy_mode = COALESCE(excluded.privacy_mode, group_settings.privacy_mode),
        require_approval = excluded.require_approval,
-       verify_channel = excluded.verify_channel,
+       verification_channel = excluded.verification_channel,
        updated_time = excluded.updated_time`,
     [
       Number(chatId),
@@ -1626,7 +1490,7 @@ export async function upsertGroupSettings(
       input.enabled === false ? 0 : 1,
       input.privacyMode === false ? 0 : 1,
       requireApprovalValue ? 1 : 0,
-      verifyChannel,
+      verificationChannelValue === "dm" ? "dm" : "group",
       dateText(new Date()),
       dateText(new Date()),
     ],
@@ -1768,13 +1632,10 @@ export async function listOperationLogs(options?: {
 }): Promise<{ rows: OperationLogRow[]; total: number }> {
   const page = Math.max(1, options?.page ?? 1);
   const pageSize = Math.min(100, Math.max(5, options?.pageSize ?? 20));
-  // v2.2.0：日志总条数 120s 缓存（COUNT 全表扫描，翻页时每次重算毫无意义）
-  const total = await cachedAggregate("count:operation_logs", 120, async () => {
-    const totalRow = await queryOne<{ count: number }>(
-      `SELECT COUNT(id) AS count FROM operation_logs`,
-    );
-    return toNumber(totalRow?.count ?? 0);
-  });
+  const totalRow = await queryOne<{ count: number }>(
+    `SELECT COUNT(id) AS count FROM operation_logs`,
+  );
+  const total = toNumber(totalRow?.count ?? 0);
   const rows = await queryAll<Record<string, unknown>>(
     `SELECT * FROM operation_logs ORDER BY created_time DESC, id DESC LIMIT ? OFFSET ?`,
     [pageSize, (page - 1) * pageSize],
@@ -1830,9 +1691,13 @@ export async function deleteAppSetting(key: string): Promise<void> {
 export const APP_SETTINGS_CACHE_KEY = "app-settings";
 
 export async function getCachedAppSettings(): Promise<Record<string, string>> {
+  // v2.0.6：15s → 120s。写路径（setAppSetting/deleteAppSetting）已 invalidateCache，
+  // 变更最大延迟 = 其他 isolate 120s 追平；app_settings 是高频读取
+  // （运行时设置/会话存储后端/隐私开关），短 TTL 下的反复 miss
+  // （miss = SELECT key,value FROM app_settings 全表）是读行大户。
   return cachedJson<Record<string, string>>(
     APP_SETTINGS_CACHE_KEY,
-    15,
+    120,
     getAllAppSettings,
   );
 }
@@ -1866,25 +1731,53 @@ function mapBot(row: Record<string, unknown>): BotRow {
 }
 
 export async function listBots(): Promise<BotRow[]> {
-  const rows = await queryAll<Record<string, unknown>>(
-    `SELECT * FROM bots ORDER BY id`,
-  );
-  return rows.map(mapBot);
+  // v2.0.6 D1 优化：registerTelegramChat / startMenuBots 等路径高频调用，
+  // 60s 进程内缓存（写路径 invalidateBotsMemos 保证本 isolate 立即一致）
+  return memoTtl<BotRow[]>("bots:all", BOT_LIST_CACHE_MS, async () => {
+    const rows = await queryAll<Record<string, unknown>>(
+      `SELECT * FROM bots ORDER BY id`,
+    );
+    return rows.map(mapBot);
+  });
 }
 
 export async function listEnabledBots(): Promise<BotRow[]> {
-  const rows = await queryAll<Record<string, unknown>>(
-    `SELECT * FROM bots WHERE enabled = 1 ORDER BY id`,
-  );
-  return rows.map(mapBot);
+  // v2.0.6 D1 优化：同 listBots
+  return memoTtl<BotRow[]>("bots:enabled", BOT_LIST_CACHE_MS, async () => {
+    const rows = await queryAll<Record<string, unknown>>(
+      `SELECT * FROM bots WHERE enabled = 1 ORDER BY id`,
+    );
+    return rows.map(mapBot);
+  });
+}
+
+/** v2.0.6：bots 表写路径统一失效（本 isolate 立即一致；其他 isolate 60s TTL 内追平） */
+function invalidateBotsMemos(botId?: bigint): void {
+  invalidateMemo("bots:all");
+  invalidateMemo("bots:enabled");
+  if (botId !== undefined) {
+    invalidateMemo(`bot:${botId}`);
+  } else {
+    invalidateMemoByPrefix("bot:");
+  }
 }
 
 export async function getBot(id: bigint): Promise<BotRow | null> {
-  const row = await queryOne<Record<string, unknown>>(
-    `SELECT * FROM bots WHERE id = ?`,
-    [Number(id)],
+  // v2.0.6 D1 优化（核心）：本函数是 webhook 热路径 —— 每条 Telegram 更新
+  // 在路由层与 acquireMenuBot 各调一次，Workers isolate 回收后首条消息
+  // 必然命中本函数。60s 进程内缓存 + null 结果也缓存（防不存在 bot 反复打库），
+  // 把每条 webhook 的 2 次 D1 读降为 ≈ 0。
+  return memoTtl<BotRow | null>(
+    `bot:${id}`,
+    BOT_ROW_CACHE_MS,
+    async () => {
+      const row = await queryOne<Record<string, unknown>>(
+        `SELECT * FROM bots WHERE id = ?`,
+        [Number(id)],
+      );
+      return row ? mapBot(row) : null;
+    },
   );
-  return row ? mapBot(row) : null;
 }
 
 export async function createBotRecord(input: {
@@ -1912,6 +1805,7 @@ export async function createBotRecord(input: {
     ],
   );
   if (result.changes !== 1) return null;
+  invalidateBotsMemos();
   return getBot(BigInt(result.lastInsertRowid));
 }
 
@@ -1963,12 +1857,14 @@ export async function updateBotRecord(
     params.push(Number(id));
     await executeRun(`UPDATE bots SET ${sets.join(", ")} WHERE id = ?`, params);
   }
+  invalidateBotsMemos(id);
   return getBot(id);
 }
 
 export async function deleteBotRecord(id: bigint): Promise<boolean> {
   await executeRun(`DELETE FROM group_bot_admins WHERE bot_id = ?`, [Number(id)]);
   const result = await executeRun(`DELETE FROM bots WHERE id = ?`, [Number(id)]);
+  invalidateBotsMemos(id);
   return result.changes > 0;
 }
 
@@ -2123,33 +2019,6 @@ export async function upsertGroupBotAdmin(input: {
   );
 }
 
-/**
- * 确保「机器人 ↔ 群组」关联存在（只建关联，绝不改写既有行）。
- *
- * rights 列存放一键部署状态（入群申请链接/部署时间）与管理员权限快照，
- * status 可能被管理端置为非 active —— 由真实同步 / 群消息事件触发的自动登记
- * 只允许补建关联，不许覆盖这些数据（历史实现用 upsert 覆盖 rights='{}'，
- * 每次机器人再触发一次登记就把部署状态清空）。
- */
-export async function ensureGroupBotAdmin(input: {
-  botId: bigint;
-  chatId: bigint;
-  status?: string;
-}): Promise<void> {
-  await executeRun(
-    `INSERT INTO group_bot_admins (bot_id, chat_id, rights, status, created_time, updated_time)
-     VALUES (?, ?, '{}', ?, ?, ?)
-     ON CONFLICT(bot_id, chat_id) DO NOTHING`,
-    [
-      Number(input.botId),
-      Number(input.chatId),
-      input.status ?? "active",
-      dateText(new Date()),
-      dateText(new Date()),
-    ],
-  );
-}
-
 export async function deleteGroupBotAdmin(id: bigint): Promise<boolean> {
   const result = await executeRun(`DELETE FROM group_bot_admins WHERE id = ?`, [Number(id)]);
   return result.changes > 0;
@@ -2249,29 +2118,35 @@ export async function listBotCommands(options: {
 }): Promise<BotCommandPage> {
   const page = Math.max(1, Math.floor(options.page ?? 1));
   const pageSize = Math.min(100, Math.max(1, Math.floor(options.pageSize ?? 20)));
-  const where: string[] = [`type = ?`];
-  const params: (string | number)[] = [options.type];
-  if (options.enabledOnly) {
-    where.push(`enabled = 1`);
-  }
-  const whereSql = where.join(" AND ");
-  const totalRow = await queryOne<{ total: number }>(
-    `SELECT COUNT(*) AS total FROM bot_commands WHERE ${whereSql}`,
-    params,
-  );
-  const total = Number(totalRow?.total ?? 0);
-  const rows = await queryAll<Record<string, unknown>>(
-    `SELECT * FROM bot_commands WHERE ${whereSql}
-     ORDER BY sort_order, id LIMIT ? OFFSET ?`,
-    [...params, pageSize, (page - 1) * pageSize],
-  );
-  return {
-    rows: rows.map(mapBotCommand),
-    total,
-    page,
-    pageSize,
-    totalPages: Math.max(1, Math.ceil(total / pageSize)),
-  };
+  // v2.0.6 D1 优化：registerBotCapabilities 在 webhook 冷实例启动时调用
+  // （每 isolate 每次回收后首条消息），COUNT(*)+SELECT 两次查询 ≈ 25-75 行读；
+  // 60s 进程内缓存 + 指令写路径 invalidateBotCommandMemos。
+  const cacheKey = `botcmd:list:${options.type}:${page}:${pageSize}:${options.enabledOnly ? 1 : 0}`;
+  return memoTtl<BotCommandPage>(cacheKey, BOT_COMMANDS_CACHE_MS, async () => {
+    const where: string[] = [`type = ?`];
+    const params: (string | number)[] = [options.type];
+    if (options.enabledOnly) {
+      where.push(`enabled = 1`);
+    }
+    const whereSql = where.join(" AND ");
+    const totalRow = await queryOne<{ total: number }>(
+      `SELECT COUNT(*) AS total FROM bot_commands WHERE ${whereSql}`,
+      params,
+    );
+    const total = Number(totalRow?.total ?? 0);
+    const rows = await queryAll<Record<string, unknown>>(
+      `SELECT * FROM bot_commands WHERE ${whereSql}
+       ORDER BY sort_order, id LIMIT ? OFFSET ?`,
+      [...params, pageSize, (page - 1) * pageSize],
+    );
+    return {
+      rows: rows.map(mapBotCommand),
+      total,
+      page,
+      pageSize,
+      totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    };
+  });
 }
 
 export async function getBotCommand(id: bigint): Promise<BotCommandRow | null> {
@@ -2280,6 +2155,11 @@ export async function getBotCommand(id: bigint): Promise<BotCommandRow | null> {
     [Number(id)],
   );
   return row ? mapBotCommand(row) : null;
+}
+
+/** v2.0.6：bot_commands 写路径统一失效（同 isolate 立即生效；其他 isolate 60s TTL 内追平） */
+function invalidateBotCommandMemos(): void {
+  invalidateMemoByPrefix("botcmd:");
 }
 
 export async function createBotCommand(input: {
@@ -2304,6 +2184,7 @@ export async function createBotCommand(input: {
       dateText(new Date()),
     ],
   );
+  invalidateBotCommandMemos();
   return result.lastInsertRowid ? BigInt(result.lastInsertRowid) : null;
 }
 
@@ -2336,11 +2217,13 @@ export async function updateBotCommand(
       Number(id),
     ],
   );
+  invalidateBotCommandMemos();
   return result.changes > 0;
 }
 
 export async function deleteBotCommand(id: bigint): Promise<boolean> {
   const result = await executeRun(`DELETE FROM bot_commands WHERE id = ?`, [Number(id)]);
+  invalidateBotCommandMemos();
   return result.changes > 0;
 }
 
@@ -2388,11 +2271,19 @@ export async function listBotCommandsByIds(
   ids: bigint[],
 ): Promise<BotCommandRow[]> {
   if (ids.length === 0) return [];
-  const placeholders = ids.map(() => "?").join(",");
-  const rows = await queryAll<Record<string, unknown>>(
-    `SELECT * FROM bot_commands WHERE id IN (${placeholders}) AND enabled = 1
-     ORDER BY sort_order, id`,
-    ids.map((id) => Number(id)),
+  // v2.0.6 D1 优化：registerBotCapabilities 冷实例热路径，60s 进程内缓存
+  const sortedKey = [...ids].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",");
+  return memoTtl<BotCommandRow[]>(
+    `botcmd:ids:${sortedKey}`,
+    BOT_COMMANDS_CACHE_MS,
+    async () => {
+      const placeholders = ids.map(() => "?").join(",");
+      const rows = await queryAll<Record<string, unknown>>(
+        `SELECT * FROM bot_commands WHERE id IN (${placeholders}) AND enabled = 1
+         ORDER BY sort_order, id`,
+        ids.map((id) => Number(id)),
+      );
+      return rows.map(mapBotCommand);
+    },
   );
-  return rows.map(mapBotCommand);
 }

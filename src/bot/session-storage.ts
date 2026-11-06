@@ -1,7 +1,7 @@
 import { session } from "grammy";
 import type { StorageAdapter } from "grammy";
 import { queryAll, queryOne, executeRun } from "@/database/client";
-import { getAppSetting, getAllAppSettings } from "@/database/operations";
+import { getAllAppSettings, getCachedAppSettings } from "@/database/operations";
 import type { BotContext } from "./context";
 
 /**
@@ -79,7 +79,10 @@ export function normalizeSessionBackend(value: unknown): SessionStorageBackend {
 }
 
 async function getSettingValue(key: string): Promise<string> {
-  return (await getAppSetting(key)) ?? "";
+  // v2.0.6 D1 优化：原 getAppSetting 直读（每次实例构建 1-7 次 D1 读）改走
+  // 全量缓存（120s TTL + 进程内 memo + KV），冷实例构建成本降为 ≈ 0
+  const stored = await getCachedAppSettings();
+  return stored[key] ?? "";
 }
 
 async function getD1Config(): Promise<SessionStorageD1Config> {

@@ -1,12 +1,13 @@
 import type { BotContext } from "../context";
 import { config } from "@/config/settings";
-import { getRuntimeSettings } from "@/config/runtime-settings";
+import { getRuntimeSettings, type RuntimeSettings } from "@/config/runtime-settings";
 import {
   createJoinRequest,
   createVerificationSession,
   getGroupSettings,
   getPendingSessionForUserChat,
   getVerificationMethod,
+  resolveVerificationChannel,
 } from "@/database/operations";
 import { generateVerificationToken, generateJoinCode } from "@/utils/crypto";
 import { htmlEscape } from "@/utils/html";
@@ -14,28 +15,25 @@ import { utcnow } from "@/utils/time";
 import { InlineKeyboard, type Api } from "grammy";
 import { codeQuestion } from "../verification-question";
 import { CODE_SELF_DEFAULT_PROMPT, sendCodeSelfPrompt } from "../verification-prompt";
+import { muteAndSendGroupPrompt } from "./group-verification";
+import { approveTelegramJoinRequest } from "@/services/approval";
 import { registerTelegramChat } from "@/services/chat-registry";
-import {
-  buildOptionCodes,
-  isGroupChannel,
-  memberDisplayName,
-  muteGroupMember,
-  resolveVerifyUrl,
-  sendGroupVerificationPrompt,
-} from "@/services/group-verification";
 
 /**
- * 加群验证引导（真实 Telegram 路径，v2.1.0 起默认群内验证）：
+ * 加群验证引导（真实 Telegram 路径）：
  *
  * 两条入口共用同一核心 bootstrapJoinVerification：
  * 1. chat_join_request —— 用户通过「入群申请链接」申请加群（需要机器人审批，入群前验证）
  * 2. chat_member       —— 用户通过普通邀请链接/被拉入群直接进来了（入群后补验证，超时/失败踢出）
  *
- * 渠道分流（group_settings.verify_channel）：
- * - group（默认，真实流程）：自动批准进群 → 立即禁言 → 群内发验证消息（mention + 倒计时 + 按钮）
- *   → 通过则解禁 + 删除群内提示 + 群内欢迎；失败/超时则删提示 + 群内告知 + 踢出；
- *   群聊明文输码被硬性拦截（见 handlers/code-input.ts），其他成员看不到任何输入内容。
- * - dm（旧版行为，逐字保留）：所有验证提示/结果只通过机器人私聊发送，群组内零消息。
+ * 验证渠道（v2.0.5，group_settings.verification_channel）：
+ * - "group"（默认）群内验证：入群申请先批准 → 用户进群 → 禁言 → 群内验证消息
+ *   （captcha/code_api = 网页按钮，code_self = 4 选 1 按钮），输入内容其他成员
+ *   不可见；验证通过解禁 + 群内欢迎，失败/超时踢出。
+ * - "dm" 私聊验证（v1.1.3 旧行为）：所有验证提示/结果只通过机器人私聊发送，
+ *   群组内绝不发送任何验证消息；私聊发送失败（用户尚未启动机器人）时仅记录日志：
+ *   - 申请类用户：之后点「开始」时 /start 会重发验证提示（pending 会话仍在）；
+ *   - 直连入群用户：验证超时后由清理任务自动踢出，可重新申请。
  */
 
 export interface JoinVerificationUser {
@@ -54,57 +52,120 @@ export interface JoinVerificationChat {
 interface BootstrapResult {
   /** 会话与加群申请记录是否创建成功 */
   created: boolean;
-  /** 验证提示是否已成功送达（group 渠道=群内消息，dm 渠道=私聊） */
+  /** 验证提示是否已成功送达（群内模式 = 群内消息；私聊模式 = 用户私聊） */
   promptDelivered: boolean;
   method: "code_api" | "code_self" | "captcha" | "none";
-  /** 本次会话使用的验证渠道（group=群内验证 / dm=私聊验证） */
-  channel: "group" | "dm";
 }
 
-/** 群内渠道：自动批准加群申请（apply 失败不阻塞 —— 用户可能已在群内） */
-async function autoApproveJoinRequest(
-  api: Api,
-  chatId: number,
-  userId: number,
-  requestType: string,
-): Promise<boolean> {
-  if (requestType !== "telegram") return false;
-  try {
-    await api.approveChatJoinRequest(chatId, userId);
-    console.log(`[group-verify] 自动批准入群: user=${userId} chat=${chatId}`);
-    return true;
-  } catch (error) {
-    // 400 = 申请已被处理/已不存在（用户重复点击申请链接等），属正常竞态
-    console.warn(
-      `[group-verify] 自动批准入群失败（可能申请已被处理）: user=${userId} chat=${chatId}: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-    return false;
-  }
-}
-
-async function bootstrapJoinVerification(
+/**
+ * 群内验证模式 bootstrap（v2.0.5）：
+ * 1. 幂等守卫：同一用户同群已有未完成会话（申请批准后的 chat_member 抖动/重复投递）
+ *    不重复创建会话、不重复发群内消息；
+ * 2. join_request：先批准 Telegram 侧入群申请让用户进群（join_requests.status 保持
+ *    pending —— 超时清理/统计依赖该语义），批准失败回落私聊验证旧行为；
+ * 3. 创建验证会话 → 禁言 → 群内验证消息（按钮按验证方式组装）。
+ */
+async function bootstrapGroupVerification(
   api: Api,
   user: JoinVerificationUser,
   chat: JoinVerificationChat,
   requestType: "telegram" | "direct",
+  runtime: RuntimeSettings,
+  groupSettings: NonNullable<Awaited<ReturnType<typeof getGroupSettings>>>,
 ): Promise<BootstrapResult> {
-  // 真实加群事件到达：登记真实群组（chat_id / 群名），供管理后台「机器人测试」选择真实群组
-  // （chat_join_request 仅出现在 supergroup，Telegram 基础群不支持入群申请）
-  if (chat.type === "supergroup") {
-    try {
-      await registerTelegramChat({
-        chatId: BigInt(chat.id),
-        chatTitle: chat.title ?? null,
-        botToken: api.token,
-      });
-    } catch (registryError) {
-      console.warn("Failed to register real chat from join flow:", registryError);
+  const existing = await getPendingSessionForUserChat(BigInt(user.id), BigInt(chat.id));
+  if (existing) {
+    console.log(
+      `Pending group verification already exists: user ${user.id} chat ${chat.id} ` +
+        `session=${existing.token.slice(0, 8)}... — skip duplicate bootstrap`,
+    );
+    return {
+      created: true,
+      promptDelivered: true,
+      method: existing.method as BootstrapResult["method"],
+    };
+  }
+
+  // 入群申请链接用户：先批准进群（群内验证的前提）；批准失败 → 回落私聊验证
+  if (requestType === "telegram") {
+    const approval = await approveTelegramJoinRequest(BigInt(chat.id), BigInt(user.id));
+    if (!approval.success) {
+      console.warn(
+        `Group-channel join request approval failed (chat ${chat.id}, user ${user.id}): ` +
+          `${approval.error ?? "unknown"} — falling back to DM verification`,
+      );
+      return bootstrapDmVerification(api, user, chat, requestType, runtime, groupSettings);
     }
   }
 
-  const runtime = await getRuntimeSettings(config);
+  // 验证方式解析（与私聊模式同一套规则：code_api 必须绑定启用中的验证方法）
+  const methodId = groupSettings.methodId ?? null;
+  let codeApiMethodId: bigint | null = null;
+  if (groupSettings.method === "code_api" && methodId) {
+    const method = await getVerificationMethod(methodId);
+    if (method && method.enabled) {
+      codeApiMethodId = method.id;
+    }
+  }
+  const useSelfCode = groupSettings.method === "code_self" && !codeApiMethodId;
+  const method = codeApiMethodId ? "code_api" : useSelfCode ? "code_self" : "captcha";
+  const joinCode = useSelfCode ? generateJoinCode() : null;
+
+  const verificationToken = generateVerificationToken();
+  const expiresAt = new Date(
+    utcnow().getTime() + (groupSettings.timeoutSeconds ?? runtime.verificationTimeout) * 1000,
+  );
+
+  const dbJoinRequest = await createJoinRequest({
+    userId: BigInt(user.id),
+    chatId: BigInt(chat.id),
+    username: user.username ?? null,
+    firstName: user.first_name ?? "",
+    lastName: user.last_name ?? null,
+    verificationToken,
+    requestType,
+  });
+  if (!dbJoinRequest) {
+    console.error(`Failed to create join request for user ${user.id} (${requestType})`);
+    return { created: false, promptDelivered: false, method: "none" };
+  }
+
+  const session = await createVerificationSession({
+    token: verificationToken,
+    userId: BigInt(user.id),
+    chatId: BigInt(chat.id),
+    expiresAt,
+    method,
+    expectedCode: joinCode,
+  });
+  if (!session) {
+    console.error(`Failed to create verification session for user ${user.id} (${requestType})`);
+    return { created: false, promptDelivered: false, method: "none" };
+  }
+
+  // 禁言 + 群内验证消息（输入内容其他成员不可见：网页按钮 / 4 选 1 callback）
+  const outcome = await muteAndSendGroupPrompt(
+    api,
+    { id: chat.id, title: chat.title },
+    user,
+    session,
+    groupSettings,
+    runtime.baseUrl,
+    runtime.verificationButtonText,
+  );
+
+  return { created: true, promptDelivered: outcome.sent, method };
+}
+
+/** 私聊验证模式 bootstrap（v1.1.3 旧行为，verification_channel=dm 或群组未配置时） */
+async function bootstrapDmVerification(
+  api: Api,
+  user: JoinVerificationUser,
+  chat: JoinVerificationChat,
+  requestType: "telegram" | "direct",
+  runtime: RuntimeSettings,
+  groupSettings: Awaited<ReturnType<typeof getGroupSettings>>,
+): Promise<BootstrapResult> {
   const verificationToken = generateVerificationToken();
 
   const dbJoinRequest = await createJoinRequest({
@@ -119,10 +180,9 @@ async function bootstrapJoinVerification(
 
   if (!dbJoinRequest) {
     console.error(`Failed to create join request for user ${user.id} (${requestType})`);
-    return { created: false, promptDelivered: false, method: "none", channel: "dm" };
+    return { created: false, promptDelivered: false, method: "none" };
   }
 
-  const groupSettings = await getGroupSettings(BigInt(chat.id));
   const methodId = groupSettings?.methodId ?? null;
   let codeApiMethodId: bigint | null = null;
   if (groupSettings?.enabled !== false && groupSettings?.method === "code_api" && methodId) {
@@ -132,56 +192,14 @@ async function bootstrapJoinVerification(
     }
   }
 
-  // v1.1.7 code_self（输入验证码加群）：机器人自生成验证码 →
-  // 私聊发给用户（dm 渠道）或作为群内 4 选 1 候选按钮（group 渠道）
+  // v1.1.7 code_self（输入验证码加群）：机器人自生成验证码 → 私聊发给用户 →
+  // 用户回复输入 → 本地比对（对→approve / 错→decline / 超时→decline），
+  // 无需外部卡密 API 与 WebApp，参考 Telegram 进群答题/对暗号验证方案。
   const useSelfCode =
     groupSettings?.enabled !== false &&
     groupSettings?.method === "code_self" &&
     !codeApiMethodId;
   const joinCode = useSelfCode ? generateJoinCode() : null;
-  const method: "code_api" | "code_self" | "captcha" = codeApiMethodId
-    ? "code_api"
-    : useSelfCode
-      ? "code_self"
-      : "captcha";
-
-  // 渠道判定：无群组配置（未配置验证）时保持旧私聊行为；
-  // captcha / code_api 在群内渠道依赖网页验证页，Base URL 缺失时降级为私聊
-  let channel: "group" | "dm" = isGroupChannel(groupSettings) ? "group" : "dm";
-  let verifyUrl: string | null = null;
-  if (channel === "group") {
-    if (method === "code_self") {
-      verifyUrl = null;
-    } else {
-      verifyUrl = await resolveVerifyUrl(verificationToken);
-      if (!verifyUrl) {
-        console.warn(
-          `[group-verify] 系统 Base URL 未配置，群内渠道无法生成验证页链接 → 本会话降级为私聊验证: chat=${chat.id}`,
-        );
-        channel = "dm";
-      }
-    }
-  }
-
-  // 群内渠道必须先让用户真正进群（自动批准入群申请），否则群里没有任何可交互对象。
-  // 批准失败（机器人缺「邀请用户」权限 / 申请已被处理 / 用户已自行进群）时：
-  // - 申请类用户并未在群内 → 本会话降级为私聊渠道（否则用户既看不到群消息也无法验证，
-  //   超时还会去踢一个不在群里的人）；
-  // - 直连入群用户本来就在群里，无需批准。
-  if (channel === "group" && requestType === "telegram") {
-    const approved = await autoApproveJoinRequest(api, chat.id, user.id, requestType);
-    if (!approved) {
-      console.warn(
-        `[group-verify] 自动批准失败 → 本会话降级为私聊验证（用户未进群，群内验证无从进行）: user=${user.id} chat=${chat.id}`,
-      );
-      channel = "dm";
-    }
-  }
-
-  const optionCodes =
-    channel === "group" && method === "code_self" && joinCode
-      ? buildOptionCodes(joinCode)
-      : null;
 
   const expiresAt = new Date(
     utcnow().getTime() +
@@ -192,66 +210,15 @@ async function bootstrapJoinVerification(
     userId: BigInt(user.id),
     chatId: BigInt(chat.id),
     expiresAt,
-    method,
+    method: codeApiMethodId ? "code_api" : useSelfCode ? "code_self" : "captcha",
     expectedCode: joinCode,
-    channel,
-    optionCodes,
   });
 
   if (!verificationSession) {
     console.error(`Failed to create verification session for user ${user.id} (${requestType})`);
-    return { created: false, promptDelivered: false, method: "none", channel };
+    return { created: false, promptDelivered: false, method: "none" };
   }
 
-  // —— 群内验证（默认真实流程）——
-  if (channel === "group") {
-    const muted = await muteGroupMember(BigInt(chat.id), BigInt(user.id));
-    if (!muted) {
-      console.warn(
-        `[group-verify] 未成功禁言 user=${user.id} chat=${chat.id}：机器人需具备「限制成员」权限；验证流程继续`,
-      );
-    }
-    const delivery = await sendGroupVerificationPrompt(api, {
-      chatId: BigInt(chat.id),
-      userId: BigInt(user.id),
-      displayName: memberDisplayName(user),
-      chatTitle: chat.title ?? null,
-      token: verificationToken,
-      method,
-      expiresAt,
-      optionCodes,
-      verifyUrl,
-    });
-    if (!delivery.delivered) {
-      // 群内提示发不出去（机器人被禁言/无发言权限）：退化为私聊提示，避免用户无从下手。
-      // 会话渠道仍为 group（结果收口必须是解禁/踢出语义，而不是「批准加群申请」）。
-      // code_self 的私聊兜底必须带上验证码：群里没有按钮可点，用户只能在私聊里回输
-      // （私聊不属于「群聊明文输码」，硬拦截只作用于群聊文本）。
-      const minutes = Math.max(1, Math.round((expiresAt.getTime() - Date.now()) / 60000));
-      const fallbackText =
-        method === "code_self" && joinCode
-          ? `您的入群验证码：<b>${htmlEscape(joinCode)}</b>\n请直接回复本对话输入该验证码完成验证（群内验证消息发送失败，本条私聊为兜底通道）。\n⏱ ${minutes} 分钟内有效。`
-          : `🔐 请打开验证页面完成验证：${verifyUrl ?? ""}\n⏱ ${minutes} 分钟内有效。`;
-      try {
-        await api.sendMessage(
-          user.id,
-          `⚠️ 群内验证消息发送失败（机器人可能被限制发言）。
-${fallbackText}
-若无法完成，请联系群管理员。`,
-          { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
-        );
-      } catch (dmError) {
-        console.warn(
-          `[group-verify] 群内提示与私聊兜底均失败，等待超时清理: user=${user.id}: ${
-            dmError instanceof Error ? dmError.message : String(dmError)
-          }`,
-        );
-      }
-    }
-    return { created: true, promptDelivered: delivery.delivered, method, channel };
-  }
-
-  // —— 以下为私聊渠道（v1.1.3 ~ v1.1.7 原有行为，逐字保留）——
   if (codeApiMethodId) {
     const promptText =
       groupSettings?.promptText ?? "🔐 请回复本消息并输入验证码完成验证";
@@ -276,7 +243,7 @@ ${fallbackText}
         },
       );
       console.log(`Code verification prompt sent to user ${user.id} (${requestType})`);
-      return { created: true, promptDelivered: true, method: "code_api", channel };
+      return { created: true, promptDelivered: true, method: "code_api" };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.toLowerCase().includes("chat not found")) {
@@ -286,10 +253,10 @@ ${fallbackText}
           `Cannot send code prompt to user ${user.id} (${requestType}): user hasn't started bot; ` +
             "prompt will be resent when the user /starts the bot; session expires per timeout",
         );
-        return { created: true, promptDelivered: false, method: "code_api", channel };
+        return { created: true, promptDelivered: false, method: "code_api" };
       }
       console.error("Failed to send code verification prompt:", error);
-      return { created: true, promptDelivered: false, method: "code_api", channel };
+      return { created: true, promptDelivered: false, method: "code_api" };
     }
   }
 
@@ -303,7 +270,7 @@ ${fallbackText}
       expiresAt,
       contextLabel: requestType,
     });
-    return { created: true, promptDelivered: delivery.delivered, method: "code_self", channel };
+    return { created: true, promptDelivered: delivery.delivered, method: "code_self" };
   }
 
   const webAppUrl = `${runtime.baseUrl}/verify?token=${verificationToken}`;
@@ -319,7 +286,7 @@ ${fallbackText}
 
     await api.sendMessage(user.id, welcomeText, { reply_markup: keyboard });
     console.log(`Verification message sent to user ${user.id} (${requestType})`);
-    return { created: true, promptDelivered: true, method: "captcha", channel };
+    return { created: true, promptDelivered: true, method: "captcha" };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (message.toLowerCase().includes("chat not found")) {
@@ -327,14 +294,50 @@ ${fallbackText}
         `Cannot send verification message to user ${user.id} (${requestType}): user hasn't started bot; ` +
           "prompt will be resent when the user /starts the bot; session expires per timeout",
       );
-      return { created: true, promptDelivered: false, method: "captcha", channel };
+      return { created: true, promptDelivered: false, method: "captcha" };
     }
     console.error("Failed to send verification message:", error);
-    return { created: true, promptDelivered: false, method: "captcha", channel };
+    return { created: true, promptDelivered: false, method: "captcha" };
   }
 }
 
-/** 真实加群申请（入群申请链接）：创建验证会话并私聊发送验证提示 */
+async function bootstrapJoinVerification(
+  api: Api,
+  user: JoinVerificationUser,
+  chat: JoinVerificationChat,
+  requestType: "telegram" | "direct",
+): Promise<BootstrapResult> {
+  // 真实加群事件到达：登记真实群组（chat_id / 群名），供管理后台「机器人测试」选择真实群组
+  // （chat_join_request 仅出现在 supergroup，Telegram 基础群不支持入群申请）
+  if (chat.type === "supergroup") {
+    try {
+      await registerTelegramChat({
+        chatId: BigInt(chat.id),
+        chatTitle: chat.title ?? null,
+        botToken: api.token,
+      });
+    } catch (registryError) {
+      console.warn("Failed to register real chat from join flow:", registryError);
+    }
+  }
+
+  const runtime = await getRuntimeSettings(config);
+  const groupSettings = await getGroupSettings(BigInt(chat.id));
+
+  // v2.0.5 群内验证模式（默认）：群组已配置且启用 → 群内验证
+  if (
+    groupSettings &&
+    groupSettings.enabled !== false &&
+    resolveVerificationChannel(groupSettings) === "group"
+  ) {
+    return bootstrapGroupVerification(api, user, chat, requestType, runtime, groupSettings);
+  }
+
+  // 私聊验证模式（verification_channel=dm 或群组未配置）：v1.1.3 旧行为
+  return bootstrapDmVerification(api, user, chat, requestType, runtime, groupSettings);
+}
+
+/** 真实加群申请（入群申请链接）：群内模式先批准进群再群内验证；私聊模式创建会话并私聊发送验证提示 */
 export async function handleJoinRequest(ctx: BotContext): Promise<void> {
   if (!ctx.chatJoinRequest) {
     return;
@@ -351,10 +354,10 @@ export async function handleJoinRequest(ctx: BotContext): Promise<void> {
 /**
  * 直连入群防线（v1.1.3 新增，堵「普通邀请链接绕过验证直接进群」漏洞）：
  * 成员未经过本机器人审批（via_join_request=false）直接进入已启用验证的群组时，
- * 同样创建验证会话并私聊发送验证任务：
- * - 验证成功：用户已在群内，无需 Telegram 审批，仅私聊祝贺并落库标记通过；
- * - 验证失败（尝试次数用尽）或超时未验证：踢出群组（ban+unban），私聊引导重新申请；
- * - 群组内零消息；管理员/创建者、机器人账号、经本机器人审批入群的用户不触发。
+ * 同样创建验证会话并补验证：
+ * - 群内模式（默认）：在群内完成验证（禁言 + 按钮），通过解禁 / 失败超时踢出；
+ * - 私聊模式（channel=dm）：私聊发送验证任务，通过落库标记 / 超时踢出；
+ * - 管理员/创建者、机器人账号、经本机器人审批入群的用户不触发。
  */
 export async function handleChatMemberUpdate(ctx: BotContext): Promise<void> {
   const memberUpdate = ctx.chatMember;
@@ -410,22 +413,11 @@ export async function handleChatMemberUpdate(ctx: BotContext): Promise<void> {
     return;
   }
 
-  // v2.1.0 防重复 bootstrap：群内渠道「自动批准 + 禁言」会再触发一次 chat_member
-  // （member→restricted），若不守卫会对同一用户重复建会话、重复发群内验证消息
-  const pendingSession = await getPendingSessionForUserChat(
-    BigInt(user.id),
-    BigInt(chat.id),
-  );
-  if (pendingSession) {
-    console.log(
-      `Skip duplicate verification bootstrap: user ${user.id} already has pending session in chat ${chat.id}`,
-    );
-    return;
-  }
-
+  const channel = resolveVerificationChannel(groupSettings);
   console.log(
     `Direct join without bot approval detected: user ${user.id} (${user.username}) ` +
-      `entered chat ${chat.id} via ${memberUpdate.invite_link ? "invite link" : "manual add"} — starting verification`,
+      `entered chat ${chat.id} via ${memberUpdate.invite_link ? "invite link" : "manual add"} — ` +
+      `starting ${channel === "group" ? "in-group" : "DM"} verification`,
   );
   await bootstrapJoinVerification(ctx.api, user, chat, "direct");
 }

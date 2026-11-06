@@ -158,6 +158,21 @@ async function ensureMigrations(): Promise<void> {
       `ALTER TABLE "group_settings" ADD COLUMN "require_approval" BOOLEAN NOT NULL DEFAULT false`,
     );
   }
+  // 旧库补列：group_settings.verification_channel（v2.0.5 群内验证渠道，默认群内验证）
+  if (groupCols.length > 0 && !groupCols.some((c) => c.name === "verification_channel")) {
+    await executeRun(
+      `ALTER TABLE "group_settings" ADD COLUMN "verification_channel" TEXT NOT NULL DEFAULT 'group'`,
+    );
+  }
+  // 旧库补列：verification_sessions.prompt_message_id（v2.0.5 群内验证提示消息 id，用于验证结束/超时后删除）
+  const sessionCols = await queryAll<{ name: string }>(
+    `PRAGMA table_info(verification_sessions)`,
+  );
+  if (sessionCols.length > 0 && !sessionCols.some((c) => c.name === "prompt_message_id")) {
+    await executeRun(
+      `ALTER TABLE "verification_sessions" ADD COLUMN "prompt_message_id" INTEGER`,
+    );
+  }
   // v1.0.8 机器人测试：闲鱼商品 / 发货日志 / 测试验证码
   await executeRun(
     `CREATE TABLE IF NOT EXISTS "xianyu_products" (

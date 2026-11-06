@@ -1,5 +1,5 @@
 import type { BotContext } from "../context";
-import { getGlobalStats, getGroupSettings, getPendingCodeContext } from "@/database/operations";
+import { getGlobalStats, getGroupSettings, getPendingCodeContext, resolveVerificationChannel } from "@/database/operations";
 import { config } from "@/config/settings";
 import { adminOnly } from "../filters";
 import { mainMenu } from "../menus";
@@ -39,10 +39,16 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
       name: "TGuard 加群验证",
     });
     const title = settings.chatTitle ?? "群组";
+    // v2.0.5 验证渠道文案：群内模式（默认）申请后自动进群、群内按钮验证；
+    // 私聊模式保持 v1.1.3 文案（私聊提示、群内零消息）
+    const flowLines =
+      resolveVerificationChannel(settings) === "group"
+        ? "• 提交申请后将自动批准进群，并在群内完成验证\n" +
+          "• 在群内点击验证按钮即可（输入内容其他成员不可见）"
+        : "• 提交申请后，验证提示将由本机器人私聊发送（群里看不到）\n" +
+          "• 按私聊提示输入验证码，校验通过后自动进群";
     await ctx.reply(
-      `🔐 点击下方按钮申请加入「${title}」。\n\n` +
-        "• 提交申请后，验证提示将由本机器人私聊发送（群里看不到）\n" +
-        "• 按私聊提示输入验证码，校验通过后自动进群",
+      `🔐 点击下方按钮申请加入「${title}」。\n\n${flowLines}`,
       { reply_markup: new InlineKeyboard().url("🔄 申请加入群组", invite.invite_link) },
     );
     return;

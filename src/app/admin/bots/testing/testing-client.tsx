@@ -105,14 +105,8 @@ interface SimSession {
   maxAttempts: number;
   expiresAt: string;
   methodName: string;
-  /** v2.1.0 验证渠道：group=群内验证（气泡在群聊）/ dm=私聊验证（切换私聊视图） */
-  channel: "group" | "dm";
-  /** 群内渠道的验证提示正文（纯文本，仿真屏群聊气泡） */
-  groupPromptText: string | null;
-  /** 群内渠道 code_self 的 4 选 1 候选码（含正确码，点对才通过） */
-  optionCodes: string[] | null;
-  /** 群内渠道 captcha/code_api 的网页验证地址（点击后用真实 /verify 页面输码） */
-  verifyUrl: string | null;
+  /** v2.0.5 验证渠道：group=群内验证（群聊视图展示群内验证消息）/ dm=私聊验证 */
+  verificationChannel: "group" | "dm";
 }
 
 interface DeliveryLogView {
@@ -234,13 +228,7 @@ export function TestingClient({
 }: {
   bots: BotOption[];
   relatedBotIds: Record<string, string[]>;
-  botGroupLinks: {
-    botId: string;
-    chatId: string;
-    deployMode: string | null;
-    inviteLink: string | null;
-    chatTitle: string | null;
-  }[];
+  botGroupLinks: { botId: string; chatId: string; deployMode: string | null; inviteLink: string | null }[];
   groups: GroupOption[];
   menuConfigs: Record<string, BotMenuConfig>;
   initialProducts: ProductItem[];
@@ -356,17 +344,7 @@ export function TestingClient({
           : group,
       );
     }
-    // 群名第三回退：一键部署时写入 rights 的真实群名（group_settings 与同步数据都缺标题时）
-    const linkTitleByChat = new Map<string, string>();
-    for (const link of botGroupLinks) {
-      if (!link.chatTitle?.trim() || !relatedIds.has(link.botId)) continue;
-      linkTitleByChat.set(link.chatId, link.chatTitle.trim());
-    }
-    const pool = [...merged.values()].map((group) =>
-      group.chatTitle.trim()
-        ? group
-        : { ...group, chatTitle: linkTitleByChat.get(group.chatId) ?? "" },
-    );
+    const pool = [...merged.values()];
     const visible =
       linkedChatIds.size > 0
         ? pool.filter(
@@ -473,12 +451,7 @@ export function TestingClient({
         const payload = (await response.json()) as {
           ok: boolean;
           error?: string;
-          data?: Record<string, string> & {
-            verify_channel?: string;
-            group_prompt_text?: string | null;
-            option_codes?: string[] | null;
-            verify_url?: string | null;
-          };
+          data?: Record<string, string>;
         };
         if (!payload.ok || !payload.data) {
           setSession(null);
@@ -486,7 +459,6 @@ export function TestingClient({
           setSimView("group");
           return { ok: false, message: payload.error ?? "申请加入失败" };
         }
-        const channel = payload.data.verify_channel === "dm" ? "dm" : "group";
         setSession({
           token: payload.data.token,
           chatId: payload.data.chat_id,
@@ -497,15 +469,13 @@ export function TestingClient({
           maxAttempts: Number(payload.data.max_attempts ?? 3),
           expiresAt: payload.data.expires_at,
           methodName: payload.data.method_name,
-          channel,
-          groupPromptText: payload.data.group_prompt_text ?? null,
-          optionCodes: payload.data.option_codes ?? null,
-          verifyUrl: payload.data.verify_url ?? null,
+          verificationChannel: payload.data.verification_channel === "dm" ? "dm" : "group",
         });
         setLatestCode(null);
         setJoinPhase("awaiting_code");
-        // 渠道分流：群内验证 → 停留在群聊（气泡 + 按钮）；私聊验证 → 切到私聊视图（旧版行为）
-        setSimView(channel === "group" ? "group" : "private");
+        // 与真实 APP 一致：私聊验证模式 → 机器人把验证提示发到买家私聊（切换到私聊视图）；
+        // 群内验证模式（默认）→ 申请自动批准进群，验证消息发到群内（留在群聊视图）
+        setSimView(payload.data.verification_channel === "dm" ? "private" : "group");
         setSelectedChatId(chatId);
         setChatOpenRequest((count) => count + 1);
         return { ok: true, message: "已提交加群申请" };
@@ -624,8 +594,6 @@ export function TestingClient({
           setJoinPhase("joined");
           // 与真实 APP 一致：验证成功后回到群组（私聊验证对话保留在私聊流中）
           setSimView("group");
-          // 群内渠道：验证通过后群内提示被删除（失败/成功都由服务端收口），气泡随之消失
-          setSession(null);
           const note = payload.data.approval_note ? `\n${payload.data.approval_note}` : "";
           return { ok: true, text: `${payload.data.replyText}${note}`, joined: true };
         }
@@ -643,29 +611,6 @@ export function TestingClient({
       }
     },
     [session],
-  );
-
-  // 群内渠道：验证进行中（尚未通过）时，群聊里的明文验证码必须被硬性拦截 ——
-  // 与真实机器人一致（handleCodeInput 直接忽略并删除该消息，其他群成员看不到输入内容）
-  const groupChannelPending = session?.channel === "group" && joinPhase !== "joined";
-
-  const handleUserSend = useCallback(
-    async (text: string): Promise<{ ok: boolean; text: string; joined?: boolean }> => {
-      if (groupChannelPending) {
-        return {
-          ok: false,
-          text: "⚠️ 群聊中的明文验证码不会被处理（其他群成员也能看到）。请点击上方数字按钮，或用验证页面输入。",
-        };
-      }
-      return submitCode(text);
-    },
-    [groupChannelPending, submitCode],
-  );
-
-  // 群内 4 选 1 按钮：点哪个只有机器人知道（正确码仅存在服务端会话里）
-  const submitVerifyOption = useCallback(
-    (code: string): Promise<{ ok: boolean; text: string; joined?: boolean }> => submitCode(code),
-    [submitCode],
   );
 
   // 一键部署（按群组）：Token → 已在群 → 管理员 → 邀请权限 → 生成入群申请链接并保存部署状态
@@ -1040,8 +985,8 @@ export function TestingClient({
                       ? `仿真真实加群流程：点击下方「申请加入群组」按钮开始（验证方式：${activeGroup.methodName ?? activeGroup.method}）`
                       : joinPhase === "joined"
                         ? `仿真群 ${activeGroup.chatId} · 已加入群组`
-                        : session?.channel === "group"
-                          ? "群内验证中：验证消息已发到群里，其他群成员看不到你点的是哪个/输入的验证码"
+                        : session?.verificationChannel === "group"
+                          ? "群内验证中：申请已自动批准进群，验证消息已发到群内（输入内容其他成员不可见）"
                           : simView === "private"
                             ? "私聊验证中（隐私模式）：验证码仅机器人可见，不会出现在群里"
                             : `仿真群 ${activeGroup.chatId} · 请输入验证码后点击发送按钮`
@@ -1052,21 +997,18 @@ export function TestingClient({
                     : undefined
                 }
                 promptMessage={
-                  session && session.channel === "dm"
-                    ? { id: 1, text: session.promptText, hint: "请输入验证码后点击发送按钮（仿真 force_reply）" }
-                    : null
-                }
-                verifyPrompt={
-                  session && session.channel === "group"
+                  session
                     ? {
-                        text: session.groupPromptText ?? session.promptText,
-                        options: session.optionCodes,
-                        url: session.verifyUrl,
+                        id: 1,
+                        text: session.promptText,
+                        hint:
+                          session.verificationChannel === "group"
+                            ? "群内验证消息（仿真：在下方输入框模拟按钮点选/网页输码）"
+                            : "请输入验证码后点击发送按钮（仿真 force_reply）",
                       }
                     : null
                 }
-                onVerifyOption={submitVerifyOption}
-                onUserSend={joinPhase === "joined" ? undefined : handleUserSend}
+                onUserSend={joinPhase === "joined" ? undefined : submitCode}
                 joinPhase={joinPhase}
                 onRequestJoin={handleRequestJoin}
                 view={simView}
