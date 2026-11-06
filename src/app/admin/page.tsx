@@ -8,6 +8,7 @@ import {
   listJoinRequests,
 } from "@/database/operations";
 import { requirePermission } from "@/lib/auth";
+import { D1UsageCard } from "./d1-usage-card";
 
 export const dynamic = "force-dynamic";
 
@@ -144,6 +145,9 @@ export default async function AdminDashboardPage({
         </div>
 
         <div className="space-y-4">
+          {/* v2.0.7 核心指标：D1 每日读写用量（免费层 5M 读 / 10 万写，UTC 重置） */}
+          <D1UsageCard />
+
           <div className="rounded-xl border bg-card p-4">
             <h2 className="mb-3 text-sm font-semibold">今日统计</h2>
             <div className="space-y-2 text-sm">

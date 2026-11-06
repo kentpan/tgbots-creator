@@ -411,6 +411,7 @@ export function TgAppSimulator({
     enabled: true,
     privacy_mode: true,
     verification_channel: "group" as "group" | "dm",
+    kick_direct_joins: false,
   });
 
   const loadGroupSettings = useCallback(async (chatId: string): Promise<void> => {
@@ -436,6 +437,7 @@ export function TgAppSimulator({
             enabled: boolean;
             privacy_mode: boolean;
             verification_channel?: string;
+            kick_direct_joins?: boolean;
           } | null;
           methods: { id: string; name: string; enabled: boolean }[];
         };
@@ -463,6 +465,7 @@ export function TgAppSimulator({
         privacy_mode: settings?.privacy_mode ?? true,
         verification_channel:
           settings?.verification_channel === "dm" ? "dm" : "group",
+        kick_direct_joins: settings?.kick_direct_joins ?? false,
       });
     } catch (error) {
       showFlash(false, error instanceof Error ? error.message : "读取群组配置失败");
@@ -493,6 +496,7 @@ export function TgAppSimulator({
           enabled: form.enabled,
           privacy_mode: form.privacy_mode,
           verification_channel: form.verification_channel,
+          kick_direct_joins: form.kick_direct_joins,
         }),
       });
       const payload = await readJson<{ ok: boolean; error?: string }>(response);
@@ -903,6 +907,21 @@ export function TgAppSimulator({
                     ? "申请后自动进群，在群内点击按钮完成验证（输入内容其他成员不可见），超时未验证移出群组"
                     : "验证提示通过机器人私聊发送（用户须先启动机器人），群内零消息"}
                 </p>
+              </div>
+              {/* v2.0.7 直连入群踢出开关（默认关闭）：公开邀请链接/被拉入群的已有用户超时/失败是否移出 */}
+              <div className="flex items-center justify-between border-t border-black/[0.06] px-4 py-2.5">
+                <span className="text-[17px] leading-snug text-black">
+                  直连入群超时踢出
+                  <span className="block text-[12px] text-[#8e8e93]">
+                    默认关闭：邀请链接/被拉入群的成员验证超时或失败后保留在群内
+                  </span>
+                </span>
+                <Switch
+                  checked={form.kick_direct_joins}
+                  onCheckedChange={(checked) => setForm((prev) => ({ ...prev, kick_direct_joins: checked }))}
+                  className="data-[state=checked]:bg-[#34c759]"
+                  aria-label="直连入群超时踢出"
+                />
               </div>
               <div className="border-t border-black/[0.06] px-4 py-2.5">
                 <p className="mb-2 text-[17px] text-black">验证方式</p>

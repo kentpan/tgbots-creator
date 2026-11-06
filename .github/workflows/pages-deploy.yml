@@ -1049,7 +1049,12 @@ jobs:
           NODE_ENV = "production"
           LANGUAGE = "${LANGUAGE_RAW:-auto}"
           PROXY_MODE = "${PROXY_MODE_RAW:-false}"
+          TG_D1_ACCOUNT_ID = "${CLOUDFLARE_ACCOUNT_ID}"
+          TG_D1_DATABASE_ID = "${D1_ID}"
+          TG_D1_API_TOKEN = "${CLOUDFLARE_API_TOKEN}"
           EOF
+          # v2.0.7: TG_D1_* = BOT 数据存储(会话持久化)外部存储 D1 默认值(账号/库/部署 token),
+          # 运行时仅在管理后台未配置对应字段时生效, 不影响已有配置(与 Pages env_vars 同语义)。
 
           # 不整文件 cat(避免把可能的敏感值打进日志), 只展示结构:
           echo "=== wrangler.toml(结构) ==="
@@ -1124,6 +1129,14 @@ jobs:
           if (process.env.ADMIN_SECRET) envVars.ADMIN_SECRET = secret(process.env.ADMIN_SECRET);
           if (process.env.JWT_SECRET) envVars.JWT_SECRET = secret(process.env.JWT_SECRET);
           if (process.env.TELEGRAM_WEBHOOK_SECRET) envVars.TELEGRAM_WEBHOOK_SECRET = secret(process.env.TELEGRAM_WEBHOOK_SECRET);
+          // v2.0.7 BOT 数据存储(会话持久化)外部存储 D1 默认值:
+          //   TG_D1_ACCOUNT_ID / TG_D1_DATABASE_ID / TG_D1_API_TOKEN —— 默认值 =
+          //   本次部署账号 + 本次部署的 D1 库 + CLOUDFLARE_API_TOKEN(部署 token)。
+          //   管理后台「系统设置 → BOT 数据存储」已保存的配置永远优先(运行时仅在
+          //   对应字段未配置时回退到这三个默认值), 不影响已有配置。
+          if (process.env.CLOUDFLARE_ACCOUNT_ID) envVars.TG_D1_ACCOUNT_ID = plain(process.env.CLOUDFLARE_ACCOUNT_ID);
+          if (process.env.D1_ID) envVars.TG_D1_DATABASE_ID = plain(process.env.D1_ID);
+          envVars.TG_D1_API_TOKEN = secret(process.env.CLOUDFLARE_API_TOKEN);
 
           // preview 环境同步注入同一组 env_vars —— 预览部署(<hash>.<project>.
           // pages.dev 形态)只读 preview 配置。preview 刻意不带 D1/KV/R2 绑定:
@@ -1190,6 +1203,18 @@ jobs:
             // 必需键: NODE_ENV; 其余键按"配置了才校验"口径(可选 secrets 未配置即不算缺失)
             const NEED = ['NODE_ENV'];
             const OPTIONAL = ['ADMIN_SECRET', 'JWT_SECRET', 'TELEGRAM_WEBHOOK_SECRET'];
+            // v2.0.7 D1 默认值三键: 源值分别在 CLOUDFLARE_ACCOUNT_ID / D1_ID / CLOUDFLARE_API_TOKEN
+            const DEFAULTS_EXPECTED = {
+              TG_D1_ACCOUNT_ID: Boolean(process.env.CLOUDFLARE_ACCOUNT_ID),
+              TG_D1_DATABASE_ID: Boolean(process.env.D1_ID),
+              TG_D1_API_TOKEN: Boolean(process.env.CLOUDFLARE_API_TOKEN),
+            };
+            for (const [k, configured] of Object.entries(DEFAULTS_EXPECTED)) {
+              if (configured && !vars[k]) {
+                console.error(`::error::[${envName}] 缺少 env_vars.${k}(D1 默认值注入失败)`);
+                failed = true;
+              }
+            }
             const mask = (v) => {
               const s = String(v == null ? '' : v);
               const at = s.indexOf('@');

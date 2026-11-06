@@ -172,6 +172,16 @@ export interface GroupSettingsRow {
    * - "dm"：私聊验证（v1.1.3 旧行为）—— 验证提示/结果全部私聊发送，群内零消息。
    */
   verificationChannel: "group" | "dm";
+  /**
+   * 直连入群踢出开关（v2.0.7，默认 false）：通过公开邀请链接/被拉入群的「已有用户」
+   * （join_requests.request_type = direct）验证未通过（尝试次数用尽）或超时未验证时，
+   * 是否自动移出群组。
+   * - false（默认）：保留在群内 —— 仅失效会话/申请 + 清理群内验证提示，禁言随
+   *   until_date 到期自动解除，用户不被移出；
+   * - true：旧行为（v1.1.3 直连入群防线），超时/失败踢出（ban+unban，可重新申请）。
+   * 入群申请链接用户（request_type = telegram）不受本开关影响，维持既有踢出/拒绝行为。
+   */
+  kickDirectJoins: boolean;
   createdTime: Date;
   updatedTime: Date;
 }
@@ -994,6 +1004,8 @@ function mapGroupSettings(row: Record<string, unknown>): GroupSettingsRow {
     privacyMode: row.privacy_mode === undefined ? true : toBoolean(row.privacy_mode),
     requireApproval: row.require_approval === undefined ? false : toBoolean(row.require_approval),
     verificationChannel: row.verification_channel === "dm" ? "dm" : "group",
+    // v2.0.7 直连入群踢出开关：列缺失/值为空 → 默认 false（不踢出已有用户）
+    kickDirectJoins: row.kick_direct_joins === undefined ? false : toBoolean(row.kick_direct_joins),
     createdTime: toDate(row.created_time),
     updatedTime: toDate(row.updated_time),
   };
@@ -1442,14 +1454,21 @@ export async function upsertGroupSettings(
     requireApproval?: boolean;
     /** v2.0.5 验证渠道（group=群内验证 / dm=私聊验证）；undefined = 不改动现有值 */
     verificationChannel?: "group" | "dm";
+    /** v2.0.7 直连入群用户（公开邀请链接/被拉入群）验证未通过/超时是否自动踢出；undefined = 不改动现有值 */
+    kickDirectJoins?: boolean;
   },
 ): Promise<void> {
-  // requireApproval / verificationChannel === undefined 语义为「不改动现有值」。
+  // requireApproval / verificationChannel / kickDirectJoins === undefined 语义为「不改动现有值」。
   // 两列都是 NOT NULL，SQLite 在 INSERT 阶段即校验约束（不会等 COALESCE 兕底），
   // 因此必须先读出现值（无行则取各自默认），绝不允许绑定 null。
   let requireApprovalValue = input.requireApproval;
   let verificationChannelValue = input.verificationChannel;
-  if (requireApprovalValue === undefined || verificationChannelValue === undefined) {
+  let kickDirectJoinsValue = input.kickDirectJoins;
+  if (
+    requireApprovalValue === undefined ||
+    verificationChannelValue === undefined ||
+    kickDirectJoinsValue === undefined
+  ) {
     const existing = await getGroupSettings(chatId);
     if (requireApprovalValue === undefined) {
       requireApprovalValue = existing ? existing.requireApproval : false;
@@ -1457,12 +1476,15 @@ export async function upsertGroupSettings(
     if (verificationChannelValue === undefined) {
       verificationChannelValue = existing ? existing.verificationChannel : "group";
     }
+    if (kickDirectJoinsValue === undefined) {
+      kickDirectJoinsValue = existing ? existing.kickDirectJoins : false;
+    }
   }
 
   await executeRun(
     `INSERT INTO group_settings
-       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, require_approval, verification_channel, created_time, updated_time)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, require_approval, verification_channel, kick_direct_joins, created_time, updated_time)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(chat_id) DO UPDATE SET
        chat_title = COALESCE(excluded.chat_title, group_settings.chat_title),
        method = COALESCE(excluded.method, group_settings.method),
@@ -1476,6 +1498,7 @@ export async function upsertGroupSettings(
        privacy_mode = COALESCE(excluded.privacy_mode, group_settings.privacy_mode),
        require_approval = excluded.require_approval,
        verification_channel = excluded.verification_channel,
+       kick_direct_joins = excluded.kick_direct_joins,
        updated_time = excluded.updated_time`,
     [
       Number(chatId),
@@ -1491,6 +1514,7 @@ export async function upsertGroupSettings(
       input.privacyMode === false ? 0 : 1,
       requireApprovalValue ? 1 : 0,
       verificationChannelValue === "dm" ? "dm" : "group",
+      kickDirectJoinsValue ? 1 : 0,
       dateText(new Date()),
       dateText(new Date()),
     ],

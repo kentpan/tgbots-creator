@@ -55,6 +55,7 @@ export async function GET(request: Request): Promise<NextResponse> {
             enabled: settings.enabled,
             privacy_mode: settings.privacyMode,
             verification_channel: settings.verificationChannel,
+            kick_direct_joins: settings.kickDirectJoins,
           }
         : null,
       methods: methods.map((method) => ({
@@ -89,6 +90,8 @@ export async function PUT(request: Request): Promise<NextResponse> {
     enabled?: boolean;
     privacy_mode?: boolean;
     verification_channel?: string;
+    /** v2.0.7 直连入群踢出开关（默认关闭） */
+    kick_direct_joins?: boolean;
   };
   try {
     payload = (await request.json()) as typeof payload;
@@ -163,6 +166,8 @@ export async function PUT(request: Request): Promise<NextResponse> {
         : payload.verification_channel === "group"
           ? "group"
           : existing?.verificationChannel,
+    // v2.0.7 直连入群踢出开关：未传时保留现值（undefined 语义 = 不改动）
+    kickDirectJoins: payload.kick_direct_joins ?? existing?.kickDirectJoins,
   });
 
   const requestHeaders = await headers();
@@ -196,6 +201,7 @@ export async function PUT(request: Request): Promise<NextResponse> {
           enabled: settings.enabled,
           privacy_mode: settings.privacyMode,
           verification_channel: settings.verificationChannel,
+          kick_direct_joins: settings.kickDirectJoins,
         }
       : null,
   });

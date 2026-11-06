@@ -21,6 +21,7 @@ import {
   completeGroupVerification,
   deleteSessionPromptMessage,
   kickUnverifiedMember,
+  unmuteGroupMember,
 } from "./approval";
 
 export type CodeCheckOutcome =
@@ -57,6 +58,11 @@ export interface CodeCheckResult {
   reapplyChatId?: string | null;
   /** 加群申请来源（telegram=入群申请链接 / direct=直连入群 / simulator=仿真）：失效后动作不同 */
   joinRequestType?: string;
+  /**
+   * v2.0.7：failed_expired 且成员未被移出群组（直连用户 kick_direct_joins 关闭，
+   * 保留在群内）——调用方据此把「已被移出群组」类提示改为「仍保留在群组中」。
+   */
+  stayedInGroup?: boolean;
 }
 
 export interface CodeCheckInput {
@@ -171,20 +177,47 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
       // 仅真实 Telegram 入群路径（telegram/direct）执行群内动作；
       // simulator/api 仿真会话绝不触碰真实群组（否则会把仿真用户踢出真实群）。
       // 私聊模式保持旧行为：telegram → 拒绝加群申请；direct → 由私聊通知路径踢出。
+      // v2.0.7 直连入群踢出开关（默认关闭）：直连用户（公开邀请链接/被拉入群的
+      // 已有用户）尝试次数用尽时不踢出，保留在群内 —— 仅删提示 + best effort 解禁
+      // （禁言 until_date 会随会话到期自动解除，此处主动解禁保证立即恢复发言）。
       const realTelegramJoin =
         joinRequest.requestType === "telegram" || joinRequest.requestType === "direct";
+      const kickDirectAllowed = settings?.kickDirectJoins ?? false;
+      const kickAllowed =
+        joinRequest.requestType !== "direct" || kickDirectAllowed;
+      const stayedInGroup =
+        joinRequest.chatId !== 0n &&
+        realTelegramJoin &&
+        settings?.verificationChannel === "group" &&
+        !kickAllowed;
       if (
         joinRequest.chatId !== 0n &&
         realTelegramJoin &&
         settings?.verificationChannel === "group"
       ) {
         await deleteSessionPromptMessage(session.token);
-        try {
-          await kickUnverifiedMember(joinRequest.chatId, joinRequest.userId);
-        } catch (error) {
-          console.error(
-            `Failed to kick unverified group user ${joinRequest.userId} (chat ${joinRequest.chatId}):`,
-            error,
+        if (kickAllowed) {
+          try {
+            await kickUnverifiedMember(joinRequest.chatId, joinRequest.userId);
+          } catch (error) {
+            console.error(
+              `Failed to kick unverified group user ${joinRequest.userId} (chat ${joinRequest.chatId}):`,
+              error,
+            );
+          }
+        } else {
+          // 保留在群内：主动解禁（best effort），并记录决策日志
+          try {
+            await unmuteGroupMember(joinRequest.chatId, joinRequest.userId);
+          } catch (error) {
+            console.warn(
+              `Failed to unmute stayed direct-join user ${joinRequest.userId} (chat ${joinRequest.chatId}):`,
+              error,
+            );
+          }
+          console.log(
+            `Direct-join user ${joinRequest.userId} (chat ${joinRequest.chatId}) failed all ` +
+              "attempts — kick_direct_joins disabled, member stays in group (unmuted)",
           );
         }
       } else if (joinRequest.requestType === "telegram" && joinRequest.chatId !== 0n) {
@@ -197,11 +230,15 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
       }
       return {
         outcome: "failed_expired",
-        replyText: `${settings?.failureText ?? "❌ 验证码错误，请重试。"}\n错误原因：${verdict.reason}\n尝试次数已达上限，本次验证已失效，请重新申请加群。`,
+        replyText: stayedInGroup
+          ? `${settings?.failureText ?? "❌ 验证码错误，请重试。"}\n错误原因：${verdict.reason}\n尝试次数已达上限，本次验证已失效，你仍保留在群组中。`
+          : `${settings?.failureText ?? "❌ 验证码错误，请重试。"}\n错误原因：${verdict.reason}\n尝试次数已达上限，本次验证已失效，请重新申请加群。`,
         reason: verdict.reason,
         remaining: 0,
         reapplyChatId: joinRequest.chatId !== 0n ? joinRequest.chatId.toString() : null,
         joinRequestType: joinRequest.requestType,
+        // v2.0.7：直连用户未被踢出（保留在群内）——调用方据此调整提示文案
+        stayedInGroup,
       };
     }
     return {

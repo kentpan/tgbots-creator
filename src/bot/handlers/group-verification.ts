@@ -7,17 +7,12 @@ import {
   isSessionExpired,
   setSessionPromptMessage,
   resolveVerificationChannel,
-  rejectJoinRequest,
   type GroupSettingsRow,
   type VerificationSessionRow,
 } from "@/database/operations";
 import { generateJoinCode } from "@/utils/crypto";
 import { htmlEscape, userMentionHTML } from "@/utils/html";
-import {
-  muteUnverifiedMember,
-  kickUnverifiedMember,
-  deleteSessionPromptMessage,
-} from "@/services/approval";
+import { muteUnverifiedMember } from "@/services/approval";
 import { evaluateSubmittedCode } from "@/services/verification-flow";
 
 /**
@@ -248,8 +243,11 @@ export async function handleVerificationChoice(
       });
       break;
     case "failed_expired":
+      // v2.0.7：直连用户踢出开关关闭时保留在群内 —— 文案与实际动作一致
       await ctx.answerCallbackQuery({
-        text: "❌ 尝试次数已用完，你已被移出群组",
+        text: result.stayedInGroup
+          ? "❌ 尝试次数已用完，本次验证已失效（你仍保留在群组中）"
+          : "❌ 尝试次数已用完，你已被移出群组",
         show_alert: true,
       });
       break;
@@ -266,27 +264,6 @@ export async function handleVerificationChoice(
   );
 }
 
-/**
- * 群内验证「被移出群组」的统一善后（验证失败次数用尽）：
- * 删除群内验证提示 + 踢出（ban+unban 可重新申请）+ 加群申请置为 rejected。
- * 全部 best effort，逐项记录失败原因。
- */
-export async function cleanupGroupVerificationFailure(
-  chatId: bigint,
-  userId: bigint,
-  token: string,
-): Promise<{ promptDeleted: boolean; kicked: boolean }> {
-  const promptDeleted = await deleteSessionPromptMessage(token);
-  let kicked = false;
-  try {
-    kicked = await kickUnverifiedMember(chatId, userId);
-  } catch (error) {
-    console.error(`Failed to kick unverified user ${userId} (chat ${chatId}):`, error);
-  }
-  try {
-    await rejectJoinRequest(token);
-  } catch (error) {
-    console.warn(`Failed to reject join request ${token.slice(0, 8)}...:`, error);
-  }
-  return { promptDeleted, kicked };
-}
+// v2.0.7 说明：原 cleanupGroupVerificationFailure（无条件踢出版善后函数）已删除 ——
+// 失效善后统一走 verification-flow.ts evaluateSubmittedCode 的失败分支
+// （按 group_settings.kick_direct_joins 开关决策踢出/保留，避免旁路绕过开关）。

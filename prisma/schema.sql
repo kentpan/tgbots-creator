@@ -109,7 +109,7 @@ CREATE TABLE "group_settings" (
     "enabled" BOOLEAN NOT NULL DEFAULT true,
     "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-, "privacy_mode" BOOLEAN NOT NULL DEFAULT true, "require_approval" BOOLEAN NOT NULL DEFAULT false, "verification_channel" TEXT NOT NULL DEFAULT 'group');
+, "privacy_mode" BOOLEAN NOT NULL DEFAULT true, "require_approval" BOOLEAN NOT NULL DEFAULT false, "verification_channel" TEXT NOT NULL DEFAULT 'group', "kick_direct_joins" BOOLEAN NOT NULL DEFAULT false);
 CREATE TABLE "verification_methods" (
     "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "name" TEXT NOT NULL,

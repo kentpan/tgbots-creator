@@ -258,6 +258,18 @@ export function SessionStorageCard({ initialConfig }: { initialConfig?: PublicSe
               <label className="block text-sm font-medium" htmlFor="d1-token">API Token {config?.d1.has_api_token ? "（留空保持不变）" : ""}</label>
               <input id="d1-token" type="password" className={`${inputClass} font-mono`} value={d1.api_token} onChange={(e) => setD1((p) => ({ ...p, api_token: e.target.value }))} placeholder={config?.d1.has_api_token ? config.d1.api_token_masked : "需要 D1 读写权限"} />
             </div>
+            {config?.d1.defaults && (config.d1.defaults.account_id || config.d1.defaults.database_id || config.d1.defaults.api_token) ? (
+              <p className="rounded-md border border-dashed bg-background px-2.5 py-2 text-xs leading-relaxed text-muted-foreground">
+                部署默认值已就绪（v2.0.7）：未填写的字段自动使用部署环境注入的默认配置
+                （TG_D1_ACCOUNT_ID / TG_D1_DATABASE_ID / TG_D1_API_TOKEN，由 pages-deploy.yml 注入），
+                <span className="font-medium">不影响你已保存的配置</span> —— 上方已填写的值始终优先。
+                {config.d1.effective_database_id ? (
+                  <span className="mt-1 block font-mono">
+                    生效 Database ID：{config.d1.effective_database_id}
+                  </span>
+                ) : null}
+              </p>
+            ) : null}
             <p className="text-xs text-muted-foreground">首次连接自动建表 bot_sessions (scope, session_key, value)。</p>
           </div>
         ) : null}

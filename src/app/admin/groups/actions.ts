@@ -47,6 +47,8 @@ export async function saveGroupAction(formData: FormData): Promise<void> {
     failureText: String(formData.get("failure_text") ?? "").trim() || undefined,
     enabled: formData.get("enabled") === "1",
     privacyMode: formData.get("privacy_mode") !== "0",
+    // v2.0.7 直连入群踢出开关（默认关闭）：开关关闭时直连用户超时/失败保留在群内
+    kickDirectJoins: formData.get("kick_direct_joins") === "1",
   });
 
   const requestHeaders = await headers();

@@ -134,40 +134,62 @@ export async function processCodeAnswer(
   // 把用户输入框的 force_reply 状态替换为可重新发起加群申请的按钮
   if (result.outcome === "failed_expired" && result.reapplyChatId) {
     if (result.joinRequestType === "direct") {
-      // 直连入群路径：用户仍物理在群内，验证失败必须踢出（ban+unban，可重新申请），
-      // 否则普通邀请链接就能绕过验证 —— 私聊告知结果并回复「申请加群」按钮（群内零消息）
-      let kicked = false;
-      try {
-        kicked = await kickUnverifiedMember(
-          BigInt(result.reapplyChatId),
-          BigInt(from.id),
-        );
-      } catch (error) {
-        console.error(`Failed to kick unverified direct-join user ${from.id}:`, error);
-      }
-      // v1.1.5：通知层发送失败兜住并记录，不影响已完成的踢出动作与日志
-      try {
-        const invite = await ctx.api.createChatInviteLink(result.reapplyChatId, {
-          creates_join_request: true,
-          name: "TGuard 加群验证",
-        });
-        await ctx.api.sendMessage(
-          from.id,
-          kicked
-            ? "本次验证已失效，你已被移出群组。请点击下方按钮重新申请加群。"
-            : "本次验证已失效，请点击下方按钮重新申请加群。",
-          {
-            reply_markup: new InlineKeyboard().url("🔄 申请加群", invite.invite_link),
-          },
-        );
-        console.log(
-          `Direct-join re-apply button sent to user ${from.id} for chat ${result.reapplyChatId} (kicked=${kicked})`,
-        );
-      } catch (error) {
-        console.error(
-          `Failed to send direct-join re-apply notice to user ${from.id} for chat ${result.reapplyChatId} (kicked=${kicked}):`,
-          error,
-        );
+      // v2.0.7 直连入群踢出开关（默认关闭）：直连用户（公开邀请链接/被拉入群的
+      // 已有用户）验证失败不自动踢出，保留在群内（evaluateSubmittedCode 已按
+      // kick_direct_joins 落库值决策 —— stayedInGroup=true 时这里不再执行踢出，
+      // 也不再附「申请加群」按钮：用户仍在群内，无需重新申请）。
+      if (result.stayedInGroup) {
+        try {
+          await ctx.api.sendMessage(
+            from.id,
+            "本次验证已失效，你仍保留在群组中，无需重新申请。",
+          );
+          console.log(
+            `Direct-join user ${from.id} (chat ${result.reapplyChatId}) failed verification — ` +
+              "kick_direct_joins disabled, stays in group",
+          );
+        } catch (error) {
+          console.error(
+            `Failed to send stayed-in-group notice to user ${from.id}:`,
+            error,
+          );
+        }
+      } else {
+        // 开关开启（旧行为）：踢出（ban+unban，可重新申请）——
+        // 否则普通邀请链接就能绕过验证 —— 私聊告知结果并回复「申请加群」按钮（群内零消息）
+        let kicked = false;
+        try {
+          kicked = await kickUnverifiedMember(
+            BigInt(result.reapplyChatId),
+            BigInt(from.id),
+          );
+        } catch (error) {
+          console.error(`Failed to kick unverified direct-join user ${from.id}:`, error);
+        }
+        // v1.1.5：通知层发送失败兜住并记录，不影响已完成的踢出动作与日志
+        try {
+          const invite = await ctx.api.createChatInviteLink(result.reapplyChatId, {
+            creates_join_request: true,
+            name: "TGuard 加群验证",
+          });
+          await ctx.api.sendMessage(
+            from.id,
+            kicked
+              ? "本次验证已失效，你已被移出群组。请点击下方按钮重新申请加群。"
+              : "本次验证已失效，请点击下方按钮重新申请加群。",
+            {
+              reply_markup: new InlineKeyboard().url("🔄 申请加群", invite.invite_link),
+            },
+          );
+          console.log(
+            `Direct-join re-apply button sent to user ${from.id} for chat ${result.reapplyChatId} (kicked=${kicked})`,
+          );
+        } catch (error) {
+          console.error(
+            `Failed to send direct-join re-apply notice to user ${from.id} for chat ${result.reapplyChatId} (kicked=${kicked}):`,
+            error,
+          );
+        }
       }
     } else {
       await sendReapplyJoinButton(ctx, from.id, result.reapplyChatId);

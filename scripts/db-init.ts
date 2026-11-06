@@ -164,6 +164,12 @@ async function ensureMigrations(): Promise<void> {
       `ALTER TABLE "group_settings" ADD COLUMN "verification_channel" TEXT NOT NULL DEFAULT 'group'`,
     );
   }
+  // 旧库补列：group_settings.kick_direct_joins（v2.0.7 直连入群踢出开关，默认 false = 不踢出已有用户）
+  if (groupCols.length > 0 && !groupCols.some((c) => c.name === "kick_direct_joins")) {
+    await executeRun(
+      `ALTER TABLE "group_settings" ADD COLUMN "kick_direct_joins" BOOLEAN NOT NULL DEFAULT false`,
+    );
+  }
   // 旧库补列：verification_sessions.prompt_message_id（v2.0.5 群内验证提示消息 id，用于验证结束/超时后删除）
   const sessionCols = await queryAll<{ name: string }>(
     `PRAGMA table_info(verification_sessions)`,

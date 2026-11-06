@@ -144,6 +144,10 @@ export async function kickUnverifiedMember(chatId: bigint, userId: bigint): Prom
  * 与失效文案同一交互形态（见 code-input.ts failed_expired 分支）；
  * 私聊发送失败（用户未启动 bot / 已拉黑）直接向上抛出，由调用方按目标逐条完整记录，
  * 绝不静默吞错，也不影响其他过期目标的处理。
+ *
+ * v2.0.7 直连入群踢出开关（默认关闭）：开关关闭时直连用户超时后仍保留在群组中，
+ * options.kicked=false —— 私聊文案改为「仍保留在群组中」且不再附「申请加群」按钮
+ * （用户仍在群内，无需重新申请；重新申请按钮仅在确实被移出/拒绝时才有意义）。
  */
 export async function notifyVerificationExpired(
   chatId: bigint,
@@ -152,8 +156,24 @@ export async function notifyVerificationExpired(
   groupActionOk: boolean,
   /** v2.0.5 群内验证模式：用户在群内已被批准入群，超时动作是「移出群组」而非「拒绝申请」 */
   groupChannel = false,
+  /** v2.0.7：成员是否已被移出群组（直连用户开关关闭时为 false，保留在群内） */
+  options?: { kicked?: boolean },
 ): Promise<void> {
   const bot = await resolveBotForChat("verificationExpiredNotice", chatId, userId);
+  const kicked = options?.kicked ?? true;
+
+  // 直连用户未被移出（kick_direct_joins 关闭）：仅告知验证失效，无按钮
+  if (!kicked && requestType === "direct") {
+    await bot.api.sendMessage(
+      Number(userId),
+      "⏰ 验证超时：超时未完成验证，本次验证已失效。你仍保留在群组中，无需重新申请。",
+    );
+    console.log(
+      `Verification timeout notice sent to user ${userId} for chat ${chatId} (stayed in group, no button)`,
+    );
+    return;
+  }
+
   const invite = await bot.api.createChatInviteLink(Number(chatId), {
     creates_join_request: true,
     name: "TGuard 加群验证",
@@ -461,16 +481,24 @@ export async function sendGroupWelcome(
   }
 }
 
-/** 群内验证超时提示（踢出前发送，被禁言成员仍可见群消息） */
-export async function sendGroupTimeoutNotice(chatId: bigint, userId: bigint): Promise<boolean> {
+/**
+ * 群内验证超时提示（踢出前发送，被禁言成员仍可见群消息）。
+ * v2.0.7 直连入群踢出开关（默认关闭）：kicked=false 时不发「已被移出群组」，
+ * 改为「本次验证已失效，成员资格保留」——文案与实际动作严格一致。
+ */
+export async function sendGroupTimeoutNotice(
+  chatId: bigint,
+  userId: bigint,
+  options?: { kicked?: boolean },
+): Promise<boolean> {
   try {
     const bot = await resolveBotForChat("sendGroupTimeoutNotice", chatId, userId);
     const mention = userMentionHTML({ id: Number(userId), first_name: "该成员" });
-    return await sendGroupNoticeHTML(
-      bot,
-      chatId,
-      `⏰ ${mention} 未在规定时间内完成验证，已被移出群组。可重新申请加群。`,
-    );
+    const text =
+      options?.kicked === false
+        ? `⏰ ${mention} 未在规定时间内完成验证，本次验证已失效（成员资格保留）。`
+        : `⏰ ${mention} 未在规定时间内完成验证，已被移出群组。可重新申请加群。`;
+    return await sendGroupNoticeHTML(bot, chatId, text);
   } catch (error) {
     console.warn(`Failed to send group timeout notice (chat ${chatId}):`, error);
     return false;

@@ -85,11 +85,76 @@ async function getSettingValue(key: string): Promise<string> {
   return stored[key] ?? "";
 }
 
-async function getD1Config(): Promise<SessionStorageD1Config> {
+/**
+ * D1 REST 配置的部署默认值（v2.0.7，结合 pages-deploy.yml 工作流）：
+ * CI 在部署时注入 TG_D1_ACCOUNT_ID / TG_D1_DATABASE_ID / TG_D1_API_TOKEN
+ * （默认值 = 部署账号 + 本次部署的 D1 库 + CLOUDFLARE_API_TOKEN）。
+ * 管理后台已保存的配置**永远优先** —— 环境默认值仅在对应字段未配置时生效，
+ * 不影响已有配置。
+ */
+export interface D1ConfigSource {
+  accountId: "stored" | "env-default" | "none";
+  databaseId: "stored" | "env-default" | "none";
+  apiToken: "stored" | "env-default" | "none";
+}
+
+export function getD1EnvDefaults(): SessionStorageD1Config {
   return {
-    accountId: await getSettingValue(SESSION_STORAGE_D1_KEYS.accountId),
-    databaseId: await getSettingValue(SESSION_STORAGE_D1_KEYS.databaseId),
-    apiToken: await getSettingValue(SESSION_STORAGE_D1_KEYS.apiToken),
+    accountId: process.env.TG_D1_ACCOUNT_ID?.trim() ?? "",
+    databaseId: process.env.TG_D1_DATABASE_ID?.trim() ?? "",
+    apiToken: process.env.TG_D1_API_TOKEN?.trim() ?? "",
+  };
+}
+
+/** 任一字段存在部署默认值（用于设置页提示与 Dashboard 判断） */
+export function hasD1EnvDefaults(): boolean {
+  const d = getD1EnvDefaults();
+  return Boolean(d.accountId || d.databaseId || d.apiToken);
+}
+
+function pickWithDefault(stored: string, envDefault: string): {
+  value: string;
+  source: "stored" | "env-default" | "none";
+} {
+  if (stored) return { value: stored, source: "stored" };
+  if (envDefault) return { value: envDefault, source: "env-default" };
+  return { value: "", source: "none" };
+}
+
+async function getD1Config(): Promise<SessionStorageD1Config> {
+  return (await resolveD1RestConfig()).config;
+}
+
+/**
+ * 解析生效的 D1 REST 配置（v2.0.7）：数据库设置优先，未配置字段回退部署默认值。
+ * 供会话存储适配器与 Dashboard D1 用量指标（d1-metrics）共用同一套解析规则。
+ */
+export async function resolveD1RestConfig(): Promise<{
+  config: SessionStorageD1Config;
+  source: D1ConfigSource;
+}> {
+  const [stored, envDefaults] = [
+    {
+      accountId: await getSettingValue(SESSION_STORAGE_D1_KEYS.accountId),
+      databaseId: await getSettingValue(SESSION_STORAGE_D1_KEYS.databaseId),
+      apiToken: await getSettingValue(SESSION_STORAGE_D1_KEYS.apiToken),
+    },
+    getD1EnvDefaults(),
+  ];
+  const account = pickWithDefault(stored.accountId, envDefaults.accountId);
+  const database = pickWithDefault(stored.databaseId, envDefaults.databaseId);
+  const token = pickWithDefault(stored.apiToken, envDefaults.apiToken);
+  return {
+    config: {
+      accountId: account.value,
+      databaseId: database.value,
+      apiToken: token.value,
+    },
+    source: {
+      accountId: account.source,
+      databaseId: database.source,
+      apiToken: token.source,
+    },
   };
 }
 
@@ -721,7 +786,16 @@ export async function listSessionBackendHealth(): Promise<{ backend: SessionStor
 export interface PublicSessionStorageConfig {
   backend: string;
   sqlite_sessions: number;
-  d1: { account_id: string; database_id: string; api_token_masked: string; has_api_token: boolean };
+  d1: {
+    account_id: string;
+    database_id: string;
+    api_token_masked: string;
+    has_api_token: boolean;
+    /** v2.0.7 部署默认值：对应字段未配置时自动生效（不影响已有配置） */
+    defaults: { account_id: boolean; database_id: boolean; api_token: boolean };
+    /** 生效中的 database_id（打码，含默认值回退后的结果，供诊断展示） */
+    effective_database_id: string;
+  };
   r2: {
     account_id: string;
     access_key_id: string;
@@ -749,6 +823,8 @@ function maskSecret(value: string | undefined): string {
 /** 读取当前会话存储配置（敏感字段打码；纯本地 DB，毫秒级） */
 export async function getPublicSessionStorageConfig(): Promise<PublicSessionStorageConfig> {
   const stored = await getAllAppSettings();
+  const envDefaults = getD1EnvDefaults();
+  const d1Public = await resolveD1RestConfig();
   return {
     backend: stored[SESSION_STORAGE_SETTING_KEY] ?? "memory",
     sqlite_sessions: await countSqliteSessions(),
@@ -757,6 +833,13 @@ export async function getPublicSessionStorageConfig(): Promise<PublicSessionStor
       database_id: stored[SESSION_STORAGE_D1_KEYS.databaseId] ?? "",
       api_token_masked: maskSecret(stored[SESSION_STORAGE_D1_KEYS.apiToken]),
       has_api_token: Boolean(stored[SESSION_STORAGE_D1_KEYS.apiToken]),
+      defaults: {
+        account_id: !stored[SESSION_STORAGE_D1_KEYS.accountId] && Boolean(envDefaults.accountId),
+        database_id: !stored[SESSION_STORAGE_D1_KEYS.databaseId] && Boolean(envDefaults.databaseId),
+        api_token: !stored[SESSION_STORAGE_D1_KEYS.apiToken] && Boolean(envDefaults.apiToken),
+      },
+      // 生效值打码透出（v2.0.7 Dashboard D1 指标与测试连接共用该解析）
+      effective_database_id: maskSecret(d1Public.config.databaseId),
     },
     r2: {
       account_id: stored[SESSION_STORAGE_R2_KEYS.accountId] ?? "",

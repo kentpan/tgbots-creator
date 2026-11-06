@@ -192,6 +192,13 @@ function GroupFormDialog({
         defaultChecked={group ? group.privacyMode : true}
         id={`privacy-${group?.chatId ?? "new"}`}
       />
+      <SwitchField
+        name="kick_direct_joins"
+        label="直连入群超时/失败踢出（默认关闭）"
+        description="针对通过公开邀请链接/被拉入群的「已有用户」：开启后，验证超时或尝试次数用尽将自动移出群组（ban+unban，可重新申请）；关闭（默认）则保留在群内，仅失效本次验证并恢复发言权限。经入群申请链接加入的用户不受此开关影响。"
+        defaultChecked={group ? group.kickDirectJoins : false}
+        id={`kick-direct-${group?.chatId ?? "new"}`}
+      />
     </FormDialog>
   );
 }
