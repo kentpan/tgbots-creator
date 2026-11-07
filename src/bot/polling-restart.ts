@@ -88,12 +88,9 @@ export async function runPollingWithAutoRestart(
     } catch (error) {
       // 绝不吞错：完整记录错误详情（grammY 官方要求调用方捕获 start() 的错误，
       // 官方 runner 语义为失败后自动重启 source）
-      const permanent =
-        Boolean(opts.shouldContinue) && !opts.shouldContinue!(error);
       console.error(
-        permanent
-          ? `[${opts.label}] polling stopped with permanent error (attempt #${attempt}); NOT restarting:`
-          : `[${opts.label}] polling stopped with error (restart #${attempt}); auto-restarting per grammY official pattern:`,
+        `[${opts.label}] polling stopped with error (restart #${attempt}); ` +
+          "auto-restarting per grammY official pattern:",
         error,
       );
       // 远程 Webhook 消费者已接管该 Token（409: webhook is active）→ 本地轮询永久让位，

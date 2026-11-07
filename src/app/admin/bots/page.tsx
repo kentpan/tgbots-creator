@@ -1,14 +1,12 @@
-import { listBots, listBotCommands, listDeveloperAccounts, listGroupSettings } from "@/database/operations";
+import { listBots, listBotCommands, listGroupSettings } from "@/database/operations";
 import { getStorage } from "@/database/bindings";
 import { countMenuStats, parseBotMenuConfig } from "@/services/menu-config";
 import { getTelegramRuntimeSettings, resolveBotRuntime } from "@/services/bot-transport";
 import { isEdgeRuntime } from "@/lib/telegram/runtime-mode";
 import { parseBotProfile, parseBotPrivacyMode } from "@/bot/multi-runtime";
-import { parseMirrorConfig } from "@/bot/mirror/types";
 import { requirePermission } from "@/lib/auth";
 import { deleteBotAction, syncBotMenuAction, testBotAction } from "./actions";
 import { BotFormDialog } from "./bot-form-dialog";
-import { MirrorFormDialog } from "./mirror-form-dialog";
 import { CommandMenuDialog } from "./command-menu-dialog";
 import { MenuDesignerDialog } from "./menu-designer-dialog";
 import { BotRuntimeDialog } from "./bot-runtime-dialog";
@@ -32,8 +30,6 @@ const ERRORS: Record<string, string> = {
   "invalid-token": "Token 格式不合法（应为 123456789:AAxxxx 形式）",
   "duplicate-token": "该 Token 已存在",
   "invalid-id": "机器人不存在",
-  "mirror-target-required": "请填写目标 bot 用户名",
-  "mirror-verify-bot-required": "验证绑定模式必须选择绑定的加群验证机器人",
   "invalid-menu": "消息内嵌按钮配置不合法",
   "invalid-commands": "指令菜单数据不合法，请重试",
   "runtime": "机器人运行配置已保存并热应用",
@@ -56,24 +52,12 @@ export default async function BotsPage({
 }) {
   await requirePermission("bots:view");
   const params = await searchParams;
-  const [bots, groups, builtinCommands, customCommands, developerAccounts] = await Promise.all([
+  const [bots, groups, builtinCommands, customCommands] = await Promise.all([
     listBots(),
     listGroupSettings(),
     listBotCommands({ type: "builtin", enabledOnly: true }),
     listBotCommands({ type: "custom", enabledOnly: true }),
-    listDeveloperAccounts(),
   ]);
-  const developerAccountOptions = developerAccounts.map((account) => ({
-    id: String(account.id),
-    apiId: String(account.apiId),
-    phone: account.phone ?? "",
-    remark: account.remark ?? "",
-  }));
-  const botOptions = bots.map((bot) => ({
-    id: String(bot.id),
-    name: bot.name,
-    username: bot.username,
-  }));
   const commandLibrary = [...builtinCommands.rows, ...customCommands.rows].map((row) => ({
     id: String(row.id),
     name: row.name,
@@ -95,12 +79,6 @@ export default async function BotsPage({
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <BotCreateGuide />
-          <MirrorFormDialog
-            developerAccounts={developerAccountOptions}
-            bots={botOptions}
-            trigger="🪞 新增镜像机器人"
-            triggerClassName="inline-flex h-10 items-center rounded-md border border-primary/50 px-4 text-sm font-medium text-primary hover:bg-primary/10"
-          />
           <BotFormDialog
             trigger="+ 新增机器人"
             triggerClassName="inline-flex h-10 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
@@ -163,18 +141,10 @@ export default async function BotsPage({
                 bots.map((bot) => {
                   const stats = countMenuStats(parseBotMenuConfig(bot.menuConfig).root);
                   const profile = parseBotProfile(bot.config);
-                  const mirrorCfg = parseMirrorConfig(bot.config);
                   return (
                     <tr key={bot.id} className="border-b last:border-0">
                       <td className="px-4 py-3 text-sm font-mono">{bot.id}</td>
-                      <td className="px-4 py-3 text-sm font-medium">
-                        {bot.name}
-                        {mirrorCfg ? (
-                          <span className="ml-2 inline-flex items-center rounded-full border border-fuchsia-200 bg-fuchsia-50 px-2 py-0.5 text-xs font-medium text-fuchsia-700">
-                            镜像 → @{mirrorCfg.targetBot}
-                          </span>
-                        ) : null}
-                      </td>
+                      <td className="px-4 py-3 text-sm font-medium">{bot.name}</td>
                       <td className="px-4 py-3 text-sm">{bot.username ? `@${bot.username}` : "-"}</td>
                       <td className="px-4 py-3 font-mono text-sm text-muted-foreground">
                         {maskToken(bot.token)}
@@ -225,55 +195,36 @@ export default async function BotsPage({
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex flex-wrap items-center gap-2">
-                          {mirrorCfg ? (
-                            <MirrorFormDialog
-                              bot={{
-                                id: String(bot.id),
-                                name: bot.name,
-                                token: bot.token,
-                                username: bot.username,
-                                enabled: bot.enabled,
-                                config: bot.config,
-                              }}
-                              developerAccounts={developerAccountOptions}
-                              bots={botOptions}
-                              trigger="🪞 镜像配置"
-                              triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
-                            />
-                          ) : (
-                            <>
-                              <MenuDesignerDialog
-                                bot={{
-                                  id: String(bot.id),
-                                  name: bot.name,
-                                  menuConfig: bot.menuConfig,
-                                  menuText: bot.menuText,
-                                  username: bot.username,
-                                  privacyMode: parseBotPrivacyMode(profile),
-                                }}
-                                groups={groups.map((group) => ({
-                                  chatId: String(group.chatId),
-                                  chatTitle: group.chatTitle,
-                                }))}
-                                storageKind={getStorage().kind}
-                                trigger="⚙️ 消息内嵌按钮"
-                                triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
-                              />
-                              <CommandMenuDialog
-                                bot={{
-                                  id: String(bot.id),
-                                  name: bot.name,
-                                  privacyMode: parseBotPrivacyMode(profile),
-                                  selectedCommandIds: Array.isArray(profile.commandIds)
-                                    ? profile.commandIds
-                                    : [],
-                                }}
-                                library={commandLibrary}
-                                trigger="⌨️ 指令菜单"
-                                triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
-                              />
-                            </>
-                          )}
+                          <MenuDesignerDialog
+                            bot={{
+                              id: String(bot.id),
+                              name: bot.name,
+                              menuConfig: bot.menuConfig,
+                              menuText: bot.menuText,
+                              username: bot.username,
+                              privacyMode: parseBotPrivacyMode(profile),
+                            }}
+                            groups={groups.map((group) => ({
+                              chatId: String(group.chatId),
+                              chatTitle: group.chatTitle,
+                            }))}
+                            storageKind={getStorage().kind}
+                            trigger="⚙️ 消息内嵌按钮"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
+                          />
+                          <CommandMenuDialog
+                            bot={{
+                              id: String(bot.id),
+                              name: bot.name,
+                              privacyMode: parseBotPrivacyMode(profile),
+                              selectedCommandIds: Array.isArray(profile.commandIds)
+                                ? profile.commandIds
+                                : [],
+                            }}
+                            library={commandLibrary}
+                            trigger="⌨️ 指令菜单"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
+                          />
                           <BotRuntimeDialog
                             bot={{
                               id: String(bot.id),
@@ -292,20 +243,18 @@ export default async function BotsPage({
                             })()}
                             trigger="🚚 运行配置"
                           />
-                          {mirrorCfg ? null : (
-                            <BotFormDialog
-                              bot={{
-                                id: String(bot.id),
-                                name: bot.name,
-                                token: bot.token,
-                                username: bot.username,
-                                enabled: bot.enabled,
-                                config: bot.config,
-                              }}
-                              trigger="编辑"
-                              triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
-                            />
-                          )}
+                          <BotFormDialog
+                            bot={{
+                              id: String(bot.id),
+                              name: bot.name,
+                              token: bot.token,
+                              username: bot.username,
+                              enabled: bot.enabled,
+                              config: bot.config,
+                            }}
+                            trigger="编辑"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
+                          />
                           <form action={testBotAction}>
                             <input type="hidden" name="id" value={String(bot.id)} />
                             <button

@@ -7,6 +7,7 @@ import {
   listVerificationMethods,
   upsertGroupSettings,
 } from "@/database/operations";
+import { assertRemoteExecution } from "@/services/remote-ops-guard";
 
 /**
  * 仿真屏群组设置页（iOS 群组信息界面）的群组验证配置读写。
@@ -19,6 +20,10 @@ import {
 const VALID_METHODS = new Set(["captcha", "code_api", "code_self"]);
 
 export async function GET(request: Request): Promise<NextResponse> {
+
+  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
+  const blocked = await assertRemoteExecution(request);
+  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });
@@ -69,6 +74,10 @@ export async function GET(request: Request): Promise<NextResponse> {
 }
 
 export async function PUT(request: Request): Promise<NextResponse> {
+
+  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
+  const blocked = await assertRemoteExecution(request);
+  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });
@@ -165,7 +174,9 @@ export async function PUT(request: Request): Promise<NextResponse> {
         ? "dm"
         : payload.verification_channel === "group"
           ? "group"
-          : existing?.verificationChannel,
+          : payload.verification_channel === "auto"
+            ? "auto"
+            : existing?.verificationChannel,
     // v2.0.7 直连入群踢出开关：未传时保留现值（undefined 语义 = 不改动）
     kickDirectJoins: payload.kick_direct_joins ?? existing?.kickDirectJoins,
   });

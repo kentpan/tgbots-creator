@@ -46,10 +46,16 @@ export async function createLoginSession(
   });
   void deleteExpiredAdminSessions();
   const jar = await cookies();
+  // v2.0.12：https 站点（Cloudflare Pages 线上）cookie 使用 SameSite=None，
+  // 允许本地 node 管理后台把「部署/加群申请」等实操请求跨站转发到线上时
+  // 自动携带线上登录态（浏览器要求 SameSite=None 必须搭配 Secure）；
+  // http（本地 dev）维持 SameSite=Lax。
+  const forwardedProto = (headers.get("x-forwarded-proto") ?? "").split(",")[0].trim();
+  const isHttps = forwardedProto === "https";
   jar.set(SESSION_COOKIE_NAME, token, {
     httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    sameSite: isHttps ? "none" : "lax",
+    secure: isHttps,
     path: "/",
     expires: expiresAt,
   });

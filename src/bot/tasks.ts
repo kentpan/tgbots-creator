@@ -15,50 +15,6 @@ import {
 
 export const CLEANUP_INTERVAL_SECONDS = 60;
 export const PURGE_INTERVAL_SECONDS = 24 * 60 * 60;
-export const MIRROR_PROBE_INTERVAL_SECONDS = 5 * 60;
-export const SYNC_INTERVAL_SECONDS = 5 * 60;
-
-/** 远程加群申请同步（本地 Node 让位线上 Webhook 后, 把线上增量拉回本地库） */
-async function runRemoteJoinRequestSync(): Promise<void> {
-  try {
-    const { isEdgeRuntime } = await import("@/lib/telegram/runtime-mode");
-    if (isEdgeRuntime()) return;
-    const { joinRequestSyncConfigured, syncRemoteJoinRequests } = await import(
-      "@/services/join-request-sync"
-    );
-    if (!(await joinRequestSyncConfigured())) return;
-    const result = await syncRemoteJoinRequests();
-    if (!result.ok) {
-      console.warn("[sync] 加群申请远程同步未执行:", result.message);
-      return;
-    }
-    if (result.fetched > 0) {
-      console.log(`[sync] ${result.message}`);
-    }
-  } catch (error) {
-    console.error("Remote join-request sync failed:", error);
-  }
-}
-
-async function runMirrorMaintenance(): Promise<void> {
-  try {
-    const { probeRelayRecovery } = await import("./mirror/relay");
-    const { purgeStaleMirrorCallbacks, purgeFinishedMirrorJobs, purgeMirrorLogs } = await import(
-      "./mirror/store"
-    );
-    await probeRelayRecovery();
-    const purgedCallbacks = await purgeStaleMirrorCallbacks();
-    const purgedJobs = await purgeFinishedMirrorJobs(7 * 24 * 60 * 60 * 1000);
-    const purgedLogs = await purgeMirrorLogs(30 * 24 * 60 * 60 * 1000);
-    if (purgedCallbacks > 0 || purgedJobs > 0 || purgedLogs > 0) {
-      console.log(
-        `[mirror] 过期数据清理：callbacks=${purgedCallbacks} jobs=${purgedJobs} logs=${purgedLogs}`,
-      );
-    }
-  } catch (error) {
-    console.error("Mirror maintenance iteration failed:", error);
-  }
-}
 
 export async function cleanupAndDismissExpiredRequests(): Promise<void> {
   try {
@@ -148,22 +104,12 @@ export async function runCleanupLoop(
   const retentionDays = config.cleanup.retentionDays;
   console.log(`Cleanup loop started (interval=${intervalSeconds}s, retention=${retentionDays}d)`);
   let elapsedSincePurge = PURGE_INTERVAL_SECONDS;
-  let elapsedSinceMirrorProbe = MIRROR_PROBE_INTERVAL_SECONDS;
-  let elapsedSinceSync = SYNC_INTERVAL_SECONDS;
   while (!signal?.aborted) {
     try {
       await cleanupAndDismissExpiredRequests();
       if (elapsedSincePurge >= PURGE_INTERVAL_SECONDS) {
         await purgeOldRecords();
         elapsedSincePurge = 0;
-      }
-      if (elapsedSinceMirrorProbe >= MIRROR_PROBE_INTERVAL_SECONDS) {
-        await runMirrorMaintenance();
-        elapsedSinceMirrorProbe = 0;
-      }
-      if (elapsedSinceSync >= SYNC_INTERVAL_SECONDS) {
-        await runRemoteJoinRequestSync();
-        elapsedSinceSync = 0;
       }
     } catch (error) {
       console.error("Cleanup loop iteration failed:", error);
@@ -180,7 +126,5 @@ export async function runCleanupLoop(
       );
     });
     elapsedSincePurge += intervalSeconds;
-    elapsedSinceMirrorProbe += intervalSeconds;
-    elapsedSinceSync += intervalSeconds;
   }
 }

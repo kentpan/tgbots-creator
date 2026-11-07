@@ -13,7 +13,6 @@ import {
 } from "@/lib/telegram/runtime-mode";
 import { TelegramGlobalCards } from "@/components/admin/telegram-global-cards";
 import { SessionStorageCard } from "@/components/admin/session-storage-card";
-import { MirrorSecretCard } from "@/components/admin/mirror-secret-card";
 import { backupDatabaseAction, saveSettingsAction } from "./actions";
 import { listDatabaseBackups } from "@/services/database-backup";
 import { getPublicSessionStorageConfig } from "@/bot/session-storage";
@@ -29,8 +28,6 @@ export default async function SettingsPage({
     backup?: string;
     tg_saved?: string;
     tg_error?: string;
-    mirror_saved?: string;
-    mirror_error?: string;
   }>;
 }) {
   const admin = await requirePermission("settings:view");
@@ -45,12 +42,6 @@ export default async function SettingsPage({
   ]);
   const kvKind = getKv().kind;
   const storageKind = getStorage().kind;
-  const isEdge = isEdgeRuntime();
-  // 镜像中继/远程同步配置（DB 保存；env 仅为存量部署回退，这里展示 DB 值）
-  const mirrorSecretValue = (stored["mirror.relay_secret"] ?? "").trim();
-  const syncSecretValue = (stored["sync.remote_secret"] ?? "").trim();
-  const maskSecret = (value: string): string =>
-    value.length <= 8 ? "••••" : `${value.slice(0, 4)}••••${value.slice(-4)}`;
 
   const defaults: Record<string, string> = {
     "bot.verification_timeout": String(config.bot.verificationTimeout),
@@ -175,28 +166,6 @@ export default async function SettingsPage({
           </div>
         </div>
       </div>
-
-      {params.mirror_saved ? (
-        <div className="rounded-md border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">
-          镜像中继/远程同步配置已保存（即时生效，无需重启）
-        </div>
-      ) : null}
-      {params.mirror_error ? (
-        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          {params.mirror_error === "short-secret"
-            ? "密钥长度不足：至少 16 个字符"
-            : params.mirror_error === "bad-url"
-              ? "线上地址必须以 http:// 或 https:// 开头"
-              : "镜像配置不合法，请检查后重试"}
-        </div>
-      ) : null}
-
-      <MirrorSecretCard
-        mode={isEdge ? "edge" : "node"}
-        secretConfigured={isEdge ? !!mirrorSecretValue : !!syncSecretValue}
-        secretMasked={isEdge ? maskSecret(mirrorSecretValue) : maskSecret(syncSecretValue)}
-        initialUrl={stored["sync.remote_url"] ?? ""}
-      />
 
       {/* Telegram 传输模式（轮询/Webhook）与隐私模式：全局默认（Tab 切换，自包含组件） */}
       <TelegramGlobalCards

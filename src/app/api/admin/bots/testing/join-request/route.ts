@@ -14,6 +14,8 @@ import {
 } from "@/database/operations";
 import { generateJoinCode, generateVerificationToken } from "@/utils/crypto";
 import { parseCodeApiConfig, type CodeApiConfig } from "@/services/external-verify";
+import { resolveVerificationChannel } from "@/database/operations";
+import { assertRemoteExecution } from "@/services/remote-ops-guard";
 
 /** 仿真屏使用的固定模拟用户（与仿真屏模板变量保持一致） */
 export const SIMULATED_USER_ID = 777000n;
@@ -67,6 +69,10 @@ function buildMethodConfig(input: JoinApiConfigInput): CodeApiConfig | null {
  * 读取该群组当前绑定的外部验证 API 配置，用于「模拟加群申请」弹窗预填。
  */
 export async function GET(request: Request): Promise<NextResponse> {
+
+  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
+  const blocked = await assertRemoteExecution(request);
+  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });
@@ -110,6 +116,10 @@ export async function GET(request: Request): Promise<NextResponse> {
  * （不存在时自动创建「加群验证码核验（外部API）」并绑定），仿真与真实验证共用同一配置。
  */
 export async function POST(request: Request): Promise<NextResponse> {
+
+  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
+  const blocked = await assertRemoteExecution(request);
+  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });
@@ -254,11 +264,11 @@ export async function POST(request: Request): Promise<NextResponse> {
     );
 
     // 提示文案与真实消息逐字一致（纯文本形态）：
-    // 群内验证模式 → 群内验证消息（4 选 1 按钮点选，正确项随会话落库，仿真候选展示正确项）；
+    // 群内验证模式（auto=超级群）→ 群内验证消息（4 选 1 按钮点选，正确项随会话落库，仿真候选展示正确项）；
     // 私聊验证模式 → 私聊验证码提示（buildCodeSelfPromptHTML 纯文本版）
     const minutes = Math.max(1, Math.round(settings.timeoutSeconds / 60));
-    const promptText =
-      settings.verificationChannel === "group"
+    const groupChannel = resolveVerificationChannel(settings, chatId) === "group";
+    const promptText = groupChannel
         ? `👋 欢迎 @preview_user 加入「${settings.chatTitle ?? "群组"}」！\n\n` +
           `请在 ${minutes} 分钟内点击下方按钮，从 4 个候选验证码中点选正确的一项完成验证，验证通过前你将无法发言。\n\n` +
           `🔒 点选结果仅机器人可见，群里其他成员不可见。\n\n` +
@@ -331,9 +341,9 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   // 隐私红线（v1.1.3）：仿真动作一律只停留在仿真屏，绝不真实发送到群组 ——
   // 验证提示/结果只会通过机器人发送给真实用户，仿真环境不调用 Telegram API。
-  // v2.0.5 群内验证模式：真实流程为「先批准进群 → 群内验证消息 + 按钮」，
-  // 仿真屏用群内消息文案展示（输入内容其他成员不可见：网页输码/按钮点选）。
-  const groupChannel = settings.verificationChannel === "group";
+  // v2.0.12 三态渠道：群内验证（auto=超级群/显式 group）用群内消息文案展示
+  //（输入内容其他成员不可见：网页输码/按钮点选），基础群 auto/dm 用私聊文案。
+  const groupChannel = resolveVerificationChannel(settings, chatId) === "group";
   const groupPromptText = groupChannel
     ? `👋 欢迎 @preview_user 加入「${settings.chatTitle ?? "群组"}」！\n\n` +
       `请在 ${Math.max(1, Math.round(settings.timeoutSeconds / 60))} 分钟内点击下方按钮完成验证，验证通过前你将无法发言。\n\n` +

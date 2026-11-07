@@ -218,7 +218,9 @@ export async function handleVerificationChoice(
   }
 
   const settings = await getGroupSettings(session.chatId);
-  if (resolveVerificationChannel(settings) !== "group") {
+  // v2.0.12 三态：auto 按群 chat_id 判定（同一群判定结果恒定，与 bootstrap 一致）；
+  // 显式配置被切换时旧会话失效要求重新申请
+  if (resolveVerificationChannel(settings, session.chatId) !== "group") {
     await ctx.answerCallbackQuery({ text: "验证渠道已切换，请重新申请加群" });
     return;
   }

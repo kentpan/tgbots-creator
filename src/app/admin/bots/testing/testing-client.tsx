@@ -2,6 +2,7 @@
 
 import { useCallback, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import { opsFetch } from "@/lib/remote-ops";
 import {
   Check,
   ChevronDown,
@@ -105,8 +106,18 @@ interface SimSession {
   maxAttempts: number;
   expiresAt: string;
   methodName: string;
-  /** v2.0.5 验证渠道：group=群内验证（群聊视图展示群内验证消息）/ dm=私聊验证 */
-  verificationChannel: "group" | "dm";
+  /** v2.0.12 三态验证渠道：group=群内验证 / dm=私聊验证 / auto=按群类型自动（超级群→群内，基础群→私聊） */
+  verificationChannel: "group" | "dm" | "auto";
+}
+
+/**
+ * v2.0.12 三态渠道视图判定：群内验证视图 = 显式 group 或（auto 且超级群 chat_id）。
+ * 与服务端 resolveVerificationChannel/isSuperGroupChatId 同语义（chat_id -100 前缀）。
+ */
+export function isGroupChannelView(channel: string | null | undefined, chatId?: string | null): boolean {
+  if (channel === "group") return true;
+  if (channel === "dm") return false;
+  return Boolean(chatId && chatId.startsWith("-100"));
 }
 
 interface DeliveryLogView {
@@ -345,9 +356,6 @@ export function TestingClient({
       );
     }
     const pool = [...merged.values()];
-    // 按机器人过滤：有部署/关联配置 → 显示关联群组 + 该 bot 真实登记的群组；
-    // 无任何关联 → 只显示该 bot Token 真实登记的群组（syncedGroups），
-    // 绝不回退到全局全部群组 —— 否则切换机器人时仿真屏群组永远不变（2026-11-08 实录）
     const visible =
       linkedChatIds.size > 0
         ? pool.filter(
@@ -355,7 +363,7 @@ export function TestingClient({
               linkedChatIds.has(group.chatId) ||
               syncedGroups.some((synced) => synced.chatId === group.chatId),
           )
-        : syncedGroups;
+        : pool;
     return visible;
   }, [selectedBot, relatedBotIds, botGroupLinks, groups, syncedGroups]);
 
@@ -410,7 +418,7 @@ export function TestingClient({
       setJoinError(null);
       setJoinPrefilling(true);
       try {
-        const response = await fetch(
+        const response = await opsFetch(
           `/api/admin/bots/testing/join-request?chat_id=${encodeURIComponent(chatId)}`,
           { cache: "no-store" },
         );
@@ -442,7 +450,7 @@ export function TestingClient({
       apiConfig: JoinApiConfig | null,
     ): Promise<{ ok: boolean; message: string }> => {
       try {
-        const response = await fetch("/api/admin/bots/testing/join-request", {
+        const response = await opsFetch("/api/admin/bots/testing/join-request", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -472,13 +480,22 @@ export function TestingClient({
           maxAttempts: Number(payload.data.max_attempts ?? 3),
           expiresAt: payload.data.expires_at,
           methodName: payload.data.method_name,
-          verificationChannel: payload.data.verification_channel === "dm" ? "dm" : "group",
+          verificationChannel:
+            payload.data.verification_channel === "dm"
+              ? "dm"
+              : payload.data.verification_channel === "group"
+                ? "group"
+                : "auto",
         });
         setLatestCode(null);
         setJoinPhase("awaiting_code");
         // 与真实 APP 一致：私聊验证模式 → 机器人把验证提示发到买家私聊（切换到私聊视图）；
-        // 群内验证模式（默认）→ 申请自动批准进群，验证消息发到群内（留在群聊视图）
-        setSimView(payload.data.verification_channel === "dm" ? "private" : "group");
+        // 群内验证模式（auto=超级群）→ 申请自动批准进群，验证消息发到群内（留在群聊视图）
+        setSimView(
+          isGroupChannelView(payload.data.verification_channel, payload.data.chat_id)
+            ? "group"
+            : "private",
+        );
         setSelectedChatId(chatId);
         setChatOpenRequest((count) => count + 1);
         return { ok: true, message: "已提交加群申请" };
@@ -570,7 +587,7 @@ export function TestingClient({
         return { ok: false, text: "尚未加入群组：请先点击下方「申请加入群组」按钮" };
       }
       try {
-        const response = await fetch("/api/admin/bots/testing/submit-code", {
+        const response = await opsFetch("/api/admin/bots/testing/submit-code", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -631,7 +648,7 @@ export function TestingClient({
       if (!selectedBotId || deployingChatId) return null;
       setDeployingChatId(chatId);
       try {
-        const response = await fetch("/api/admin/bots/testing/deploy", {
+        const response = await opsFetch("/api/admin/bots/testing/deploy", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ bot_id: selectedBotId, chat_id: chatId }),
@@ -988,7 +1005,7 @@ export function TestingClient({
                       ? `仿真真实加群流程：点击下方「申请加入群组」按钮开始（验证方式：${activeGroup.methodName ?? activeGroup.method}）`
                       : joinPhase === "joined"
                         ? `仿真群 ${activeGroup.chatId} · 已加入群组`
-                        : session?.verificationChannel === "group"
+                        : isGroupChannelView(session?.verificationChannel, session?.chatId)
                           ? "群内验证中：申请已自动批准进群，验证消息已发到群内（输入内容其他成员不可见）"
                           : simView === "private"
                             ? "私聊验证中（隐私模式）：验证码仅机器人可见，不会出现在群里"
@@ -1005,7 +1022,7 @@ export function TestingClient({
                         id: 1,
                         text: session.promptText,
                         hint:
-                          session.verificationChannel === "group"
+                          isGroupChannelView(session.verificationChannel, session.chatId)
                             ? "群内验证消息（仿真：在下方输入框模拟按钮点选/网页输码）"
                             : "请输入验证码后点击发送按钮（仿真 force_reply）",
                       }

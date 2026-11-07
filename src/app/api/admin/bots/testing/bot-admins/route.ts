@@ -23,6 +23,7 @@ import {
   withTelegramTimeout,
 } from "@/services/telegram-sync";
 import { GrammyError } from "grammy";
+import { assertRemoteExecution } from "@/services/remote-ops-guard";
 
 /**
  * 仿真屏「机器人权限配置」页（iOS 管理员权限界面）的读写。
@@ -37,6 +38,10 @@ import { GrammyError } from "grammy";
 type Rights = BotAdminRights;
 
 export async function GET(request: Request): Promise<NextResponse> {
+
+  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
+  const blocked = await assertRemoteExecution(request);
+  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });
@@ -93,6 +98,10 @@ export async function GET(request: Request): Promise<NextResponse> {
 }
 
 export async function PUT(request: Request): Promise<NextResponse> {
+
+  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
+  const blocked = await assertRemoteExecution(request);
+  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });

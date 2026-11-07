@@ -1,5 +1,5 @@
 import type { BotContext } from "../context";
-import { getGlobalStats, getGroupSettings, getPendingCodeContext, resolveVerificationChannel } from "@/database/operations";
+import { getGlobalStats, getGroupSettings, getPendingCodeContext, resolveVerificationChannel, isSuperGroupChatId } from "@/database/operations";
 import { config } from "@/config/settings";
 import { adminOnly } from "../filters";
 import { mainMenu } from "../menus";
@@ -34,18 +34,21 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
       await ctx.reply("⚠️ 该群组未启用加群验证，暂不接受入群申请。");
       return;
     }
+    // v2.0.12：基础群不支持 creates_join_request 邀请链接（Telegram 限制），
+    // 自动回退普通链接（买家点链接直接进群 → chat_member 补验证私聊发码）
+    const superGroup = isSuperGroupChatId(chatId);
     const invite = await ctx.api.createChatInviteLink(Number(chatId), {
-      creates_join_request: true,
+      ...(superGroup ? { creates_join_request: true } : {}),
       name: "TGuard 加群验证",
     });
     const title = settings.chatTitle ?? "群组";
-    // v2.0.5 验证渠道文案：群内模式（默认）申请后自动进群、群内按钮验证；
-    // 私聊模式保持 v1.1.3 文案（私聊提示、群内零消息）
+    // v2.0.12 三态验证渠道文案：群内模式（超级群 auto/显式 group）申请后自动进群、群内按钮验证；
+    // 私聊模式保持 v1.1.3 文案（私聊提示、群内零消息）；基础群提示直连入群补验证
     const flowLines =
-      resolveVerificationChannel(settings) === "group"
+      resolveVerificationChannel(settings, chatId) === "group"
         ? "• 提交申请后将自动批准进群，并在群内完成验证\n" +
           "• 在群内点击验证按钮即可（输入内容其他成员不可见）"
-        : "• 提交申请后，验证提示将由本机器人私聊发送（群里看不到）\n" +
+        : "• 验证提示将由本机器人私聊发送（群里看不到）\n" +
           "• 按私聊提示输入验证码，校验通过后自动进群";
     await ctx.reply(
       `🔐 点击下方按钮申请加入「${title}」。\n\n${flowLines}`,

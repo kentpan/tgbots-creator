@@ -1,6 +1,6 @@
 {
   "name": "tgbots-creator",
-  "version": "2.0.10",
+  "version": "2.0.12",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -11,8 +11,7 @@
     "db:init": "tsx scripts/db-init.ts",
     "seed:commands": "tsx scripts/seed-builtin-commands.ts",
     "db:export": "tsx scripts/export-schema.ts > prisma/schema.sql",
-    "typecheck": "tsc --noEmit",
-    "test:mirror": "tsx scripts/test-mirror.ts"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -81,7 +80,6 @@
     "sonner": "^2.0.6",
     "tailwind-merge": "^3.3.1",
     "tailwindcss-animate": "^1.0.7",
-    "telegram": "^2.26.16",
     "uuid": "^11.1.0",
     "vaul": "^1.1.2",
     "z-ai-web-dev-sdk": "^0.0.18",

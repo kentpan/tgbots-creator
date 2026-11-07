@@ -4,6 +4,8 @@ import { headers } from "next/headers";
 import { getBot, getGroupBotAdminByBotAndChat, upsertGroupBotAdmin } from "@/database/operations";
 import { botByToken, describeSyncError, withTelegramTimeout } from "@/services/telegram-sync";
 import { parseGroupDeployState } from "@/services/group-deploy";
+import { isSuperGroupChatId } from "@/database/operations";
+import { assertRemoteExecution } from "@/services/remote-ops-guard";
 
 /**
  * 一键部署校验：把仿真屏配置好的加群验证机器人真实部署到指定群组。
@@ -20,6 +22,10 @@ import { parseGroupDeployState } from "@/services/group-deploy";
  * 校验不通过时返回对应 stage 和喂饭级操作指引。
  */
 export async function POST(request: Request): Promise<NextResponse> {
+
+  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
+  const blocked = await assertRemoteExecution(request);
+  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });
@@ -146,9 +152,14 @@ export async function POST(request: Request): Promise<NextResponse> {
       });
     }
 
+    // v2.0.12：Telegram 官方限制 creates_join_request 仅超级群/频道可用，
+    // 基础群传该参数会直接报错 —— 按群组类型自动选择链接形态：
+    // 超级群/频道 → 申请制链接（点链接出「申请加入」按钮 → chat_join_request 事件）；
+    // 基础群 → 普通链接（点链接直接进群 → chat_member 事件触发补验证，私聊发码）
+    const superGroup = isSuperGroupChatId(chatId);
     const invite = await withTelegramTimeout(
       api.createChatInviteLink(Number(chatId), {
-        creates_join_request: true,
+        ...(superGroup ? { creates_join_request: true } : {}),
         name: "TGuard 加群验证",
       }),
     );
@@ -162,7 +173,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         invite_link: invite.invite_link,
         invite_link_name: invite.name ?? null,
         deployed_at: deployedAt,
-        deploy_mode: "join_request",
+        deploy_mode: superGroup ? "join_request" : "direct",
         bot_username: me.username ?? null,
         chat_title: chatTitle,
       }),
@@ -185,14 +196,23 @@ export async function POST(request: Request): Promise<NextResponse> {
       bot_status: status,
       invite_link: invite.invite_link,
       deployed_at: deployedAt,
-      guide: [
-        "部署完成！把入群申请链接发给买家（或配置到闲鱼自动发货）",
-        "买家点链接 → 申请入群 → 机器人私聊发送验证提示 → 输入验证码通过后自动进群",
-        "验证码仅机器人与买家私聊可见，不会出现在群里（隐私模式）",
-        "⚠️ 只能分享本系统生成的「入群申请链接」（需机器人审批）！",
-        "⚠️ 严禁分享群主 Telegram 客户端里的主邀请链接/任何普通链接 —— 那种链接会绕过审批直接进群；即使有人这样进群，机器人也会私聊要求其补验证，超时/失败将自动移出群组（需机器人有「封禁用户」权限）",
-        "💡 推荐入口：t.me/<机器人用户名>?start=join_<群组chat_id>（买家先启动机器人再申请入群，验证更顺畅）",
-      ],
+      deploy_mode: superGroup ? "join_request" : "direct",
+      guide: superGroup
+        ? [
+            "部署完成！把入群申请链接发给买家（或配置到闲鱼自动发货）",
+            "买家点链接 → 申请入群 → 机器人私聊发送验证提示 → 输入验证码通过后自动进群",
+            "验证码仅机器人与买家私聊可见，不会出现在群里（隐私模式）",
+            "⚠️ 只能分享本系统生成的「入群申请链接」（需机器人审批）！",
+            "⚠️ 严禁分享群主 Telegram 客户端里的主邀请链接/任何普通链接 —— 那种链接会绕过审批直接进群；即使有人这样进群，机器人也会私聊要求其补验证，超时/失败将自动移出群组（需机器人有「封禁用户」权限）",
+            "💡 推荐入口：t.me/<机器人用户名>?start=join_<群组chat_id>（买家先启动机器人再申请入群，验证更顺畅）",
+          ]
+        : [
+            "部署完成！该群组为基础群（Telegram 限制：不支持「申请加入」审批制链接），已自动改用普通邀请链接：",
+            "买家点链接 → 直接进群 → 机器人私聊发送验证码 → 回复验证码完成验证（验证失败/超时自动移出）",
+            "验证码仅机器人与买家私聊可见，不会出现在群里（隐私模式）",
+            "💡 基础群买家必须先启动机器人（t.me/<机器人用户名>?start=join_<群组chat_id>）才能收到私聊验证码",
+            "💡 如需「申请加入」审批制入群体验，请将群组升级为超级群（Telegram 群设置 → 将群组变为可见/超级群）",
+          ],
     });
   } catch (error) {
     return NextResponse.json({ ok: false, error: describeSyncError(error) }, { status: 200 });
@@ -201,6 +221,10 @@ export async function POST(request: Request): Promise<NextResponse> {
 
 /** 读取已保存的部署状态（group_bot_admins.rights 中的 deploy 字段） */
 export async function GET(request: Request): Promise<NextResponse> {
+
+  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
+  const blocked = await assertRemoteExecution(request);
+  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });

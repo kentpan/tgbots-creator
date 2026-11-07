@@ -89,6 +89,11 @@ export async function startBotRuntime(): Promise<void> {
       );
       return;
     }
+    if (!remote) {
+      console.log(
+        "[runtime] Main bot 未探测到远程 Webhook 消费者（无 webhook 或探测连续失败），按本地轮询启动。",
+      );
+    }
   }
 
   const bot = await createBot(config.bot.token);

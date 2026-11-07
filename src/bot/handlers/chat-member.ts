@@ -26,8 +26,9 @@ import { registerTelegramChat } from "@/services/chat-registry";
  * 1. chat_join_request —— 用户通过「入群申请链接」申请加群（需要机器人审批，入群前验证）
  * 2. chat_member       —— 用户通过普通邀请链接/被拉入群直接进来了（入群后补验证，超时/失败踢出）
  *
- * 验证渠道（v2.0.5，group_settings.verification_channel）：
- * - "group"（默认）群内验证：入群申请先批准 → 用户进群 → 禁言 → 群内验证消息
+ * 验证渠道（v2.0.12 三态，group_settings.verification_channel）：
+ * - "auto"（默认）按群组类型自动：超级群/频道 → 群内验证；基础群 → 私聊验证；
+ * - "group" 群内验证：入群申请先批准 → 用户进群 → 禁言 → 群内验证消息
  *   （captcha/code_api = 网页按钮，code_self = 4 选 1 按钮），输入内容其他成员
  *   不可见；验证通过解禁 + 群内欢迎，失败/超时踢出。
  * - "dm" 私聊验证（v1.1.3 旧行为）：所有验证提示/结果只通过机器人私聊发送，
@@ -324,11 +325,11 @@ async function bootstrapJoinVerification(
   const runtime = await getRuntimeSettings(config);
   const groupSettings = await getGroupSettings(BigInt(chat.id));
 
-  // v2.0.5 群内验证模式（默认）：群组已配置且启用 → 群内验证
+  // v2.0.12 群内验证模式（auto=超级群自动启用 / 显式 group）：群组已配置且启用 → 群内验证
   if (
     groupSettings &&
     groupSettings.enabled !== false &&
-    resolveVerificationChannel(groupSettings) === "group"
+    resolveVerificationChannel(groupSettings, chat.id) === "group"
   ) {
     return bootstrapGroupVerification(api, user, chat, requestType, runtime, groupSettings);
   }
@@ -413,7 +414,7 @@ export async function handleChatMemberUpdate(ctx: BotContext): Promise<void> {
     return;
   }
 
-  const channel = resolveVerificationChannel(groupSettings);
+  const channel = resolveVerificationChannel(groupSettings, chat.id);
   console.log(
     `Direct join without bot approval detected: user ${user.id} (${user.username}) ` +
       `entered chat ${chat.id} via ${memberUpdate.invite_link ? "invite link" : "manual add"} — ` +

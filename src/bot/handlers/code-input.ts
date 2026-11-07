@@ -236,11 +236,11 @@ export async function handleCodeInput(
     return;
   }
 
-  // 群内验证模式短路（v2.0.6）：群聊 + group 渠道 → 文本输码永不生效，
-  // 不必查询该用户是否挂着待验证会话（省掉每条群消息 1 次 D1 会话查询）
+  // 群内验证模式短路（v2.0.6，v2.0.12 三态）：群聊 + 群内渠道（含 auto 判定超级群）→
+  // 文本输码永不生效，不必查询该用户是否挂着待验证会话（省掉每条群消息 1 次 D1 会话查询）
   if (ctx.chat && ctx.chat.type !== "private") {
     const chatSettings = await getGroupSettings(BigInt(ctx.chat.id));
-    if (resolveVerificationChannel(chatSettings) === "group") {
+    if (resolveVerificationChannel(chatSettings, ctx.chat.id) === "group") {
       await next();
       return;
     }

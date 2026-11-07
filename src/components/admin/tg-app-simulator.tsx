@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { opsFetch } from "@/lib/remote-ops";
 import {
   Battery,
   ChevronRight,
@@ -194,16 +195,13 @@ async function readJson<T>(response: Response): Promise<T | null> {
 }
 
 function GroupAvatar({ title, size }: { title: string; size: number }) {
-  // Array.from 按 codePoint 取首字符：slice(0,1) 会把 emoji（代理对）切成半个
-  // 码元，SSR 与浏览器端序列化表现不一致导致 hydration mismatch（2026-11-08 实录）
-  const initial = Array.from(title ?? "")[0] || "?";
   return (
     <div
       className="flex shrink-0 items-center justify-center rounded-full font-semibold text-white"
       style={{ width: size, height: size, backgroundColor: nameColor(title), fontSize: size * 0.42 }}
       aria-hidden
     >
-      {initial}
+      {title.slice(0, 1) || "?"}
     </div>
   );
 }
@@ -324,7 +322,7 @@ export function TgAppSimulator({
     if (!link || resolving) return;
     setResolving(true);
     try {
-      const response = await fetch(
+      const response = await opsFetch(
         `/api/admin/bots/testing/resolve-invite?link=${encodeURIComponent(link)}&bot_id=${encodeURIComponent(selectedBotId)}`,
         { cache: "no-store" },
       );
@@ -413,14 +411,14 @@ export function TgAppSimulator({
     failure_text: "",
     enabled: true,
     privacy_mode: true,
-    verification_channel: "group" as "group" | "dm",
+    verification_channel: "auto" as "auto" | "group" | "dm",
     kick_direct_joins: false,
   });
 
   const loadGroupSettings = useCallback(async (chatId: string): Promise<void> => {
     setSettingsLoading(true);
     try {
-      const response = await fetch(
+      const response = await opsFetch(
         `/api/admin/bots/testing/group-settings?chat_id=${encodeURIComponent(chatId)}`,
         { cache: "no-store" },
       );
@@ -467,7 +465,11 @@ export function TgAppSimulator({
         enabled: settings?.enabled ?? true,
         privacy_mode: settings?.privacy_mode ?? true,
         verification_channel:
-          settings?.verification_channel === "dm" ? "dm" : "group",
+          settings?.verification_channel === "dm"
+            ? "dm"
+            : settings?.verification_channel === "group"
+              ? "group"
+              : "auto",
         kick_direct_joins: settings?.kick_direct_joins ?? false,
       });
     } catch (error) {
@@ -481,7 +483,7 @@ export function TgAppSimulator({
     if (!activeChatId || settingsSaving) return;
     setSettingsSaving(true);
     try {
-      const response = await fetch("/api/admin/bots/testing/group-settings", {
+      const response = await opsFetch("/api/admin/bots/testing/group-settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -534,7 +536,7 @@ export function TgAppSimulator({
   const loadBotAdmins = useCallback(async (chatId: string): Promise<void> => {
     setAdminsLoading(true);
     try {
-      const response = await fetch(
+      const response = await opsFetch(
         `/api/admin/bots/testing/bot-admins?chat_id=${encodeURIComponent(chatId)}`,
         { cache: "no-store" },
       );
@@ -565,7 +567,7 @@ export function TgAppSimulator({
     if (!activeChatId || adminsSaving) return;
     setAdminsSaving(true);
     try {
-      const response = await fetch("/api/admin/bots/testing/bot-admins", {
+      const response = await opsFetch("/api/admin/bots/testing/bot-admins", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chat_id: activeChatId, bot_id: selectedBotId, rights: adminRights }),
@@ -888,6 +890,7 @@ export function TgAppSimulator({
                 <p className="mb-2 text-[17px] text-black">验证渠道</p>
                 <div className="flex rounded-lg bg-black/[0.05] p-0.5">
                   {([
+                    { value: "auto", label: "自动" },
                     { value: "group", label: "群内验证" },
                     { value: "dm", label: "私聊验证" },
                   ] as const).map((option) => (
@@ -907,8 +910,10 @@ export function TgAppSimulator({
                 </div>
                 <p className="mt-1.5 text-[12px] leading-relaxed text-[#8e8e93]">
                   {form.verification_channel === "group"
-                    ? "申请后自动进群，在群内点击按钮完成验证（输入内容其他成员不可见），超时未验证移出群组"
-                    : "验证提示通过机器人私聊发送（用户须先启动机器人），群内零消息"}
+                    ? "群内验证：申请后自动进群，在群内点击按钮完成验证（输入内容其他成员不可见），超时未验证移出群组"
+                    : form.verification_channel === "dm"
+                      ? "私聊验证：验证提示通过机器人私聊发送（用户须先启动机器人），群内零消息"
+                      : "自动（默认）：超级群/频道 → 群内验证；基础群 → 私聊验证（Telegram 限制：基础群不支持申请制入群）"}
                 </p>
               </div>
               {/* v2.0.7 直连入群踢出开关（默认关闭）：公开邀请链接/被拉入群的已有用户超时/失败是否移出 */}

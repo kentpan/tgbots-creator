@@ -171,7 +171,7 @@ export interface GroupSettingsRow {
    *   验证消息（验证码走网页输入/按钮点选，输入内容其他成员不可见），验证通过前禁言；
    * - "dm"：私聊验证（v1.1.3 旧行为）—— 验证提示/结果全部私聊发送，群内零消息。
    */
-  verificationChannel: "group" | "dm";
+  verificationChannel: "group" | "dm" | "auto";
   /**
    * 直连入群踢出开关（v2.0.7，默认 false）：通过公开邀请链接/被拉入群的「已有用户」
    * （join_requests.request_type = direct）验证未通过（尝试次数用尽）或超时未验证时，
@@ -722,13 +722,36 @@ export async function expirePendingSessionsForUserChat(
 }
 
 /**
- * 群内验证渠道判定（v2.0.5）：未配置/无群组设置时默认群内验证（"group"），
- * 仅显式配置为 "dm" 才走私聊验证旧行为。
+ * 超级群/频道 chat_id 判定（v2.0.12）：Telegram 现行规则下 supergroup/channel 的
+ * chat_id 形如 -100xxxxxxxxxx（绝对值 ≥ 1e12）；基础群（basic group）绝对值更小。
+ * 基础群不支持 creates_join_request 邀请链接与 chat_join_request 事件。
+ */
+export function isSuperGroupChatId(chatId?: bigint | number | string | null): boolean {
+  if (chatId === null || chatId === undefined) return false;
+  try {
+    return BigInt(chatId) <= -1000000000000n;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 验证渠道判定（v2.0.12 三态）：
+ * - "group" 群内验证 / "dm" 私聊验证：显式配置直接生效；
+ * - "auto"（默认，含未配置/历史空值）：按群组类型自动选择 ——
+ *   超级群/频道（chat_id -100 前缀）→ 群内验证；基础群 → 私聊验证。
+ *   背景：Telegram 官方限制 chat_join_request 仅超级群/频道可用，
+ *   基础群只能走「直连入群 chat_member 补验证 + 私聊发码」路径。
+ * chatId 未传且为 auto 时保守回落私聊（避免无群上下文时误发群内消息）。
  */
 export function resolveVerificationChannel(
-  settings: { verificationChannel?: "group" | "dm" } | null | undefined,
+  settings: { verificationChannel?: "group" | "dm" | "auto" } | null | undefined,
+  chatId?: bigint | number | string | null,
 ): "group" | "dm" {
-  return settings?.verificationChannel === "dm" ? "dm" : "group";
+  const configured = settings?.verificationChannel ?? "auto";
+  if (configured === "group") return "group";
+  if (configured === "dm") return "dm";
+  return isSuperGroupChatId(chatId) ? "group" : "dm";
 }
 
 /**
@@ -1003,7 +1026,13 @@ function mapGroupSettings(row: Record<string, unknown>): GroupSettingsRow {
     enabled: toBoolean(row.enabled),
     privacyMode: row.privacy_mode === undefined ? true : toBoolean(row.privacy_mode),
     requireApproval: row.require_approval === undefined ? false : toBoolean(row.require_approval),
-    verificationChannel: row.verification_channel === "dm" ? "dm" : "group",
+    // v2.0.12 三态渠道：dm/group 显式值原样保留，列缺失/空/未知值 → auto（按群类型自动）
+    verificationChannel:
+      row.verification_channel === "group"
+        ? "group"
+        : row.verification_channel === "dm"
+          ? "dm"
+          : "auto",
     // v2.0.7 直连入群踢出开关：列缺失/值为空 → 默认 false（不踢出已有用户）
     kickDirectJoins: row.kick_direct_joins === undefined ? false : toBoolean(row.kick_direct_joins),
     createdTime: toDate(row.created_time),
@@ -1453,7 +1482,7 @@ export async function upsertGroupSettings(
     /** v1.1.9 加群需要管理员审核；undefined = 不改动现有值 */
     requireApproval?: boolean;
     /** v2.0.5 验证渠道（group=群内验证 / dm=私聊验证）；undefined = 不改动现有值 */
-    verificationChannel?: "group" | "dm";
+    verificationChannel?: "group" | "dm" | "auto";
     /** v2.0.7 直连入群用户（公开邀请链接/被拉入群）验证未通过/超时是否自动踢出；undefined = 不改动现有值 */
     kickDirectJoins?: boolean;
   },
@@ -1474,7 +1503,8 @@ export async function upsertGroupSettings(
       requireApprovalValue = existing ? existing.requireApproval : false;
     }
     if (verificationChannelValue === undefined) {
-      verificationChannelValue = existing ? existing.verificationChannel : "group";
+      // v2.0.12 新记录默认 auto（按群类型自动：超级群→群内 / 基础群→私聊）
+      verificationChannelValue = existing ? existing.verificationChannel : "auto";
     }
     if (kickDirectJoinsValue === undefined) {
       kickDirectJoinsValue = existing ? existing.kickDirectJoins : false;

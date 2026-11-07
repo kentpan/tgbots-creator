@@ -80,23 +80,34 @@ export function resolveBotRuntime(
  * 掐断线上事件推送（新群组的 my_chat_member 从此丢失、线上库永远无法登记），且全部
  * 更新被本地轮询吃进本地库。此探测用于本地轮询启动前守卫（见 multi-runtime/runtime）。
  *
- * 网络失败返回 null（调用方按「未探测到」处理，不阻塞本地启动决策）。
+ * 可靠性（v2.0.10 实测教训）：沙盒/受限网络下 getWebhookInfo 偶发超时/网络失败 ——
+ * 初版「失败=null=放行」策略在探测失败时让本地抢占并删掉线上 Webhook（事故复发）。
+ * 现改为失败自动重试（共 3 次尝试，间隔 2s），全部失败才返回 null 并由调用方打
+ * 警告日志 —— 显著降低网络抖动导致的误放行。
  */
 export async function probeRemoteWebhook(
   token: string,
 ): Promise<{ url: string; pendingUpdateCount: number } | null> {
-  try {
-    const { tgRawCall } = await import("@/lib/telegram/transport");
-    const res = await tgRawCall<{
-      ok: boolean;
-      result?: { url?: string; pending_update_count?: number };
-    }>(token, "getWebhookInfo");
-    const url = res?.ok ? (res.result?.url ?? "").trim() : "";
-    if (!url) return null;
-    return { url, pendingUpdateCount: res?.result?.pending_update_count ?? 0 };
-  } catch {
-    return null;
+  const { tgRawCall } = await import("@/lib/telegram/transport");
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const res = await tgRawCall<{
+        ok: boolean;
+        result?: { url?: string; pending_update_count?: number };
+      }>(token, "getWebhookInfo");
+      // 请求成功：明确判定（url 非空 = 远程消费者存在；空 = 无 webhook）
+      const url = res?.ok ? (res.result?.url ?? "").trim() : "";
+      if (!url) return null;
+      return { url, pendingUpdateCount: res?.result?.pending_update_count ?? 0 };
+    } catch {
+      // 网络失败：重试（最后一次仍失败 → null，调用方按「未探测到」处理并告警）
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    }
   }
+  return null;
 }
 
 /**

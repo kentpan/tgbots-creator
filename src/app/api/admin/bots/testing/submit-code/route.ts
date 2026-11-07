@@ -5,6 +5,7 @@ import {
   evaluateSubmittedCode,
   loadPendingContextByToken,
 } from "@/services/verification-flow";
+import { assertRemoteExecution } from "@/services/remote-ops-guard";
 
 /**
  * 提交验证码（机器人测试页仿真屏）。
@@ -13,6 +14,10 @@ import {
  * 同一外部验证 API、同一尝试次数控制、同一成功/失败文案。
  */
 export async function POST(request: Request): Promise<NextResponse> {
+
+  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
+  const blocked = await assertRemoteExecution(request);
+  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });

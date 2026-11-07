@@ -9,6 +9,7 @@ import {
 } from "@/database/operations";
 import { parseGroupDeployState } from "@/services/group-deploy";
 import { botByToken, describeSyncError, withTelegramTimeout } from "@/services/telegram-sync";
+import { assertRemoteExecution } from "@/services/remote-ops-guard";
 
 /** 尝试获取真实群成员数（机器人需在群内；失败返回 null，面板降级显示群 ID） */
 async function fetchMemberCount(botToken: string | null, chatId: bigint): Promise<number | null> {
@@ -36,6 +37,10 @@ async function fetchMemberCount(botToken: string | null, chatId: bigint): Promis
  * 此时仿真屏展示「申请加入」按钮，申请由加群验证机器人接管（与真实 chat_join_request 一致）。
  */
 export async function GET(request: Request): Promise<NextResponse> {
+
+  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
+  const blocked = await assertRemoteExecution(request);
+  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });
