@@ -41,6 +41,7 @@ export function SessionStorageCard({ initialConfig }: { initialConfig?: PublicSe
   });
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [fillingDefaults, setFillingDefaults] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
 
   /** 应用配置数据到表单状态（RSC 直传与接口拉取共用） */
@@ -184,6 +185,85 @@ export function SessionStorageCard({ initialConfig }: { initialConfig?: PublicSe
     }
   };
 
+  /**
+   * v2.0.9 「默认配置」一键填入：拉取 pages-deploy.yml 注入的部署默认值（TG_D1_* / TG_R2_*），
+   * 仅填入表单中的空字段（已填写/已保存的值一律不动；D1 API Token 在已保存过时遵循
+   * 「留空保持不变」语义同样不填）。填入后仍需点「保存存储配置」才真正持久化。
+   */
+  const fillDefaults = async (): Promise<void> => {
+    setFillingDefaults(true);
+    setMessage(null);
+    try {
+      const response = await fetch("/api/admin/session-storage/defaults");
+      const payload = (await response.json()) as {
+        ok: boolean;
+        error?: string;
+        data?: {
+          d1?: { account_id?: string; database_id?: string; api_token?: string };
+          r2?: { account_id?: string; bucket?: string };
+        };
+      };
+      if (!payload.ok || !payload.data) {
+        setMessage({ kind: "error", text: payload.error ?? "获取部署默认值失败" });
+        return;
+      }
+      const d1Default = payload.data.d1 ?? {};
+      const r2Default = payload.data.r2 ?? {};
+      const filledNames: string[] = [];
+
+      const nextD1 = { ...d1 };
+      if (!nextD1.account_id.trim() && d1Default.account_id) {
+        nextD1.account_id = d1Default.account_id;
+        filledNames.push("D1 Account ID");
+      }
+      if (!nextD1.database_id.trim() && d1Default.database_id) {
+        nextD1.database_id = d1Default.database_id;
+        filledNames.push("D1 Database ID");
+      }
+      // 已保存过 token（has_api_token）时表单留空=保持不变，不覆盖
+      if (!nextD1.api_token.trim() && d1Default.api_token && !config?.d1.has_api_token) {
+        nextD1.api_token = d1Default.api_token;
+        filledNames.push("D1 API Token");
+      }
+      setD1(nextD1);
+
+      const nextR2 = { ...r2 };
+      if (!nextR2.account_id.trim() && r2Default.account_id) {
+        nextR2.account_id = r2Default.account_id;
+        filledNames.push("R2 Account ID");
+      }
+      if (!nextR2.bucket.trim() && r2Default.bucket) {
+        nextR2.bucket = r2Default.bucket;
+        filledNames.push("R2 Bucket");
+      }
+      setR2(nextR2);
+
+      const anyDefault = Boolean(
+        d1Default.account_id || d1Default.database_id || d1Default.api_token || r2Default.account_id || r2Default.bucket,
+      );
+      if (filledNames.length > 0) {
+        setMessage({
+          kind: "ok",
+          text: `已填入部署默认值：${filledNames.join("、")}（仅填空字段，已填写的值不动；点「保存存储配置」后生效）｜R2 Access Key / Secret 无默认值，需在 Cloudflare 控制台创建后手动填写`,
+        });
+      } else if (anyDefault) {
+        setMessage({
+          kind: "ok",
+          text: "部署默认值存在，但对应字段均已有值（已保存配置优先），未做改动。",
+        });
+      } else {
+        setMessage({
+          kind: "error",
+          text: "当前环境没有部署默认值：TG_D1_* / TG_R2_* 由 pages-deploy.yml 在 Cloudflare Pages 部署时注入，本地/Node 直跑环境不存在属正常。",
+        });
+      }
+    } catch {
+      setMessage({ kind: "error", text: "获取部署默认值请求失败，请稍后重试" });
+    } finally {
+      setFillingDefaults(false);
+    }
+  };
+
   return (
     <div className="rounded-xl border bg-card p-6">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -194,10 +274,21 @@ export function SessionStorageCard({ initialConfig }: { initialConfig?: PublicSe
             Node 环境走 REST API。
           </p>
         </div>
-        <span className="rounded-full border bg-muted/40 px-3 py-1 text-xs font-medium text-muted-foreground">
-          当前：{BACKENDS.find((item) => item.value === backend)?.icon}{" "}
-          {BACKENDS.find((item) => item.value === backend)?.label}
-        </span>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={fillDefaults}
+            disabled={fillingDefaults}
+            title="从部署注入的 TG_D1_* / TG_R2_* 环境变量拉取默认配置填入空字段（pages-deploy.yml 部署时注入）"
+            className="inline-flex h-9 items-center rounded-md border px-4 text-sm font-medium hover:bg-accent disabled:opacity-50"
+          >
+            {fillingDefaults ? "获取中…" : "默认配置"}
+          </button>
+          <span className="rounded-full border bg-muted/40 px-3 py-1 text-xs font-medium text-muted-foreground">
+            当前：{BACKENDS.find((item) => item.value === backend)?.icon}{" "}
+            {BACKENDS.find((item) => item.value === backend)?.label}
+          </span>
+        </div>
       </div>
 
       <div className="mt-4 grid gap-4 lg:grid-cols-2">
@@ -304,6 +395,14 @@ export function SessionStorageCard({ initialConfig }: { initialConfig?: PublicSe
                 配置后对象公开读取 URL 走自定义 CDN 域名（如 https://cdn.example.com/&lt;key&gt;），可套 Cloudflare 缓存加速；留空回退源站 S3 API 域名。
               </p>
             </div>
+            {config?.r2.defaults && (config.r2.defaults.account_id || config.r2.defaults.bucket) ? (
+              <p className="rounded-md border border-dashed bg-background px-2.5 py-2 text-xs leading-relaxed text-muted-foreground">
+                部署默认值已就绪（v2.0.9）：Account ID / Bucket 未填写时自动使用部署注入的
+                TG_R2_ACCOUNT_ID / TG_R2_BUCKET（pages-deploy.yml），
+                <span className="font-medium">不影响你已保存的配置</span>。
+                Access Key ID / Secret Access Key 属 R2 控制台创建的 S3 兼容凭证，无部署默认值，需手动填写。
+              </p>
+            ) : null}
           </div>
         ) : null}
 

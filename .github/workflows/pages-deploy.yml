@@ -1138,6 +1138,14 @@ jobs:
           if (process.env.D1_ID) envVars.TG_D1_DATABASE_ID = plain(process.env.D1_ID);
           envVars.TG_D1_API_TOKEN = secret(process.env.CLOUDFLARE_API_TOKEN);
 
+          // v2.0.9 BOT 数据存储 R2 默认值: TG_R2_ACCOUNT_ID(部署账号) /
+          //   TG_R2_BUCKET(工作流 R2_NAME, 配置了才注入)。供管理后台「BOT 数据存储」
+          //   卡片「默认配置」按钮一键填入 + 运行时未配置字段回退。
+          //   ⚠ R2 的 SigV4 访问密钥(Access Key/Secret)属 R2 控制台凭证,
+          //     工作流不含, 不注入 —— 需在管理后台手动填写。
+          if (process.env.CLOUDFLARE_ACCOUNT_ID) envVars.TG_R2_ACCOUNT_ID = plain(process.env.CLOUDFLARE_ACCOUNT_ID);
+          if (process.env.R2_NAME) envVars.TG_R2_BUCKET = plain(process.env.R2_NAME);
+
           // preview 环境同步注入同一组 env_vars —— 预览部署(<hash>.<project>.
           // pages.dev 形态)只读 preview 配置。preview 刻意不带 D1/KV/R2 绑定:
           // 预览写入不得污染生产数据(预览按存储降级链路运行)。
@@ -1247,6 +1255,17 @@ jobs:
               for (const [k, configured] of Object.entries(DEFAULTS_EXPECTED)) {
                 if (configured && !vars[k]) {
                   console.error(`::error::[${envName}] 缺少 env_vars.${k}(D1 默认值注入失败)`);
+                  failed = true;
+                }
+              }
+              // v2.0.9 R2 默认值两键(同源校验; R2 SigV4 访问密钥无默认值不校验)
+              const R2_DEFAULTS_EXPECTED = {
+                TG_R2_ACCOUNT_ID: Boolean(process.env.CLOUDFLARE_ACCOUNT_ID),
+                TG_R2_BUCKET: Boolean(process.env.R2_NAME),
+              };
+              for (const [k, configured] of Object.entries(R2_DEFAULTS_EXPECTED)) {
+                if (configured && !vars[k]) {
+                  console.error(`::error::[${envName}] 缺少 env_vars.${k}(R2 默认值注入失败)`);
                   failed = true;
                 }
               }

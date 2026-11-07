@@ -112,6 +112,20 @@ export function hasD1EnvDefaults(): boolean {
   return Boolean(d.accountId || d.databaseId || d.apiToken);
 }
 
+/**
+ * R2 配置的部署默认值（v2.0.9，结合 pages-deploy.yml 工作流）：
+ * CI 注入 TG_R2_ACCOUNT_ID（= 部署账号）/ TG_R2_BUCKET（= 工作流 R2_NAME，配置了才注入）。
+ * ⚠ R2 的 Access Key ID / Secret Access Key 属 R2 控制台创建的 S3 兼容凭证，
+ *   部署工作流不含该凭证 —— 无默认值，需在管理后台手动填写。
+ * 管理后台已保存的配置永远优先，与 D1 同口径。
+ */
+export function getR2EnvDefaults(): { accountId: string; bucket: string } {
+  return {
+    accountId: process.env.TG_R2_ACCOUNT_ID?.trim() ?? "",
+    bucket: process.env.TG_R2_BUCKET?.trim() ?? "",
+  };
+}
+
 function pickWithDefault(stored: string, envDefault: string): {
   value: string;
   source: "stored" | "env-default" | "none";
@@ -159,11 +173,14 @@ export async function resolveD1RestConfig(): Promise<{
 }
 
 async function getR2Config(): Promise<SessionStorageR2Config> {
+  // v2.0.9：account_id / bucket 未配置时回退部署默认值（TG_R2_*，与 D1 同口径；
+  // SigV4 访问密钥无部署默认值，必须手动配置）
+  const envDefaults = getR2EnvDefaults();
   return {
-    accountId: await getSettingValue(SESSION_STORAGE_R2_KEYS.accountId),
+    accountId: (await getSettingValue(SESSION_STORAGE_R2_KEYS.accountId)) || envDefaults.accountId,
     accessKeyId: await getSettingValue(SESSION_STORAGE_R2_KEYS.accessKeyId),
     secretAccessKey: await getSettingValue(SESSION_STORAGE_R2_KEYS.secretAccessKey),
-    bucket: await getSettingValue(SESSION_STORAGE_R2_KEYS.bucket),
+    bucket: (await getSettingValue(SESSION_STORAGE_R2_KEYS.bucket)) || envDefaults.bucket,
     cdnUrl: await getSettingValue(SESSION_STORAGE_R2_KEYS.cdnUrl),
   };
 }
@@ -803,6 +820,8 @@ export interface PublicSessionStorageConfig {
     has_secret: boolean;
     bucket: string;
     cdn_url: string;
+    /** v2.0.9 部署默认值：对应字段未配置时自动生效（不影响已有配置） */
+    defaults: { account_id: boolean; bucket: boolean };
   };
   s3: {
     endpoint: string;
@@ -824,6 +843,7 @@ function maskSecret(value: string | undefined): string {
 export async function getPublicSessionStorageConfig(): Promise<PublicSessionStorageConfig> {
   const stored = await getAllAppSettings();
   const envDefaults = getD1EnvDefaults();
+  const r2EnvDefaults = getR2EnvDefaults();
   const d1Public = await resolveD1RestConfig();
   return {
     backend: stored[SESSION_STORAGE_SETTING_KEY] ?? "memory",
@@ -848,6 +868,10 @@ export async function getPublicSessionStorageConfig(): Promise<PublicSessionStor
       has_secret: Boolean(stored[SESSION_STORAGE_R2_KEYS.secretAccessKey]),
       bucket: stored[SESSION_STORAGE_R2_KEYS.bucket] ?? "",
       cdn_url: stored[SESSION_STORAGE_R2_KEYS.cdnUrl] ?? "",
+      defaults: {
+        account_id: !stored[SESSION_STORAGE_R2_KEYS.accountId] && Boolean(r2EnvDefaults.accountId),
+        bucket: !stored[SESSION_STORAGE_R2_KEYS.bucket] && Boolean(r2EnvDefaults.bucket),
+      },
     },
     s3: {
       endpoint: stored[SESSION_STORAGE_S3_KEYS.endpoint] ?? "",
