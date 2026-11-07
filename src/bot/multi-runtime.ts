@@ -4,6 +4,7 @@ import { autoRetry } from "@grammyjs/auto-retry";
 import { apiThrottler } from "@grammyjs/transformer-throttler";
 import { telegramBotClientOptions } from "@/lib/telegram/transport";
 import {
+  resolveEffectiveTransport,
   resolveEffectiveTransportWithFallback,
   resolveEffectivePrivacy,
   isEdgeRuntime,
@@ -414,6 +415,40 @@ async function startMenuBot(row: BotRow): Promise<void> {
       `Menu bot #${row.id} token already polled by another bot entry; skip duplicate polling instance`,
     );
     return;
+  }
+
+  // 【v2.0.10 远程消费者守卫】轮询启动前探测该 Token 是否已被另一环境（典型：线上
+  // Cloudflare Pages 的 Webhook 消费者）接管 —— getUpdates 与 Webhook 在 Telegram
+  // 侧严格互斥：此前本地轮询启动时无条件 deleteWebhook，会直接掐断线上事件推送
+  // （新群组的 my_chat_member 丢失、线上库永远登记不了），且全部更新被本地轮询
+  // 吃进本地库（2026-11-07「线上获取不到新创建的群组、沙盒却能看到」事故根因）。
+  //
+  // 默认一律让位（含显式 polling 配置 —— 历史遗留的显式配置同样会悄悄掐断线上，
+  // 沙盒实测：全局 transport_mode=polling 的遗留配置让初版「显式放行」守卫失效）。
+  // 确需本环境接管（本地调试机器人）时设置环境变量 TG_FORCE_LOCAL_POLLING=1，
+  // 或先在远程环境停用其 Webhook。
+  const explicitPolling =
+    resolveEffectiveTransport(profile.transportMode ?? "inherit", global.transportMode) === "polling";
+  {
+    const { probeRemoteWebhook } = await import("@/services/bot-transport");
+    const remote = await probeRemoteWebhook(row.token);
+    if (remote) {
+      const forced = process.env.TG_FORCE_LOCAL_POLLING === "1";
+      const intent = explicitPolling ? "显式配置了本地长轮询" : "隐式回退本地长轮询";
+      if (forced) {
+        console.warn(
+          `[multi-runtime] Menu bot #${row.id} ${intent}，检测到远程 Webhook 消费者（${remote.url}），` +
+            "但 TG_FORCE_LOCAL_POLLING=1 —— 按强制接管执行，远程 Webhook 将被删除（远程环境停止收到该机器人事件）。",
+        );
+      } else {
+        console.warn(
+          `[multi-runtime] Menu bot #${row.id} ${intent}，但检测到远程 Webhook 消费者（${remote.url}，待处理更新 ${remote.pendingUpdateCount} 条），` +
+            "本地长轮询已停用：getUpdates 与 Webhook 互斥，删除远程 Webhook 会掐断另一环境（如线上部署）的事件推送。" +
+            "如需本环境接管，请设置 TG_FORCE_LOCAL_POLLING=1 或先在远程环境停用其 Webhook。",
+        );
+        return;
+      }
+    }
   }
 
   if (existing) {

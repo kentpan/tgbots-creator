@@ -42,6 +42,21 @@ export function isPollingRestartable(error: unknown): boolean {
   return !(error instanceof GrammyError && error.error_code === 401);
 }
 
+/**
+ * 【v2.0.10】409 Conflict 且原因为 Webhook 活跃：该 Token 已被另一环境（典型：线上
+ * Cloudflare Pages 的 Webhook 消费者）接管。getUpdates 与 Webhook 在 Telegram 侧严格
+ * 互斥，继续重启只会无限刷 409（Telegram 侧持续报错）。此前仅 401 停止重启，409 会
+ * 以 3s 间隔无限重试 —— 检测到此形态时本地轮询应永久让位（重启循环退出），并在日志
+ * 中给出恢复指引（2026-11-07「线上获取不到新创建的群组」事故的伴生场景）。
+ */
+export function isRemoteWebhookConflict(error: unknown): boolean {
+  return (
+    error instanceof GrammyError &&
+    error.error_code === 409 &&
+    /webhook/i.test(error.message)
+  );
+}
+
 export interface PollingAutoRestartOptions {
   /** 日志前缀（如 `Menu bot #2` / `Main bot`），用于完整错误定位 */
   label: string;
@@ -78,6 +93,16 @@ export async function runPollingWithAutoRestart(
           "auto-restarting per grammY official pattern:",
         error,
       );
+      // 远程 Webhook 消费者已接管该 Token（409: webhook is active）→ 本地轮询永久让位，
+      // 避免与远程消费者互斥刷错；绝不 deleteWebhook 反抢（那会掐断远程事件流）。
+      if (isRemoteWebhookConflict(error)) {
+        console.warn(
+          `[${opts.label}] getUpdates 409：该 Token 的 Webhook 已被其他环境激活（如线上部署的 Webhook 消费者）。` +
+            "getUpdates 与 Webhook 互斥，本地轮询停止让位；如需本环境接管，请先在远程环境停用其 Webhook 后重启本地服务。",
+        );
+        opts.onExit?.();
+        return;
+      }
       if (opts.shouldContinue && !opts.shouldContinue(error)) {
         opts.onExit?.();
         return;

@@ -72,6 +72,34 @@ export function resolveBotRuntime(
 }
 
 /**
+ * 只读探测该 Token 是否已被「远程环境」的 Webhook 消费者接管（getWebhookInfo，url 非空即存在）。
+ *
+ * 背景（2026-11-07「线上获取不到新创建的群组」事故根因）：
+ * 同一 Bot Token 被本地 Node 环境（长轮询）与线上 Cloudflare Pages（Webhook）共用时，
+ * Telegram 侧 getUpdates 与 Webhook 严格互斥 —— 本地启动轮询前 deleteWebhook 会直接
+ * 掐断线上事件推送（新群组的 my_chat_member 从此丢失、线上库永远无法登记），且全部
+ * 更新被本地轮询吃进本地库。此探测用于本地轮询启动前守卫（见 multi-runtime/runtime）。
+ *
+ * 网络失败返回 null（调用方按「未探测到」处理，不阻塞本地启动决策）。
+ */
+export async function probeRemoteWebhook(
+  token: string,
+): Promise<{ url: string; pendingUpdateCount: number } | null> {
+  try {
+    const { tgRawCall } = await import("@/lib/telegram/transport");
+    const res = await tgRawCall<{
+      ok: boolean;
+      result?: { url?: string; pending_update_count?: number };
+    }>(token, "getWebhookInfo");
+    const url = res?.ok ? (res.result?.url ?? "").trim() : "";
+    if (!url) return null;
+    return { url, pendingUpdateCount: res?.result?.pending_update_count ?? 0 };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 注册/更新机器人的 Webhook（setWebhook）或关闭它（deleteWebhook）。
  * 仅在 transport 生效模式变化或首次启用时调用；幂等可重复执行。
  */

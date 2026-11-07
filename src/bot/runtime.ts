@@ -73,6 +73,24 @@ export async function startBotRuntime(): Promise<void> {
     return;
   }
 
+  // 【v2.0.10 远程消费者守卫】主 bot 与 multi-runtime 同一守卫：启动轮询前探测该 Token
+  // 是否已被另一环境（如线上 Webhook 消费者）接管。getUpdates 与 Webhook 互斥 —— 下方
+  // deleteWebhook 自愈此前会无条件掐断远程事件流，导致线上收不到新群组等事件而本地库
+  // 全量吃进（2026-11-07 生产事故根因）。默认一律让位（含显式 polling 配置）；确需本
+  // 环境接管时设置 TG_FORCE_LOCAL_POLLING=1 或先在远程环境停用其 Webhook。
+  {
+    const { probeRemoteWebhook } = await import("@/services/bot-transport");
+    const remote = await probeRemoteWebhook(config.bot.token);
+    if (remote && process.env.TG_FORCE_LOCAL_POLLING !== "1") {
+      console.warn(
+        `[runtime] Main bot 检测到远程 Webhook 消费者（${remote.url}，待处理更新 ${remote.pendingUpdateCount} 条），` +
+          "本地长轮询已停用：getUpdates 与 Webhook 互斥，删除远程 Webhook 会掐断另一环境（如线上部署）的事件推送。" +
+          "如需本环境接管，请设置 TG_FORCE_LOCAL_POLLING=1 或先在远程环境停用其 Webhook。",
+      );
+      return;
+    }
+  }
+
   const bot = await createBot(config.bot.token);
 
   // 自愈：本应用为轮询消费模式，历史会话遗留的 webhook（如指向已失效的沙箱预览地址）
