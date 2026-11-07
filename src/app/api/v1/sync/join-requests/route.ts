@@ -12,7 +12,7 @@ export const runtime = "nodejs";
 export async function GET(request: Request): Promise<NextResponse> {
   const timestamp = request.headers.get("x-mirror-timestamp") ?? "";
   const signature = request.headers.get("x-mirror-signature") ?? "";
-  if (!verifyRelaySignature(timestamp, "", signature)) {
+  if (!(await verifyRelaySignature(timestamp, "", signature))) {
     console.error("[sync-api] join-requests 拉取验签失败");
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }

@@ -48,7 +48,9 @@ export async function register(): Promise<() => Promise<void>> {
   }
 
   // 镜像中继面自动拉起（MIRROR_* 凭据齐全才注册 inprocess relay；缺省静默跳过，
-  // resolveRelay 会自动回退 remote 或受控降级）
+  // resolveRelay 会自动回退 remote 或受控降级）。动态 import 保持懒加载：
+  // telegram 只在 Node 常驻进程执行到这里（上方 NEXT_RUNTIME/workerd 检查已短路），
+  // edge 平面永不触达该 chunk。
   try {
     const { startMirrorRelayIfConfigured } = await import("@/relay/mirror-relay");
     await startMirrorRelayIfConfigured();

@@ -55,10 +55,10 @@ export function setRelayMaintenance(value: boolean): void {
 // ============ HMAC 签名（remote 模式鉴权） ============
 
 export { mirrorSecret } from "./config";
-import { mirrorSecret as mirrorSecretFromEnv } from "./config";
 
-export function signRelayRequest(timestamp: string, body: string): string {
-  return createHmac("sha256", mirrorSecret()).update(`${timestamp}.${body}`).digest("hex");
+export async function signRelayRequest(timestamp: string, body: string): Promise<string> {
+  const secret = await mirrorSecret();
+  return createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex");
 }
 
 function verifyTimestampDrift(timestamp: string): boolean {
@@ -67,9 +67,9 @@ function verifyTimestampDrift(timestamp: string): boolean {
   return Math.abs(Date.now() - ts) <= 5 * 60 * 1000;
 }
 
-export function verifyRelaySignature(timestamp: string, body: string, signature: string): boolean {
+export async function verifyRelaySignature(timestamp: string, body: string, signature: string): Promise<boolean> {
   if (!verifyTimestampDrift(timestamp)) return false;
-  const expected = signRelayRequest(timestamp, body);
+  const expected = await signRelayRequest(timestamp, body);
   if (expected.length !== signature.length) return false;
   let diff = 0;
   for (let i = 0; i < expected.length; i++) {
@@ -102,7 +102,7 @@ class RemoteRelay implements MirrorRelay {
       headers: {
         "content-type": "application/json",
         "x-mirror-timestamp": timestamp,
-        "x-mirror-signature": signRelayRequest(timestamp, body),
+        "x-mirror-signature": await signRelayRequest(timestamp, body),
       },
       body,
       signal: AbortSignal.timeout(timeoutMs),
@@ -148,7 +148,7 @@ class RemoteRelay implements MirrorRelay {
       const response = await fetch(`${this.baseUrl}/v1/health`, {
         headers: {
           "x-mirror-timestamp": timestamp,
-          "x-mirror-signature": signRelayRequest(timestamp, ""),
+          "x-mirror-signature": await signRelayRequest(timestamp, ""),
         },
         signal: AbortSignal.timeout(this.healthTimeoutMs),
       });
@@ -280,7 +280,9 @@ async function startInprocessIfCreds(cfg: ResolvedMirrorConfig): Promise<MirrorR
     }
     return null;
   }
-  // 凭据齐全但中继面尚未启动：instrumentation 启动时会拉起；此处触发兜底拉起
+  // 凭据齐全但中继面尚未启动：instrumentation 启动时会拉起；此处触发兜底拉起。
+  // 动态 import 保持懒加载：telegram（GramJS）只进独立 chunk，edge 平面在上方
+  // detectPlane() !== "node" 已短路、永不执行到这里，workerd 不会加载该 chunk。
   const { startMirrorRelayIfConfigured } = await import("@/relay/mirror-relay");
   const relay = await startMirrorRelayIfConfigured({
     targetBot: cfg.targetBot,

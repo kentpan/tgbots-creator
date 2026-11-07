@@ -26,7 +26,7 @@ async function runRemoteJoinRequestSync(): Promise<void> {
     const { joinRequestSyncConfigured, syncRemoteJoinRequests } = await import(
       "@/services/join-request-sync"
     );
-    if (!joinRequestSyncConfigured()) return;
+    if (!(await joinRequestSyncConfigured())) return;
     const result = await syncRemoteJoinRequests();
     if (!result.ok) {
       console.warn("[sync] 加群申请远程同步未执行:", result.message);

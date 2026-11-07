@@ -48,6 +48,7 @@ dev.log
 dev.out.log
 test
 prompt
+.wrangler/
 .workbuddy/
 server.log
 /*.zip

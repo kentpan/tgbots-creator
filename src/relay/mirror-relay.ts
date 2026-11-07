@@ -58,7 +58,7 @@ export interface RelayConfig {
   rewriteRules: Record<string, string>;
 }
 
-export function readRelayConfig(overrides: Partial<RelayConfig> = {}): RelayConfig | null {
+export async function readRelayConfig(overrides: Partial<RelayConfig> = {}): Promise<RelayConfig | null> {
   const envCreds = readMirrorCredentials();
   // 凭据优先级：显式 overrides（bot 行绑定的开发者账号）→ 环境变量；session 只走环境变量
   const apiId = overrides.apiId ?? envCreds?.apiId ?? 0;
@@ -74,7 +74,7 @@ export function readRelayConfig(overrides: Partial<RelayConfig> = {}): RelayConf
   }
   return {
     listen: overrides.listen ?? process.env.MIRROR_LISTEN ?? "127.0.0.1:8787",
-    secret: overrides.secret ?? mirrorSecret(),
+    secret: overrides.secret ?? (await mirrorSecret()),
     proxyBotToken,
     targetBot,
     apiId: overrides.apiId ?? apiId,
@@ -219,7 +219,7 @@ class RemoteAppSink implements AppSink {
       headers: {
         "content-type": "application/json",
         "x-mirror-timestamp": timestamp,
-        "x-mirror-signature": signRelayRequest(timestamp, body),
+        "x-mirror-signature": await signRelayRequest(timestamp, body),
       },
       body,
     });
@@ -737,7 +737,7 @@ export async function startMirrorRelayIfConfigured(overrides: Partial<RelayConfi
   if (runtimeInstance) return runtimeInstance.relay;
   let config: RelayConfig;
   try {
-    const parsed = readRelayConfig(overrides);
+    const parsed = await readRelayConfig(overrides);
     if (!parsed) return null;
     config = parsed;
   } catch (error) {
@@ -792,7 +792,7 @@ async function handleRelayHttp(
     const signature = String(req.headers["x-mirror-signature"] ?? "");
     const body = await readBody(req);
     if (pathname !== "/v1/health") {
-      if (!verifyRelaySignature(timestamp, body, signature)) {
+      if (!(await verifyRelaySignature(timestamp, body, signature))) {
         console.error(`[mirror-relay] HMAC 验签失败（${pathname}）`);
         respond(res, 401, { ok: false, error: "unauthorized" });
         return;

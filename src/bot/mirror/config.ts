@@ -1,17 +1,26 @@
 /**
- * 镜像模块环境变量覆盖层（方案 §3.5）：
- * settings.ts 不支持 env 覆盖，镜像模块自建覆盖层读取 MIRROR_* 四个变量。
+ * 镜像模块配置读取：v2.1.0 起密钥/地址保存在数据库 app_settings（管理后台「系统设置」
+ * 可视化配置），环境变量作为存量部署的兼容回退。
  */
+
+const MIRROR_RELAY_SECRET_KEY = "mirror.relay_secret";
 
 let secretWarned = false;
 
-/** 内部 API HMAC 密钥：中继面与用户面必须一致（缺省空值时告警一次） */
-export function mirrorSecret(): string {
+/** 内部 API HMAC 密钥：DB（后台配置）优先 → 环境变量回退；都缺失时告警一次 */
+export async function mirrorSecret(): Promise<string> {
+  try {
+    const { getCachedAppSettings } = await import("@/database/operations");
+    const fromDb = (await getCachedAppSettings())[MIRROR_RELAY_SECRET_KEY]?.trim();
+    if (fromDb) return fromDb;
+  } catch (error) {
+    console.error("[mirror] 读取数据库镜像密钥失败，回退环境变量:", error);
+  }
   const value = (process.env.MIRROR_RELAY_SECRET ?? "").trim();
   if (!value && !secretWarned) {
     secretWarned = true;
     console.warn(
-      "[mirror] MIRROR_RELAY_SECRET 未配置：remote 中继 HMAC 鉴权将使用空密钥，公网部署前必须显式配置",
+      "[mirror] 镜像密钥未配置（后台「系统设置」或 MIRROR_RELAY_SECRET）：remote 中继 HMAC 鉴权将使用空密钥，公网部署前必须显式配置",
     );
   }
   return value;

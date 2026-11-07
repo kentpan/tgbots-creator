@@ -9,7 +9,7 @@ import { loadDotEnv } from "@/lib/dotenv";
 
 async function main(): Promise<void> {
   loadDotEnv();
-  const config = readRelayConfig();
+  const config = await readRelayConfig();
   if (!config) {
     console.error(
       "中继面配置不完整：需要 MIRROR_API_ID / MIRROR_API_HASH / MIRROR_SESSION_STRING / MIRROR_TARGET_BOT / MIRROR_PROXY_BOT_TOKEN",

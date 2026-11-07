@@ -12,7 +12,7 @@ export async function POST(request: Request): Promise<NextResponse> {
   const timestamp = request.headers.get("x-mirror-timestamp") ?? "";
   const signature = request.headers.get("x-mirror-signature") ?? "";
   const body = await request.text();
-  if (!verifyRelaySignature(timestamp, body, signature)) {
+  if (!(await verifyRelaySignature(timestamp, body, signature))) {
     console.error("[mirror-api] callbacks 回写验签失败");
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }

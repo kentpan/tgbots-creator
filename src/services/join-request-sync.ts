@@ -14,9 +14,11 @@
  */
 import { createHmac } from "node:crypto";
 import { executeRun } from "@/database/client";
-import { getAppSetting, setAppSetting } from "@/database/operations";
+import { getAppSetting, getCachedAppSettings, setAppSetting } from "@/database/operations";
 
 const SINCE_KEY = "sync.join_requests_since";
+const URL_KEY = "sync.remote_url";
+const SECRET_KEY = "sync.remote_secret";
 const PAGE_LIMIT = 500;
 const MAX_PAGES = 40;
 
@@ -28,8 +30,30 @@ function signHeaders(secret: string): { "x-mirror-timestamp": string; "x-mirror-
   };
 }
 
-export function joinRequestSyncConfigured(): boolean {
-  return !!(process.env.SYNC_REMOTE_URL ?? "").trim() && !!(process.env.SYNC_REMOTE_SECRET ?? "").trim();
+export interface RemoteSyncConfig {
+  baseUrl: string;
+  secret: string;
+}
+
+/** 同步配置：DB（后台「系统设置」）优先 → 环境变量回退（存量部署兼容） */
+export async function resolveRemoteSyncConfig(): Promise<RemoteSyncConfig> {
+  let url = "";
+  let secret = "";
+  try {
+    const settings = await getCachedAppSettings();
+    url = (settings[URL_KEY] ?? "").trim();
+    secret = (settings[SECRET_KEY] ?? "").trim();
+  } catch (error) {
+    console.error("[sync] 读取数据库同步配置失败，回退环境变量:", error);
+  }
+  if (!url) url = (process.env.SYNC_REMOTE_URL ?? "").trim().replace(/\/+$/, "");
+  if (!secret) secret = (process.env.SYNC_REMOTE_SECRET ?? "").trim();
+  return { baseUrl: url.replace(/\/+$/, ""), secret };
+}
+
+export async function joinRequestSyncConfigured(): Promise<boolean> {
+  const { baseUrl, secret } = await resolveRemoteSyncConfig();
+  return !!baseUrl && !!secret;
 }
 
 export interface JoinRequestSyncResult {
@@ -48,10 +72,9 @@ type SyncPayload = {
 };
 
 export async function syncRemoteJoinRequests(): Promise<JoinRequestSyncResult> {
-  const baseUrl = (process.env.SYNC_REMOTE_URL ?? "").trim().replace(/\/+$/, "");
-  const secret = (process.env.SYNC_REMOTE_SECRET ?? "").trim();
+  const { baseUrl, secret } = await resolveRemoteSyncConfig();
   if (!baseUrl || !secret) {
-    return { ok: false, imported: 0, fetched: 0, message: "未配置 SYNC_REMOTE_URL / SYNC_REMOTE_SECRET, 跳过同步" };
+    return { ok: false, imported: 0, fetched: 0, message: "同步未配置（后台「系统设置」填写线上地址与共享密钥）, 跳过同步" };
   }
   let since = (await getAppSetting(SINCE_KEY)) ?? "1970-01-01T00:00:00.000Z";
   let fetched = 0;
