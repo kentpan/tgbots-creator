@@ -236,6 +236,152 @@ async function syncBotUsername(token: string, botId: bigint): Promise<void> {
   await updateBotRecord(botId, { username: me.username });
 }
 
+function parseRewriteRules(raw: string): Record<string, string> {
+  const rules: Record<string, string> = {};
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const from = trimmed.slice(0, eq).trim();
+    const to = trimmed.slice(eq + 1).trim();
+    if (from) rules[from] = to;
+  }
+  return rules;
+}
+
+function parseAllowedUserIds(raw: string): number[] {
+  return raw
+    .split(/[,\s，、]+/)
+    .map((item) => Number(item.trim()))
+    .filter((value) => Number.isInteger(value) && value > 0);
+}
+
+/** 新增/编辑镜像机器人：config JSON 写入 mirror 段，multi-runtime 按此分发到 createMirrorBot */
+export async function saveMirrorBotAction(formData: FormData): Promise<void> {
+  const admin = await requirePermission("bots:manage");
+  const idRaw = String(formData.get("id") ?? "").trim();
+  const name = String(formData.get("name") ?? "").trim();
+  const token = String(formData.get("token") ?? "").trim();
+  const enabled = formData.get("enabled") === "1";
+  const targetBot = String(formData.get("target_bot") ?? "").trim().replace(/^@/, "");
+  const relayModeRaw = String(formData.get("relay_mode") ?? "auto").trim();
+  const relayBaseUrl = String(formData.get("relay_base_url") ?? "").trim();
+  const serializeModeRaw = String(formData.get("serialize_mode") ?? "global").trim();
+  const actionTimeoutSeconds = Number(String(formData.get("action_timeout_seconds") ?? "60"));
+  const mediaInlineMaxMb = Number(String(formData.get("media_inline_max_mb") ?? "20"));
+  const allowedUserIds = parseAllowedUserIds(String(formData.get("allowed_user_ids") ?? ""));
+  const rewriteRules = parseRewriteRules(String(formData.get("rewrite_rules") ?? ""));
+
+  const isEdit = Boolean(idRaw && /^\d+$/.test(idRaw));
+  if (!name) redirect(botPath({ error: "name-required" }));
+  if (!targetBot) redirect(botPath({ error: "mirror-target-required" }));
+  if (token && !/^\d{6,}:[\w-]{30,}$/.test(token)) {
+    redirect(botPath({ error: "invalid-token" }));
+  }
+  if (!token && !isEdit) {
+    redirect(botPath({ error: "invalid-token" }));
+  }
+
+  // 访问模式：open / verify_bot（绑定加群验证机器人）/ whitelist（显式用户 ID 列表）
+  const accessModeRaw = String(formData.get("access_mode") ?? "open").trim();
+  const accessMode =
+    accessModeRaw === "verify_bot" || accessModeRaw === "whitelist" ? accessModeRaw : "open";
+  const verifyBotIdRaw = Number(String(formData.get("verify_bot_id") ?? ""));
+  const developerAccountIdRaw = Number(String(formData.get("developer_account_id") ?? ""));
+
+  const requestHeaders = await headers();
+  const existingForEdit = isEdit ? await getBot(BigInt(idRaw)) : null;
+  if (isEdit && !existingForEdit) redirect(botPath({ error: "invalid-id" }));
+
+  // 编辑时保留 mirror 以外的既有 profile 字段
+  const profile = parseBotProfile(existingForEdit?.config ?? "{}");
+  profile.mirror = {
+    targetBot,
+    relayMode: relayModeRaw === "inprocess" || relayModeRaw === "remote" ? relayModeRaw : "auto",
+    relayBaseUrl: relayBaseUrl || undefined,
+    developerAccountId:
+      Number.isInteger(developerAccountIdRaw) && developerAccountIdRaw > 0
+        ? developerAccountIdRaw
+        : undefined,
+    allowedUserIds: accessMode === "whitelist" ? allowedUserIds : [],
+    accessMode,
+    verifyBotId:
+      accessMode === "verify_bot" && Number.isInteger(verifyBotIdRaw) && verifyBotIdRaw > 0
+        ? verifyBotIdRaw
+        : undefined,
+    serializeMode: serializeModeRaw === "per_user" ? "per_user" : "global",
+    actionTimeoutSeconds: Number.isFinite(actionTimeoutSeconds) ? actionTimeoutSeconds : 60,
+    syncCommands: true,
+    mediaInlineMaxMb: Number.isFinite(mediaInlineMaxMb) ? mediaInlineMaxMb : 20,
+    rewriteRules,
+  };
+  const configJson = JSON.stringify(profile);
+
+  if (accessMode === "verify_bot" && !(Number.isInteger(verifyBotIdRaw) && verifyBotIdRaw > 0)) {
+    redirect(botPath({ error: "mirror-verify-bot-required" }));
+  }
+
+  const accessDetail =
+    accessMode === "verify_bot"
+      ? `绑定验证机器人 #${verifyBotIdRaw}`
+      : accessMode === "whitelist"
+        ? `白名单 ${allowedUserIds.length} 人`
+        : "开放使用";
+
+  if (isEdit) {
+    const existing = existingForEdit!;
+    await updateBotRecord(BigInt(idRaw), {
+      name,
+      token: token || existing.token,
+      enabled,
+      config: configJson,
+    });
+    if (enabled) {
+      void restartMenuBot(BigInt(idRaw)).catch((error: unknown) => {
+        console.error(`[bots] 镜像机器人 #${idRaw} 保存后重启失败:`, error);
+      });
+    } else {
+      void stopMenuBot(BigInt(idRaw)).catch((error: unknown) => {
+        console.error(`[bots] 镜像机器人 #${idRaw} 保存后停止失败:`, error);
+      });
+    }
+    void syncBotUsername(token || existing.token, existing.id).catch((error: unknown) => {
+      console.error(`[bots] 镜像机器人 #${existing.id} 回写用户名失败:`, error);
+    });
+    await logOperation(admin, {
+      action: "保存镜像机器人",
+      target: name,
+      detail: `目标：@${targetBot}，${accessDetail}，状态：${enabled ? "启用" : "停用"}`,
+      headers: requestHeaders,
+    });
+  } else {
+    const created = await createBotRecord({
+      name,
+      token,
+      enabled,
+      config: configJson,
+    });
+    if (!created) redirect(botPath({ error: "duplicate-token" }));
+    if (enabled) {
+      void restartMenuBot(created.id).catch((error: unknown) => {
+        console.error(`[bots] 新建镜像机器人 #${created.id} 启动失败:`, error);
+      });
+    }
+    void syncBotUsername(token, created.id).catch((error: unknown) => {
+      console.error(`[bots] 新建镜像机器人 #${created.id} 回写用户名失败:`, error);
+    });
+    await logOperation(admin, {
+      action: "新增镜像机器人",
+      target: name,
+      detail: `目标：@${targetBot}，${accessDetail}`,
+      headers: requestHeaders,
+    });
+  }
+  revalidatePath("/admin/bots");
+  redirect(botPath({ saved: "1" }));
+}
+
 export async function deleteBotAction(formData: FormData): Promise<void> {
   const admin = await requirePermission("bots:manage");
   const idRaw = String(formData.get("id") ?? "").trim();

@@ -194,13 +194,16 @@ async function readJson<T>(response: Response): Promise<T | null> {
 }
 
 function GroupAvatar({ title, size }: { title: string; size: number }) {
+  // Array.from 按 codePoint 取首字符：slice(0,1) 会把 emoji（代理对）切成半个
+  // 码元，SSR 与浏览器端序列化表现不一致导致 hydration mismatch（2026-11-08 实录）
+  const initial = Array.from(title ?? "")[0] || "?";
   return (
     <div
       className="flex shrink-0 items-center justify-center rounded-full font-semibold text-white"
       style={{ width: size, height: size, backgroundColor: nameColor(title), fontSize: size * 0.42 }}
       aria-hidden
     >
-      {title.slice(0, 1) || "?"}
+      {initial}
     </div>
   );
 }

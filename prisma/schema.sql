@@ -303,4 +303,46 @@ CREATE UNIQUE INDEX "user_stats_user_id_key" ON "user_stats"("user_id");
 CREATE UNIQUE INDEX "verification_methods_name_key" ON "verification_methods"("name");
 CREATE UNIQUE INDEX "verification_sessions_token_key" ON "verification_sessions"("token");
 CREATE UNIQUE INDEX "verify_codes_code_key" ON "verify_codes"("code");
+
+-- ============ 镜像机器人（mirror）应用侧表 ============
+CREATE TABLE "mirror_callbacks" (
+  "proxy_key" TEXT NOT NULL PRIMARY KEY,
+  "target_msg_id" INTEGER NOT NULL,
+  "button_text" TEXT,
+  "button_data" BLOB,
+  "proxy_chat_id" INTEGER,
+  "user_id" INTEGER,
+  "created_at" INTEGER NOT NULL,
+  "stale_at" INTEGER
+);
+CREATE TABLE "mirror_targets" (
+  "username" TEXT NOT NULL PRIMARY KEY,
+  "title" TEXT,
+  "description" TEXT,
+  "commands_cache" TEXT,
+  "last_probed_at" INTEGER
+);
+CREATE TABLE "mirror_jobs" (
+  "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  "user_id" INTEGER,
+  "proxy_chat_id" INTEGER,
+  "target_msg_id" INTEGER NOT NULL,
+  "media_kind" TEXT,
+  "status" TEXT NOT NULL DEFAULT 'pending',
+  "error" TEXT,
+  "claimed_at" INTEGER,
+  "created_at" INTEGER NOT NULL
+);
+CREATE TABLE "mirror_logs" (
+  "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  "user_id" INTEGER,
+  "direction" TEXT,
+  "event" TEXT,
+  "payload" TEXT,
+  "created_at" INTEGER NOT NULL
+);
+CREATE INDEX "idx_mirror_callbacks_stale_at" ON "mirror_callbacks"("stale_at");
+CREATE INDEX "idx_mirror_jobs_status" ON "mirror_jobs"("status");
+CREATE INDEX "idx_mirror_logs_created_at" ON "mirror_logs"("created_at");
+CREATE INDEX "idx_mirror_logs_user_id" ON "mirror_logs"("user_id");
 COMMIT;

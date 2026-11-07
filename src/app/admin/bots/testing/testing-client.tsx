@@ -345,6 +345,9 @@ export function TestingClient({
       );
     }
     const pool = [...merged.values()];
+    // 按机器人过滤：有部署/关联配置 → 显示关联群组 + 该 bot 真实登记的群组；
+    // 无任何关联 → 只显示该 bot Token 真实登记的群组（syncedGroups），
+    // 绝不回退到全局全部群组 —— 否则切换机器人时仿真屏群组永远不变（2026-11-08 实录）
     const visible =
       linkedChatIds.size > 0
         ? pool.filter(
@@ -352,7 +355,7 @@ export function TestingClient({
               linkedChatIds.has(group.chatId) ||
               syncedGroups.some((synced) => synced.chatId === group.chatId),
           )
-        : pool;
+        : syncedGroups;
     return visible;
   }, [selectedBot, relatedBotIds, botGroupLinks, groups, syncedGroups]);
 

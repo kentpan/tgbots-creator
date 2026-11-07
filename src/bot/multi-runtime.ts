@@ -1,4 +1,4 @@
-import { Bot } from "grammy";
+import { Bot, GrammyError } from "grammy";
 import type { ChatAdministratorRights } from "grammy/types";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { apiThrottler } from "@grammyjs/transformer-throttler";
@@ -18,6 +18,8 @@ import {
   type BotRow,
 } from "@/database/operations";
 import { installBotMenu, parseBotMenuConfig, type BotMenuConfig } from "@/services/bot-menu";
+import { createMirrorBot, parseMirrorConfig } from "./mirror";
+import type { MirrorConfig } from "./mirror/types";
 import { CommandGroup } from "@grammyjs/commands";
 import { codeQuestion } from "./verification-question";
 import { registerAiSupport, type AiSupportConfig } from "./handlers/ai-support";
@@ -60,6 +62,8 @@ interface BotProfileConfig {
   plugins?: BotPluginsConfig;
   /** AI 客服配置 */
   aiSupport?: AiSupportConfig;
+  /** 镜像机器人配置（存在即按 createMirrorBot 装配） */
+  mirror?: MirrorConfig;
 }
 
 export interface BotPluginsConfig {
@@ -205,6 +209,44 @@ export async function applyBotProfile(bot: Bot<BotContext>, profile: BotProfileC
     await bot.api
       .setMyDefaultAdministratorRights({ rights: buildAdminRights(rights.channel), for_channels: true })
       .catch((error) => console.warn("setMyDefaultAdministratorRights(channel) failed:", error));
+  }
+}
+
+/**
+ * 镜像 bot 实例：config JSON 含 mirror 段 → 走 createMirrorBot，
+ * 不注册验证/指令能力（mirror 壳 bot 不挂验证菜单），capabilitiesReady 恒 true。
+ */
+async function createMirrorInstance(row: BotRow, mode: EffectiveTransport): Promise<MenuBotInstance> {
+  const mirrorCfg = parseMirrorConfig(row.config);
+  if (!mirrorCfg) {
+    throw new Error(`Bot #${row.id} config 缺少合法 mirror 段`);
+  }
+  const bot = await createMirrorBot(row, mirrorCfg);
+  console.log(`Mirror bot #${row.id} instance created (target=@${mirrorCfg.targetBot}, mode=${mode})`);
+  return { bot, running: false, mode, capabilitiesReady: true };
+}
+
+/**
+ * 启动预检：显式 bot.init()（内部 getMe 一次，结果缓存，bot.start 不会重复调用）。
+ * - 401 Unauthorized = Token 永久无效（被 @BotFather 撤销或填错）：输出一条明确
+ *   指引后返回 false，调用方完全跳过该 bot（不轮询、不注册 Webhook、不同步
+ *   官方资料/指令菜单）—— 否则并行任务各自打一轮 API 全部 401 刷屏。
+ * - 其余错误（网络抖动等非永久性）返回 true，交由 polling-restart / 调用方兜底。
+ */
+async function initBotOrSkip(label: string, bot: Bot<BotContext>): Promise<boolean> {
+  try {
+    await bot.init();
+    return true;
+  } catch (error) {
+    if (error instanceof GrammyError && error.error_code === 401) {
+      console.error(
+        `[${label}] Token 无效（401 Unauthorized）：Token 已被 @BotFather 撤销或填写错误，` +
+          "已跳过启动与官方资料/指令菜单同步。请在机器人管理页更换有效 Token 后重新保存启用。",
+      );
+      return false;
+    }
+    console.error(`[${label}] 启动预检失败（非永久性错误，按原流程继续）:`, error);
+    return true;
   }
 }
 
@@ -387,8 +429,12 @@ async function startMenuBot(row: BotRow): Promise<void> {
       }
       instance = { ...existing, mode: "webhook", running: false };
     } else {
-      instance = await createMenuBot(row, parseBotMenuConfig(row.menuConfig), "webhook");
+      instance = parseMirrorConfig(row.config)
+        ? await createMirrorInstance(row, "webhook")
+        : await createMenuBot(row, parseBotMenuConfig(row.menuConfig), "webhook");
     }
+    // 启动预检：401 永久无效 Token → 跳过注册 Webhook 与后续全部 Telegram 调用
+    if (!(await initBotOrSkip(`Menu bot #${row.id}`, instance.bot))) return;
     // 能力幂等补齐：轮询切换来的实例已具备则跳过；新建/历史裸实例在此注册
     const syncCommandsWebhook = await ensureMenuBotCapabilities(instance, row, profile, effectivePrivacy);
     instances.set(Number(row.id), instance);
@@ -461,7 +507,11 @@ async function startMenuBot(row: BotRow): Promise<void> {
   }
 
   const menuConfig = parseBotMenuConfig(row.menuConfig);
-  const instance = await createMenuBot(row, menuConfig, "polling");
+  const instance = parseMirrorConfig(row.config)
+    ? await createMirrorInstance(row, "polling")
+    : await createMenuBot(row, menuConfig, "polling");
+  // 启动预检：401 永久无效 Token → 不进 registry、不启动轮询、不触发后续同步
+  if (!(await initBotOrSkip(`Menu bot #${row.id}`, instance.bot))) return;
   instances.set(Number(row.id), instance);
 
   // v1.1.1 性能修复：只等中间件注册 + 指令库读取（毫秒级，不碰网络），
@@ -591,7 +641,9 @@ export async function acquireMenuBot(botId: bigint): Promise<MenuBotHandle | nul
     return { bot: running.bot };
   }
   const menuConfig = parseBotMenuConfig(row.menuConfig);
-  const instance = await createMenuBot(row, menuConfig, "polling");
+  const instance = parseMirrorConfig(row.config)
+    ? await createMirrorInstance(row, "polling")
+    : await createMenuBot(row, menuConfig, "polling");
   // 兑底实例必须具备完整能力（验证/指令/输码通道），否则 webhook 更新静默落空。
   // 隐私解析与 startMenuBot 同款：单项配置 > 全局配置 > 默认开启。
   const profile = parseBotProfile(row.config);
