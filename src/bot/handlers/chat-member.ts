@@ -408,9 +408,48 @@ export async function handleChatMemberUpdate(ctx: BotContext): Promise<void> {
     return;
   }
 
-  // 群组未启用验证（无配置 / 已停用）→ 不拦截
+  // v2.0.13：真实直连入群一律登记真实群组（幂等，基础群也登记）——
+  // 原先仅超级群登记，基础群（chat_join_request 官方不支持、只有 chat_member 事件）
+  // 在线上永远无法出现在「机器人测试」群组列表与加群申请记录里
+  if (chat.type === "supergroup" || chat.type === "group") {
+    try {
+      await registerTelegramChat({
+        chatId: BigInt(chat.id),
+        chatTitle: chat.title ?? null,
+        botToken: ctx.api.token,
+      });
+    } catch (registryError) {
+      console.warn("Failed to register real chat from direct join:", registryError);
+    }
+  }
+
+  // 群组未启用验证（无配置 / 已停用）→ 不拦截、不验证，但仍落库加群申请记录。
+  // v2.0.13 修复「edge 环境无法获取加群申请」：线上真实群组大多未在 D1 配置验证，
+  // 旧逻辑在这里直接 return，一条记录不留 → /admin/join-requests 永远为空；
+  // 现在所有真实入群轨迹（request_type=direct）都可追溯，管理员可手动批准/拒绝。
   const groupSettings = await getGroupSettings(BigInt(chat.id));
   if (!groupSettings || groupSettings.enabled === false) {
+    try {
+      const recorded = await createJoinRequest({
+        userId: BigInt(user.id),
+        chatId: BigInt(chat.id),
+        username: user.username ?? null,
+        firstName: user.first_name ?? "",
+        lastName: user.last_name ?? null,
+        verificationToken: generateVerificationToken(),
+        requestType: "direct",
+      });
+      console.log(
+        `Direct join into unconfigured/disabled chat ${chat.id}: join request ` +
+          `${recorded ? "recorded" : "record FAILED"} for user ${user.id} ` +
+          "(verification not enabled — no prompt sent, no kick)",
+      );
+    } catch (recordError) {
+      console.error(
+        `Failed to record join request for unconfigured chat ${chat.id}:`,
+        recordError,
+      );
+    }
     return;
   }
 

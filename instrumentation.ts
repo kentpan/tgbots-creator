@@ -19,13 +19,7 @@ export async function register(): Promise<() => Promise<void>> {
   // 高延迟出站网络（实测 IPv4 握手 ~240ms 擦边必输、IPv6 ENETUNREACH）下所有
   // fetch 全部 ETIMEDOUT——外部验证接口因此「一直网络异常」（2026-11-03 实测，
   // 修复后同一路径 2/3 成功）。2000ms 是 Node 官方 API 的合法取值范围。
-  // node:net 走 new Function 逃逸：本文件会被 Next 打进 Edge chunk 做静态分析，
-  // 静态 import("node:net") 触发 "not supported in the Edge Runtime" 构建警告
-  // （与 src/database/client.ts 的 node:sqlite 范式一致）。
-  const loadNet = new Function("return import('node:net')") as () => Promise<
-    typeof import("node:net")
-  >;
-  const net = await loadNet();
+  const net = await import("node:net");
   net.setDefaultAutoSelectFamilyAttemptTimeout(2000);
 
   // Node 出站代理补丁：必须在任何 Bot 实例 / Telegram 请求之前装载
@@ -35,48 +29,19 @@ export async function register(): Promise<() => Promise<void>> {
   const { startBotRuntime, stopBotRuntime } = await import("@/bot/runtime");
   const { startMenuBots, stopAllMenuBots } = await import("@/bot/multi-runtime");
 
-  // v2.1.1 修复「页面一直待处理」：Next 在 instrumentation register 完成前不服务
-  // 任何请求 —— 此前 await startBotRuntime/startMenuBots，在出站网络不可达的环境
-  // （本地开发断网/代理失效）下，每个 bot 启动要经历 代理重试×3 + 直连超时，
-  // 多 bot 串行后页面 pending 数分钟。改为后台启动：页面即刻可用，bot 稍后就绪
-  // （轮询本就是后台消费者，不阻塞 Web 是正确语义）。
-  // TELEGRAM_AUTOSTART=0 可完全跳过（纯页面开发模式，不发起任何 Telegram 出站）。
-  const telegramAutostart = process.env.TELEGRAM_AUTOSTART !== "0";
-  let bootstrapStarted = false;
-  const bootstrap = async (): Promise<void> => {
-    bootstrapStarted = true;
-    try {
-      await startBotRuntime();
-    } catch (error) {
-      console.error("Failed to start bot runtime:", error);
-    }
-    try {
-      await startMenuBots();
-    } catch (error) {
-      console.error("Failed to start menu bots:", error);
-    }
-    // 镜像中继面自动拉起（MIRROR_* 凭据齐全才注册 inprocess relay；缺省静默跳过，
-    // resolveRelay 会自动回退 remote 或受控降级）。动态 import 保持懒加载：
-    // telegram 只在 Node 常驻进程执行到这里（上方 NEXT_RUNTIME/workerd 检查已短路），
-    // edge 平面永不触达该 chunk。
-    try {
-      const { startMirrorRelayIfConfigured } = await import("@/relay/mirror-relay");
-      await startMirrorRelayIfConfigured();
-    } catch (error) {
-      console.error("Failed to start mirror relay:", error);
-    }
-  };
-  if (telegramAutostart) {
-    void bootstrap();
-  } else {
-    console.log("[instrumentation] TELEGRAM_AUTOSTART=0：跳过 Telegram 启动（纯页面开发模式）");
+  try {
+    await startBotRuntime();
+  } catch (error) {
+    console.error("Failed to start bot runtime:", error);
+  }
+
+  try {
+    await startMenuBots();
+  } catch (error) {
+    console.error("Failed to start menu bots:", error);
   }
 
   return async () => {
-    if (telegramAutostart && !bootstrapStarted) {
-      // 极端竞态：启动还没标记完成就被要求停止（进程即将退出），直接返回
-      return;
-    }
     try {
       await stopBotRuntime();
     } catch (error) {

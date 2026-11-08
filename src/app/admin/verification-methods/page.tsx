@@ -1,4 +1,5 @@
 import { listVerificationMethods, type VerificationMethodRow } from "@/database/operations";
+import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { requirePermission } from "@/lib/auth";
 import { parseCodeApiConfig } from "@/services/external-verify";
 import { hasRadsIssueConfig } from "@/services/rads-issue";
@@ -64,9 +65,9 @@ const RADS_PRESET = JSON.stringify(
   2,
 );
 
+// v2.0.13：时间展示统一北京时间（服务器/Edge 运行时时区为 UTC）
 function formatDateTime(date: Date): string {
-  const pad = (value: number): string => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return formatBeijingDateTimeMinute(date);
 }
 
 function MethodFormDialog({

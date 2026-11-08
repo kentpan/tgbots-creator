@@ -1,5 +1,12 @@
 import type { BotContext } from "../context";
-import { getGlobalStats, getGroupSettings, getPendingCodeContext, resolveVerificationChannel, isSuperGroupChatId } from "@/database/operations";
+import {
+  getGlobalStats,
+  getGroupSettings,
+  getPendingCodeContext,
+  resolveVerificationChannel,
+  isSuperGroupChatId,
+} from "@/database/operations";
+import { formatBeijingDateTime } from "@/utils/datetime";
 import { config } from "@/config/settings";
 import { adminOnly } from "../filters";
 import { mainMenu } from "../menus";
@@ -116,18 +123,9 @@ export async function cmdHelp(ctx: BotContext): Promise<void> {
   );
 }
 
-function padNumber(value: number): string {
-  return String(value).padStart(2, "0");
-}
-
+// v2.0.13：机器人消息内时间统一北京时间（服务器时区为 UTC，用户在国内）
 function formatDateTime(date: Date): string {
-  const year = date.getFullYear();
-  const month = padNumber(date.getMonth() + 1);
-  const day = padNumber(date.getDate());
-  const hours = padNumber(date.getHours());
-  const minutes = padNumber(date.getMinutes());
-  const seconds = padNumber(date.getSeconds());
-  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+  return formatBeijingDateTime(date);
 }
 
 function formatRate(rate: number): string {

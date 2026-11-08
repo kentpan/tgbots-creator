@@ -1,4 +1,5 @@
 import { listBots, listBotCommands, listGroupSettings } from "@/database/operations";
+import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { getStorage } from "@/database/bindings";
 import { countMenuStats, parseBotMenuConfig } from "@/services/menu-config";
 import { getTelegramRuntimeSettings, resolveBotRuntime } from "@/services/bot-transport";
@@ -35,9 +36,9 @@ const ERRORS: Record<string, string> = {
   "runtime": "机器人运行配置已保存并热应用",
 };
 
+// v2.0.13：时间展示统一北京时间（服务器/Edge 运行时时区为 UTC）
 function formatDateTime(date: Date): string {
-  const pad = (value: number): string => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return formatBeijingDateTimeMinute(date);
 }
 
 function maskToken(token: string): string {

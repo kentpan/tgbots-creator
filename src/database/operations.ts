@@ -1543,7 +1543,12 @@ export async function upsertGroupSettings(
       input.enabled === false ? 0 : 1,
       input.privacyMode === false ? 0 : 1,
       requireApprovalValue ? 1 : 0,
-      verificationChannelValue === "dm" ? "dm" : "group",
+      // v2.0.13 修复：v2.0.12 此处把 "auto" 折叠成 "group" 写库 —— UI 选「自动判断」
+      // 保存后落库变「群内验证」，基础群（auto→私聊）被错误群内验证。
+      // 三态值原样持久化，未知/空值回退 auto（读取端 mapGroupSettings 同语义）
+      verificationChannelValue === "dm" || verificationChannelValue === "group"
+        ? verificationChannelValue
+        : "auto",
       kickDirectJoinsValue ? 1 : 0,
       dateText(new Date()),
       dateText(new Date()),

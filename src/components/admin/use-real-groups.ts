@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * 统一「真实群组」获取 Hook（v1.1.1）：
@@ -63,6 +63,13 @@ export function useRealGroups(options: { botId: string | null; enabled?: boolean
   /** 手动同步进行中（POST，请求 Telegram） */
   const [syncing, setSyncing] = useState(false);
   const [note, setNote] = useState<SyncNote | null>(null);
+  // v2.0.13 修复「切换机器人时仿真屏所属群组不同步」：慢响应竞态守卫 ——
+  // 切换后旧 botId 的 GET 响应后到时必须丢弃，否则会把上一个机器人的群组
+  // 覆盖回列表（用户看到的就是「群组没跟着机器人切」）
+  const botIdRef = useRef(botId);
+  useEffect(() => {
+    botIdRef.current = botId;
+  }, [botId]);
 
   /** 读取该机器人已登记的群组（数据库缓存，零 Telegram 消耗） */
   const loadCached = useCallback(async (): Promise<void> => {
@@ -76,6 +83,7 @@ export function useRealGroups(options: { botId: string | null; enabled?: boolean
         `/api/admin/telegram/real-groups?bot_id=${encodeURIComponent(botId)}`,
       );
       const payload = await readJson(response);
+      if (botIdRef.current !== botId) return; // 已切换机器人：丢弃过期响应
       if (payload && payload.ok === true && payload.data) {
         const data = payload.data as { groups?: { chat_id: string; chat_title: string; source: string; is_new: boolean }[] };
         setGroups(mapGroups(data.groups));
@@ -86,9 +94,10 @@ export function useRealGroups(options: { botId: string | null; enabled?: boolean
         }
       }
     } catch {
+      if (botIdRef.current !== botId) return; // 已切换机器人：丢弃过期异常
       setGroups([]);
     } finally {
-      setLoading(false);
+      if (botIdRef.current === botId) setLoading(false);
     }
   }, [botId]);
 
@@ -125,6 +134,7 @@ export function useRealGroups(options: { botId: string | null; enabled?: boolean
         groups: { chat_id: string; chat_title: string; source: string; is_new: boolean }[];
         note: string | null;
       };
+      if (botIdRef.current !== botId) return null; // 已切换机器人：丢弃过期响应
       const synced = mapGroups(data.groups);
       setGroups(synced);
       setNote({
@@ -144,8 +154,10 @@ export function useRealGroups(options: { botId: string | null; enabled?: boolean
 
   // 切换机器人时重新读取该机器人已登记的群组（只读数据库，不请求 Telegram）
   // enabled=false 时跳过：由宿主组件在真正需要展示时（如弹窗打开）再启用
+  // v2.0.13：切换瞬间先清空旧机器人列表 + 提示，避免旧群组残留展示
   useEffect(() => {
     if (!enabled) return;
+    setGroups([]);
     setNote(null);
     void loadCached();
   }, [loadCached, enabled]);

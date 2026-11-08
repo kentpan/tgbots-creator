@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { formatBeijingDateTime } from "@/utils/datetime";
 import {
   listBotCommands,
   type BotCommandRow,
@@ -256,7 +257,7 @@ function CommandRow({
         </span>
       </td>
       <td className="px-4 py-3 text-xs text-muted-foreground">
-        {row.updatedTime.toLocaleString("zh-CN", { hour12: false })}
+        {formatBeijingDateTime(row.updatedTime)}
       </td>
       <td className="px-4 py-3">
         <div className="flex items-center justify-end gap-2">

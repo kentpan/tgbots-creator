@@ -1,4 +1,5 @@
 import type { MenuRow } from "@/database/operations";
+import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import { permissionLabel } from "@/lib/menu-permissions";
 import type { MenuTreeOption } from "@/components/admin/menu-parent-select";
@@ -6,9 +7,9 @@ import type { MenuFormValues } from "./menu-form-dialog";
 import { deleteMenuAction } from "./actions";
 import { MenuFormDialog } from "./menu-form-dialog";
 
+// v2.0.13：时间展示统一北京时间（服务器/Edge 运行时时区为 UTC）
 function formatDateTime(date: Date): string {
-  const pad = (value: number): string => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return formatBeijingDateTimeMinute(date);
 }
 
 function sortTree(rows: MenuRow[]): MenuRow[] {

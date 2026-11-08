@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { listJoinRequests, RequestStatus } from "@/database/operations";
+import { formatBeijingDateTime } from "@/utils/datetime";
 import { requirePermission } from "@/lib/auth";
 import {
   approveJoinRequestAction,
@@ -8,10 +9,10 @@ import {
 
 export const dynamic = "force-dynamic";
 
+// v2.0.13：时间展示统一北京时间（Asia/Shanghai）—— 服务器/Edge 运行时时区为 UTC，
+// 原本地时区拼接导致线上「申请时间不是北京时间」，改用显式时区工具函数
 function formatDateTime(date: Date | null): string {
-  if (!date) return "-";
-  const pad = (value: number): string => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return formatBeijingDateTime(date);
 }
 
 const STATUS_BADGES: Record<string, string> = {

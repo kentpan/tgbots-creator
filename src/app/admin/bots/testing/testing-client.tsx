@@ -3,6 +3,7 @@
 import { useCallback, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { opsFetch } from "@/lib/remote-ops";
+import { formatBeijingShortDateTime } from "@/utils/datetime";
 import {
   Check,
   ChevronDown,
@@ -136,10 +137,9 @@ interface DeliveryLogView {
   error: string | null;
 }
 
+// v2.0.13：时间展示统一北京时间（服务器/浏览器时区不可控，显式锁定 Asia/Shanghai）
 function formatTime(iso: string): string {
-  const date = new Date(iso);
-  const pad = (value: number): string => String(value).padStart(2, "0");
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return formatBeijingShortDateTime(new Date(iso));
 }
 
 function CopyCodeButton({ code }: { code: string }) {
@@ -331,18 +331,26 @@ export function TestingClient({
 
   const selectedBot = bots.find((bot) => bot.id === selectedBotId) ?? null;
 
-  // 选中机器人的 Token 所关联的全部机器人条目 → 这些条目在群组中配置的 Chat ID 集合
+  // 选中机器人的 Token 所关联的全部机器人条目 → 这些条目在群组中配置的 Chat ID 集合。
+  // v2.0.13 修复「切换机器人时仿真屏所属群组不同步」：严格按当前机器人 Token 关联的
+  // 群组过滤（部署链接 bot_admins ∪ 该 Token 已登记真实群组 chat_registry），
+  // 绝不回退到全量 group_settings —— 旧逻辑在机器人无部署链接时把其他机器人的
+  // 群组全部展示出来，看起来像切换失效。
   const availableGroups = useMemo<GroupOption[]>(() => {
     if (!selectedBot) return [];
     const relatedIds = new Set(relatedBotIds[selectedBot.id] ?? [selectedBot.id]);
     const linkedChatIds = new Set(
       botGroupLinks.filter((link) => relatedIds.has(link.botId)).map((link) => link.chatId),
     );
+    const syncedChatIds = new Set(syncedGroups.map((group) => group.chatId));
     // 群组合并：同 chatId 时群组配置（groups，来自 group_settings）的非空群名优先 ——
     // 数据库里有群名的群永远显示群名，绝不被同步数据的空标题覆盖；
     // 配置缺标题时才用同步数据标题，两者皆空显示空
     const merged = new Map<string, GroupOption>();
-    for (const group of groups) merged.set(group.chatId, group);
+    for (const group of groups) {
+      if (!linkedChatIds.has(group.chatId) && !syncedChatIds.has(group.chatId)) continue;
+      merged.set(group.chatId, group);
+    }
     for (const group of syncedGroups) {
       const existing = merged.get(group.chatId);
       merged.set(
@@ -355,16 +363,7 @@ export function TestingClient({
           : group,
       );
     }
-    const pool = [...merged.values()];
-    const visible =
-      linkedChatIds.size > 0
-        ? pool.filter(
-            (group) =>
-              linkedChatIds.has(group.chatId) ||
-              syncedGroups.some((synced) => synced.chatId === group.chatId),
-          )
-        : pool;
-    return visible;
+    return [...merged.values()];
   }, [selectedBot, relatedBotIds, botGroupLinks, groups, syncedGroups]);
 
   const activeGroup = useMemo(
@@ -851,6 +850,11 @@ export function TestingClient({
             value={selectedBotId}
             onValueChange={(value) => {
               setSelectedBotId(value);
+              // v2.0.13：切换机器人必须同步重置仿真屏上下文 ——
+              // 群组列表（availableGroups 随 selectedBot 重算）、当前打开的会话视图
+              // （selectedChatId 残留会让 activeGroup 回退到旧机器人群组）、
+              // 验证会话/验证码/加群状态机/聊天视图全部清空
+              setSelectedChatId("");
               setSession(null);
               setLatestCode(null);
               setJoinPhase("idle");

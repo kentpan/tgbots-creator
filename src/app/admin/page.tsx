@@ -2,6 +2,7 @@ import Link from "next/link";
 import {
   getDatabaseInfo,
 } from "@/database/client";
+import { formatBeijingDateTime } from "@/utils/datetime";
 import { getKv, getStorage } from "@/database/bindings";
 import {
   getGlobalStats,
@@ -12,9 +13,9 @@ import { D1UsageCard } from "./d1-usage-card";
 
 export const dynamic = "force-dynamic";
 
+// v2.0.13：时间展示统一北京时间（服务器/Edge 运行时时区为 UTC）
 function formatDateTime(date: Date): string {
-  const pad = (value: number): string => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return formatBeijingDateTime(date);
 }
 
 const STATUS_BADGES: Record<string, string> = {

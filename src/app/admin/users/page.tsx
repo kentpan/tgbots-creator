@@ -1,4 +1,5 @@
 import { listAdminUsers, listRoles, type AdminUserRow } from "@/database/operations";
+import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { requirePermission } from "@/lib/auth";
 import { FormDialog } from "@/components/admin/form-dialog";
 import { inputClass, labelClass, selectClass } from "@/components/admin/form-styles";
@@ -19,10 +20,9 @@ const ERRORS: Record<string, string> = {
   "builtin-user": "内置超级管理员账号不允许删除",
 };
 
+// v2.0.13：时间展示统一北京时间（服务器/Edge 运行时时区为 UTC）
 function formatDateTime(date: Date | null): string {
-  if (!date) return "-";
-  const pad = (value: number): string => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return formatBeijingDateTimeMinute(date);
 }
 
 function UserFormDialog({
