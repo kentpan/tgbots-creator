@@ -1,5 +1,7 @@
 import { InlineKeyboard, type Api } from "grammy";
 import type { BotContext } from "../context";
+import { codeQuestion } from "../verification-question";
+import { CODE_SELF_DEFAULT_PROMPT } from "../verification-prompt";
 import {
   getGroupSettings,
   getJoinRequestByToken,
@@ -25,8 +27,13 @@ import { evaluateSubmittedCode } from "@/services/verification-flow";
  * - code_self（自动验证码）   → 群内消息 + 4 选 1 数字按钮（callback 提交，
  *                              其他成员仅看到候选码按钮，点击结果只有机器人可见）。
  *
- * 群内绝不提供「回复消息明文输码」通道（code-input.ts 已硬性拦截），
+ * 群内默认绝不提供「回复消息明文输码」通道（code-input.ts 已硬性拦截），
  * 所有用户输入都发生在网页或 callback payload 里，群成员全程不可见。
+ *
+ * v2.1.5 受控例外：群设置开启 reply_code_in_group（群内回复输码快速验证）且
+ * 方式为 code_self/code_api 时，群内提示改为 force_reply 形态（送达即自动聚焦
+ * 输入框进入回复态），用户回复输码 —— 该模式下不禁言（输码需要发言权限），
+ * 验证结束/失败后自动删除验证提示与验证码消息（机器人需具备「删除消息」权限）。
  */
 
 /** code_self 4 选 1 按钮的 callback_data 前缀：vs:{token}:{choice} */
@@ -34,6 +41,20 @@ export const CODE_SELF_CALLBACK_PREFIX = "vs:";
 
 /** code_self 候选按钮数量（1 正确 + 3 干扰） */
 const CODE_SELF_CHOICES = 4;
+
+/**
+ * v2.1.5 群内回复输码模式的判定：群设置开启 reply_code_in_group 且方式为
+ * code_self/code_api（captcha 必须在验证网页完成，无回复输码形态）。
+ */
+export function isGroupReplyInputMode(
+  settings: GroupSettingsRow | null,
+  method: string,
+): boolean {
+  return (
+    settings?.replyCodeInGroup === true &&
+    (method === "code_self" || method === "code_api")
+  );
+}
 
 export function isCodeSelfCallbackData(data: string): boolean {
   return data.startsWith(CODE_SELF_CALLBACK_PREFIX) && data.split(":").length === 3;
@@ -105,6 +126,44 @@ function buildCodeSelfChoices(correct: string): string[] {
   return Array.from(choices).sort(() => Math.random() - 0.5);
 }
 
+/**
+ * v2.1.5 群内回复输码快速提示（reply_code_in_group=true 且 code_self/code_api）：
+ * 与私聊验证同一交互形态 —— force_reply 提示（送达即自动聚焦输入框进入回复态，
+ * 用户无需点击任何按钮即可直接输码），提示正文带 stateless-question 隐形后缀，
+ * 用户回复该消息时机器人即可收到验证码（Telegram 隐私模式开启的群组同样可用：
+ * 「回复机器人消息」始终可达）。
+ *
+ * code_self：提示内直接展示一次性验证码（用户明确接受输码在群内短暂可见）；
+ * code_api：用户输入自己持有的外部卡密（验证码本身不落群聊）。
+ * 验证结束/失败/超时后机器人自动删除验证提示与验证码消息（code-input.ts /
+ * approval.ts 协同，需机器人具备「删除消息」管理员权限，失败 best effort）。
+ */
+function buildGroupReplyPromptHTML(
+  session: VerificationSessionRow,
+  settings: GroupSettingsRow,
+  user: JoinPromptUser,
+  chatTitle: string,
+  timeoutSeconds: number,
+): string {
+  const minutes = Math.max(1, Math.round(timeoutSeconds / 60));
+  const mention = userMentionHTML(user);
+  const title = htmlEscape(chatTitle);
+  const promptText = htmlEscape(settings.promptText ?? CODE_SELF_DEFAULT_PROMPT);
+  const codeLine =
+    session.method === "code_self" && session.expectedCode
+      ? `\n\n您的入群验证码：<b>${htmlEscape(session.expectedCode)}</b>`
+      : "";
+  return (
+    `👋 欢迎 ${mention} 加入「${title}」！\n\n` +
+    promptText +
+    codeLine +
+    "\n\n" +
+    `⏱ 验证码 ${minutes} 分钟内有效：输入框已自动定位到回复本消息，直接输入验证码发送即可。` +
+    "\n🧹 验证结束后机器人将自动删除本提示与验证码消息。" +
+    codeQuestion.messageSuffixHTML()
+  );
+}
+
 export interface GroupPromptOutcome {
   /** 提示消息是否成功发送到群内 */
   sent: boolean;
@@ -114,6 +173,10 @@ export interface GroupPromptOutcome {
 
 /**
  * 群内验证 bootstrap 的发送阶段：禁言 + 群内验证消息（按方式组装按钮）。
+ *
+ * v2.1.5 群内回复输码模式（reply_code_in_group=true 且 code_self/code_api）：
+ * 用户需在群内回复提示输码 —— 禁言会导致无法发言，该模式**不禁言**，提示改为
+ * force_reply 形态（无按钮）；captcha 仍走网页按钮，code_self 默认仍走 4 选 1。
  *
  * 禁言失败（机器人无「限制成员」权限）不阻塞验证：提示照发，超时/失败仍会尝试踢出；
  * 提示发送失败（机器人被移出群/无发言权限）返回 sent=false，由调用方记录日志——
@@ -128,13 +191,32 @@ export async function muteAndSendGroupPrompt(
   webAppBaseUrl: string,
   verifyButtonText: string,
 ): Promise<GroupPromptOutcome> {
+  // v2.1.5 群内回复输码模式：不禁言（禁言成员无法在群内发言/回复输码）
+  const replyInputMode = isGroupReplyInputMode(settings, session.method);
+
   // 1. 禁言（验证通过前无法发言；until_date 已在服务内做 30s~366d 边界钳制）
   // v2.1.1：禁言也由事件接收 bot（api）执行，不再依赖绑定行/主 bot token
-  await muteUnverifiedMember(BigInt(chat.id), BigInt(user.id), session.expiresAt, api);
+  if (!replyInputMode) {
+    await muteUnverifiedMember(BigInt(chat.id), BigInt(user.id), session.expiresAt, api);
+  } else {
+    console.log(
+      `Group reply-input mode enabled: user ${user.id} chat ${chat.id} method=${session.method} — skip mute (member must be able to reply)`,
+    );
+  }
 
-  // 2. 组装回复键盘：captcha/code_api → URL 按钮打开验证网页；code_self → 4 选 1
-  let replyMarkup: InlineKeyboard;
-  if (session.method === "code_self" && session.expectedCode) {
+  // 2. 组装键盘/提示形态：回复输码 → force_reply 提示（无按钮）；
+  //    code_self 默认 → 4 选 1；captcha/code_api 默认 → URL 按钮打开验证网页
+  let replyMarkup: InlineKeyboard | undefined;
+  let html: string;
+  if (replyInputMode && settings) {
+    html = buildGroupReplyPromptHTML(
+      session,
+      settings,
+      user,
+      chat.title ?? "群组",
+      Math.max(30, Math.round((session.expiresAt.getTime() - Date.now()) / 1000)),
+    );
+  } else if (session.method === "code_self" && session.expectedCode) {
     const choices = buildCodeSelfChoices(session.expectedCode);
     const keyboard = new InlineKeyboard();
     choices.forEach((choice, index) => {
@@ -142,27 +224,32 @@ export async function muteAndSendGroupPrompt(
       if (index % 2 === 1) keyboard.row();
     });
     replyMarkup = keyboard;
+    html = buildGroupPromptHTML(
+      session.method,
+      user,
+      chat.title ?? "群组",
+      Math.max(30, Math.round((session.expiresAt.getTime() - Date.now()) / 1000)),
+    );
   } else {
     const verifyUrl = `${webAppBaseUrl.replace(/\/$/, "")}/verify?token=${session.token}`;
     replyMarkup = new InlineKeyboard().url(verifyButtonText || "验证", verifyUrl);
+    html = buildGroupPromptHTML(
+      session.method,
+      user,
+      chat.title ?? "群组",
+      Math.max(30, Math.round((session.expiresAt.getTime() - Date.now()) / 1000)),
+    );
   }
-
-  const html = buildGroupPromptHTML(
-    session.method,
-    user,
-    chat.title ?? "群组",
-    Math.max(30, Math.round((session.expiresAt.getTime() - Date.now()) / 1000)),
-  );
 
   try {
     const message = await api.sendMessage(chat.id, html, {
       parse_mode: "HTML",
       link_preview_options: { is_disabled: true },
-      reply_markup: replyMarkup,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
     await setSessionPromptMessage(session.token, message.message_id);
     console.log(
-      `Group verification prompt sent: user ${user.id} chat ${chat.id} method=${session.method} message=${message.message_id}`,
+      `Group verification prompt sent: user ${user.id} chat ${chat.id} method=${session.method} message=${message.message_id}${replyInputMode ? " (reply-input mode)" : ""}`,
     );
     return { sent: true, messageId: message.message_id };
   } catch (error) {

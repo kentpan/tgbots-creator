@@ -8,6 +8,7 @@ import {
   getPendingSessionForUserChat,
   getVerificationMethod,
   resolveVerificationChannel,
+  wasRecentlyApprovedForUserChat,
 } from "@/database/operations";
 import { generateVerificationToken, generateJoinCode } from "@/utils/crypto";
 import { htmlEscape } from "@/utils/html";
@@ -99,7 +100,8 @@ async function bootstrapGroupVerification(
   }
 
   // 幂等守卫：同一用户同群已有未完成会话（申请批准后的 chat_member 抖动/重复投递）
-  // 不重复创建会话、不重复发群内消息
+  // 不重复创建会话、不重复发群内消息；v2.1.5 补充「近 15 分钟已批准」守卫，
+  // 拦截 webhook 迟到重投递（首次事件已走完批准→验证→批准全流程后的重试）
   const existing = await getPendingSessionForUserChat(BigInt(user.id), BigInt(chat.id));
   if (existing) {
     console.log(
@@ -111,6 +113,13 @@ async function bootstrapGroupVerification(
       promptDelivered: true,
       method: existing.method as BootstrapResult["method"],
     };
+  }
+  const recentlyApproved = await wasRecentlyApprovedForUserChat(BigInt(user.id), BigInt(chat.id));
+  if (recentlyApproved) {
+    console.log(
+      `Join request recently approved: user ${user.id} chat ${chat.id} — skip duplicate group bootstrap`,
+    );
+    return { created: false, promptDelivered: true, method: "none" };
   }
 
   // 验证方式解析（与私聊模式同一套规则：code_api 必须绑定启用中的验证方法）
@@ -172,7 +181,17 @@ async function bootstrapGroupVerification(
   return { created: true, promptDelivered: outcome.sent, method };
 }
 
-/** 私聊验证模式 bootstrap（v1.1.3 旧行为，verification_channel=dm 或群组未配置时） */
+/**
+ * 私聊验证模式 bootstrap（v1.1.3 旧行为，verification_channel=dm 或群组未配置时）。
+ *
+ * v2.1.5 幂等守卫（修复线上「私聊验证通过后又重复发送验证消息」，2026-11-08）：
+ * 旧实现与群内验证不同，没有任何幂等保护 —— 同一 chat_join_request 的 webhook
+ * 重投递/重复点击申请链接都会再建一个新会话并重发验证提示；若重投递发生在首次
+ * 事件走完「验证通过→批准入群」之后，用户端表现就是「已收到验证成功消息，紧接着
+ * 又收到一条新的验证提示」。现在两道守卫：
+ * 1. 同用户同群已有未完成会话 → 不新建、不重发（/start 重发路径继续复用同一会话）；
+ * 2. 近 15 分钟内该用户在该群的申请已被批准 → 验证早已完成，绝不重发验证提示。
+ */
 async function bootstrapDmVerification(
   api: Api,
   user: JoinVerificationUser,
@@ -181,6 +200,26 @@ async function bootstrapDmVerification(
   runtime: RuntimeSettings,
   groupSettings: Awaited<ReturnType<typeof getGroupSettings>>,
 ): Promise<BootstrapResult> {
+  const existingPending = await getPendingSessionForUserChat(BigInt(user.id), BigInt(chat.id));
+  if (existingPending) {
+    console.log(
+      `Pending DM verification already exists: user ${user.id} chat ${chat.id} ` +
+        `session=${existingPending.token.slice(0, 8)}... — skip duplicate bootstrap`,
+    );
+    return {
+      created: true,
+      promptDelivered: true,
+      method: existingPending.method as BootstrapResult["method"],
+    };
+  }
+  const recentlyApproved = await wasRecentlyApprovedForUserChat(BigInt(user.id), BigInt(chat.id));
+  if (recentlyApproved) {
+    console.log(
+      `Join request recently approved: user ${user.id} chat ${chat.id} — skip duplicate DM bootstrap`,
+    );
+    return { created: false, promptDelivered: true, method: "none" };
+  }
+
   const verificationToken = generateVerificationToken();
 
   const dbJoinRequest = await createJoinRequest({

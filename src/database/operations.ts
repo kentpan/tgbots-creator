@@ -196,6 +196,16 @@ export interface GroupSettingsRow {
    * 入群申请链接用户（request_type = telegram）不受本开关影响，维持既有踢出/拒绝行为。
    */
   kickDirectJoins: boolean;
+  /**
+   * 群内回复输码快速验证（v2.1.5，默认 false）：仅群内验证渠道且方式为
+   * code_self/code_api 时生效。
+   * - false（默认）：隐私红线 —— 群内输码只发生在验证网页（URL 按钮）或 4 选 1
+   *   callback 按钮里，输入内容其他成员不可见；
+   * - true：群内发送 force_reply 验证提示（送达即自动聚焦输入框进入回复态），用户
+   *   回复输码（code_self 提示内直接展示一次性验证码，短暂可见）；验证结束/失败后
+   *   机器人自动删除验证提示与验证码消息（需机器人具备「删除消息」管理员权限）。
+   */
+  replyCodeInGroup: boolean;
   createdTime: Date;
   updatedTime: Date;
 }
@@ -811,6 +821,39 @@ export async function getPendingSessionForUserChat(
   }
 }
 
+/**
+ * v2.1.5 加群验证引导幂等守卫（私聊/群内两渠道共用）：
+ * 判定该用户在该群是否处于「批准后事件风暴窗口」——加群申请已批准且批准发生在
+ * 近 15 分钟内。覆盖两类重复事件，均不再重复发起验证/重发验证提示：
+ * 1. webhook 迟到重投递：首次 chat_join_request 已处理完毕（申请已批准、会话已完成）
+ *    后，Telegram 侧重试投递同一事件 —— 此时 pending 守卫（getPendingSessionForUserChat）
+ *    已查不到未完成会话，必须靠本守卫拦住「通过后又重复发送验证消息」（2026-11-08 线上实证）；
+ * 2. 批准后的 chat_member 抖动/重复投递（个别场景 via_join_request 标志缺失时，
+ *    直连入群防线会把已批准成员误判为直连入群再补一次验证）。
+ *
+ * 15 分钟窗口语义：批准后短时间内的关联事件全部视为重复投递；窗口外（用户退群后
+ * 重新申请、被移出后再次入群等真实二次入群）不受影响，正常走完整验证流程。
+ */
+export async function wasRecentlyApprovedForUserChat(
+  userId: bigint,
+  chatId: bigint,
+  windowSeconds = 900,
+): Promise<boolean> {
+  try {
+    const cutoff = dateText(new Date(Date.now() - windowSeconds * 1000));
+    const row = await queryOne<{ count: number }>(
+      `SELECT COUNT(id) AS count FROM join_requests
+       WHERE user_id = ? AND chat_id = ? AND status = ?
+         AND processed_time IS NOT NULL AND processed_time > ?`,
+      [Number(userId), Number(chatId), RequestStatus.APPROVED, cutoff],
+    );
+    return toNumber(row?.count ?? 0) > 0;
+  } catch (error) {
+    console.error("Error checking recently approved join request:", error);
+    return false;
+  }
+}
+
 export async function purgeStaleRecords(
   retentionDays = 30,
 ): Promise<{
@@ -1049,6 +1092,8 @@ function mapGroupSettings(row: Record<string, unknown>): GroupSettingsRow {
           : "auto",
     // v2.0.7 直连入群踢出开关：列缺失/值为空 → 默认 false（不踢出已有用户）
     kickDirectJoins: row.kick_direct_joins === undefined ? false : toBoolean(row.kick_direct_joins),
+    // v2.1.5 群内回复输码开关：列缺失/值为空 → 默认 false（维持隐私红线）
+    replyCodeInGroup: row.reply_code_in_group === undefined ? false : toBoolean(row.reply_code_in_group),
     createdTime: toDate(row.created_time),
     updatedTime: toDate(row.updated_time),
   };
@@ -1518,18 +1563,22 @@ export async function upsertGroupSettings(
     verificationChannel?: "group" | "dm" | "auto";
     /** v2.0.7 直连入群用户（公开邀请链接/被拉入群）验证未通过/超时是否自动踢出；undefined = 不改动现有值 */
     kickDirectJoins?: boolean;
+    /** v2.1.5 群内回复输码快速验证（force_reply + 验证后自动删除消息）；undefined = 不改动现有值 */
+    replyCodeInGroup?: boolean;
   },
 ): Promise<void> {
-  // requireApproval / verificationChannel / kickDirectJoins === undefined 语义为「不改动现有值」。
+  // requireApproval / verificationChannel / kickDirectJoins / replyCodeInGroup === undefined 语义为「不改动现有值」。
   // 两列都是 NOT NULL，SQLite 在 INSERT 阶段即校验约束（不会等 COALESCE 兕底），
   // 因此必须先读出现值（无行则取各自默认），绝不允许绑定 null。
   let requireApprovalValue = input.requireApproval;
   let verificationChannelValue = input.verificationChannel;
   let kickDirectJoinsValue = input.kickDirectJoins;
+  let replyCodeInGroupValue = input.replyCodeInGroup;
   if (
     requireApprovalValue === undefined ||
     verificationChannelValue === undefined ||
-    kickDirectJoinsValue === undefined
+    kickDirectJoinsValue === undefined ||
+    replyCodeInGroupValue === undefined
   ) {
     const existing = await getGroupSettings(chatId);
     if (requireApprovalValue === undefined) {
@@ -1542,12 +1591,15 @@ export async function upsertGroupSettings(
     if (kickDirectJoinsValue === undefined) {
       kickDirectJoinsValue = existing ? existing.kickDirectJoins : false;
     }
+    if (replyCodeInGroupValue === undefined) {
+      replyCodeInGroupValue = existing ? existing.replyCodeInGroup : false;
+    }
   }
 
   await executeRun(
     `INSERT INTO group_settings
-       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, require_approval, verification_channel, kick_direct_joins, created_time, updated_time)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, require_approval, verification_channel, kick_direct_joins, reply_code_in_group, created_time, updated_time)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(chat_id) DO UPDATE SET
        chat_title = COALESCE(excluded.chat_title, group_settings.chat_title),
        method = COALESCE(excluded.method, group_settings.method),
@@ -1562,6 +1614,7 @@ export async function upsertGroupSettings(
        require_approval = excluded.require_approval,
        verification_channel = excluded.verification_channel,
        kick_direct_joins = excluded.kick_direct_joins,
+       reply_code_in_group = excluded.reply_code_in_group,
        updated_time = excluded.updated_time`,
     [
       Number(chatId),
@@ -1583,6 +1636,7 @@ export async function upsertGroupSettings(
         ? verificationChannelValue
         : "auto",
       kickDirectJoinsValue ? 1 : 0,
+      replyCodeInGroupValue ? 1 : 0,
       dateText(new Date()),
       dateText(new Date()),
     ],

@@ -22,6 +22,7 @@ import {
   Settings2,
   ShieldCheck,
   SquarePen,
+  Trash2,
   UserRoundPlus,
   Users,
   X,
@@ -123,6 +124,20 @@ const ADMIN_RIGHTS: { key: string; label: string; hint: string }[] = [
   { key: "can_promote_members", label: "添加新管理员", hint: "提升其他成员为管理员" },
   { key: "can_manage_chat", label: "管理聊天", hint: "默认管理员基础权限" },
 ];
+
+/** 邀请链接台账条目（/api/admin/telegram/invite-links GET 返回项） */
+interface SimInviteLinkEntry {
+  id: string;
+  bot_id: string | null;
+  chat_id: string;
+  link: string;
+  name: string | null;
+  creates_join_request: boolean;
+  is_revoked: boolean;
+  source: string;
+  created_time: string;
+  updated_time: string;
+}
 
 /** 浮层动画（设置/权限/加群确认面板：右侧滑入） */
 const OVERLAY_VARIANTS = {
@@ -593,6 +608,7 @@ export function TgAppSimulator({
     privacy_mode: true,
     verification_channel: "auto" as "auto" | "group" | "dm",
     kick_direct_joins: false,
+    reply_code_in_group: false,
   });
 
   const loadGroupSettings = useCallback(async (chatId: string): Promise<void> => {
@@ -619,6 +635,7 @@ export function TgAppSimulator({
             privacy_mode: boolean;
             verification_channel?: string;
             kick_direct_joins?: boolean;
+            reply_code_in_group?: boolean;
           } | null;
           methods: { id: string; name: string; enabled: boolean }[];
         };
@@ -651,6 +668,7 @@ export function TgAppSimulator({
               ? "group"
               : "auto",
         kick_direct_joins: settings?.kick_direct_joins ?? false,
+        reply_code_in_group: settings?.reply_code_in_group ?? false,
       });
     } catch (error) {
       showFlash(false, error instanceof Error ? error.message : "读取群组配置失败");
@@ -681,6 +699,7 @@ export function TgAppSimulator({
           privacy_mode: form.privacy_mode,
           verification_channel: form.verification_channel,
           kick_direct_joins: form.kick_direct_joins,
+          reply_code_in_group: form.reply_code_in_group,
         }),
       });
       const payload = await readJson<{ ok: boolean; error?: string }>(response);
@@ -895,6 +914,10 @@ export function TgAppSimulator({
   const [adminsSaving, setAdminsSaving] = useState(false);
   const [adminRights, setAdminRights] = useState<Record<string, boolean>>({});
   const [adminRecord, setAdminRecord] = useState<{ bot_name: string | null; bot_username: string | null } | null>(null);
+  // —— 邀请链接台账（管理员权限页底部；与群组管理邀请链接弹窗同一 API 同一台账） ——
+  const [inviteLinks, setInviteLinks] = useState<SimInviteLinkEntry[]>([]);
+  const [inviteLinksLoading, setInviteLinksLoading] = useState(false);
+  const [inviteBusyId, setInviteBusyId] = useState<string | null>(null);
 
   const loadBotAdmins = useCallback(async (chatId: string): Promise<void> => {
     setAdminsLoading(true);
@@ -967,10 +990,75 @@ export function TgAppSimulator({
     }
   }, [activeChatId, adminsSaving, selectedBotId, adminRights, showFlash, onSettingsSaved]);
 
-  // 打开权限浮层时加载当前机器人对该群的权限
+  // —— 邀请链接台账读写（GET 列表 / POST action=delete 仅删台账记录，与群组管理弹窗同 API） ——
+  const loadInviteLinks = useCallback(async (chatId: string): Promise<void> => {
+    setInviteLinksLoading(true);
+    try {
+      const params = new URLSearchParams({ chat_id: chatId });
+      if (selectedBotId) params.set("bot_id", selectedBotId);
+      const response = await opsFetch(
+        `/api/admin/telegram/invite-links?${params.toString()}`,
+        { cache: "no-store" },
+      );
+      const payload = await readJson<{ ok: boolean; error?: string; data?: { links: SimInviteLinkEntry[] } }>(response);
+      if (!payload) {
+        showFlash(false, `服务返回异常（HTTP ${response.status}），请查看服务端日志后重试`);
+        return;
+      }
+      if (!payload.ok) {
+        showFlash(false, payload.error ?? "读取邀请链接失败");
+        return;
+      }
+      setInviteLinks(payload.data?.links ?? []);
+    } catch (error) {
+      showFlash(false, error instanceof Error ? error.message : "读取邀请链接失败");
+    } finally {
+      setInviteLinksLoading(false);
+    }
+  }, [selectedBotId, showFlash]);
+
+  const deleteInviteLink = useCallback(
+    async (linkId: string): Promise<void> => {
+      if (!activeChatId || inviteBusyId) return;
+      setInviteBusyId(linkId);
+      try {
+        const response = await opsFetch("/api/admin/telegram/invite-links", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: activeChatId,
+            bot_id: selectedBotId,
+            action: "delete",
+            link_id: linkId,
+          }),
+        });
+        const payload = await readJson<{ ok: boolean; error?: string; data?: { message?: string } }>(response);
+        if (!payload) {
+          showFlash(false, `服务返回异常（HTTP ${response.status}），请查看服务端日志后重试`);
+          return;
+        }
+        if (!payload.ok) {
+          showFlash(false, payload.error ?? "删除邀请链接失败");
+          return;
+        }
+        showFlash(true, payload.data?.message ?? "邀请链接记录已删除");
+        await loadInviteLinks(activeChatId);
+      } catch (error) {
+        showFlash(false, error instanceof Error ? error.message : "删除邀请链接失败");
+      } finally {
+        setInviteBusyId(null);
+      }
+    },
+    [activeChatId, inviteBusyId, selectedBotId, showFlash, loadInviteLinks],
+  );
+
+  // 打开权限浮层时加载当前机器人对该群的权限 + 邀请链接台账
   useEffect(() => {
-    if (screen === "admins" && activeChatId) void loadBotAdmins(activeChatId);
-  }, [screen, activeChatId, loadBotAdmins]);
+    if (screen === "admins" && activeChatId) {
+      void loadBotAdmins(activeChatId);
+      void loadInviteLinks(activeChatId);
+    }
+  }, [screen, activeChatId, loadBotAdmins, loadInviteLinks]);
 
   const activeGroup = useMemo(
     () => groups.find((group) => group.chatId === activeChatId) ?? null,
@@ -1104,6 +1192,21 @@ export function TgAppSimulator({
                   onCheckedChange={(checked) => setForm((prev) => ({ ...prev, kick_direct_joins: checked }))}
                   className="data-[state=checked]:bg-[#34c759]"
                   aria-label="直连入群超时踢出"
+                />
+              </div>
+              {/* v2.1.5 群内回复输码快速验证（默认关闭）：force_reply 定位输入框 + 验证后自动删除消息 */}
+              <div className="flex items-center justify-between border-t border-black/[0.06] px-4 py-2.5">
+                <span className="text-[17px] leading-snug text-black">
+                  群内回复输码快速验证
+                  <span className="block text-[12px] text-[#8e8e93]">
+                    默认关闭：开启后群内提示送达即定位输入框，回复输码后自动删除验证码消息
+                  </span>
+                </span>
+                <Switch
+                  checked={form.reply_code_in_group}
+                  onCheckedChange={(checked) => setForm((prev) => ({ ...prev, reply_code_in_group: checked }))}
+                  className="data-[state=checked]:bg-[#34c759]"
+                  aria-label="群内回复输码快速验证"
                 />
               </div>
               <div className="border-t border-black/[0.06] px-4 py-2.5">
@@ -1333,7 +1436,7 @@ export function TgAppSimulator({
   );
 
   const adminsOverlay = (
-    <div className="flex h-full flex-col" style={{ backgroundColor: IOS_GRAY_BG }}>
+    <div className="relative flex h-full flex-col" style={{ backgroundColor: IOS_GRAY_BG }}>
       <div className="flex items-center justify-between border-b border-black/[0.06] bg-white/85 px-3 py-2 backdrop-blur">
         <button
           type="button"
@@ -1347,7 +1450,8 @@ export function TgAppSimulator({
         <span className="h-9 w-9" aria-hidden />
       </div>
 
-      <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+      {/* 滚动内容区：paddingBottom 加高，避免底部浮动保存按钮遮挡最后的内容 */}
+      <div className="flex-1 space-y-4 overflow-y-auto px-4 pt-4" style={{ paddingBottom: 116 }}>
         {adminsLoading ? (
           <div className="flex justify-center py-8">
             <Loader2 className="h-6 w-6 animate-spin text-[#8e8e93]" />
@@ -1396,28 +1500,95 @@ export function TgAppSimulator({
               ))}
             </div>
 
-            {/* 保存更改 */}
-            <button
-              type="button"
-              onClick={() => void saveBotAdmins()}
-              disabled={adminsSaving}
-              className="w-full cursor-pointer rounded-full py-3.5 text-[17px] font-semibold text-white transition-transform active:scale-[0.99] disabled:opacity-60"
-              style={{ backgroundColor: IOS_GREEN }}
-            >
-              {adminsSaving ? (
-                <span className="inline-flex items-center gap-2">
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                  正在同步到 Telegram…
+            {/* 机器人创建的邀请链接台账（与群组管理邀请链接弹窗同一 API） */}
+            <div className="overflow-hidden rounded-xl bg-white">
+              <div className="flex items-center justify-between px-4 py-2.5">
+                <span className="text-[17px] text-black">
+                  邀请链接
+                  <span className="block text-[12px] text-[#8e8e93]">
+                    机器人创建的入群邀请链接（台账）
+                  </span>
                 </span>
+                {inviteLinksLoading ? (
+                  <Loader2 className="h-4 w-4 animate-spin text-[#8e8e93]" />
+                ) : (
+                  <span className="text-[13px]" style={{ color: IOS_TEXT_SECONDARY }}>
+                    {inviteLinks.length} 条
+                  </span>
+                )}
+              </div>
+              {inviteLinks.length > 0 ? (
+                inviteLinks.map((entry, index) => (
+                  <div
+                    key={entry.id}
+                    className="border-t border-black/[0.06]"
+                  >
+                    <div className="flex items-center gap-3 px-4 py-2.5">
+                      <div className="min-w-0 flex-1">
+                        <p
+                          className="truncate font-mono text-[13px] text-black"
+                          title={entry.link}
+                        >
+                          {entry.link}
+                        </p>
+                        <p className="mt-0.5 truncate text-[12px]" style={{ color: IOS_TEXT_SECONDARY }}>
+                          <ListTime iso={entry.created_time} />
+                          {" · "}
+                          {entry.is_revoked ? "已撤销/失效" : "有效"}
+                          {entry.name ? ` · ${entry.name}` : ""}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void deleteInviteLink(entry.id)}
+                        disabled={inviteBusyId === entry.id}
+                        aria-label="删除邀请链接记录"
+                        className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-full text-[#ff3b30] transition-transform active:scale-90 disabled:opacity-50"
+                      >
+                        {inviteBusyId === entry.id ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Trash2 className="h-4 w-4" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                ))
               ) : (
-                "保存更改"
+                <div
+                  className="border-t border-black/[0.06] px-4 py-4 text-center text-[13px]"
+                  style={{ color: IOS_TEXT_SECONDARY }}
+                >
+                  暂无记录：机器人在该群创建邀请链接后会自动登记
+                </div>
               )}
-            </button>
+            </div>
+
             <p className="px-1 text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
               「添加成员（邀请用户）」是一键部署生成申请制入群链接的必需权限。
             </p>
           </>
         )}
+      </div>
+
+      {/* 固定浮动保存按钮（悬浮于滚动区底部，随内容滚动保持不动） */}
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-[#efeff4] via-[#efeff4]/95 to-transparent px-4 pb-5 pt-8">
+        <button
+          type="button"
+          onClick={() => void saveBotAdmins()}
+          disabled={adminsSaving}
+          className="pointer-events-auto w-full cursor-pointer rounded-full py-3.5 text-[17px] font-semibold text-white shadow-sm transition-transform active:scale-[0.99] disabled:opacity-60"
+          style={{ backgroundColor: IOS_GREEN }}
+        >
+          {adminsSaving ? (
+            <span className="inline-flex items-center gap-2">
+              <Loader2 className="h-5 w-5 animate-spin" />
+              正在同步到 Telegram…
+            </span>
+          ) : (
+            "保存更改"
+          )}
+        </button>
       </div>
     </div>
   );

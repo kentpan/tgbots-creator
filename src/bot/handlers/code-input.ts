@@ -10,10 +10,118 @@ import {
   type CodeCheckResult,
 } from "@/services/verification-flow";
 import { kickUnverifiedMember } from "@/services/approval";
+import { isGroupReplyInputMode } from "./group-verification";
 
 /** 网络波动、服务端即将重试时立即私聊发送给用户的提示文案 */
 const NETWORK_RETRY_NOTICE = "🌐 网络波动，正在重试...";
 
+/** 群内回复输码模式：失败重试类群内回执的自动删除延时（毫秒） */
+const GROUP_REPLY_TRANSIENT_DELETE_MS = 8000;
+/** 群内回复输码模式：验证失效类群内回执的自动删除延时（毫秒，留更多阅读时间） */
+const GROUP_REPLY_EXPIRED_DELETE_MS = 15000;
+
+/**
+ * 群内回复输码模式的单条消息删除（best effort）：
+ * 需要机器人具备「删除消息」管理员权限；失败仅记录，绝不影响验证主流程。
+ */
+async function deleteGroupMessageBestEffort(
+  api: BotContext["api"],
+  chatId: number,
+  messageId: number,
+  label: string,
+): Promise<boolean> {
+  try {
+    await api.deleteMessage(chatId, messageId);
+    return true;
+  } catch (error) {
+    console.warn(
+      `Failed to delete group message (${label}) ${messageId} in chat ${chatId} ` +
+        "（需机器人「删除消息」管理员权限）:",
+      error instanceof Error ? error.message : error,
+    );
+    return false;
+  }
+}
+
+/**
+ * 群内回复输码模式：延时批量删除（回执 + 用户验证码消息），
+ * setTimeout 在长驻 Node 进程内可靠触发；Workers/Webhook 场景下为 best effort。
+ */
+function scheduleGroupReplyCleanup(
+  api: BotContext["api"],
+  chatId: number,
+  messageIds: number[],
+  delayMs: number,
+): void {
+  const targets = messageIds.filter((id) => Number.isFinite(id) && id > 0);
+  if (targets.length === 0) return;
+  const timer = setTimeout(() => {
+    for (const messageId of targets) {
+      void deleteGroupMessageBestEffort(api, chatId, messageId, "reply-mode cleanup");
+    }
+  }, delayMs);
+  // Node 长驻进程不阻塞进程退出；Workers 等环境的 number 返回值无 unref，跳过
+  if (typeof timer === "object" && timer !== null && "unref" in timer) {
+    (timer as { unref: () => void }).unref();
+  }
+}
+
+/**
+ * 群内回复输码模式（v2.1.5）的结果回执与消息清理：
+ * - success：立即删除用户验证码消息（群内欢迎/私聊祝贺由验证流程自身发送，
+ *   不重复回执，保持群内零残留）；
+ * - failed_retry / network_error / 其他状态异常：群内回执（回复用户消息）+ 8 秒后
+ *   连同用户验证码消息一并删除；
+ * - failed_expired：群内回执 + 15 秒后删除（群内验证提示由 verification-flow
+ *   失败分支/超时清理负责删除）。
+ *
+ * 与私聊路径不同：回复输码用户的操作发生在群内，回执必须在群内可见（用户未必
+ * 已启动机器人，私聊不可达）；但回执与验证码消息都必须自动清理，避免验证码、
+ * 错误提示长期留在群里。
+ */
+async function deliverGroupReplyModeResult(
+  ctx: BotContext,
+  result: CodeCheckResult,
+  userMessageId: number | undefined,
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+  const codeMessageId =
+    userMessageId && Number.isFinite(userMessageId) && userMessageId > 0 ? userMessageId : undefined;
+
+  // 成功：立即删除验证码消息，群内不重复回执（群内欢迎由 completeGroupVerification 发送）
+  if (result.outcome === "success") {
+    if (codeMessageId) {
+      const deleted = await deleteGroupMessageBestEffort(ctx.api, chatId, codeMessageId, "user code");
+      if (deleted) {
+        console.log(
+          `Group reply-input mode: user code message ${codeMessageId} deleted after success (chat ${chatId})`,
+        );
+      }
+    }
+    return;
+  }
+
+  // 非成功：群内回执（回复用户验证码消息，定位明确）+ 定时清理
+  const text = result.replyText || "验证状态异常，请重新申请加群";
+  let feedbackId: number | undefined;
+  try {
+    const feedback = await ctx.api.sendMessage(chatId, text, {
+      ...(codeMessageId
+        ? { reply_parameters: { message_id: codeMessageId, allow_sending_without_reply: true } }
+        : {}),
+    });
+    feedbackId = feedback.message_id;
+  } catch (error) {
+    console.error(`Failed to send group reply-mode feedback to chat ${chatId}:`, error);
+  }
+
+  const delayMs = result.outcome === "failed_expired" ? GROUP_REPLY_EXPIRED_DELETE_MS : GROUP_REPLY_TRANSIENT_DELETE_MS;
+  scheduleGroupReplyCleanup(ctx.api, chatId, [feedbackId, codeMessageId].filter((id): id is number => id !== undefined), delayMs);
+  console.log(
+    `Group reply-input mode feedback sent: chat ${chatId} outcome=${result.outcome} cleanup in ${delayMs}ms`,
+  );
+}
 /**
  * 验证失效（尝试次数用尽）后回复「申请加群」按钮：
  * 生成入群申请链接（creates_join_request，与「一键部署」同一参数），
@@ -61,6 +169,8 @@ async function sendReapplyJoinButton(
  *
  * 隐私红线：所有结果类消息（重试提示/成功/失败/失效文案）一律私聊发送
  * （受理 bot 自己的 ctx.api.sendMessage(from.id, …)），群组内绝不出现验证消息。
+ * v2.1.5 受控例外：群内回复输码模式（reply_code_in_group=true）下回执改在群内
+ * 发送（回复用户验证码消息）并自动删除 —— 用户在群内完成输码，未必私聊可达。
  *
  * v1.1.4：返回校验结果供 stateless-question 路径判断 no_pending
  * （回复的是验证提示但会话已失效/已完成时必须给出明确反馈，不静默吞掉）。
@@ -78,9 +188,17 @@ export async function processCodeAnswer(
   // v2.0.5 群内验证模式前提条件：群聊内禁止明文输码（回复消息全员可见）。
   // 群内验证的输入只发生在验证网页（URL 按钮）或 4 选 1 callback 里；
   // 用户私聊（DM）输码不受限 —— 私聊内容群友本就不可见，作为兼容通道保留。
+  //
+  // v2.1.5 受控例外（群内回复输码模式）：reply_code_in_group=true 且群内渠道时，
+  // force_reply 提示引导用户回复输码（验证码短暂可见，管理员已明确接受），
+  // 回执与验证码消息在验证结束后自动删除；captcha 会话仍只走验证网页。
+  let groupReplyMode = false;
   if (ctx.chat && ctx.chat.type !== "private") {
     const chatSettings = await getGroupSettings(BigInt(ctx.chat.id));
-    if (chatSettings?.verificationChannel === "group") {
+    const groupChannel =
+      resolveVerificationChannel(chatSettings, ctx.chat.id) === "group";
+    groupReplyMode = groupChannel && chatSettings?.replyCodeInGroup === true;
+    if (groupChannel && !groupReplyMode) {
       console.log(
         `Blocked plain-text code input in group ${ctx.chat.id} (verification_channel=group): ` +
           `user ${from.id} must use the in-group button/web page`,
@@ -107,6 +225,13 @@ export async function processCodeAnswer(
   // no_pending：非验证会话中的普通消息，交还后续中间件处理。
   // stateless-question 路径（回复验证提示）据此走「失效反馈」分支，见 verification-question.ts
   if (result.outcome === "no_pending" && !result.replyText) {
+    return result;
+  }
+
+  // v2.1.5 群内回复输码模式：用户在群内完成输码，回执与消息清理全部在群内进行
+  //（用户未必已启动机器人，私聊不可达）；不走下方私聊回执/私聊「申请加群」按钮路径
+  if (groupReplyMode) {
+    await deliverGroupReplyModeResult(ctx, result, ctx.message?.message_id);
     return result;
   }
 
@@ -244,9 +369,14 @@ export async function handleCodeInput(
 
   // 群内验证模式短路（v2.0.6，v2.0.12 三态）：群聊 + 群内渠道（含 auto 判定超级群）→
   // 文本输码永不生效，不必查询该用户是否挂着待验证会话（省掉每条群消息 1 次 D1 会话查询）
+  // v2.1.5：群内回复输码模式（reply_code_in_group=true）开启时不短路 ——
+  // force_reply 提示引导的群内回复输码需要进入会话校验
   if (ctx.chat && ctx.chat.type !== "private") {
     const chatSettings = await getGroupSettings(BigInt(ctx.chat.id));
-    if (resolveVerificationChannel(chatSettings, ctx.chat.id) === "group") {
+    if (
+      resolveVerificationChannel(chatSettings, ctx.chat.id) === "group" &&
+      chatSettings?.replyCodeInGroup !== true
+    ) {
       await next();
       return;
     }

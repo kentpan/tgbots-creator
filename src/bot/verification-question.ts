@@ -17,6 +17,35 @@ import { getLatestVerificationContext } from "@/database/operations";
  */
 export const VERIFICATION_QUESTION_ID = "tgcode";
 
+/**
+ * v2.1.5：群聊内的失效/已完成反馈自动清理（60 秒后删除，留足点按「申请加群」按钮
+ * 的时间）。私聊反馈永久保留。删除失败（机器人无「删除消息」权限）仅记录不抛出。
+ */
+const GROUP_FEEDBACK_AUTO_DELETE_MS = 60000;
+
+async function replyWithGroupAutoCleanup(
+  ctx: BotContext,
+  text: string,
+  extra?: Parameters<BotContext["reply"]>[1],
+): Promise<void> {
+  const inGroup = Boolean(ctx.chat && ctx.chat.type !== "private");
+  const sent = await ctx.reply(text, extra);
+  if (inGroup && sent?.message_id && ctx.chat) {
+    const chatId = ctx.chat.id;
+    const messageId = sent.message_id;
+    setTimeout(() => {
+      void ctx.api
+        .deleteMessage(chatId, messageId)
+        .catch((error: unknown) => {
+          console.warn(
+            `Failed to delete group stale-reply feedback ${messageId} in chat ${chatId}:`,
+            error,
+          );
+        });
+    }, GROUP_FEEDBACK_AUTO_DELETE_MS);
+  }
+}
+
 export const codeQuestion = new StatelessQuestion<BotContext>(
   VERIFICATION_QUESTION_ID,
   async (ctx) => {
@@ -38,7 +67,7 @@ export const codeQuestion = new StatelessQuestion<BotContext>(
         latest.session.captchaCompleted ||
         latest.joinRequest.status === "approved"
       ) {
-        await ctx.reply("✅ 你已完成验证，无需重复验证。");
+        await replyWithGroupAutoCleanup(ctx, "✅ 你已完成验证，无需重复验证。");
         return;
       }
       if (latest.joinRequest.chatId !== 0n) {
@@ -49,14 +78,18 @@ export const codeQuestion = new StatelessQuestion<BotContext>(
             name: "TGuard 加群验证",
           },
         );
-        await ctx.reply("❌ 本次验证已失效，请点击下方按钮重新申请加群。", {
-          reply_markup: new InlineKeyboard().url(
-            "🔄 申请加群",
-            invite.invite_link,
-          ),
-        });
+        await replyWithGroupAutoCleanup(
+          ctx,
+          "❌ 本次验证已失效，请点击下方按钮重新申请加群。",
+          {
+            reply_markup: new InlineKeyboard().url(
+              "🔄 申请加群",
+              invite.invite_link,
+            ),
+          },
+        );
       } else {
-        await ctx.reply("❌ 本次验证已失效，请重新申请加群。");
+        await replyWithGroupAutoCleanup(ctx, "❌ 本次验证已失效，请重新申请加群。");
       }
       console.log(
         `Stale verification prompt reply from user ${ctx.from.id}: ` +

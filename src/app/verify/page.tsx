@@ -44,8 +44,16 @@ export default async function VerifyPage({ searchParams }: VerifyPageProps) {
       } else if (session.captchaCompleted) {
         view = { kind: "completed" };
       } else {
-        const captchaProvider = await getCaptchaProvider();
-        const captchaConfig = captchaProvider.getFrontendConfig() as unknown as CaptchaConfig;
+        // v2.1.4 修复验证页整体报错：验证码 provider 仅在会话真正需要人机验证组件时
+        // 初始化（method=captcha），与 POST /api/v1/verify 的会话方式分支同源。
+        // code_api/code_self 是网页输码通道（verify-client codeMode，不渲染任何
+        // 验证码组件）；此前无条件初始化，Edge/Cloudflare 形态下 config.toml 不存在、
+        // provider 配置为空 → createCaptchaProvider 抛 "Missing configuration" →
+        // 整个验证页进入错误态。输码会话无需任何验证码配置。
+        const codeMode = session.method === "code_api" || session.method === "code_self";
+        const captchaConfig: CaptchaConfig = codeMode
+          ? { provider: "none" }
+          : ((await getCaptchaProvider()).getFrontendConfig() as unknown as CaptchaConfig);
         view = {
           kind: "verify",
           token,

@@ -200,6 +200,13 @@ function GroupFormDialog({
         defaultChecked={group ? group.kickDirectJoins : false}
         id={`kick-direct-${group?.chatId ?? "new"}`}
       />
+      <SwitchField
+        name="reply_code_in_group"
+        label="群内回复输码快速验证（默认关闭）"
+        description="仅群内验证渠道且验证方式为自动验证码/自定义验证码时生效：群内发送验证提示后输入框自动定位到回复态，成员直接回复输码即可（一次性验证码短暂可见）；验证结束/失败后机器人自动删除验证提示与验证码消息（需机器人具备「删除消息」管理员权限）。关闭（默认）时群内输码只能通过验证网页或点选按钮，输入内容其他成员不可见。"
+        defaultChecked={group ? group.replyCodeInGroup : false}
+        id={`reply-code-${group?.chatId ?? "new"}`}
+      />
     </FormDialog>
   );
 }

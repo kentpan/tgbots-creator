@@ -7,6 +7,7 @@ import {
   approveJoinRequest,
   getVerificationSession,
   getGroupSettings,
+  isSuperGroupChatId,
 } from "@/database/operations";
 import { escapeMarkdownV2 } from "@/utils/markdown";
 import { htmlEscape, userMentionHTML } from "@/utils/html";
@@ -228,15 +229,59 @@ export async function notifyVerificationExpired(
   console.log(`Verification timeout notice sent to user ${userId} for chat ${chatId}`);
 }
 
+/**
+ * 解析「前往群组」按钮链接（v2.1.5，私聊验证通过后自动引导进入群组）：
+ * - 公开群（有 username）→ t.me/username（零 API 调用）；
+ * - 私有群 → 规范邀请链接管道 acquireStableGroupInviteLink（优先复用一键部署
+ *   保存的链接并做存活探测，绝不每次新建链接造成链接泛滥）；
+ * - 全部失败 → 返回 null（欢迎语不带按钮，不影响验证成功主流程）。
+ *
+ * Telegram Bot API 无任何「强制客户端跳转到某会话」的能力，官方标准做法就是
+ * 邀请链接按钮 —— 已批准成员点开链接即直达群组（显示「打开群组」而非申请入群）。
+ */
+async function resolveGroupJumpUrl(bot: Bot, chatId: bigint): Promise<string | null> {
+  try {
+    const chatInfo = await bot.api.getChat(Number(chatId));
+    if ("username" in chatInfo && typeof chatInfo.username === "string" && chatInfo.username) {
+      return `https://t.me/${chatInfo.username}`;
+    }
+  } catch (error) {
+    console.warn(`Could not fetch chat info for group jump URL (chat ${chatId}):`, error);
+  }
+  try {
+    const { acquireStableGroupInviteLink } = await import("./invite-link");
+    const binding = await getActiveBotForChat(chatId);
+    const acquired = await acquireStableGroupInviteLink({
+      api: bot.api,
+      chatId,
+      superGroup: isSuperGroupChatId(chatId),
+      botId: binding?.botId ?? null,
+    });
+    return acquired.invite_link;
+  } catch (error) {
+    console.warn(`Could not acquire invite link for group jump URL (chat ${chatId}):`, error);
+    return null;
+  }
+}
+
 async function sendWelcomeMessage(bot: Bot, chatId: bigint, userId: bigint): Promise<void> {
   try {
     const chatInfo = await bot.api.getChat(Number(chatId));
     const escapedTitle = escapeMarkdownV2(
       "title" in chatInfo && chatInfo.title ? chatInfo.title : "群组",
     );
-    await bot.api.sendMessage(Number(userId), `🎉 *验证成功\\!*\n\n您已成功加入 *${escapedTitle}*，欢迎\\!`, {
-      parse_mode: "MarkdownV2",
-    });
+    // v2.1.5：附「🚀 前往群组」按钮 —— 验证通过后用户无需翻找群组，一键直达
+    const jumpUrl = await resolveGroupJumpUrl(bot, chatId);
+    await bot.api.sendMessage(
+      Number(userId),
+      `🎉 *验证成功\\!*\n\n您已成功加入 *${escapedTitle}*，欢迎\\!`,
+      {
+        parse_mode: "MarkdownV2",
+        ...(jumpUrl
+          ? { reply_markup: new InlineKeyboard().url("🚀 前往群组", jumpUrl) }
+          : {}),
+      },
+    );
   } catch (error) {
     console.warn(`Could not send welcome message to ${userId}:`, error);
   }

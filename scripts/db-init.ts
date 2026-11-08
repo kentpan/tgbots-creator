@@ -170,6 +170,13 @@ async function ensureMigrations(): Promise<void> {
       `ALTER TABLE "group_settings" ADD COLUMN "kick_direct_joins" BOOLEAN NOT NULL DEFAULT false`,
     );
   }
+  // 旧库补列：group_settings.reply_code_in_group（v2.1.5 群内回复输码快速验证，
+  // 默认 false = 维持隐私红线：群内输码只走网页按钮/4选1点选）
+  if (groupCols.length > 0 && !groupCols.some((c) => c.name === "reply_code_in_group")) {
+    await executeRun(
+      `ALTER TABLE "group_settings" ADD COLUMN "reply_code_in_group" BOOLEAN NOT NULL DEFAULT false`,
+    );
+  }
   // 旧库补列：verification_sessions.prompt_message_id（v2.0.5 群内验证提示消息 id，用于验证结束/超时后删除）
   const sessionCols = await queryAll<{ name: string }>(
     `PRAGMA table_info(verification_sessions)`,

@@ -30,10 +30,8 @@ CREATE TABLE "verification_sessions" (
     "completed_time" DATETIME,
     "expires_at" DATETIME NOT NULL,
     "method" TEXT NOT NULL DEFAULT 'captcha',
-    "attempts" INTEGER NOT NULL DEFAULT 0,
-    "expected_code" TEXT,
-    "prompt_message_id" INTEGER
-);
+    "attempts" INTEGER NOT NULL DEFAULT 0
+, expected_code TEXT, "prompt_message_id" INTEGER);
 CREATE TABLE "user_stats" (
     "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "user_id" BIGINT NOT NULL,
@@ -109,7 +107,7 @@ CREATE TABLE "group_settings" (
     "enabled" BOOLEAN NOT NULL DEFAULT true,
     "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-, "privacy_mode" BOOLEAN NOT NULL DEFAULT true, "require_approval" BOOLEAN NOT NULL DEFAULT false, "verification_channel" TEXT NOT NULL DEFAULT 'group', "kick_direct_joins" BOOLEAN NOT NULL DEFAULT false);
+, "privacy_mode" BOOLEAN NOT NULL DEFAULT true, require_approval BOOLEAN NOT NULL DEFAULT false, "verification_channel" TEXT NOT NULL DEFAULT 'group', kick_direct_joins BOOLEAN NOT NULL DEFAULT false, reply_code_in_group BOOLEAN NOT NULL DEFAULT false);
 CREATE TABLE "verification_methods" (
     "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "name" TEXT NOT NULL,
@@ -252,89 +250,62 @@ CREATE TABLE "bot_sessions" (
       "value" TEXT NOT NULL DEFAULT '{}',
       "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
--- v2.1.2 邀请链接台账：机器人经 Bot API 创建的全部邀请链接（部署规范链接 /
--- 验证超时补发链接 / 重新申请链接 / 管理后台手动登记链接）统一落库，
--- 供「群组管理 → 邀请链接」查看与撤销（revokeChatInviteLink 后 Telegram 侧链接立即作废）
-CREATE TABLE IF NOT EXISTS "invite_links" (
-    "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-    "bot_id" INTEGER,
-    "chat_id" BIGINT NOT NULL,
-    "link" TEXT NOT NULL,
-    "name" TEXT,
-    "creates_join_request" BOOLEAN NOT NULL DEFAULT false,
-    "is_revoked" BOOLEAN NOT NULL DEFAULT false,
-    "source" TEXT NOT NULL DEFAULT 'api',
-    "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE "invite_links" (
+  "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  "bot_id" INTEGER,
+  "chat_id" BIGINT NOT NULL,
+  "link" TEXT NOT NULL,
+  "name" TEXT,
+  "creates_join_request" BOOLEAN NOT NULL DEFAULT false,
+  "is_revoked" BOOLEAN NOT NULL DEFAULT false,
+  "source" TEXT NOT NULL DEFAULT 'api',
+  "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE UNIQUE INDEX IF NOT EXISTS "invite_links_link_key" ON "invite_links"("link");
-CREATE INDEX IF NOT EXISTS "idx_invite_links_bot_chat" ON "invite_links"("bot_id", "chat_id");
-CREATE INDEX IF NOT EXISTS "idx_invite_links_chat" ON "invite_links"("chat_id");
-
--- v2.1.2 群消息台账：webhook 收到的群消息（bot 可见 = 按 bot 权限视角）落库，
--- 供仿真屏右侧对话区展示真实群消息。Bot API 无历史消息拉取能力，
--- 仅收集部署后新到达的消息；每群只保留最近 200 条（进程内计数触发清理）。
-CREATE TABLE IF NOT EXISTS "chat_messages" (
-    "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-    "bot_id" INTEGER,
-    "chat_id" BIGINT NOT NULL,
-    "message_id" INTEGER,
-    "user_id" BIGINT,
-    "username" TEXT,
-    "first_name" TEXT,
-    "from_bot" BOOLEAN NOT NULL DEFAULT false,
-    "kind" TEXT NOT NULL DEFAULT 'message',
-    "text" TEXT,
-    "message_time" DATETIME,
-    "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE "chat_messages" (
+  "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  "bot_id" INTEGER,
+  "chat_id" BIGINT NOT NULL,
+  "message_id" INTEGER,
+  "user_id" BIGINT,
+  "username" TEXT,
+  "first_name" TEXT,
+  "from_bot" BOOLEAN NOT NULL DEFAULT false,
+  "kind" TEXT NOT NULL DEFAULT 'message',
+  "text" TEXT,
+  "message_time" DATETIME,
+  "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE UNIQUE INDEX IF NOT EXISTS "chat_messages_chat_msg_key" ON "chat_messages"("chat_id", "bot_id", "message_id");
-CREATE INDEX IF NOT EXISTS "idx_chat_messages_chat_id" ON "chat_messages"("chat_id", "id");
-
 CREATE UNIQUE INDEX "admin_users_username_key" ON "admin_users"("username");
 CREATE UNIQUE INDEX "bot_commands_type_name_key" ON "bot_commands"("type", "name");
 CREATE UNIQUE INDEX "bot_sessions_scope_key" ON "bot_sessions"("scope", "session_key");
+CREATE UNIQUE INDEX "chat_messages_chat_msg_key" ON "chat_messages"("chat_id", "bot_id", "message_id");
 CREATE UNIQUE INDEX "group_bot_admins_bot_chat_key" ON "group_bot_admins"("bot_id", "chat_id");
 CREATE INDEX "idx_admin_sessions_token_hash" ON "admin_sessions"("token_hash");
 CREATE INDEX "idx_admin_sessions_user_id" ON "admin_sessions"("user_id");
 CREATE INDEX "idx_ai_usage_created" ON "ai_usage_logs"("created_time");
 CREATE INDEX "idx_ai_usage_provider" ON "ai_usage_logs"("provider_id");
 CREATE INDEX idx_bots_token ON bots(token);
--- v2.0.6 D1 读行额度优化：以下复合索引消除高频路径的全表扫描
--- （D1 免费层 5,000,000 行读/天；缺索引的查询每执行一次都按扫描行数计费）
--- 覆盖：getPendingCodeContext / getLatestVerificationContext
---   （WHERE user_id=? AND captcha_completed=0 ORDER BY created_time DESC LIMIT 1）
-CREATE INDEX IF NOT EXISTS "idx_verification_sessions_user_completed"
-  ON "verification_sessions"("user_id", "captcha_completed", "created_time");
--- 覆盖：getPendingSessionForUserChat / expirePendingSessionsForUserChat
---   （WHERE s.user_id=? AND s.chat_id=? AND s.captcha_completed=0 ...）
-CREATE INDEX IF NOT EXISTS "idx_verification_sessions_user_chat"
-  ON "verification_sessions"("user_id", "chat_id", "captcha_completed");
--- 覆盖：cleanupExpiredSessions（清理循环每 60s）
---   （WHERE expires_at < ? AND captcha_completed = 0 ORDER BY expires_at DESC LIMIT 400）
---   与 purgeStaleRecords（DELETE WHERE created_time < ?）
-CREATE INDEX IF NOT EXISTS "idx_verification_sessions_expires"
-  ON "verification_sessions"("expires_at");
-CREATE INDEX IF NOT EXISTS "idx_verification_sessions_created"
-  ON "verification_sessions"("created_time");
--- 覆盖：listJoinRequests / getPendingRequestsByChat（WHERE chat_id=? AND status=?）
-CREATE INDEX IF NOT EXISTS "idx_join_requests_chat_status"
-  ON "join_requests"("chat_id", "status");
--- 覆盖：countPendingJoinRequestsByChat（WHERE status='pending' GROUP BY chat_id）
-CREATE INDEX IF NOT EXISTS "idx_join_requests_status_chat"
-  ON "join_requests"("status", "chat_id");
--- 覆盖：getGlobalStats 今日统计 / purgeStaleRecords（request_time 范围）
-CREATE INDEX IF NOT EXISTS "idx_join_requests_request_time"
-  ON "join_requests"("request_time");
+CREATE INDEX "idx_chat_messages_chat_id" ON "chat_messages"("chat_id", "id");
+CREATE INDEX "idx_invite_links_bot_chat" ON "invite_links"("bot_id", "chat_id");
+CREATE INDEX "idx_invite_links_chat" ON "invite_links"("chat_id");
 CREATE INDEX "idx_join_requests_chat_id" ON "join_requests"("chat_id");
+CREATE INDEX 'idx_join_requests_chat_status' ON 'join_requests'('chat_id', 'status');
+CREATE INDEX 'idx_join_requests_request_time' ON 'join_requests'('request_time');
 CREATE INDEX "idx_join_requests_request_type" ON "join_requests"("request_type");
 CREATE INDEX "idx_join_requests_status" ON "join_requests"("status");
+CREATE INDEX 'idx_join_requests_status_chat' ON 'join_requests'('status', 'chat_id');
 CREATE INDEX "idx_join_requests_user_id" ON "join_requests"("user_id");
 CREATE INDEX "idx_operation_logs_created_time" ON "operation_logs"("created_time");
+CREATE INDEX 'idx_verification_sessions_created' ON 'verification_sessions'('created_time');
+CREATE INDEX 'idx_verification_sessions_expires' ON 'verification_sessions'('expires_at');
+CREATE INDEX 'idx_verification_sessions_user_chat' ON 'verification_sessions'('user_id', 'chat_id', 'captcha_completed');
+CREATE INDEX 'idx_verification_sessions_user_completed' ON 'verification_sessions'('user_id', 'captcha_completed', 'created_time');
 CREATE INDEX "idx_verification_sessions_user_id" ON "verification_sessions"("user_id");
 CREATE INDEX idx_verify_codes_status ON verify_codes(status);
 CREATE INDEX idx_xianyu_delivery_logs_product ON xianyu_delivery_logs(product_id);
 CREATE INDEX idx_xianyu_products_created ON xianyu_products(created_time);
+CREATE UNIQUE INDEX "invite_links_link_key" ON "invite_links"("link");
 CREATE UNIQUE INDEX "join_requests_verification_token_key" ON "join_requests"("verification_token");
 CREATE UNIQUE INDEX "permissions_code_key" ON "permissions"("code");
 CREATE UNIQUE INDEX "roles_code_key" ON "roles"("code");
