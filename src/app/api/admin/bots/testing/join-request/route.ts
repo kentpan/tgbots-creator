@@ -15,7 +15,6 @@ import {
 import { generateJoinCode, generateVerificationToken } from "@/utils/crypto";
 import { parseCodeApiConfig, type CodeApiConfig } from "@/services/external-verify";
 import { resolveVerificationChannel } from "@/database/operations";
-import { assertRemoteExecution } from "@/services/remote-ops-guard";
 
 /** 仿真屏使用的固定模拟用户（与仿真屏模板变量保持一致） */
 export const SIMULATED_USER_ID = 777000n;
@@ -70,9 +69,6 @@ function buildMethodConfig(input: JoinApiConfigInput): CodeApiConfig | null {
  */
 export async function GET(request: Request): Promise<NextResponse> {
 
-  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
-  const blocked = await assertRemoteExecution(request);
-  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });
@@ -117,9 +113,6 @@ export async function GET(request: Request): Promise<NextResponse> {
  */
 export async function POST(request: Request): Promise<NextResponse> {
 
-  // v2.0.12 node 环境兜底：已配置线上站点时禁止本地直连执行（前端 opsFetch 已自动转发线上）
-  const blocked = await assertRemoteExecution(request);
-  if (blocked) return blocked;
   const admin = await getCurrentAdmin();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });

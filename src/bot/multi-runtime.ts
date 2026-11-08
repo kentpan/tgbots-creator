@@ -344,7 +344,21 @@ async function ensureMenuBotCapabilities(
   return syncCommands;
 }
 
-async function startMenuBot(row: BotRow): Promise<void> {
+/** 启动选项（v2.1.0 按需化） */
+interface StartMenuBotOptions {
+  /**
+   * 是否推送 Telegram 侧档案/指令（setMyName/setMyDescription/setMyShortDescription/
+   * setMyCommands/setChatMenuButton/setMyDefaultAdministratorRights）。
+   * 仅管理后台显式操作（保存/新建/启停机器人 → restartMenuBot）默认触发；
+   * 进程启动 / 运行时恢复 / 全局传输变更（startMenuBots 路径）一律静默启动 ——
+   * 档案本就持久化在 Telegram 侧，启动重放纯属多余网络调用（且在代理抖动时
+   * 会在 dev 首次请求/首页加载时刷网络报错）。
+   */
+  syncProfile?: boolean;
+}
+
+async function startMenuBot(row: BotRow, options: StartMenuBotOptions = {}): Promise<void> {
+  const syncProfile = options.syncProfile ?? true;
   const instances = registry();
   if (row.token === config.bot.token) {
     console.warn(`Menu bot #${row.id} uses the main bot token; skip separate polling instance`);
@@ -400,8 +414,8 @@ async function startMenuBot(row: BotRow): Promise<void> {
     console.log(
       `Menu bot #${row.id} transport=webhook ${applied.ok ? `registered: ${applied.url}` : `register failed: ${applied.error ?? "?"}`}`,
     );
-    // 指令菜单同步后台执行（与轮询路径同款：不阻塞返回）
-    void syncCommandsWebhook();
+    // 指令菜单同步后台执行（与轮询路径同款：不阻塞返回；v2.1.0 按需化 —— 仅显式操作触发）
+    if (syncProfile) void syncCommandsWebhook();
     return;
   }
 
@@ -516,23 +530,30 @@ async function startMenuBot(row: BotRow): Promise<void> {
   instance.running = true;
   runningTokens().add(row.token);
 
-  // Telegram 侧配置同步（互相独立，并行后台执行，单调用有传输层超时兜底）
+  // Telegram 侧配置同步（互相独立，并行后台执行，单调用有传输层超时兜底）。
+  // v2.1.0 按需化：档案/指令推送仅在管理后台显式操作时执行（syncProfile）；
+  // 启动路径只做传输应用（deleteWebhook 确保 getUpdates 不与残留 Webhook 互斥）
   void Promise.allSettled([
-    applyBotProfile(instance.bot, profile),
-    syncCommands(),
     applyBotTransport(
       { token: row.token, botId: String(row.id) },
       "polling",
       global.webhookBaseUrl,
     ),
+    ...(syncProfile ? [applyBotProfile(instance.bot, profile), syncCommands()] : []),
   ]);
 }
 
 export async function startMenuBots(): Promise<void> {
+  // v2.1.0 按需化：本函数的三处调用方（instrumentation 进程启动 /
+  // telegram-sync 运行时恢复 / bot-transport 全局传输变更）都不是档案操作 ——
+  // 静默启动，不推送档案/指令（dev 模式下首次请求触发 instrumentation，
+  // 此前会在打开首页时对每个 bot 重放 setMyName/setMyCommands/… 并刷网络报错）。
+  // 档案/指令推送的按需入口：管理后台保存机器人（restartMenuBot）/ 应用档案 /
+  // 同步指令（syncBotCommandsToTelegram）。
   const rows = await listEnabledBots();
   for (const row of rows) {
     try {
-      await startMenuBot(row);
+      await startMenuBot(row, { syncProfile: false });
     } catch (error) {
       console.error(`Failed to start menu bot #${row.id}:`, error);
     }
@@ -572,6 +593,7 @@ export async function restartMenuBot(botId: bigint): Promise<void> {
   await stopMenuBot(botId);
   const row = await getBot(botId);
   if (!row || !row.enabled) return;
+  // 管理后台显式重启 = 按需推送档案/指令（syncProfile 默认 true）
   await startMenuBot(row);
 }
 

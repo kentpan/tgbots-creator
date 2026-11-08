@@ -112,8 +112,12 @@ jobs:
           echo "✓ Required secrets present (CLOUDFLARE_API_TOKEN)."
 
       - name: Detect PROXY_MODE (proxy passthrough)
-        # 通用机制保留(适配⑦): TGuard 未使用 PROXY_MODE, 此步骤恒解析为
-        # "未开启"(PROXY_PASSTHROUGH=false), 全部 D1/KV/R2 步骤正常执行。
+        # v2.1.0 TGuard 正式启用 PROXY_MODE 代理透传架构：
+        #   PROXY_MODE=apikey@http://<node服务器>:<端口>（GitHub Variable/Secret/.env）
+        #   → PROXY_PASSTHROUGH=true：跳过 D1/KV/R2 与 schema、构建前剥离全部业务
+        #     API 路由（仅留 /api/[...path] 代理文件）、全部 /api/* 经 Bearer apikey
+        #     透传转发到 node 服务器（服务端+数据库全在 node，edge 只有前端+proxy）。
+        #   PROXY_MODE=false / 未配置 → 完整部署（D1/KV/R2 正常创建），行为不变。
         run: |
           # 优先级: repo Variable > repo Secret > .env 文件; 输出一律脱敏
           # (apiKey 属敏感值, 配在 Variables 时 GitHub 不自动打码)。
@@ -433,6 +437,29 @@ jobs:
           else
             echo "使用仓库中已有的 open-next.config.ts"
           fi
+
+      - name: Strip API routes (proxy passthrough mode)
+        # v2.1.0 PROXY_MODE 代理透传架构（用户拍板）：
+        # 服务端和数据库全放在 node 服务器上，edge 上只有前端 + proxy 代理文件。
+        # PROXY_MODE=apikey@<target>（不为 false）时，构建前删除 src/app/api 下
+        # 其余全部 API 路由，仅保留唯一的 /api/[...path] 代理转发文件 —— edge 站
+        # 收到的所有 /api/* 请求由它透传转发到代理目标（authorization: Bearer
+        # apikey 鉴权），本地 D1/KV/R2 绑定与 schema 步骤已被 PROXY_PASSTHROUGH
+        # 条件跳过。
+        if: env.PROXY_PASSTHROUGH == 'true'
+        run: |
+          if [ ! -f "src/app/api/[...path]/route.ts" ]; then
+            echo "::error::代理透传模式要求 src/app/api/[...path]/route.ts 存在（v2.1.0+），当前源码缺失。"
+            exit 1
+          fi
+          # [..] 在 shell 中是 glob，直接 mv 出来再删再放回，避免任何模式展开歧义
+          mv "src/app/api/[...path]" /tmp/proxy-route-keep
+          rm -rf src/app/api
+          mkdir -p "src/app/api"
+          mv /tmp/proxy-route-keep "src/app/api/[...path]"
+          echo "::notice::PROXY_MODE 透传模式：已剥离全部业务 API 路由，edge 仅保留 /api/[...path] 代理转发文件"
+          echo "剩余 src/app/api 结构:"
+          find src/app/api -type f | sort
 
       - name: Build with OpenNext (Pages/Workers 共用)
         run: |
@@ -1338,6 +1365,14 @@ jobs:
               echo "✓ /health → 200(worker 启动 + 路由健康)"
               DDETAIL=$(curl -sS -m 20 -w '\n%{http_code}' "$DEPLOY_URL/health/detailed" 2>/dev/null || echo "")
               echo "::notice::/health/detailed 诊断(503 属空库业务检查, 非部署失败): ${DDETAIL:-'(请求失败)'}"
+              exit 0
+            fi
+            # v2.1.0：PROXY_MODE 代理透传模式下 edge 无数据库绑定 —— /health 的
+            # 数据库检查预期 unhealthy(HTTP 503 JSON, status:"unhealthy")。
+            # worker 能正常响应 503 即代表部署成功(路由通 + worker 启动)，
+            # 不再重试 6 次白等后 fail hard。
+            if [ "${PROXY_PASSTHROUGH:-false}" = "true" ] && [ "$CODE" = "503" ]; then
+              echo "✓ /health → 503(代理透传模式预期：edge 无数据库绑定, worker 正常响应)"
               exit 0
             fi
             sleep 5

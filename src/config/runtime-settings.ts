@@ -59,20 +59,9 @@ export const EDITABLE_SETTINGS: {
     description: "过期验证记录的保留天数",
     kind: "number",
   },
-  {
-    key: APP_SETTING_KEYS.telegramProxyEnabled,
-    label: "Telegram API 代理（Node）",
-    description:
-      "Node 环境通过 HTTP 前缀代理连接 api.telegram.org（代理网络失败自动回退直连；Cloudflare 部署始终直连，不受本项影响）",
-    kind: "boolean",
-  },
-  {
-    key: APP_SETTING_KEYS.telegramProxyUrl,
-    label: "Telegram 代理地址（URL 前缀）",
-    description:
-      "代理前缀，内含 Basic 鉴权（用户名:密码@主机/路径）；最终请求为 <前缀>https://api.telegram.org/...，保存后立即生效无需重启",
-    kind: "text",
-  },
+  // v2.0.15：Telegram 代理配置（telegram.proxy_enabled / telegram.proxy_url）已从系统设置
+  // 迁移到「机器人测试 → 仿真屏盾牌图标 → 代理偏好设置」面板（APP 风格，含连通性测试与
+  // 线上 Edge 站代理一键接入），仍存储于同一批 app_settings 键，历史配置无损迁移。
 ];
 
 function toNumber(value: string | undefined, fallback: number): number {

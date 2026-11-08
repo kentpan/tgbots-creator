@@ -13,7 +13,12 @@
  *   绝不经 acquireMenuBot 启动轮询 runtime（无效 token 时启动链路卡死 20s+）。
  */
 import { Bot } from "grammy";
-import { listBots } from "@/database/operations";
+import {
+  getGroupBotAdminByBotAndChat,
+  listBots,
+  upsertGroupBotAdmin,
+} from "@/database/operations";
+import { mergeGroupBotAdminRights } from "@/services/invite-link";
 import {
   BOT_ADMIN_RIGHT_KEYS,
   BOT_ADMIN_RIGHT_LABELS,
@@ -84,6 +89,29 @@ export const PROMOTE_SELF_GUIDE =
   "Telegram 官方限制：机器人无法提升自己为管理员（can't promote self），也无法修改自己的权限。" +
   "请打开 Telegram 客户端：群设置 → 管理员 → 添加管理员 → 选择该机器人并勾选权限 → 保存；" +
   "完成后回到本弹窗重新点击「保存」，系统将自动读取并同步 Telegram 实际权限。";
+
+/**
+ * v2.0.14：机器人管理员权限落库（合并写入，全局唯一实现）。
+ *
+ * group_bot_admins.rights 列由「机器人权限配置」与「一键部署状态」共用 ——
+ * 旧实现整列覆盖（JSON.stringify(rights)），权限保存会把部署保存的 invite_link /
+ * deploy_mode 抹掉，导致下次部署找不到旧链接又新建（「每次部署都生成新链接」
+ * 的帮凶之一）；反向部署保存也会抹掉权限集合。统一改走合并：保留既有字段，
+ * 仅覆盖本次的 can_* 权限集合。
+ */
+export async function saveGroupBotAdminRights(
+  botId: bigint,
+  chatId: bigint,
+  rights: BotAdminRights,
+): Promise<void> {
+  const row = await getGroupBotAdminByBotAndChat(botId, chatId);
+  await upsertGroupBotAdmin({
+    botId,
+    chatId,
+    rights: mergeGroupBotAdminRights(row?.rights ?? null, rights as unknown as Record<string, unknown>),
+    status: "active",
+  });
+}
 
 /** v1.2.0：401（Token 失效）替代原始 GrammyError 描述的可读中文 */
 export const INVALID_TOKEN_GUIDE =

@@ -12,7 +12,6 @@ import {
   getBot,
   getGroupBotAdmin,
   getGroupSettings,
-  upsertGroupBotAdmin,
   upsertGroupSettings,
   updateBotRecord,
 } from "@/database/operations";
@@ -33,6 +32,7 @@ import {
   actualRightsFromMember,
   findPromoterBot,
   formatRights,
+  saveGroupBotAdminRights,
 } from "@/services/bot-group-admin-sync";
 import { BOT_ADMIN_RIGHT_KEYS, type BotAdminRights } from "@/services/bot-admin-rights";
 
@@ -477,7 +477,7 @@ export async function setBotGroupAdminAction(formData: FormData): Promise<void> 
       member = await withTelegramTimeout(api.getChatMember(chatIdNum, me.id));
     } catch (error) {
       // 机器人不在群/群不可见：无法读取也无法提升 → 保存本地配置 + 指引
-      await upsertGroupBotAdmin({ botId: bot.id, chatId, rights: JSON.stringify(rights) });
+      await saveGroupBotAdminRights(bot.id, chatId, rights);
       await updateBotRecord(bot.id, { username: me.username });
       const { describeSyncError } = await import("@/services/telegram-sync");
       const detail = describeSyncError(error).slice(0, 120);
@@ -496,7 +496,7 @@ export async function setBotGroupAdminAction(formData: FormData): Promise<void> 
     if (member.status === "administrator") {
       // 已是管理员：以 Telegram 实际权限为准保存（真实同步）
       const actual = actualRightsFromMember(member);
-      await upsertGroupBotAdmin({ botId: bot.id, chatId, rights: JSON.stringify(actual) });
+      await saveGroupBotAdminRights(bot.id, chatId, actual);
       await updateBotRecord(bot.id, { username: me.username });
       const diffKeys = BOT_ADMIN_RIGHT_KEYS.filter((key) => Boolean(rights[key]) !== Boolean(actual[key]));
       notice =
@@ -523,14 +523,14 @@ export async function setBotGroupAdminAction(formData: FormData): Promise<void> 
         const after = await withTelegramTimeout(promoter.api.getChatMember(chatIdNum, me.id));
         if (after.status === "administrator") {
           const actual = actualRightsFromMember(after);
-          await upsertGroupBotAdmin({ botId: bot.id, chatId, rights: JSON.stringify(actual) });
+          await saveGroupBotAdminRights(bot.id, chatId, actual);
           notice = `已通过提升者 @${promoter.username ?? "bot"} 真实提升为管理员并同步实际权限：${formatRights(actual)}`;
         } else {
-          await upsertGroupBotAdmin({ botId: bot.id, chatId, rights: JSON.stringify(rights) });
+          await saveGroupBotAdminRights(bot.id, chatId, rights);
           notice = "提升请求已发送，复查显示机器人尚未成为管理员（Telegram 可能延迟），已保存所配权限，稍后可重新保存同步";
         }
       } else {
-        await upsertGroupBotAdmin({ botId: bot.id, chatId, rights: JSON.stringify(rights) });
+        await saveGroupBotAdminRights(bot.id, chatId, rights);
         await updateBotRecord(bot.id, { username: me.username });
         notice = `已保存权限配置。${PROMOTE_SELF_GUIDE}`;
       }

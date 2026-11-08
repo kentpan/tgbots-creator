@@ -1,4 +1,3 @@
-import { headers } from "next/headers";
 import { requirePermission } from "@/lib/auth";
 import {
   countPendingJoinRequestsByChat,
@@ -7,8 +6,6 @@ import {
   listGroupBotAdmins,
   listVerificationMethods,
 } from "@/database/operations";
-import { listXianyuProducts } from "@/database/xianyu-operations";
-import { listVerifyApiKeys } from "@/services/verify-codes";
 import { parseBotMenuConfig } from "@/services/bot-menu";
 import { parseGroupDeployState } from "@/services/group-deploy";
 import type { BotMenuConfig } from "@/services/menu-config";
@@ -24,21 +21,13 @@ function maskToken(token: string): string {
 export default async function BotTestingPage() {
   await requirePermission("bots:view");
 
-  const [bots, groups, methods, botAdmins, products, apiKeys, requestHeaders, pendingByChat] =
-    await Promise.all([
-      listBots(),
-      listGroupSettings(),
-      listVerificationMethods(),
-      listGroupBotAdmins(),
-      listXianyuProducts(100),
-      listVerifyApiKeys(),
-      headers(),
-      countPendingJoinRequestsByChat(),
-    ]);
-
-  const proto = requestHeaders.get("x-forwarded-proto") ?? "http";
-  const host = requestHeaders.get("host") ?? "localhost:3000";
-  const origin = `${proto}://${host}`;
+  const [bots, groups, methods, botAdmins, pendingByChat] = await Promise.all([
+    listBots(),
+    listGroupSettings(),
+    listVerificationMethods(),
+    listGroupBotAdmins(),
+    countPendingJoinRequestsByChat(),
+  ]);
 
   // 同 Token 的机器人条目归为一组（如「交付机器人」与「加群验证机器人」共用同一 Token），
   // 测试任一条目时均可使用该 Token 关联的全部群组。
@@ -97,20 +86,6 @@ export default async function BotTestingPage() {
       botGroupLinks={botGroupLinks}
       groups={groupOptions}
       menuConfigs={menuConfigs}
-      initialProducts={products.map((product) => ({
-        id: String(product.id),
-        externalId: product.externalId,
-        title: product.title,
-        price: product.price,
-        description: product.description,
-        imageUrl: product.imageUrl,
-        detailJson: product.detailJson,
-        sourceUrl: product.sourceUrl,
-        rawJson: product.rawJson,
-        createdTime: product.createdTime.toISOString(),
-      }))}
-      origin={origin}
-      demoApiKey={apiKeys[0] ?? ""}
     />
   );
 }

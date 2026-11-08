@@ -3,9 +3,11 @@ import {
   getGlobalStats,
   getGroupSettings,
   getPendingCodeContext,
+  listBots,
   resolveVerificationChannel,
   isSuperGroupChatId,
 } from "@/database/operations";
+import { acquireStableGroupInviteLink } from "@/services/invite-link";
 import { formatBeijingDateTime } from "@/utils/datetime";
 import { config } from "@/config/settings";
 import { adminOnly } from "../filters";
@@ -43,11 +45,28 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
     }
     // v2.0.12：基础群不支持 creates_join_request 邀请链接（Telegram 限制），
     // 自动回退普通链接（买家点链接直接进群 → chat_member 补验证私聊发码）
+    // v2.0.14：不再每次 /start 都新建一条链接（旧实现买家每点一次深链就多一条
+    // 链接，且与一键部署保存的链接不一致）—— 统一走规范链接管道：优先复用
+    // 一键部署保存的链接（editChatInviteLink 存活探测，死链自动重建并落库），
+    // 保证买家拿到的永远与部署面板展示的是同一条有效链接。
     const superGroup = isSuperGroupChatId(chatId);
-    const invite = await ctx.api.createChatInviteLink(Number(chatId), {
-      ...(superGroup ? { creates_join_request: true } : {}),
-      name: "TGuard 加群验证",
-    });
+    let inviteLink: string;
+    try {
+      const bots = await listBots();
+      const botRow = bots.find((item) => item.enabled && item.token === ctx.api.token);
+      const acquired = await acquireStableGroupInviteLink({
+        api: ctx.api,
+        chatId,
+        superGroup,
+        botId: botRow?.id ?? null,
+        meta: { chat_title: settings.chatTitle ?? null },
+      });
+      inviteLink = acquired.invite_link;
+    } catch (error) {
+      console.error("cmdStart: acquire invite link failed:", error);
+      await ctx.reply("⚠️ 生成入群链接失败，请稍后重试；若持续失败请联系管理员重新部署该群组。");
+      return;
+    }
     const title = settings.chatTitle ?? "群组";
     // v2.0.12 三态验证渠道文案：群内模式（超级群 auto/显式 group）申请后自动进群、群内按钮验证；
     // 私聊模式保持 v1.1.3 文案（私聊提示、群内零消息）；基础群提示直连入群补验证
@@ -59,7 +78,7 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
           "• 按私聊提示输入验证码，校验通过后自动进群";
     await ctx.reply(
       `🔐 点击下方按钮申请加入「${title}」。\n\n${flowLines}`,
-      { reply_markup: new InlineKeyboard().url("🔄 申请加入群组", invite.invite_link) },
+      { reply_markup: new InlineKeyboard().url("🔄 申请加入群组", inviteLink) },
     );
     return;
   }

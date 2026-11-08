@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentAdmin, hasPermission, logOperation } from "@/lib/auth";
 import { headers } from "next/headers";
-import { getBot, listGroupBotAdmins, listGroupSettings } from "@/database/operations";
+import { getAppSetting, getBot, listGroupBotAdmins, listGroupSettings, setAppSetting } from "@/database/operations";
 import { fetchRealGroups } from "@/services/telegram-sync";
 import { registerTelegramChat } from "@/services/chat-registry";
 
@@ -154,6 +154,31 @@ export async function POST(request: Request): Promise<NextResponse> {
     });
   }
 
+  // v2.0.15 新建群组自动绑定：登记中的「待绑定群组」（telegram.pending_groups）
+  // 在同步发现同名真实群组时自动消除（群组本身已由 registerTelegramChat 正常登记）
+  let autoBoundCount = 0;
+  try {
+    const pendingRaw = await getAppSetting("telegram.pending_groups");
+    if (pendingRaw) {
+      const parsed = JSON.parse(pendingRaw) as { id: string; bot_id: string; title: string }[];
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const titles = new Set(synced.map((item) => item.chat_title.trim()));
+        const next = parsed.filter((item) => {
+          if (String(item.bot_id) === String(botId) && titles.has(item.title.trim())) {
+            autoBoundCount += 1;
+            return false;
+          }
+          return true;
+        });
+        if (next.length !== parsed.length) {
+          await setAppSetting("telegram.pending_groups", JSON.stringify(next));
+        }
+      }
+    }
+  } catch {
+    // 待绑定清理失败不影响同步主流程
+  }
+
   const requestHeaders = await headers();
   await logOperation(admin, {
     action: "同步真实群组",
@@ -163,6 +188,9 @@ export async function POST(request: Request): Promise<NextResponse> {
   });
 
   const notes: string[] = [];
+  if (autoBoundCount > 0) {
+    notes.push(`已自动绑定新建群组 ${autoBoundCount} 个（待绑定条目已消除）`);
+  }
   if (synced.length === 0) {
     notes.push(
       "未发现机器人所在的群组：把机器人拉进目标群组并设为管理员（管理员可收到全部群消息），在群里发一条消息或重新拉一次机器人，数秒后点「同步真实群组」即可发现。",

@@ -19,8 +19,20 @@ export async function register(): Promise<() => Promise<void>> {
   // 高延迟出站网络（实测 IPv4 握手 ~240ms 擦边必输、IPv6 ENETUNREACH）下所有
   // fetch 全部 ETIMEDOUT——外部验证接口因此「一直网络异常」（2026-11-03 实测，
   // 修复后同一路径 2/3 成功）。2000ms 是 Node 官方 API 的合法取值范围。
-  const net = await import("node:net");
-  net.setDefaultAutoSelectFamilyAttemptTimeout(2000);
+  // v2.1.0: 改用 process.getBuiltinModule —— 静态 await import("node:net") 会被
+  // Turbopack 打进 Edge 产物（每次编译刷「node:net is not supported in the Edge
+  // Runtime」告警 + Ecmascript file had an error）；getBuiltinModule 无法被静态
+  // 追踪，仅在 Node 22.3+ 运行时取用，缺失时安全跳过（仅损失该调优）。
+  const getBuiltinModule = (
+    process as unknown as {
+      getBuiltinModule?: (
+        id: string,
+      ) => { setDefaultAutoSelectFamilyAttemptTimeout: (timeout: number) => void } | undefined;
+    }
+  ).getBuiltinModule;
+  if (typeof getBuiltinModule === "function") {
+    getBuiltinModule.call(process, "node:net")?.setDefaultAutoSelectFamilyAttemptTimeout(2000);
+  }
 
   // Node 出站代理补丁：必须在任何 Bot 实例 / Telegram 请求之前装载
   const { installTelegramProxyFetch } = await import("@/lib/telegram/transport");

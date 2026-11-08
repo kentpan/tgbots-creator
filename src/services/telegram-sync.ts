@@ -169,6 +169,22 @@ export async function approveJoinRequestRemote(
   }
 }
 
+/** 真实拒绝加群申请（v2.0.16 仿真屏加群申请列表「拒绝申请」按钮：declineChatJoinRequest） */
+export async function declineJoinRequestRemote(
+  token: string,
+  chatId: bigint,
+  userId: bigint,
+): Promise<SyncActionResult> {
+  try {
+    await withTelegramTimeout(
+      botByToken(token).api.declineChatJoinRequest(Number(chatId), Number(userId)),
+    );
+    return { ok: true, error: null };
+  } catch (error) {
+    return { ok: false, error: describeSyncError(error) };
+  }
+}
+
 /** 为 grammy API 调用附加超时限制（grammy 默认无超时，沙箱/断网时会永久挂起） */
 export async function withTelegramTimeout<T>(promise: Promise<T>): Promise<T> {
   return await Promise.race([

@@ -37,6 +37,15 @@
  *   （tgOutbound 字段），describeSyncError 会将其转成人话附在管理端错误信息里，
  *   线上不再只剩一句「网络不可达」。
  *
+ * v2.1.0 多代理回退链（Node 出站）：
+ * - 代理不再只有「选中条目」一条路：系统设置 telegram.proxy_entries 里的全部条目
+ *   组成回退链（选中条目最优先 → 其余条目依次兜底 → 全部失败才直连回退）。
+ * - 粘性游标：某条目失败后自动前进到下一候选；新候选成功后后续请求直接从它开始
+ *   （用户改选条目时游标归零）。线上 Edge 站代理端点未部署/故障时，本地开发不再
+ *   每个请求都失败刷屏，自动落到可用条目（如 kent 网关）。
+ * - 失败告警按条目 60s 限流，杜绝轮询场景的日志刷屏；诊断 attempts 增加 via
+ *   （命中的代理条目名）。
+ *
  * 接入方式：
  * - grammY：telegramBotClientOptions() 已注入 client.fetch（grammY 在 Node 下默认用
  *   node-fetch，不经过 globalThis.fetch，必须显式注入）
@@ -55,6 +64,7 @@ export const DEFAULT_TELEGRAM_PROXY_URL = "https://ayue222:12345678@kent.ccwu.cc
 export const TELEGRAM_PROXY_SETTING_KEYS = {
   enabled: "telegram.proxy_enabled",
   url: "telegram.proxy_url",
+  entries: "telegram.proxy_entries",
 } as const;
 
 export function telegramUpstreamRoot(): string {
@@ -82,14 +92,30 @@ export function telegramBotClientOptions(): { client: ApiClientOptions } {
 // 代理配置（系统设置 app_settings，15s 内存缓存）
 // ---------------------------------------------------------------------------
 
+/** 代理候选条目（v2.1.0 回退链单元） */
+interface ProxyCandidate {
+  /** 原始地址（可含 userinfo 内嵌凭据） */
+  url: string;
+  /** 日志/诊断用名称 */
+  label: string;
+}
+
 interface TelegramProxyState {
   enabled: boolean;
   url: string;
+  /** v2.1.0: telegram.proxy_entries 全量条目（回退链数据源） */
+  entries: ProxyCandidate[];
   loadedAt: number;
+  /** v2.1.0: 代理回退链粘性游标（失败自动前进，成功后停在命中的条目） */
+  proxyCursor: number;
+  /** v2.1.0: 上次见到的选中地址（变更时重置游标） */
+  configUrlSeen: string;
   /** 直连回退连续失败计数（≥2 触发熔断，10 分钟内不再尝试直连） */
   directFailCount: number;
   /** 直连熔断截止时间戳（ms） */
   directBlockedUntil: number;
+  /** v2.1.0: 告警限流表（key → 上次输出时间戳） */
+  warnAt: Map<string, number>;
 }
 
 const globalForTransport = globalThis as unknown as { tguardTelegramProxy?: TelegramProxyState };
@@ -100,9 +126,13 @@ function proxyState(): TelegramProxyState {
     globalForTransport.tguardTelegramProxy = {
       enabled: true,
       url: DEFAULT_TELEGRAM_PROXY_URL,
+      entries: [],
       loadedAt: 0,
+      proxyCursor: 0,
+      configUrlSeen: "",
       directFailCount: 0,
       directBlockedUntil: 0,
+      warnAt: new Map<string, number>(),
     };
   }
   return globalForTransport.tguardTelegramProxy;
@@ -130,12 +160,20 @@ export async function ensureTelegramProxyConfig(): Promise<void> {
   proxyRefreshInFlight = (async () => {
     try {
       const { getAppSetting } = await import("@/database/operations");
-      const [enabledRaw, urlRaw] = await Promise.all([
+      const [enabledRaw, urlRaw, entriesRaw] = await Promise.all([
         getAppSetting(TELEGRAM_PROXY_SETTING_KEYS.enabled),
         getAppSetting(TELEGRAM_PROXY_SETTING_KEYS.url),
+        getAppSetting(TELEGRAM_PROXY_SETTING_KEYS.entries),
       ]);
       current.enabled = enabledRaw !== "false"; // 未设置时默认开启
-      current.url = urlRaw?.trim() || DEFAULT_TELEGRAM_PROXY_URL;
+      const selectedUrl = urlRaw?.trim() ?? "";
+      current.entries = parseProxyEntries(entriesRaw);
+      // 用户改选条目时重置粘性游标，从新选中条目重新开始
+      if (selectedUrl !== current.configUrlSeen) {
+        current.configUrlSeen = selectedUrl;
+        current.proxyCursor = 0;
+      }
+      current.url = selectedUrl || DEFAULT_TELEGRAM_PROXY_URL;
     } catch {
       // 读取失败保持现状
     } finally {
@@ -151,6 +189,89 @@ export function invalidateTelegramProxyConfig(): void {
   proxyState().loadedAt = 0;
 }
 
+/**
+ * v2.0.16：代理开启但未选中任何条目（url 为空）时回退到内置默认代理 ——
+ * 与代理面板语义一致（已开启 = 所有 api.telegram.org 请求走代理），
+ * 绝不静默直连（沙盒/被墙环境直连只会白等超时）。只有显式关闭开关才直连。
+ */
+function effectiveProxyUrl(config: TelegramProxyState): string | null {
+  if (!config.enabled) return null;
+  return config.url.trim() || DEFAULT_TELEGRAM_PROXY_URL;
+}
+
+// ---------------------------------------------------------------------------
+// v2.1.0 多代理回退链（Node 出站）：entries 解析 / 候选排序 / 告警限流
+// ---------------------------------------------------------------------------
+
+/** 从系统设置 telegram.proxy_entries 解析代理条目列表（JSON 数组，容错解析） */
+function parseProxyEntries(raw: string | null | undefined): ProxyCandidate[] {
+  if (!raw?.trim()) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const list: ProxyCandidate[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const record = item as { url?: unknown; label?: unknown };
+      if (typeof record.url !== "string" || !record.url.trim()) continue;
+      const url = record.url.trim();
+      list.push({
+        url,
+        label: typeof record.label === "string" && record.label.trim() ? record.label.trim() : proxyLabelOf(url),
+      });
+    }
+    return list;
+  } catch {
+    return [];
+  }
+}
+
+/** 代理条目日志名：host + 非根路径（不含 userinfo/query，可安全打印） */
+function proxyLabelOf(url: string): string {
+  try {
+    const parsed = new URL(splitProxyAuth(url)?.cleanPrefix ?? url);
+    return parsed.host + (parsed.pathname && parsed.pathname !== "/" ? parsed.pathname : "");
+  } catch {
+    return url;
+  }
+}
+
+/** 代理回退链：选中条目最优先 → 其余条目 → （全空时）内置默认代理 */
+function orderedProxyCandidates(config: TelegramProxyState): ProxyCandidate[] {
+  if (!config.enabled) return [];
+  const list: ProxyCandidate[] = [];
+  const push = (url: string, label?: string): void => {
+    const trimmed = url?.trim();
+    if (!trimmed) return;
+    if (list.some((item) => item.url === trimmed)) return;
+    list.push({ url: trimmed, label: label?.trim() || proxyLabelOf(trimmed) });
+  };
+  push(config.url);
+  for (const entry of config.entries) push(entry.url, entry.label);
+  if (list.length === 0) push(DEFAULT_TELEGRAM_PROXY_URL, "内置默认代理");
+  return list;
+}
+
+/** 同一原因的告警 60s 内只输出一次（轮询场景防刷屏） */
+const WARN_RATE_LIMIT_MS = 60_000;
+function warnRateLimited(key: string, message: string): void {
+  const state = proxyState();
+  const now = Date.now();
+  if (now - (state.warnAt.get(key) ?? 0) < WARN_RATE_LIMIT_MS) return;
+  state.warnAt.set(key, now);
+  console.warn(message);
+}
+
+/** 代理候选响应可用性（v2.1.0）：/bot API 恒返回 JSON，3xx 重定向与 HTML 错误页
+ *  （部署站旧版无 tg-proxy 路由 → 308→404 页、CF 挑战页）视为候选失败继续回退链 */
+function isUsableProxyResponse(pathname: string, response: Response): boolean {
+  if (response.status >= 300 && response.status < 400) return false;
+  if (pathname.startsWith("/file/")) return true; // 文件下载为二进制，非 JSON 响应放行
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType && !/json/i.test(contentType)) return false;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // 请求改写
 // ---------------------------------------------------------------------------
@@ -163,8 +284,9 @@ export function applyProxyPrefix(prefix: string, upstreamRoot: string): string {
   return `${trimmed}/${upstreamRoot}`;
 }
 
-/** 拆出代理地址中的 Basic 鉴权（undici 禁止 URL 内嵌凭据），返回净化后的前缀与鉴权头 */
-function splitProxyAuth(prefix: string): { cleanPrefix: string; authHeader: string | null } | null {
+/** 拆出代理地址中的 Basic 鉴权（undici 禁止 URL 内嵌凭据），返回净化后的前缀与鉴权头。
+ *  v2.0.15 导出：代理面板 ping 测试复用同一拆分规则（URL 内嵌凭据 → Authorization 头） */
+export function splitProxyAuth(prefix: string): { cleanPrefix: string; authHeader: string | null } | null {
   try {
     const url = new URL(prefix);
     const authHeader =
@@ -234,6 +356,8 @@ const globalForPatch = globalThis as unknown as { tguardProxyFetchInstalled?: bo
 export interface TgOutboundAttempt {
   /** direct=直连；proxy=系统设置代理；direct-retry=直连重试（全新连接） */
   path: "direct" | "proxy" | "direct-retry";
+  /** v2.1.0: 命中的代理条目名（多代理回退链诊断用；直连尝试无此字段） */
+  via?: string;
   ms: number;
   /** 网络层错误消息（不含 token，可安全透出） */
   error?: string;
@@ -414,8 +538,9 @@ async function resolveEdgeProxyRewrite(
 
   await ensureTelegramProxyConfig();
   const config = proxyState();
-  if (!config.enabled || !config.url.trim()) return null;
-  const parts = splitProxyAuth(config.url);
+  const proxyUrl = effectiveProxyUrl(config);
+  if (!proxyUrl) return null;
+  const parts = splitProxyAuth(proxyUrl);
   if (!parts) return null;
   return {
     url: applyProxyPrefix(parts.cleanPrefix, telegramUpstreamRoot()) + target.pathname + target.search,
@@ -459,28 +584,18 @@ export function telegramProxyFetch(): typeof fetch {
 
     await ensureTelegramProxyConfig();
     const config = proxyState();
-    if (!config.enabled || !config.url.trim()) {
+
+    // v2.1.0 多代理回退链：选中条目优先，其余代理条目依次兜底，全部失败才直连回退
+    const candidates = orderedProxyCandidates(config);
+    if (candidates.length === 0) {
       return underlying()(input as Request, init);
     }
-
-    const parts = splitProxyAuth(config.url);
-    if (!parts) {
-      console.warn("[telegram-proxy] 代理地址不合法，本次请求直连:", config.url);
-      return underlying()(input as Request, init);
-    }
-
-    const finalUrl =
-      applyProxyPrefix(parts.cleanPrefix, telegramUpstreamRoot()) + target.pathname + target.search;
-    const headers = new Headers(
-      typeof input === "object" && !(input instanceof URL) ? input.headers : (init?.headers ?? undefined),
-    );
-    if (parts.authHeader) headers.set("Authorization", parts.authHeader);
 
     const aborted =
       init?.signal?.aborted === true ||
       (typeof input === "object" && !(input instanceof URL) && input.signal?.aborted === true);
 
-    // v2.0.4 出站诊断：整条失败链（代理→代理重试→直连）逐次记录，附到最终抛出的错误
+    // v2.0.4 出站诊断：整条失败链（各代理条目→直连）逐次记录，附到最终抛出的错误
     const diagStartedAt = Date.now();
     const diagAttempts: TgOutboundAttempt[] = [];
     const attachDiag = (error: unknown): void => {
@@ -501,110 +616,164 @@ export function telegramProxyFetch(): typeof fetch {
     const isLongPoll = method === "getUpdates";
     const attemptTimeoutMs = isLongPoll ? 35000 : 20000;
 
-    const callViaProxy = async (): Promise<Response> => {
-      // 单次尝试超时 + 调用方 signal 合并（任一触发即中止）
-      const attemptController = new AbortController();
-      const attemptTimer = setTimeout(
-        () => attemptController.abort(new Error(`Telegram 请求超时（${attemptTimeoutMs / 1000}s）`)),
-        attemptTimeoutMs,
-      );
-      if (typeof attemptTimer === "object" && attemptTimer && "unref" in attemptTimer) {
-        (attemptTimer as { unref: () => void }).unref();
-      }
-      const sourceSignal = toNativeSignal(init?.signal);
-      if (sourceSignal) {
-        if (sourceSignal.aborted) attemptController.abort(sourceSignal.reason);
-        else
-          sourceSignal.addEventListener("abort", () => attemptController.abort(sourceSignal.reason), {
-            once: true,
-          });
-      }
-      try {
-        if (typeof input === "object" && !(input instanceof URL)) {
-          // Request 形态：拆出字段重建（undici 同样校验 Request 内的 signal）
-          const req = input as Request;
-          const initHeaders = new Headers(init?.headers ?? req.headers);
-          if (parts.authHeader) initHeaders.set("Authorization", parts.authHeader);
-          const reqMethod = init?.method ?? req.method;
-          const body = init?.body ?? (reqMethod !== "GET" && reqMethod !== "HEAD" ? req.body : undefined);
-          return await underlying()(finalUrl, {
-            method: reqMethod,
-            headers: initHeaders,
-            body,
-            signal: attemptController.signal,
-            ...(body && typeof body !== "string" ? { duplex: "half" as const } : {}),
-          });
+    /** 单候选调用：一次尝试；allowRetry 时网络层失败用全新连接重试一次 */
+    const callViaProxy = async (
+      finalUrl: string,
+      authHeader: string | null,
+      allowRetry: boolean,
+    ): Promise<Response> => {
+      const attemptOnce = async (): Promise<Response> => {
+        // 单次尝试超时 + 调用方 signal 合并（任一触发即中止）
+        const attemptController = new AbortController();
+        const attemptTimer = setTimeout(
+          () => attemptController.abort(new Error(`Telegram 请求超时（${attemptTimeoutMs / 1000}s）`)),
+          attemptTimeoutMs,
+        );
+        if (typeof attemptTimer === "object" && attemptTimer && "unref" in attemptTimer) {
+          (attemptTimer as { unref: () => void }).unref();
         }
-        return await underlying()(finalUrl, {
-          ...(init ?? {}),
-          headers,
-          signal: attemptController.signal,
-        });
-      } finally {
-        clearTimeout(attemptTimer);
+        const sourceSignal = toNativeSignal(init?.signal);
+        if (sourceSignal) {
+          if (sourceSignal.aborted) attemptController.abort(sourceSignal.reason);
+          else
+            sourceSignal.addEventListener("abort", () => attemptController.abort(sourceSignal.reason), {
+              once: true,
+            });
+        }
+        try {
+          if (typeof input === "object" && !(input instanceof URL)) {
+            // Request 形态：拆出字段重建（undici 同样校验 Request 内的 signal）
+            const req = input as Request;
+            const initHeaders = new Headers(init?.headers ?? req.headers);
+            if (authHeader) initHeaders.set("Authorization", authHeader);
+            const reqMethod = init?.method ?? req.method;
+            const body = init?.body ?? (reqMethod !== "GET" && reqMethod !== "HEAD" ? req.body : undefined);
+            return await underlying()(finalUrl, {
+              method: reqMethod,
+              headers: initHeaders,
+              body,
+              signal: attemptController.signal,
+              // v2.1.0: 不跟随重定向 —— 代理站路径规范化会 308 到 HTML 页
+              // （404 页/挑战页），跟随只会把垃圾响应丢给 grammY 解析崩溃
+              redirect: "manual" as const,
+              ...(body && typeof body !== "string" ? { duplex: "half" as const } : {}),
+            });
+          }
+          const headers = new Headers(init?.headers ?? undefined);
+          if (authHeader) headers.set("Authorization", authHeader);
+          return await underlying()(finalUrl, {
+            ...(init ?? {}),
+            headers,
+            signal: attemptController.signal,
+            redirect: "manual", // 同上：不跟随代理站 308
+          });
+        } finally {
+          clearTimeout(attemptTimer);
+        }
+      };
+      try {
+        return await attemptOnce();
+      } catch (firstError) {
+        // 网络层失败先用全新连接重试一次（仅首个候选；keep-alive 半开连接
+        // 换新连接即可恢复 —— 实测呈「成功/失败交替」规律；非首个候选不重试，
+        // 避免坏条目把失败链拖到 40s+）
+        if (!allowRetry || aborted) throw firstError;
+        return await attemptOnce();
       }
     };
 
-    try {
-      return await callViaProxy();
-    } catch (firstError) {
-      diagAttempts.push({ path: "proxy", ms: Date.now() - diagStartedAt, error: outboundErrorMessage(firstError) });
-      if (aborted) {
-        attachDiag(firstError);
-        throw firstError;
-      }
-      const reason = firstError instanceof Error ? firstError.message : String(firstError);
-      // 网络层失败先用全新连接重试一次（前缀代理/CF Workers 会在空闲时半关 keep-alive
-      // 连接，undici 连接池复用半开连接会立即 ECONNRESET —— 换新连接即可成功，
-      // 实测呈「成功/失败交替」规律）；重试仍失败再回退直连（普通调用限 8s、
-      // getUpdates 长轮询限 20s，避免直连不可达环境长时间挂起 grammY 调用）。
-      try {
-        return await callViaProxy();
-      } catch (retryError) {
-        diagAttempts.push({ path: "proxy", ms: Date.now() - diagStartedAt, error: outboundErrorMessage(retryError) });
-        console.warn("[telegram-proxy] 代理请求失败（重试后放弃，回退直连）:", reason);
-        // v1.2.0 直连熔断：直连连续 2 次失败（网络不可达环境）后 10 分钟内
-        // 不再尝试直连回退 —— 避免每次失败路径都白等 8s 直连超时，
-        // 管理端操作的失败反馈从 25s+ 缩短到 20s 级
-        const breaker = proxyState();
-        if (Date.now() < breaker.directBlockedUntil) {
-          attachDiag(firstError);
-          throw firstError;
-        }
-        const fallbackTimeoutMs = isLongPoll ? 20000 : 8000;
-        const fallbackController = new AbortController();
-        const fallbackTimer = setTimeout(
-          () => fallbackController.abort(new Error(`直连回退超时（${fallbackTimeoutMs / 1000}s）`)),
-          fallbackTimeoutMs,
+    // ① 代理候选链：从粘性游标处开始，失败自动前进到下一候选（v2.1.0）
+    const initialCursor = config.proxyCursor % candidates.length;
+    let lastProxyError: unknown = null;
+    for (let offset = 0; offset < candidates.length; offset++) {
+      const idx = (initialCursor + offset) % candidates.length;
+      const candidate = candidates[idx];
+      const parts = splitProxyAuth(candidate.url);
+      if (!parts) {
+        warnRateLimited(
+          `bad-url:${candidate.url}`,
+          `[telegram-proxy] 代理条目「${candidate.label}」地址不合法，已跳过`,
         );
-        if (typeof fallbackTimer === "object" && fallbackTimer && "unref" in fallbackTimer) {
-          (fallbackTimer as { unref: () => void }).unref();
-        }
-        const fallbackSource = toNativeSignal(init?.signal);
-        if (fallbackSource) {
-          if (fallbackSource.aborted) fallbackController.abort(fallbackSource.reason);
-          else fallbackSource.addEventListener("abort", () => fallbackController.abort(fallbackSource.reason), { once: true });
-        }
-        try {
-          const response = await underlying()(input as Request, { ...(init ?? {}), signal: fallbackController.signal });
-          // 直连成功：重置熔断计数（网络恢复后自动回到「代理→直连」全链路）
-          breaker.directFailCount = 0;
-          breaker.directBlockedUntil = 0;
-          return response;
-        } catch (directError) {
-          diagAttempts.push({ path: "direct", ms: Date.now() - diagStartedAt, error: outboundErrorMessage(directError) });
-          breaker.directFailCount += 1;
-          if (breaker.directFailCount >= 2) {
-            breaker.directFailCount = 0;
-            breaker.directBlockedUntil = Date.now() + 10 * 60 * 1000;
-            console.warn("[telegram-proxy] 直连连续失败已熔断 10 分钟（期间仅走代理，不再尝试直连回退）");
-          }
-          attachDiag(directError);
-          throw directError;
-        } finally {
-          clearTimeout(fallbackTimer);
-        }
+        continue;
       }
+      const finalUrl =
+        applyProxyPrefix(parts.cleanPrefix, telegramUpstreamRoot()) + target.pathname + target.search;
+      try {
+        const response = await callViaProxy(finalUrl, parts.authHeader, offset === 0);
+        // v2.1.0 响应可用性校验：3xx 重定向页 / HTML 错误页视为该条目失败
+        // （上游 Bot API /bot 调用恒返回 JSON；部署站旧版无 tg-proxy 路由时会
+        // 308→404 HTML —— 不能把这种「成功」响应丢给 grammY 解析）
+        if (!isUsableProxyResponse(target.pathname, response)) {
+          void response.body?.cancel().catch(() => {}); // 及时释放底层连接
+          throw new Error(`代理返回非 API 响应（HTTP ${response.status}）`);
+        }
+        if (idx !== initialCursor) {
+          console.log(`[telegram-proxy] 代理链路已切换 → 「${candidate.label}」（后续请求优先使用该条目）`);
+        }
+        config.proxyCursor = idx;
+        return response;
+      } catch (error) {
+        if (aborted) {
+          attachDiag(error);
+          throw error;
+        }
+        lastProxyError = error;
+        diagAttempts.push({
+          path: "proxy",
+          via: candidate.label,
+          ms: Date.now() - diagStartedAt,
+          error: outboundErrorMessage(error),
+        });
+        config.proxyCursor = (idx + 1) % candidates.length;
+        warnRateLimited(
+          `proxy-fail:${candidate.label}`,
+          `[telegram-proxy] 代理条目「${candidate.label}」请求失败: ${outboundErrorMessage(error)}`,
+        );
+      }
+    }
+
+    // ② 全部代理候选失败 → 直连回退（v1.2.0 熔断逻辑不变：直连连续 2 次失败后
+    //    10 分钟内不再尝试直连，避免网络不可达环境每次白等超时）
+    const breaker = proxyState();
+    if (lastProxyError != null && Date.now() < breaker.directBlockedUntil) {
+      attachDiag(lastProxyError);
+      throw lastProxyError;
+    }
+    const fallbackTimeoutMs = isLongPoll ? 20000 : 8000;
+    const fallbackController = new AbortController();
+    const fallbackTimer = setTimeout(
+      () => fallbackController.abort(new Error(`直连回退超时（${fallbackTimeoutMs / 1000}s）`)),
+      fallbackTimeoutMs,
+    );
+    if (typeof fallbackTimer === "object" && fallbackTimer && "unref" in fallbackTimer) {
+      (fallbackTimer as { unref: () => void }).unref();
+    }
+    const fallbackSource = toNativeSignal(init?.signal);
+    if (fallbackSource) {
+      if (fallbackSource.aborted) fallbackController.abort(fallbackSource.reason);
+      else fallbackSource.addEventListener("abort", () => fallbackController.abort(fallbackSource.reason), { once: true });
+    }
+    try {
+      const response = await underlying()(input as Request, { ...(init ?? {}), signal: fallbackController.signal });
+      // 直连成功：重置熔断计数（网络恢复后自动回到「代理→直连」全链路）
+      breaker.directFailCount = 0;
+      breaker.directBlockedUntil = 0;
+      return response;
+    } catch (directError) {
+      diagAttempts.push({ path: "direct", ms: Date.now() - diagStartedAt, error: outboundErrorMessage(directError) });
+      breaker.directFailCount += 1;
+      if (breaker.directFailCount >= 2) {
+        breaker.directFailCount = 0;
+        breaker.directBlockedUntil = Date.now() + 10 * 60 * 1000;
+        warnRateLimited(
+          "direct-breaker",
+          "[telegram-proxy] 直连连续失败已熔断 10 分钟（期间仅走代理，不再尝试直连回退）",
+        );
+      }
+      attachDiag(directError);
+      throw directError;
+    } finally {
+      clearTimeout(fallbackTimer);
     }
   };
   return proxyFetch as typeof fetch;

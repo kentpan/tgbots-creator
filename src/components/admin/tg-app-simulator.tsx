@@ -1,13 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { opsFetch } from "@/lib/remote-ops";
 import {
-  Battery,
+  Check,
   ChevronRight,
   CircleUserRound,
   Hand,
   Heart,
+  Info,
   Link2,
   ListTree,
   Loader2,
@@ -20,9 +21,9 @@ import {
   Search,
   Settings2,
   ShieldCheck,
-  SignalHigh,
+  SquarePen,
+  UserRoundPlus,
   Users,
-  Wifi,
   X,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
@@ -32,20 +33,21 @@ import {
   type BotMenuConfig,
   type MenuTemplateVars,
 } from "@/services/menu-config";
-import { TgSimulator } from "@/components/admin/tg-simulator";
+import { TgDesktopChat } from "@/components/admin/tg-desktop-chat";
+import { TgProxyPanel } from "@/components/admin/tg-proxy-panel";
+import { TgNewGroupPanel, type NewGroupBot } from "@/components/admin/tg-new-group-panel";
 
 /**
- * iOS Telegram APP 仿真外壳（机器人测试页仿真屏）。
+ * Telegram 桌面客户端仿真外壳（机器人测试页仿真屏，v2.0.14）。
  *
- * 视图层栈（iOS push/pop 导航，左滑进入）：
- *   list     群组列表（顶部搜索框 + 群组行 + 底部 Tab，图1）
- *   chat     群内聊天界面（复用 TgSimulator：菜单消息 + 加群验证全流程）
- *   settings 群组设置（图2：iOS 群组信息页 + 与「群组管理」同源的验证配置）
- *   admins   机器人权限配置（图3：iOS 管理员权限页 + promoteChatMember 真实保存）
- *   join     加群确认面板（搜索框输入加群链接 → resolve-invite 解析 → 申请加入）
+ * 桌面双栏布局（复刻 Telegram Desktop macOS 截图1/截图2）：
+ *   · 左侧会话列表窗口卡（红绿灯标题栏 + 搜索框 + 群组行 + 底部 Tab，样式与旧版列表一致）
+ *   · 右侧群组内对话区域：未选会话时为壁纸空态（「选择一个会话开始聊天」），
+ *     点击左侧群组即在右侧打开聊天（TgDesktopChat），切换群组右侧同步切换
+ *   · 群组设置 / 机器人权限 / 加群确认面板 / 部署结果以浮层展示
  *
  * 数据边界：组件只做视图编排与 API 读写，群组数据/验证会话状态由父组件
- * （testing-client）持有，保证仿真屏与页面其他区域（会话徽章、闲鱼面板）状态一致。
+ * （testing-client）持有，保证仿真屏与页面上方（会话徽章）状态一致。
  */
 
 const NAME_COLORS = ["#e17076", "#faa774", "#a695e7", "#7bc862", "#6ec9cb", "#65aadd", "#ee7aae"];
@@ -58,32 +60,6 @@ function nameColor(name: string): string {
   let hash = 0;
   for (const char of name) hash = (hash * 31 + char.charCodeAt(0)) % 997;
   return NAME_COLORS[hash % NAME_COLORS.length];
-}
-
-function nowTime(): string {
-  const now = new Date();
-  return `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-}
-
-// —— 水合安全时钟（与 tg-simulator 同款 useSyncExternalStore 模式）——
-let appClockCache: { minute: number; value: string } = { minute: -1, value: "" };
-
-function subscribeClock(onStoreChange: () => void): () => void {
-  const timer = window.setInterval(onStoreChange, 15000);
-  return () => window.clearInterval(timer);
-}
-
-function getClockSnapshot(): string {
-  const now = new Date();
-  const minute = now.getHours() * 60 + now.getMinutes();
-  if (appClockCache.minute !== minute) {
-    appClockCache = { minute, value: nowTime() };
-  }
-  return appClockCache.value;
-}
-
-function getServerClockSnapshot(): string {
-  return "";
 }
 
 export interface AppSimGroup {
@@ -124,6 +100,18 @@ interface BotAdminEntry {
   rights: Record<string, boolean>;
 }
 
+/** v2.0.16 待处理加群申请（/api/admin/bots/testing/join-requests GET 返回项） */
+interface PendingJoinRequest {
+  id: string;
+  token: string;
+  user_id: string;
+  username: string | null;
+  first_name: string;
+  last_name: string | null;
+  request_time: string;
+  request_type: string;
+}
+
 /** 与 bots/actions.ts BOT_ADMIN_RIGHT_KEYS 一致（Telegram promoteChatMember 支持的 8 项） */
 const ADMIN_RIGHTS: { key: string; label: string; hint: string }[] = [
   { key: "can_change_info", label: "修改群组信息", hint: "更改群名称、头像与描述" },
@@ -136,12 +124,11 @@ const ADMIN_RIGHTS: { key: string; label: string; hint: string }[] = [
   { key: "can_manage_chat", label: "管理聊天", hint: "默认管理员基础权限" },
 ];
 
-type Screen = "list" | "chat" | "settings" | "admins";
-
-const NAV_VARIANTS = {
-  enter: (dir: "fwd" | "back") => ({ x: dir === "fwd" ? "100%" : "-28%" }),
+/** 浮层动画（设置/权限/加群确认面板：右侧滑入） */
+const OVERLAY_VARIANTS = {
+  enter: { x: "100%" },
   center: { x: "0%" },
-  exit: (dir: "fwd" | "back") => ({ x: dir === "fwd" ? "-28%" : "100%" }),
+  exit: { x: "100%" },
 };
 
 /** 列表时间列：当天显示 HH:mm，更早显示 M/D（与真实 Telegram 会话列表一致） */
@@ -165,7 +152,7 @@ function formatListTime(iso: string): string {
  * match the client" hydration 错误。因此 mount 前与 SSR 保持一致渲染空字符串，
  * mount 后再写入本地时区时间，并每 30 秒刷新（保证跨天 M/D 判定持续正确）。
  */
-function ListTime({ iso }: { iso: string }) {
+function ListTime({ iso, active }: { iso: string; active?: boolean }) {
   const [value, setValue] = useState("");
   useEffect(() => {
     const update = (): void => setValue(formatListTime(iso));
@@ -173,7 +160,9 @@ function ListTime({ iso }: { iso: string }) {
     const timer = window.setInterval(update, 30000);
     return () => window.clearInterval(timer);
   }, [iso]);
-  return <span className="shrink-0 text-[13px] text-[#8e8e93]">{value}</span>;
+  return (
+    <span className={`shrink-0 text-[13px] ${active ? "text-white/85" : "text-[#8e8e93]"}`}>{value}</span>
+  );
 }
 
 function methodLabel(method: string | null): string {
@@ -218,6 +207,74 @@ function IosRowIcon({ bg, children }: { bg: string; children: React.ReactNode })
   );
 }
 
+/**
+ * Telegram 桌面端绿色涂鸦壁纸（截图1/截图2 背景）：
+ * 绿色渐变底 + 白色描边涂鸦图案（SVG pattern 内联渲染，避免 data-URI 编码问题）。
+ */
+function DoodleWallpaper() {
+  return (
+    <div className="pointer-events-none absolute inset-0 overflow-hidden" style={{ backgroundColor: "#94bd8a" }} aria-hidden>
+      <div
+        className="absolute inset-0"
+        style={{ backgroundImage: "linear-gradient(160deg, #a9cb9a 0%, #8fb886 48%, #9dc191 100%)" }}
+      />
+      <svg className="absolute inset-0 h-full w-full" aria-hidden>
+        <defs>
+          <pattern id="tg-desktop-doodles" width="300" height="300" patternUnits="userSpaceOnUse">
+            <g
+              fill="none"
+              stroke="#ffffff"
+              strokeOpacity="0.32"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              {/* 爱心 */}
+              <path d="M38 64c-9-8.5-15-14-15-21.5C23 36 28 31 34.5 31c3.6 0 6.5 2.4 3.5 5.8C41 33.4 44 31 47.5 31 54 31 59 36 59 42.5 59 50 53 55.5 44 64l-6 5.4z" transform="scale(0.62) translate(8 -18)" />
+              {/* 五角星 */}
+              <path d="M156 20l5.4 11 12.1 1.7-8.8 8.5 2.1 12-10.8-5.7-10.8 5.7 2.1-12-8.8-8.5 12.1-1.7z" />
+              {/* 笑脸 */}
+              <circle cx="262" cy="52" r="13" />
+              <circle cx="257.5" cy="49" r="1.3" fill="#ffffff" stroke="none" />
+              <circle cx="266.5" cy="49" r="1.3" fill="#ffffff" stroke="none" />
+              <path d="M256.5 55c1.6 2.2 4 3.4 5.5 3.4s3.9-1.2 5.5-3.4" />
+              {/* 纸飞机 */}
+              <path d="M52 138l52-18-34 38-5.5-13.5z" />
+              <path d="M64.5 144.5L104 120" />
+              {/* 音符 */}
+              <path d="M204 158v-26l16-5v26" />
+              <circle cx="200" cy="158" r="4.6" />
+              <circle cx="216" cy="153" r="4.6" />
+              {/* 小房子 */}
+              <path d="M30 216l15-13 15 13" />
+              <path d="M35 212v18h20v-18" />
+              <path d="M42 230v-9h6v9" />
+              {/* 螺旋 */}
+              <path d="M148 246c0-5 4-9 9-9s9 4 9 9-4 9-9 9-13-4-13-11 6-15 15-15 16 7 16 17" />
+              {/* 气球 */}
+              <ellipse cx="258" cy="222" rx="11" ry="13" />
+              <path d="M258 235l-2.5 5h5z" />
+              <path d="M258 240c0 8-6 10-6 17" />
+              {/* 十字与圆点散布 */}
+              <path d="M112 62v10M107 67h10" />
+              <path d="M236 116v8M232 120h8" />
+              <circle cx="86" cy="196" r="2.2" fill="#ffffff" stroke="none" />
+              <circle cx="176" cy="96" r="2.2" fill="#ffffff" stroke="none" />
+              <circle cx="30" cy="150" r="2.2" fill="#ffffff" stroke="none" />
+              <circle cx="284" cy="160" r="2.2" fill="#ffffff" stroke="none" />
+              {/* 云朵 */}
+              <path d="M92 268c-5 0-8-3.4-8-7.6 0-4.2 3.4-7.4 7.6-7.4 1.2-4.6 5.4-7.6 10-7.2 4.4.4 8 3.6 8.8 7.8 3.8.4 6.6 3.4 6.6 7 0 4-3.2 7.4-7.6 7.4z" />
+            </g>
+          </pattern>
+        </defs>
+        <rect width="100%" height="100%" fill="url(#tg-desktop-doodles)" />
+      </svg>
+    </div>
+  );
+}
+
+type Screen = "chat" | "settings" | "admins" | "proxy" | "newgroup";
+
 export function TgAppSimulator({
   config,
   botName,
@@ -234,13 +291,14 @@ export function TgAppSimulator({
   onRequestJoin,
   view,
   onSelectGroup,
+  onBackToList,
   onSyncGroups,
   syncing,
   onDeployGroup,
   deployingChatId,
   onSimulateJoinForGroup,
-  chatOpenRequest,
   onSettingsSaved,
+  bots,
 }: {
   config: BotMenuConfig;
   botName: string;
@@ -257,33 +315,32 @@ export function TgAppSimulator({
   onRequestJoin?: () => Promise<{ ok: boolean; message: string }>;
   view: "group" | "private";
   onSelectGroup: (chatId: string) => void;
+  /** 移动端从聊天区返回列表（桌面端双栏常驻不需要） */
+  onBackToList?: () => void;
   onSyncGroups: () => void;
   syncing: boolean;
   /** 一键部署：父组件调用 deploy API，返回校验结果（stage/guide 由部署面板展示） */
-  onDeployGroup: (chatId: string) => Promise<{ ok: boolean; message: string; stage?: string; guide?: string[]; invite_link?: string | null } | null>;
+  onDeployGroup: (chatId: string) => Promise<{
+    ok: boolean;
+    message: string;
+    stage?: string;
+    guide?: string[];
+    invite_link?: string | null;
+    chat_title?: string | null;
+    reused?: boolean;
+    chat_id?: string | null;
+    migrated_from_chat_id?: string | null;
+  } | null>;
   deployingChatId: string | null;
   /** 从列表/加群确认面板发起模拟加群申请（父组件创建验证会话并切换视图） */
   onSimulateJoinForGroup: (chatId: string) => Promise<{ ok: boolean; message: string }>;
-  /** 父组件创建会话成功后递增；本组件监听后 push 到群聊界面 */
-  chatOpenRequest: number;
   /** 群组设置保存成功后由父组件刷新列表数据（router.refresh + realGroups 重载） */
   onSettingsSaved: () => void;
+  /** v2.0.15 新建群组流程的机器人列表（已有机器人，替代 APP「选择用户」） */
+  bots: NewGroupBot[];
 }) {
-  const clock = useSyncExternalStore(subscribeClock, getClockSnapshot, getServerClockSnapshot);
-
-  // —— iOS 导航栈 ——
-  const [stack, setStack] = useState<Screen[]>(["list"]);
-  // 导航方向参与渲染（push 从右滑入 / pop 向右滑出），必须用 state 而非 ref
-  const [navDir, setNavDir] = useState<"fwd" | "back">("fwd");
-  const current = stack[stack.length - 1];
-  const push = useCallback((screen: Screen): void => {
-    setNavDir("fwd");
-    setStack((prev) => (prev[prev.length - 1] === screen ? prev : [...prev, screen]));
-  }, []);
-  const pop = useCallback((): void => {
-    setNavDir("back");
-    setStack((prev) => (prev.length > 1 ? prev.slice(0, -1) : prev));
-  }, []);
+  // —— 浮层屏幕：chat=聊天区（默认初始界面），settings=群组设置，admins=机器人权限 ——
+  const [screen, setScreen] = useState<Screen>("chat");
 
   // —— 顶部 flash 提示（iOS 深色胶囊）——
   const [flash, setFlash] = useState<{ ok: boolean; text: string } | null>(null);
@@ -297,7 +354,7 @@ export function TgAppSimulator({
     if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
   }, []);
 
-  // —— 群组列表搜索（普通文本过滤；加群链接 → 打开确认面板）——
+  // —— 会话列表搜索（普通文本过滤；加群链接 → 打开确认面板）——
   const [search, setSearch] = useState("");
   const isJoinLink = /t\.me\/(\+|joinchat\/)/i.test(search) || /start=join_-?\d+/i.test(search);
   const filteredGroups = useMemo(() => {
@@ -360,10 +417,101 @@ export function TgAppSimulator({
     }
   }, [joinPanel, applyingJoin, onSimulateJoinForGroup, showFlash]);
 
-  // 父组件创建验证会话成功 → 自动 push 到群聊界面（验证码在私聊视图输入）
-  useEffect(() => {
-    if (chatOpenRequest > 0) push("chat");
-  }, [chatOpenRequest, push]);
+  // —— v2.0.16 加群申请列表（聊天区顶部横幅点击 → 上滑面板，复刻真实 APP） ——
+  const [joinSheetOpen, setJoinSheetOpen] = useState(false);
+  const [joinRequests, setJoinRequests] = useState<PendingJoinRequest[]>([]);
+  const [joinRequestsLoading, setJoinRequestsLoading] = useState(false);
+  /** 正在审批中的申请 token（按钮 spinner；一个群同时只审批一条） */
+  const [joinActionToken, setJoinActionToken] = useState<string | null>(null);
+
+  const loadJoinRequests = useCallback(
+    async (chatId: string): Promise<void> => {
+      setJoinRequestsLoading(true);
+      try {
+        const response = await opsFetch(
+          `/api/admin/bots/testing/join-requests?chat_id=${encodeURIComponent(chatId)}`,
+          { cache: "no-store" },
+        );
+        const payload = await readJson<{ ok: boolean; error?: string; data?: { items?: PendingJoinRequest[] } }>(response);
+        if (!payload) {
+          showFlash(false, `服务返回异常（HTTP ${response.status}）`);
+          return;
+        }
+        if (!payload.ok || !payload.data) {
+          showFlash(false, payload.error ?? "读取加群申请失败");
+          return;
+        }
+        setJoinRequests(payload.data.items ?? []);
+      } catch (error) {
+        showFlash(false, error instanceof Error ? error.message : "读取加群申请失败");
+      } finally {
+        setJoinRequestsLoading(false);
+      }
+    },
+    [showFlash],
+  );
+
+  /** 打开上滑申请列表：拉取当前群组待处理申请 */
+  const openJoinRequests = useCallback((): void => {
+    if (!activeChatId) return;
+    setJoinSheetOpen(true);
+    void loadJoinRequests(activeChatId);
+  }, [activeChatId, loadJoinRequests]);
+
+  /** 通过 / 拒绝申请：真实 Telegram 同步 + 落库（与「加群申请」管理页同源），成功后刷新列表与徽章 */
+  const handleJoinAction = useCallback(
+    async (request: PendingJoinRequest, action: "approve" | "deny"): Promise<void> => {
+      if (!activeChatId || joinActionToken) return;
+      setJoinActionToken(request.token);
+      try {
+        const response = await opsFetch("/api/admin/bots/testing/join-requests", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: activeChatId,
+            token: request.token,
+            action,
+            bot_id: selectedBotId,
+          }),
+        });
+        const payload = await readJson<{ ok: boolean; error?: string; data?: { notice?: string } }>(response);
+        if (!payload) {
+          showFlash(false, `服务返回异常（HTTP ${response.status}）`);
+          return;
+        }
+        if (!payload.ok) {
+          showFlash(false, payload.error ?? (action === "approve" ? "批准失败" : "拒绝失败"));
+          return;
+        }
+        showFlash(true, payload.data?.notice ?? (action === "approve" ? "已批准该加群申请" : "已拒绝该加群申请"));
+        // 从列表移除已处理项 + 刷新页面数据（列表徽章/横幅计数同步减少）
+        setJoinRequests((prev) => prev.filter((item) => item.token !== request.token));
+        onSettingsSaved();
+      } catch (error) {
+        showFlash(false, error instanceof Error ? error.message : "审批失败");
+      } finally {
+        setJoinActionToken(null);
+      }
+    },
+    [activeChatId, joinActionToken, selectedBotId, showFlash, onSettingsSaved],
+  );
+
+  /** 申请时间（北京时间 Asia/Shanghai）：客户端渲染（面板仅在点击后出现），无水合风险 */
+  const formatRequestTime = useCallback((iso: string): string => {
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return "";
+    return new Intl.DateTimeFormat("zh-CN", {
+      timeZone: "Asia/Shanghai",
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(date);
+  }, []);
+
+  /** 上滑面板唯一待处理申请（1 条时直接展示用户卡片 + 通过/拒绝两个按钮，与真实 APP 一致） */
+  const singleJoinRequest = joinRequests.length === 1 ? joinRequests[0] : null;
 
   // —— 一键部署 ——
   const [deployResult, setDeployResult] = useState<{
@@ -373,6 +521,8 @@ export function TgAppSimulator({
     invite_link?: string | null;
     chat_title?: string;
     bot_username?: string | null;
+    reused?: boolean;
+    migrated_from_chat_id?: string | null;
   } | null>(null);
   const [deployLinkCopied, setDeployLinkCopied] = useState(false);
 
@@ -380,23 +530,31 @@ export function TgAppSimulator({
     const result = await onDeployGroup(chatId);
     if (!result) return;
     if (result.ok && result.stage === "deployed") {
-      showFlash(true, "部署完成：申请制入群链接已生成并保存");
+      showFlash(
+        true,
+        result.reused
+          ? "部署完成：复用已生成的有效邀请链接"
+          : "部署完成：申请制入群链接已生成并保存",
+      );
     } else {
       showFlash(false, result.message || "部署校验未通过，请按指引操作");
     }
-    // 详情（含喂饭级 guide / 链接）以 iOS 弹层展示
+    // 详情（含喂饭级 guide / 链接）以浮层展示；
+    // chat_title 优先用服务端返回（迁移后新群的标题，本地列表可能还是旧数据）
     setDeployLinkCopied(false);
     setDeployResult({
       stage: result.stage,
       message: result.message,
       guide: result.guide,
       invite_link: result.invite_link,
-      chat_title: groups.find((group) => group.chatId === chatId)?.chatTitle,
+      chat_title: result.chat_title ?? groups.find((group) => group.chatId === chatId)?.chatTitle,
       bot_username: botUsername,
+      reused: result.reused,
+      migrated_from_chat_id: result.migrated_from_chat_id ?? null,
     });
   }, [onDeployGroup, showFlash, groups, botUsername]);
 
-  // —— 群组设置页（图2）状态 ——
+  // —— 群组设置页状态 ——
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsMethods, setSettingsMethods] = useState<{ id: string; name: string; enabled: boolean }[]>([]);
@@ -490,8 +648,7 @@ export function TgAppSimulator({
           chat_id: activeChatId,
           chat_title: form.chat_title,
           method: form.method,
-          // v2.0.1：透传所选绑定方法（服务端与群组管理 saveGroupAction 同语义落库保留）——
-          // 不再非 code_api 时强制 null，否则用户在「群组管理」绑定的方法会被仿真屏保存静默清掉
+          // 透传所选绑定方法（服务端与群组管理 saveGroupAction 同语义落库保留）
           method_id: form.method_id || null,
           timeout_seconds: Number(form.timeout_seconds) || 300,
           max_attempts: Number(form.max_attempts) || 3,
@@ -522,12 +679,12 @@ export function TgAppSimulator({
     }
   }, [activeChatId, settingsSaving, form, showFlash, onSettingsSaved]);
 
-  // 进入设置页时加载该群当前配置
+  // 打开设置浮层时加载该群当前配置
   useEffect(() => {
-    if (current === "settings" && activeChatId) void loadGroupSettings(activeChatId);
-  }, [current, activeChatId, loadGroupSettings]);
+    if (screen === "settings" && activeChatId) void loadGroupSettings(activeChatId);
+  }, [screen, activeChatId, loadGroupSettings]);
 
-  // —— 机器人权限页（图3）状态 ——
+  // —— 机器人权限浮层状态 ——
   const [adminsLoading, setAdminsLoading] = useState(false);
   const [adminsSaving, setAdminsSaving] = useState(false);
   const [adminRights, setAdminRights] = useState<Record<string, boolean>>({});
@@ -585,7 +742,7 @@ export function TgAppSimulator({
         showFlash(false, payload.error ?? "保存权限失败");
         return;
       }
-      // 与机器人管理员弹窗同源：以 Telegram 实际权限为准回显（弹窗返回真实同步后的权限与详情）
+      // 与机器人管理员弹窗同源：以 Telegram 实际权限为准回显
       if (payload.data?.rights) {
         setAdminRights((prev) => {
           const actual = { ...prev };
@@ -604,17 +761,16 @@ export function TgAppSimulator({
     }
   }, [activeChatId, adminsSaving, selectedBotId, adminRights, showFlash, onSettingsSaved]);
 
-  // 进入权限页时加载当前机器人对该群的权限
+  // 打开权限浮层时加载当前机器人对该群的权限
   useEffect(() => {
-    if (current === "admins" && activeChatId) void loadBotAdmins(activeChatId);
-  }, [current, activeChatId, loadBotAdmins]);
+    if (screen === "admins" && activeChatId) void loadBotAdmins(activeChatId);
+  }, [screen, activeChatId, loadBotAdmins]);
 
   const activeGroup = useMemo(
     () => groups.find((group) => group.chatId === activeChatId) ?? null,
     [groups, activeChatId],
   );
 
-  // —— 各屏幕渲染 ——
   const vars = useMemo<MenuTemplateVars>(
     () => ({
       chat_id: "-1001998877661",
@@ -634,200 +790,13 @@ export function TgAppSimulator({
     [config, vars],
   );
 
-  const listView = (
-    <div className="flex h-full flex-col bg-white">
-      {/* iOS 状态栏 */}
-      <div className="flex items-center justify-between px-6 pt-2.5 pb-1 text-[13px] font-semibold text-black">
-        <span className="min-w-[54px]">{clock || "\u00A0"}</span>
-        <span className="flex items-center gap-1.5 text-black/85">
-          <SignalHigh className="h-3.5 w-3.5" />
-          <Wifi className="h-3.5 w-3.5" />
-          <Battery className="h-4 w-4" />
-        </span>
-      </div>
-
-      {/* 搜索框（图1）：普通文本过滤群组；输入加群链接回车 → 真实解析并弹出加群确认面板 */}
-      <div className="px-3 pt-1 pb-2">
-        <div className="flex items-center gap-2 rounded-[10px] bg-black/[0.07] px-2.5 py-[7px]">
-          <Search className="h-4 w-4 shrink-0 text-[#8e8e93]" />
-          <input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && isJoinLink) void openJoinLink();
-            }}
-            placeholder="搜索 或 粘贴加群链接（t.me/+...）"
-            className="min-w-0 flex-1 bg-transparent text-[15px] text-black outline-none placeholder:text-[#8e8e93]"
-            aria-label="搜索群组或输入加群链接"
-          />
-          {isJoinLink ? (
-            <button
-              type="button"
-              onClick={() => void openJoinLink()}
-              disabled={resolving}
-              className="flex shrink-0 items-center gap-1 rounded-full bg-[#3390ec] px-3 py-1 text-[13px] font-medium text-white disabled:opacity-60"
-            >
-              {resolving ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
-              打开链接
-            </button>
-          ) : null}
-        </div>
-      </div>
-
-      {/* 同步真实群组（由父组件触发，与页面顶部按钮同一管道） */}
-      <div className="flex items-center justify-between px-4 pb-1.5">
-        <span className="text-[12px] text-[#8e8e93]">
-          当前机器人 Token 下的群组（{filteredGroups.length}）
-        </span>
-        <button
-          type="button"
-          onClick={onSyncGroups}
-          disabled={syncing}
-          className="flex items-center gap-1 text-[12px] font-medium text-[#3390ec] disabled:opacity-60"
-        >
-          {syncing ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
-          {syncing ? "同步中…" : "同步真实群组"}
-        </button>
-      </div>
-
-      {/* 群组列表（图1样式） */}
-      <div className="flex-1 overflow-y-auto">
-        {filteredGroups.length === 0 ? (
-          <div className="px-6 py-10 text-center text-[14px] leading-relaxed text-[#8e8e93]">
-            {groups.length === 0
-              ? "该机器人尚未登记群组：把机器人拉进群设为管理员后在群里发一条消息，再点「同步真实群组」"
-              : "没有匹配的群组"}
-          </div>
-        ) : (
-          filteredGroups.map((group, index) => (
-            <div key={group.chatId} className={index > 0 ? "border-t border-black/[0.07]" : ""}>
-              <button
-                type="button"
-                onClick={() => {
-                  onSelectGroup(group.chatId);
-                  push("chat");
-                }}
-                className="flex w-full items-center gap-3 px-3 pt-2 pb-1.5 text-left transition-colors active:bg-black/[0.04]"
-              >
-                <GroupAvatar title={group.chatTitle} size={54} />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-baseline justify-between gap-2">
-                    <p className="min-w-0 truncate text-[16px] font-semibold text-black">
-                      {group.chatTitle || `群组 ${group.chatId}`}
-                      {group.enabled ? null : (
-                        <span className="ml-1.5 rounded bg-black/10 px-1 py-0.5 align-middle text-[10px] font-medium text-[#8e8e93]">
-                          已停用
-                        </span>
-                      )}
-                    </p>
-                    <ListTime iso={group.updatedTime} />
-                  </div>
-                  <div className="mt-0.5 flex items-center justify-between gap-2">
-                    <p className="min-w-0 truncate text-[14.5px] text-[#8e8e93]">
-                      {group.methodName ?? methodLabel(group.method)}
-                      {group.deployed ? " · 已部署" : ""}
-                    </p>
-                    {group.unread > 0 ? (
-                      <span className="flex h-[22px] min-w-[22px] shrink-0 items-center justify-center rounded-full bg-[#3390ec] px-1.5 text-[13px] font-semibold text-white">
-                        {group.unread}
-                      </span>
-                    ) : null}
-                  </div>
-                </div>
-              </button>
-              {/* 每个群组底部的操作行：一键部署 / 模拟加群申请 */}
-              <div className="flex gap-2 px-3 pb-2.5">
-                <button
-                  type="button"
-                  onClick={() => void handleDeploy(group.chatId)}
-                  disabled={deployingChatId === group.chatId}
-                  className={`flex h-[30px] flex-1 items-center justify-center gap-1.5 rounded-lg text-[13px] font-medium transition-colors ${
-                    group.deployed
-                      ? "border border-[#34c759]/40 bg-[#34c759]/10 text-[#1e8e3e]"
-                      : "bg-[#3390ec]/10 text-[#3390ec]"
-                  } disabled:opacity-60`}
-                  title={group.deployed ? "已部署：重新校验并刷新入群申请链接" : "校验机器人身份并生成申请制入群链接"}
-                >
-                  {deployingChatId === group.chatId ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <Rocket className="h-3.5 w-3.5" />
-                  )}
-                  {group.deployed ? "重新部署" : "一键部署"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void onSimulateJoinForGroup(group.chatId)}
-                  className="flex h-[30px] flex-1 items-center justify-center gap-1.5 rounded-lg bg-black/[0.05] text-[13px] font-medium text-[#3b4a54] transition-colors hover:bg-black/[0.09]"
-                  title="以模拟用户身份发起加群申请，由加群验证机器人接管验证"
-                >
-                  <PlayCircle className="h-3.5 w-3.5" />
-                  模拟加群申请
-                </button>
-              </div>
-            </div>
-          ))
-        )}
-      </div>
-
-      {/* 底部 Tab（图1） */}
-      <div className="flex items-start justify-around border-t border-black/[0.08] bg-white/95 px-2 pt-1.5 pb-4 backdrop-blur">
-        {[
-          { key: "contacts", label: "联系人", icon: CircleUserRound },
-          { key: "calls", label: "通话", icon: Phone },
-          { key: "chats", label: "聊天", icon: MessageCircle, active: true, badge: totalUnread },
-          { key: "settings", label: "设置", icon: Settings2 },
-        ].map((tab) => (
-          <button
-            key={tab.key}
-            type="button"
-            onClick={() => {
-              if (!tab.active) showFlash(true, "仿真模式聚焦「聊天」：联系人 / 通话 / 设置为 APP 结构还原");
-            }}
-            className={`relative flex w-16 flex-col items-center gap-0.5 ${
-              tab.active ? "text-[#3390ec]" : "text-[#8e8e93]"
-            }`}
-          >
-            <tab.icon className="h-[26px] w-[26px]" />
-            <span className="text-[11px] font-medium">{tab.label}</span>
-            {tab.badge && tab.badge > 0 ? (
-              <span className="absolute -top-1 left-1/2 ml-1 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-[#eb5545] px-1 text-[11px] font-semibold text-white">
-                {tab.badge}
-              </span>
-            ) : null}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-
-  const chatView = (
-    <TgSimulator
-      config={config}
-      botName={botName}
-      groupTitle={activeGroup?.chatTitle ?? "测试群组"}
-      memberCount={memberCount}
-      nodeId="root"
-      onNodeNavigate={() => undefined}
-      systemNote={systemNote}
-      templateVars={templateVars}
-      promptMessage={promptMessage}
-      onUserSend={onUserSend}
-      joinPhase={joinPhase}
-      onRequestJoin={onRequestJoin}
-      view={view}
-      onBack={pop}
-      onOpenSettings={() => push("settings")}
-    />
-  );
-
-  const settingsView = (
+  // —— 设置 / 权限浮层（iOS 风格页，覆盖在聊天区上方） ——
+  const settingsOverlay = (
     <div className="flex h-full flex-col" style={{ backgroundColor: IOS_GRAY_BG }}>
-      {/* 顶部导航：X 关闭 + ✓ 保存（图2） */}
       <div className="flex items-center justify-between border-b border-black/[0.06] bg-white/85 px-3 py-2 backdrop-blur">
         <button
           type="button"
-          onClick={pop}
+          onClick={() => setScreen("chat")}
           aria-label="关闭群组设置"
           className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] text-black transition-transform active:scale-95"
         >
@@ -853,7 +822,7 @@ export function TgAppSimulator({
           </div>
         ) : (
           <>
-            {/* 头像区（图2） */}
+            {/* 头像区 */}
             <div className="flex flex-col items-center pb-1">
               <GroupAvatar title={form.chat_title || activeGroup?.chatTitle || "群"} size={96} />
               <span className="mt-2 text-[15px]" style={{ color: IOS_BLUE }}>
@@ -916,7 +885,7 @@ export function TgAppSimulator({
                       : "自动（默认）：超级群/频道 → 群内验证；基础群 → 私聊验证（Telegram 限制：基础群不支持申请制入群）"}
                 </p>
               </div>
-              {/* v2.0.7 直连入群踢出开关（默认关闭）：公开邀请链接/被拉入群的已有用户超时/失败是否移出 */}
+              {/* 直连入群踢出开关（默认关闭）：公开邀请链接/被拉入群的已有用户超时/失败是否移出 */}
               <div className="flex items-center justify-between border-t border-black/[0.06] px-4 py-2.5">
                 <span className="text-[17px] leading-snug text-black">
                   直连入群超时踢出
@@ -1037,7 +1006,7 @@ export function TgAppSimulator({
               ))}
             </div>
 
-            {/* 群组信息行（图2 结构，展示系统真实状态） */}
+            {/* 群组信息行（展示系统真实状态） */}
             <div className="overflow-hidden rounded-xl bg-white">
               <div className="flex items-center gap-3 border-b border-black/[0.06] px-4 py-2.5">
                 <IosRowIcon bg="#3390ec">
@@ -1122,10 +1091,10 @@ export function TgAppSimulator({
               群聊将被划分为由管理员或用户创建的话题。
             </p>
 
-            {/* 机器人权限配置入口（图3） */}
+            {/* 机器人权限配置入口 */}
             <button
               type="button"
-              onClick={() => push("admins")}
+              onClick={() => setScreen("admins")}
               className="flex w-full cursor-pointer items-center gap-3 rounded-xl bg-white px-4 py-3 text-left transition-transform active:scale-[0.99]"
             >
               <IosRowIcon bg="#1e8e3e">
@@ -1140,13 +1109,12 @@ export function TgAppSimulator({
     </div>
   );
 
-  const adminsView = (
+  const adminsOverlay = (
     <div className="flex h-full flex-col" style={{ backgroundColor: IOS_GRAY_BG }}>
-      {/* 顶部导航（图3）：X 返回设置页 */}
       <div className="flex items-center justify-between border-b border-black/[0.06] bg-white/85 px-3 py-2 backdrop-blur">
         <button
           type="button"
-          onClick={pop}
+          onClick={() => setScreen("settings")}
           aria-label="返回群组设置"
           className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] text-black transition-transform active:scale-95"
         >
@@ -1163,7 +1131,7 @@ export function TgAppSimulator({
           </div>
         ) : (
           <>
-            {/* 机器人信息卡片（图3 顶部） */}
+            {/* 机器人信息卡片 */}
             <div className="flex items-center gap-3 rounded-xl bg-white p-4">
               <GroupAvatar title={adminRecord?.bot_name ?? botName} size={56} />
               <div className="min-w-0">
@@ -1180,7 +1148,7 @@ export function TgAppSimulator({
               这位管理员可以做什么？（保存将通过 Telegram API 真实同步）
             </p>
 
-            {/* 权限开关列表（图3，iOS 绿色开关） */}
+            {/* 权限开关列表（iOS 绿色开关） */}
             <div className="overflow-hidden rounded-xl bg-white">
               {ADMIN_RIGHTS.map((right, index) => (
                 <div
@@ -1205,7 +1173,7 @@ export function TgAppSimulator({
               ))}
             </div>
 
-            {/* 保存更改（图3 底部大按钮） */}
+            {/* 保存更改 */}
             <button
               type="button"
               onClick={() => void saveBotAdmins()}
@@ -1231,7 +1199,7 @@ export function TgAppSimulator({
     </div>
   );
 
-  const joinPanelView = joinPanel ? (
+  const joinPanelOverlay = joinPanel ? (
     <div className="flex h-full flex-col" style={{ backgroundColor: IOS_GRAY_BG }}>
       <div className="flex items-center justify-between border-b border-black/[0.06] bg-white/85 px-3 py-2 backdrop-blur">
         <button
@@ -1309,198 +1277,618 @@ export function TgAppSimulator({
     </div>
   ) : null;
 
-  return (
-    <div className="flex h-full min-h-[560px] flex-col overflow-hidden rounded-[2rem] border-8 border-[#0c0d10] bg-white shadow-2xl">
-      <div className="relative min-h-0 flex-1 overflow-hidden">
-        {/* 底层列表（iOS push 时向下层视差） */}
-        <AnimatePresence initial={false} custom={navDir} mode="popLayout">
-          {current === "list" ? (
-            <motion.div
-              key="list"
-              custom={navDir}
-              variants={NAV_VARIANTS}
-              initial="enter"
-              animate="center"
-              exit="exit"
-              transition={{ type: "tween", duration: 0.3, ease: [0.32, 0.72, 0, 1] }}
-              className="absolute inset-0 z-10"
-            >
-              {listView}
-            </motion.div>
-          ) : null}
-          {current === "chat" ? (
-            <motion.div
-              key="chat"
-              custom={navDir}
-              variants={NAV_VARIANTS}
-              initial="enter"
-              animate="center"
-              exit="exit"
-              transition={{ type: "tween", duration: 0.3, ease: [0.32, 0.72, 0, 1] }}
-              className="absolute inset-0 z-10"
-            >
-              {chatView}
-            </motion.div>
-          ) : null}
-          {current === "settings" ? (
+  const chatPane = activeChatId ? (
+    /* 移动端：全屏覆盖列表；桌面端：右侧聊天栏（双栏） */
+    <div className="absolute inset-0 z-30 flex min-w-0 flex-1 lg:static lg:z-auto">
+      <div className="relative min-w-0 flex-1">
+        <DoodleWallpaper />
+        <div className="absolute inset-0">
+          <TgDesktopChat
+            key={`${selectedBotId}-${activeChatId}`}
+            config={config}
+            botName={botName}
+            groupTitle={view === "private" ? botName : (activeGroup?.chatTitle ?? "测试群组")}
+            memberCount={memberCount}
+            isPrivate={view === "private"}
+            systemNote={systemNote}
+            templateVars={templateVars}
+            promptMessage={promptMessage}
+            onUserSend={onUserSend}
+            joinPhase={joinPhase}
+            onRequestJoin={onRequestJoin}
+            onOpenSettings={() => setScreen("settings")}
+            onBackToList={onBackToList}
+            pendingJoinCount={view === "private" ? 0 : (activeGroup?.unread ?? 0)}
+            onOpenJoinRequests={openJoinRequests}
+          />
+        </div>
+
+        {/* 群组设置 / 机器人权限浮层（覆盖聊天区；移动端覆盖全屏） */}
+        <AnimatePresence initial={false}>
+          {screen === "settings" ? (
             <motion.div
               key="settings"
-              custom={navDir}
-              variants={NAV_VARIANTS}
+              variants={OVERLAY_VARIANTS}
               initial="enter"
               animate="center"
               exit="exit"
-              transition={{ type: "tween", duration: 0.3, ease: [0.32, 0.72, 0, 1] }}
-              className="absolute inset-0 z-10"
+              transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+              className="absolute inset-0 z-40"
             >
-              {settingsView}
+              {settingsOverlay}
             </motion.div>
           ) : null}
-          {current === "admins" ? (
+          {screen === "admins" ? (
             <motion.div
               key="admins"
-              custom={navDir}
-              variants={NAV_VARIANTS}
+              variants={OVERLAY_VARIANTS}
               initial="enter"
               animate="center"
               exit="exit"
-              transition={{ type: "tween", duration: 0.3, ease: [0.32, 0.72, 0, 1] }}
-              className="absolute inset-0 z-10"
+              transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+              className="absolute inset-0 z-40"
             >
-              {adminsView}
+              {adminsOverlay}
             </motion.div>
           ) : null}
-        </AnimatePresence>
-
-        {/* 加群确认面板（最高层级 push） */}
-        <AnimatePresence>
-          {joinPanelView ? (
+          {/* v2.0.16 加群申请上滑面板（真实 APP：标题条横幅点击 → 底部滑出申请列表） */}
+          {joinSheetOpen ? (
             <motion.div
-              key="join-panel"
-              initial={{ x: "100%" }}
-              animate={{ x: "0%" }}
-              exit={{ x: "100%" }}
-              transition={{ type: "tween", duration: 0.3, ease: [0.32, 0.72, 0, 1] }}
-              className="absolute inset-0 z-30"
-            >
-              {joinPanelView}
-            </motion.div>
-          ) : null}
-        </AnimatePresence>
-
-        {/* 一键部署结果详情（喂饭级指引 + 链接复制） */}
-        <AnimatePresence>
-          {deployResult ? (
-            <motion.div
-              key="deploy-sheet"
+              key="join-requests-sheet"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
+              transition={{ duration: 0.18 }}
               className="absolute inset-0 z-40 flex items-end justify-center bg-black/40"
-              onClick={() => setDeployResult(null)}
+              onClick={() => setJoinSheetOpen(false)}
             >
               <motion.div
                 initial={{ y: "100%" }}
                 animate={{ y: 0 }}
                 exit={{ y: "100%" }}
                 transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
-                className="max-h-[80%] w-full overflow-y-auto rounded-t-2xl bg-white px-5 pb-6 pt-4"
+                className="flex max-h-[82%] w-full flex-col overflow-hidden rounded-t-2xl bg-white"
                 onClick={(event) => event.stopPropagation()}
                 role="dialog"
-                aria-label="一键部署结果"
+                aria-label="加群申请"
               >
-                <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-black/15" aria-hidden />
-                <div className="mb-2 flex items-center gap-2">
-                  <span
-                    className="rounded-full px-2.5 py-1 text-[12px] font-semibold text-white"
-                    style={{
-                      backgroundColor:
-                        deployResult.stage === "deployed" ? IOS_GREEN : "#f5a623",
-                    }}
+                {/* 顶部把手 + 标题 */}
+                <div className="flex items-center justify-between px-5 pb-2 pt-3">
+                  <span className="h-1 w-10 rounded-full bg-black/15" aria-hidden />
+                  <div className="flex items-center gap-2">
+                    <UserRoundPlus className="h-5 w-5 text-[#3390ec]" aria-hidden />
+                    <span className="text-[17px] font-semibold text-black">加群申请</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setJoinSheetOpen(false)}
+                    aria-label="关闭加群申请"
+                    className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] text-black transition-transform active:scale-95"
                   >
-                    {deployResult.stage === "deployed"
-                      ? "✓ 部署成功"
-                      : deployResult.stage === "add_bot"
-                        ? "缺步骤：机器人不在群里"
-                        : deployResult.stage === "promote_admin"
-                          ? "缺步骤：还不是管理员"
-                          : deployResult.stage === "grant_permission"
-                            ? "缺权限：未开启「邀请用户」"
-                            : "部署结果"}
-                  </span>
-                  <span className="truncate text-[13px] text-[#8e8e93]">
-                    {deployResult.chat_title ?? ""}
-                    {deployResult.bot_username ? ` · @${deployResult.bot_username}` : ""}
-                  </span>
+                    <X className="h-4 w-4" />
+                  </button>
                 </div>
-                <p className="mb-3 text-[14px] leading-relaxed text-[#3b4a54]">{deployResult.message}</p>
-                {deployResult.stage === "deployed" && deployResult.invite_link ? (
-                  <div className="mb-3 rounded-xl p-3" style={{ backgroundColor: "rgba(52,199,89,0.1)" }}>
-                    <p className="mb-1.5 text-[12px] font-medium text-[#1e8e3e]">
-                      入群申请链接（发给买家 / 配置到闲鱼自动发货）
-                    </p>
-                    <div className="flex items-center gap-2">
-                      <code className="min-w-0 flex-1 truncate rounded bg-white px-2 py-1.5 font-mono text-[12px] text-black">
-                        {deployResult.invite_link}
-                      </code>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void navigator.clipboard.writeText(deployResult.invite_link ?? "");
-                          setDeployLinkCopied(true);
-                          window.setTimeout(() => setDeployLinkCopied(false), 2000);
-                        }}
-                        className="shrink-0 rounded-full px-3 py-1.5 text-[12px] font-medium text-white"
-                        style={{ backgroundColor: IOS_BLUE }}
-                      >
-                        {deployLinkCopied ? "已复制" : "复制"}
-                      </button>
+                <p className="px-5 pb-2 text-[13px] text-[#8e8e93]">
+                  {activeGroup?.chatTitle ?? ""} · 共 {joinRequests.length} 条待处理申请
+                </p>
+
+                <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-5">
+                  {joinRequestsLoading ? (
+                    <div className="flex justify-center py-8">
+                      <Loader2 className="h-6 w-6 animate-spin text-[#8e8e93]" />
                     </div>
-                  </div>
-                ) : null}
-                {deployResult.guide && deployResult.guide.length > 0 ? (
-                  <div className="rounded-xl bg-black/[0.04] p-3">
-                    <p className="mb-1.5 text-[12px] font-medium text-black">下一步操作</p>
-                    <ol className="list-decimal space-y-1 pl-4 text-[12px] leading-relaxed text-[#3b4a54]">
-                      {deployResult.guide.map((step, index) => (
-                        <li key={index}>{step}</li>
-                      ))}
-                    </ol>
-                  </div>
-                ) : null}
-                <button
-                  type="button"
-                  onClick={() => setDeployResult(null)}
-                  className="mt-4 w-full cursor-pointer rounded-full bg-black/[0.06] py-3 text-[16px] font-semibold text-black"
-                >
-                  知道了
-                </button>
+                  ) : joinRequests.length === 0 ? (
+                    <div className="px-6 py-10 text-center text-[14px] leading-relaxed text-[#8e8e93]">
+                      没有待处理的加群申请
+                    </div>
+                  ) : singleJoinRequest ? (
+                    /* 只有 1 条申请：直接展示用户卡片 + 通过申请 / 拒绝申请 两个按钮（真实 APP 一致） */
+                    <div className="flex flex-col items-center pt-2">
+                      <GroupAvatar title={
+                        [singleJoinRequest.first_name, singleJoinRequest.last_name].filter(Boolean).join(" ") ||
+                        (singleJoinRequest.username ? `@${singleJoinRequest.username}` : `用户 ${singleJoinRequest.user_id}`)
+                      } size={72} />
+                      <p className="mt-2 text-[18px] font-semibold text-black">
+                        {[singleJoinRequest.first_name, singleJoinRequest.last_name].filter(Boolean).join(" ") ||
+                          (singleJoinRequest.username ? `@${singleJoinRequest.username}` : `用户 ${singleJoinRequest.user_id}`)}
+                      </p>
+                      <p className="mt-0.5 text-[13px] text-[#8e8e93]">
+                        {singleJoinRequest.username ? `@${singleJoinRequest.username} · ` : ""}ID {singleJoinRequest.user_id} · {formatRequestTime(singleJoinRequest.request_time)} 申请
+                      </p>
+                      <div className="mt-5 flex w-full gap-3">
+                        <button
+                          type="button"
+                          onClick={() => void handleJoinAction(singleJoinRequest, "approve")}
+                          disabled={joinActionToken === singleJoinRequest.token}
+                          className="flex flex-1 cursor-pointer items-center justify-center gap-2 rounded-xl py-3.5 text-[16px] font-semibold text-white transition-transform active:scale-[0.99] disabled:opacity-60"
+                          style={{ backgroundColor: "#34c759" }}
+                        >
+                          {joinActionToken === singleJoinRequest.token ? (
+                            <Loader2 className="h-5 w-5 animate-spin" />
+                          ) : (
+                            <Check className="h-5 w-5" />
+                          )}
+                          通过申请
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleJoinAction(singleJoinRequest, "deny")}
+                          disabled={joinActionToken === singleJoinRequest.token}
+                          className="flex flex-1 cursor-pointer items-center justify-center gap-2 rounded-xl py-3.5 text-[16px] font-semibold text-white transition-transform active:scale-[0.99] disabled:opacity-60"
+                          style={{ backgroundColor: "#eb5545" }}
+                        >
+                          {joinActionToken === singleJoinRequest.token ? (
+                            <Loader2 className="h-5 w-5 animate-spin" />
+                          ) : (
+                            <X className="h-5 w-5" />
+                          )}
+                          拒绝申请
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    /* 多条申请：Telegram APP 列表样式（每行头像+名称+时间+✓/✗） */
+                    <div className="divide-y divide-black/[0.06]">
+                      {joinRequests.map((request) => {
+                        const displayName =
+                          [request.first_name, request.last_name].filter(Boolean).join(" ") ||
+                          (request.username ? `@${request.username}` : `用户 ${request.user_id}`);
+                        const busy = joinActionToken === request.token;
+                        return (
+                          <div key={request.id} className="flex items-center gap-3 py-2.5">
+                            <GroupAvatar title={displayName} size={44} />
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-[16px] font-medium text-black">{displayName}</p>
+                              <p className="truncate text-[12.5px] text-[#8e8e93]">
+                                {request.username ? `@${request.username} · ` : ""}ID {request.user_id} · {formatRequestTime(request.request_time)}
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => void handleJoinAction(request, "approve")}
+                              disabled={busy}
+                              aria-label={`通过 ${displayName} 的加群申请`}
+                              className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-[#34c759]/12 text-[#1e8e3e] transition-transform active:scale-95 disabled:opacity-60"
+                            >
+                              {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Check className="h-5 w-5" />}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void handleJoinAction(request, "deny")}
+                              disabled={busy}
+                              aria-label={`拒绝 ${displayName} 的加群申请`}
+                              className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-[#eb5545]/12 text-[#eb5545] transition-transform active:scale-95 disabled:opacity-60"
+                            >
+                              <X className="h-5 w-5" />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               </motion.div>
             </motion.div>
           ) : null}
         </AnimatePresence>
-
-        {/* iOS 深色 flash 提示 */}
-        <AnimatePresence>
-          {flash ? (
-            <motion.div
-              key="flash"
-              initial={{ opacity: 0, y: -16 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -16 }}
-              className="pointer-events-none absolute left-1/2 top-3 z-40 w-[86%] -translate-x-1/2"
-              role="status"
-            >
-              <div
-                className="rounded-2xl px-4 py-2.5 text-center text-[13px] font-medium leading-relaxed text-white shadow-lg"
-                style={{ backgroundColor: flash.ok ? "rgba(30,142,62,0.92)" : "rgba(190,44,44,0.92)" }}
-              >
-                {flash.text}
-              </div>
-            </motion.div>
-          ) : null}
-        </AnimatePresence>
       </div>
+    </div>
+  ) : (
+    /* 截图1 空态：绿色涂鸦壁纸 + 居中「选择一个会话开始聊天」+ 右上角 ⓘ（仅桌面双栏显示） */
+    <div className="relative hidden min-w-0 flex-1 items-center justify-center lg:flex">
+      <DoodleWallpaper />
+      <button
+        type="button"
+        onClick={() =>
+          showFlash(
+            true,
+            "从左侧列表选择一个群组，即可在右侧打开群聊；搜索框支持粘贴 t.me 加群链接发起申请",
+          )
+        }
+        className="relative z-10 cursor-pointer rounded-full bg-[#e5ffd1]/95 px-5 py-2.5 text-[15px] font-medium text-[#4a7a52] shadow-[0_1px_6px_rgba(0,0,0,0.14)] transition-transform hover:scale-[1.02] active:scale-[0.98]"
+      >
+        选择一个会话开始聊天
+      </button>
+      <button
+        type="button"
+        onClick={() =>
+          showFlash(
+            true,
+            "仿真说明：左侧为当前机器人 Token 下的真实群组；列表项按钮支持一键部署与模拟加群申请；点击群组在右侧打开聊天，点头像/三个点进入群组设置",
+          )
+        }
+        aria-label="仿真说明"
+        className="absolute right-5 top-5 z-10 flex h-10 w-10 cursor-pointer items-center justify-center rounded-full bg-white/90 text-[#5e6e7e] shadow-[0_1px_8px_rgba(0,0,0,0.16)] transition-colors hover:text-[#3390ec]"
+      >
+        <Info className="h-5 w-5" />
+      </button>
+    </div>
+  );
+
+  return (
+    <div className="relative flex h-full min-h-[560px] overflow-hidden rounded-2xl bg-white shadow-2xl ring-1 ring-black/10">
+      <div className="flex h-full w-full">
+        {/* —— 左侧：会话列表窗口卡（样式与旧版列表一致，图1） —— */}
+        <div className="flex h-full w-full min-w-0 flex-col border-r border-black/10 bg-white lg:w-[360px] lg:shrink-0">
+          {/* macOS 红绿灯标题栏（截图1） */}
+          <div className="relative flex items-center justify-center px-4 pt-3.5 pb-2.5">
+            <div className="absolute left-4 flex items-center gap-2" aria-hidden>
+              <span className="h-3 w-3 rounded-full bg-[#ff5f57]" />
+              <span className="h-3 w-3 rounded-full bg-[#febc2e]" />
+              <span className="h-3 w-3 rounded-full bg-[#28c840]" />
+            </div>
+            <span className="text-[16px] font-semibold text-black">聊天</span>
+            <div className="absolute right-4 flex items-center gap-3.5 text-[#3390ec]">
+              <button
+                type="button"
+                onClick={() => setScreen("proxy")}
+                aria-label="代理偏好设置"
+                title="代理偏好设置：管理 Telegram API 代理（原系统设置代理配置）"
+                className="cursor-pointer transition-transform active:scale-95"
+              >
+                <ShieldCheck className="h-5 w-5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setScreen("newgroup")}
+                aria-label="新建群组"
+                title="新建群组：选择机器人并登记待绑定群组"
+                className="cursor-pointer transition-transform active:scale-95"
+              >
+                <SquarePen className="h-5 w-5" />
+              </button>
+            </div>
+          </div>
+
+          {/* 搜索框：普通文本过滤群组；输入加群链接回车 → 真实解析并弹出加群确认面板 */}
+          <div className="px-3 pb-2">
+            <div className="flex items-center gap-2 rounded-[10px] bg-black/[0.07] px-2.5 py-[7px]">
+              <Search className="h-4 w-4 shrink-0 text-[#8e8e93]" />
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && isJoinLink) void openJoinLink();
+                }}
+                placeholder="搜索（⌘K）或粘贴加群链接（t.me/+...）"
+                className="min-w-0 flex-1 bg-transparent text-[15px] text-black outline-none placeholder:text-[#8e8e93]"
+                aria-label="搜索群组或输入加群链接"
+              />
+              {isJoinLink ? (
+                <button
+                  type="button"
+                  onClick={() => void openJoinLink()}
+                  disabled={resolving}
+                  className="flex shrink-0 items-center gap-1 rounded-full bg-[#3390ec] px-3 py-1 text-[13px] font-medium text-white disabled:opacity-60"
+                >
+                  {resolving ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                  打开链接
+                </button>
+              ) : null}
+            </div>
+          </div>
+
+          {/* 同步真实群组（由父组件触发，与页面上方按钮同一管道） */}
+          <div className="flex items-center justify-between px-4 pb-1.5">
+            <span className="text-[12px] text-[#8e8e93]">
+              当前机器人 Token 下的群组（{filteredGroups.length}）
+            </span>
+            <button
+              type="button"
+              onClick={onSyncGroups}
+              disabled={syncing}
+              className="flex items-center gap-1 text-[12px] font-medium text-[#3390ec] disabled:opacity-60"
+            >
+              {syncing ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+              {syncing ? "同步中…" : "同步真实群组"}
+            </button>
+          </div>
+
+          {/* 群组列表（保持旧版列表样式；选中项蓝色高亮，点击在右侧打开聊天） */}
+          <div className="flex-1 overflow-y-auto">
+            {filteredGroups.length === 0 ? (
+              <div className="px-6 py-10 text-center text-[14px] leading-relaxed text-[#8e8e93]">
+                {groups.length === 0
+                  ? "该机器人尚未登记群组：把机器人拉进群设为管理员后在群里发一条消息，再点「同步真实群组」"
+                  : "没有匹配的群组"}
+              </div>
+            ) : (
+              filteredGroups.map((group, index) => {
+                const isSelected = group.chatId === activeChatId;
+                return (
+                  <div key={group.chatId} className={index > 0 ? "border-t border-black/[0.07]" : ""}>
+                    <button
+                      type="button"
+                      onClick={() => onSelectGroup(group.chatId)}
+                      aria-current={isSelected ? "true" : undefined}
+                      className={`flex w-full items-center gap-3 px-3 pt-2 pb-1.5 text-left transition-colors ${
+                        isSelected ? "bg-[#3390ec]" : "hover:bg-black/[0.04] active:bg-black/[0.06]"
+                      }`}
+                    >
+                      <GroupAvatar title={group.chatTitle} size={54} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-baseline justify-between gap-2">
+                          <p
+                            className={`min-w-0 truncate text-[16px] font-semibold ${
+                              isSelected ? "text-white" : "text-black"
+                            }`}
+                          >
+                            {group.chatTitle || `群组 ${group.chatId}`}
+                            {group.enabled ? null : (
+                              <span
+                                className={`ml-1.5 rounded px-1 py-0.5 align-middle text-[10px] font-medium ${
+                                  isSelected ? "bg-white/25 text-white" : "bg-black/10 text-[#8e8e93]"
+                                }`}
+                              >
+                                已停用
+                              </span>
+                            )}
+                          </p>
+                          <ListTime iso={group.updatedTime} active={isSelected} />
+                        </div>
+                        <div className="mt-0.5 flex items-center justify-between gap-2">
+                          <p
+                            className={`min-w-0 truncate text-[14.5px] ${
+                              isSelected ? "text-white/85" : "text-[#8e8e93]"
+                            }`}
+                          >
+                            {group.methodName ?? methodLabel(group.method)}
+                            {group.deployed ? " · 已部署" : ""}
+                          </p>
+                          {group.unread > 0 ? (
+                            <span
+                              className={`flex h-[22px] min-w-[22px] shrink-0 items-center justify-center rounded-full px-1.5 text-[13px] font-semibold ${
+                                isSelected ? "bg-white text-[#3390ec]" : "bg-[#3390ec] text-white"
+                              }`}
+                            >
+                              {group.unread}
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+                    </button>
+                    {/* 每个群组底部的操作行：一键部署 / 模拟加群申请 */}
+                    <div className="flex gap-2 px-3 pb-2.5">
+                      <button
+                        type="button"
+                        onClick={() => void handleDeploy(group.chatId)}
+                        disabled={deployingChatId === group.chatId}
+                        className={`flex h-[30px] flex-1 items-center justify-center gap-1.5 rounded-lg text-[13px] font-medium transition-colors ${
+                          group.deployed
+                            ? "border border-[#34c759]/40 bg-[#34c759]/10 text-[#1e8e3e]"
+                            : "bg-[#3390ec]/10 text-[#3390ec]"
+                        } disabled:opacity-60`}
+                        title={group.deployed ? "已部署：重新校验并刷新入群申请链接" : "校验机器人身份并生成申请制入群链接"}
+                      >
+                        {deployingChatId === group.chatId ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Rocket className="h-3.5 w-3.5" />
+                        )}
+                        {group.deployed ? "重新部署" : "一键部署"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void onSimulateJoinForGroup(group.chatId)}
+                        className="flex h-[30px] flex-1 items-center justify-center gap-1.5 rounded-lg bg-black/[0.05] text-[13px] font-medium text-[#3b4a54] transition-colors hover:bg-black/[0.09]"
+                        title="以模拟用户身份发起加群申请，由加群验证机器人接管验证"
+                      >
+                        <PlayCircle className="h-3.5 w-3.5" />
+                        模拟加群申请
+                      </button>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {/* 底部 Tab（图1） */}
+          <div className="flex items-start justify-around border-t border-black/[0.08] bg-white/95 px-2 pt-1.5 pb-4 backdrop-blur">
+            {[
+              { key: "contacts", label: "联系人", icon: CircleUserRound },
+              { key: "calls", label: "通话", icon: Phone },
+              { key: "chats", label: "聊天", icon: MessageCircle, active: true, badge: totalUnread },
+              { key: "settings", label: "设置", icon: Settings2 },
+            ].map((tab) => (
+              <button
+                key={tab.key}
+                type="button"
+                onClick={() => {
+                  if (!tab.active) showFlash(true, "仿真模式聚焦「聊天」：联系人 / 通话 / 设置为 APP 结构还原");
+                }}
+                className={`relative flex w-16 flex-col items-center gap-0.5 ${
+                  tab.active ? "text-[#3390ec]" : "text-[#8e8e93]"
+                }`}
+              >
+                <tab.icon className="h-[26px] w-[26px]" />
+                <span className="text-[11px] font-medium">{tab.label}</span>
+                {tab.badge && tab.badge > 0 ? (
+                  <span className="absolute -top-1 left-1/2 ml-1 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-[#eb5545] px-1 text-[11px] font-semibold text-white">
+                    {tab.badge}
+                  </span>
+                ) : null}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* —— 右侧：群组内对话区域 / 空态（图1 空态、图2 聊天） —— */}
+        {chatPane}
+      </div>
+
+      {/* v2.0.15 代理偏好设置 / 新建群组浮层：桌面端只覆盖右侧区域（左滑滑入，复刻图3/图4），
+          移动端覆盖全屏；不依赖当前会话 —— 与群组设置浮层（需先打开会话）不同 */}
+      <AnimatePresence initial={false}>
+        {screen === "proxy" ? (
+          <motion.div
+            key="proxy"
+            variants={OVERLAY_VARIANTS}
+            initial="enter"
+            animate="center"
+            exit="exit"
+            transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+            className="absolute inset-0 z-40 lg:left-[360px]"
+          >
+            <TgProxyPanel onClose={() => setScreen("chat")} onNotify={showFlash} />
+          </motion.div>
+        ) : null}
+        {screen === "newgroup" ? (
+          <motion.div
+            key="newgroup"
+            variants={OVERLAY_VARIANTS}
+            initial="enter"
+            animate="center"
+            exit="exit"
+            transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+            className="absolute inset-0 z-40 lg:left-[360px]"
+          >
+            <TgNewGroupPanel
+              bots={bots}
+              onClose={() => setScreen("chat")}
+              onNotify={showFlash}
+              onMutated={onSettingsSaved}
+            />
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+
+      {/* 加群确认面板（最高层级浮层，覆盖整个窗口） */}
+      <AnimatePresence>
+        {joinPanelOverlay ? (
+          <motion.div
+            key="join-panel"
+            variants={OVERLAY_VARIANTS}
+            initial="enter"
+            animate="center"
+            exit="exit"
+            transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+            className="absolute inset-0 z-50"
+          >
+            {joinPanelOverlay}
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+
+      {/* 一键部署结果详情（喂饭级指引 + 链接复制） */}
+      <AnimatePresence>
+        {deployResult ? (
+          <motion.div
+            key="deploy-sheet"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 z-50 flex items-end justify-center bg-black/40"
+            onClick={() => setDeployResult(null)}
+          >
+            <motion.div
+              initial={{ y: "100%" }}
+              animate={{ y: 0 }}
+              exit={{ y: "100%" }}
+              transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+              className="max-h-[80%] w-full overflow-y-auto rounded-t-2xl bg-white px-5 pb-6 pt-4"
+              onClick={(event) => event.stopPropagation()}
+              role="dialog"
+              aria-label="一键部署结果"
+            >
+              <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-black/15" aria-hidden />
+              <div className="mb-2 flex items-center gap-2">
+                <span
+                  className="rounded-full px-2.5 py-1 text-[12px] font-semibold text-white"
+                  style={{
+                    backgroundColor:
+                      deployResult.stage === "deployed" ? IOS_GREEN : "#f5a623",
+                  }}
+                >
+                  {deployResult.stage === "deployed"
+                    ? "✓ 部署成功"
+                    : deployResult.stage === "add_bot"
+                      ? "缺步骤：机器人不在群里"
+                      : deployResult.stage === "promote_admin"
+                        ? "缺步骤：还不是管理员"
+                        : deployResult.stage === "grant_permission"
+                          ? "缺权限：未开启「邀请用户」"
+                          : "部署结果"}
+                </span>
+                <span className="truncate text-[13px] text-[#8e8e93]">
+                  {deployResult.chat_title ?? ""}
+                  {deployResult.bot_username ? ` · @${deployResult.bot_username}` : ""}
+                </span>
+              </div>
+              <p className="mb-3 text-[14px] leading-relaxed text-[#3b4a54]">{deployResult.message}</p>
+              {deployResult.stage === "deployed" && deployResult.invite_link ? (
+                <div className="mb-3 rounded-xl p-3" style={{ backgroundColor: "rgba(52,199,89,0.1)" }}>
+                  <p className="mb-1.5 text-[12px] font-medium text-[#1e8e3e]">
+                    {deployResult.reused
+                      ? "入群申请链接（复用已有链接，未生成新链接）"
+                      : "入群申请链接（发给买家 / 配置到闲鱼自动发货）"}
+                  </p>
+                  {deployResult.migrated_from_chat_id ? (
+                    <p className="mb-1.5 text-[12px] leading-relaxed text-[#c2410c]">
+                      ⚠️ 该群已升级为超级群（{deployResult.migrated_from_chat_id} → 新群 ID），旧链接已全部作废，请以此链接为准
+                    </p>
+                  ) : null}
+                  <div className="flex items-center gap-2">
+                    <code className="min-w-0 flex-1 truncate rounded bg-white px-2 py-1.5 font-mono text-[12px] text-black">
+                      {deployResult.invite_link}
+                    </code>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void navigator.clipboard.writeText(deployResult.invite_link ?? "");
+                        setDeployLinkCopied(true);
+                        window.setTimeout(() => setDeployLinkCopied(false), 2000);
+                      }}
+                      className="shrink-0 rounded-full px-3 py-1.5 text-[12px] font-medium text-white"
+                      style={{ backgroundColor: IOS_BLUE }}
+                    >
+                      {deployLinkCopied ? "已复制" : "复制"}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+              {deployResult.guide && deployResult.guide.length > 0 ? (
+                <div className="rounded-xl bg-black/[0.04] p-3">
+                  <p className="mb-1.5 text-[12px] font-medium text-black">下一步操作</p>
+                  <ol className="list-decimal space-y-1 pl-4 text-[12px] leading-relaxed text-[#3b4a54]">
+                    {deployResult.guide.map((step, index) => (
+                      <li key={index}>{step}</li>
+                    ))}
+                  </ol>
+                </div>
+              ) : null}
+              <button
+                type="button"
+                onClick={() => setDeployResult(null)}
+                className="mt-4 w-full cursor-pointer rounded-full bg-black/[0.06] py-3 text-[16px] font-semibold text-black"
+              >
+                知道了
+              </button>
+            </motion.div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+
+      {/* 深色 flash 提示 */}
+      <AnimatePresence>
+        {flash ? (
+          <motion.div
+            key="flash"
+            initial={{ opacity: 0, y: -16 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -16 }}
+            className="pointer-events-none absolute left-1/2 top-3 z-[60] w-[86%] -translate-x-1/2"
+            role="status"
+          >
+            <div
+              className="rounded-2xl px-4 py-2.5 text-center text-[13px] font-medium leading-relaxed text-white shadow-lg"
+              style={{ backgroundColor: flash.ok ? "rgba(30,142,62,0.92)" : "rgba(190,44,44,0.92)" }}
+            >
+              {flash.text}
+            </div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
     </div>
   );
 }

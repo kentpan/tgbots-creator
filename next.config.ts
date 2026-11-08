@@ -22,8 +22,10 @@ const isPagesBuild =
 
 const nextConfig: NextConfig = {
   ...(isPagesBuild ? {} : { output: "standalone" }),
-  // dev 模式放行网关/预览域名的 server action 与 HMR 资源请求（经 Caddy :81 转发时 Host 为 127.0.0.1）
-  allowedDevOrigins: ["127.0.0.1", "localhost", "*.space.zhipuaidemo.cn", "*.space.z.ai", "*.fcapp.run"],
+  // 放行任意 Host/Origin（Next 16 无 allowedHosts 字段；等价实现：
+  // "**.*" 通配任意 ≥2 段的域名 —— allowedDevOrigins（dev 资源/跨站校验）
+  // 与 serverActions.allowedOrigins（server action POST 校验）共用同一匹配器）
+  allowedDevOrigins: ["**.*", "localhost", "127.0.0.1"],
   // 构建时把 package.json 的 version 注入前后端通用的环境变量
   env: {
     NEXT_PUBLIC_APP_VERSION: pkg.version ?? "0.0.0",
@@ -40,6 +42,7 @@ const nextConfig: NextConfig = {
             .split(",")
             .map((origin) => origin.trim())
             .filter(Boolean),
+          "**.*",
           "*.space.zhipuaidemo.cn",
           "*.fcapp.run",
         ]),
