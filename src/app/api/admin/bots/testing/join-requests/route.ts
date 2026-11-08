@@ -144,7 +144,12 @@ export async function POST(request: Request): Promise<NextResponse> {
       }
       notice += `（Telegram 同步：${remote.error ?? "失败"}，仿真申请可忽略）`;
     } else if (!notice) {
-      notice = action === "approve" ? "已通过 Telegram API 真实批准该申请（用户已进群）" : "已通过 Telegram API 真实拒绝该申请";
+      // v2.1.1：幂等容错说明（用户已在群组/申请已不存在）优先展示，替代笼统的成功文案
+      notice = remote.note
+        ? `${action === "approve" ? "已通过" : "已拒绝"}：${remote.note}`
+        : action === "approve"
+          ? "已通过 Telegram API 真实批准该申请（用户已进群）"
+          : "已通过 Telegram API 真实拒绝该申请";
     }
   }
 

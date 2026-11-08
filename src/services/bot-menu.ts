@@ -171,13 +171,18 @@ export function installBotMenu(bot: Bot<BotContext>, config: BotMenuConfig): TGu
  * 把菜单配置渲染为普通 InlineKeyboardMarkup（官方 menu.render(ctx)）。
  * 管理后台在 update 管道之外直发消息时使用；优先用运行实例已缓存的
  * botInfo，实例尚未初始化时补一次 getMe（真实的机器人身份）。
+ *
+ * v2.1.1 修复「同步失败：Bot information unavailable!」：grammY 的 bot.botInfo
+ * 是 getter —— 实例未 init() 时访问直接抛错（而不是返回 undefined），
+ * 旧写法 `bot.botInfo ?? (await bot.api.getMe())` 的兜底分支永远走不到。
+ * 必须先用 isInited() 显式判定（与 webhook 路由同款），未初始化时走 getMe。
  */
 export async function renderMenuMarkup(
   config: BotMenuConfig,
   bot: Bot<BotContext>,
 ): Promise<InlineKeyboardMarkup> {
   const menu = buildBotMenu(config);
-  const me = bot.botInfo ?? (await bot.api.getMe());
+  const me = bot.isInited() ? bot.botInfo : await bot.api.getMe();
   const ctx = new Context({ update_id: 0 }, bot.api, me);
   return { inline_keyboard: await menu.renderMarkup(ctx) };
 }

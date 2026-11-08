@@ -418,7 +418,11 @@ export async function setBotGroupAdminAction(formData: FormData): Promise<void> 
   for (const key of BOT_ADMIN_RIGHT_KEYS) {
     rights[key] = formData.get(key) === "1";
   }
-  const requireApproval = formData.get("require_approval") === "1";
+  // v2.1.1：「加群审核」开关已从弹窗移除（Bot API 无法远程修改该群级开关，旧可点开关为误导性展示）。
+  // 表单不再提交 require_approval —— 缺失时传 undefined（upsert 语义：保持现有值不变），
+  // 绝不能把旧实现默认的 false 覆盖写入。
+  const requireApprovalRaw = formData.get("require_approval");
+  const requireApproval = requireApprovalRaw === null ? undefined : requireApprovalRaw === "1";
 
   const chatId = BigInt(chatIdRaw);
   const chatIdNum = Number(chatId);

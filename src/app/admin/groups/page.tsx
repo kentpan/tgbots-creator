@@ -13,6 +13,7 @@ import { inputClass, labelClass, selectClass } from "@/components/admin/form-sty
 import { SwitchField } from "@/components/admin/switch-field";
 import { deleteGroupAction, saveGroupAction } from "./actions";
 import { BotAdminsDialog } from "./bot-admins-dialog";
+import { InviteLinksDialog } from "./invite-links-dialog";
 
 export const dynamic = "force-dynamic";
 
@@ -356,6 +357,18 @@ export default async function GroupsPage({
                             })}
                             trigger="🤖 机器人管理员"
                             triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
+                          />
+                          <InviteLinksDialog
+                            chatId={chatKey}
+                            chatTitle={group.chatTitle ?? ""}
+                            bots={chatAdmins.map((admin) => ({
+                              id: String(admin.botId),
+                              name:
+                                botNameById.get(String(admin.botId))?.name ??
+                                `机器人 #${String(admin.botId)}`,
+                            }))}
+                            trigger="🔗 邀请链接"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
                           />
                           <form action={deleteGroupAction}>
                             <input type="hidden" name="chat_id" value={chatKey} />

@@ -287,8 +287,55 @@ async function ensureMigrations(): Promise<void> {
   await executeRun(
     `CREATE UNIQUE INDEX IF NOT EXISTS "bot_sessions_scope_key" ON "bot_sessions"("scope", "session_key")`,
   );
+  // v2.1.2 邀请链接台账：机器人创建的全部邀请链接统一落库（群组管理可查看/撤销）
+  await executeRun(
+    `CREATE TABLE IF NOT EXISTS "invite_links" (
+      "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      "bot_id" INTEGER,
+      "chat_id" BIGINT NOT NULL,
+      "link" TEXT NOT NULL,
+      "name" TEXT,
+      "creates_join_request" BOOLEAN NOT NULL DEFAULT false,
+      "is_revoked" BOOLEAN NOT NULL DEFAULT false,
+      "source" TEXT NOT NULL DEFAULT 'api',
+      "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`,
+  );
+  await executeRun(
+    `CREATE UNIQUE INDEX IF NOT EXISTS "invite_links_link_key" ON "invite_links"("link")`,
+  );
+  await executeRun(
+    `CREATE INDEX IF NOT EXISTS "idx_invite_links_bot_chat" ON "invite_links"("bot_id", "chat_id")`,
+  );
+  await executeRun(
+    `CREATE INDEX IF NOT EXISTS "idx_invite_links_chat" ON "invite_links"("chat_id")`,
+  );
+  // v2.1.2 群消息台账：webhook 收到的群消息（按 bot 权限视角）落库，仿真屏展示真实群消息
+  await executeRun(
+    `CREATE TABLE IF NOT EXISTS "chat_messages" (
+      "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      "bot_id" INTEGER,
+      "chat_id" BIGINT NOT NULL,
+      "message_id" INTEGER,
+      "user_id" BIGINT,
+      "username" TEXT,
+      "first_name" TEXT,
+      "from_bot" BOOLEAN NOT NULL DEFAULT false,
+      "kind" TEXT NOT NULL DEFAULT 'message',
+      "text" TEXT,
+      "message_time" DATETIME,
+      "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`,
+  );
+  await executeRun(
+    `CREATE UNIQUE INDEX IF NOT EXISTS "chat_messages_chat_msg_key" ON "chat_messages"("chat_id", "bot_id", "message_id")`,
+  );
+  await executeRun(
+    `CREATE INDEX IF NOT EXISTS "idx_chat_messages_chat_id" ON "chat_messages"("chat_id", "id")`,
+  );
   console.log(
-    "Migrations ensured: bots, developer_accounts, group_bot_admins, bot_commands, privacy_mode, require_approval, xianyu_products, xianyu_delivery_logs, verify_codes, ai_providers, ai_usage_logs, bot_sessions",
+    "Migrations ensured: bots, developer_accounts, group_bot_admins, bot_commands, privacy_mode, require_approval, xianyu_products, xianyu_delivery_logs, verify_codes, ai_providers, ai_usage_logs, bot_sessions, invite_links, chat_messages",
   );
 }
 

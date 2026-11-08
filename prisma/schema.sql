@@ -252,6 +252,45 @@ CREATE TABLE "bot_sessions" (
       "value" TEXT NOT NULL DEFAULT '{}',
       "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+-- v2.1.2 邀请链接台账：机器人经 Bot API 创建的全部邀请链接（部署规范链接 /
+-- 验证超时补发链接 / 重新申请链接 / 管理后台手动登记链接）统一落库，
+-- 供「群组管理 → 邀请链接」查看与撤销（revokeChatInviteLink 后 Telegram 侧链接立即作废）
+CREATE TABLE IF NOT EXISTS "invite_links" (
+    "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "bot_id" INTEGER,
+    "chat_id" BIGINT NOT NULL,
+    "link" TEXT NOT NULL,
+    "name" TEXT,
+    "creates_join_request" BOOLEAN NOT NULL DEFAULT false,
+    "is_revoked" BOOLEAN NOT NULL DEFAULT false,
+    "source" TEXT NOT NULL DEFAULT 'api',
+    "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "invite_links_link_key" ON "invite_links"("link");
+CREATE INDEX IF NOT EXISTS "idx_invite_links_bot_chat" ON "invite_links"("bot_id", "chat_id");
+CREATE INDEX IF NOT EXISTS "idx_invite_links_chat" ON "invite_links"("chat_id");
+
+-- v2.1.2 群消息台账：webhook 收到的群消息（bot 可见 = 按 bot 权限视角）落库，
+-- 供仿真屏右侧对话区展示真实群消息。Bot API 无历史消息拉取能力，
+-- 仅收集部署后新到达的消息；每群只保留最近 200 条（进程内计数触发清理）。
+CREATE TABLE IF NOT EXISTS "chat_messages" (
+    "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    "bot_id" INTEGER,
+    "chat_id" BIGINT NOT NULL,
+    "message_id" INTEGER,
+    "user_id" BIGINT,
+    "username" TEXT,
+    "first_name" TEXT,
+    "from_bot" BOOLEAN NOT NULL DEFAULT false,
+    "kind" TEXT NOT NULL DEFAULT 'message',
+    "text" TEXT,
+    "message_time" DATETIME,
+    "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "chat_messages_chat_msg_key" ON "chat_messages"("chat_id", "bot_id", "message_id");
+CREATE INDEX IF NOT EXISTS "idx_chat_messages_chat_id" ON "chat_messages"("chat_id", "id");
+
 CREATE UNIQUE INDEX "admin_users_username_key" ON "admin_users"("username");
 CREATE UNIQUE INDEX "bot_commands_type_name_key" ON "bot_commands"("type", "name");
 CREATE UNIQUE INDEX "bot_sessions_scope_key" ON "bot_sessions"("scope", "session_key");

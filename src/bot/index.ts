@@ -13,6 +13,7 @@ import { registerAiSupport, type AiSupportConfig } from "./handlers/ai-support";
 import { buildSessionMiddleware } from "./session-storage";
 import { listBotCommands } from "@/database/operations";
 import { registerChatTracking } from "./chat-tracking";
+import { registerInviteLinkTracking } from "./invite-link-tracking";
 import { telegramBotClientOptions } from "@/lib/telegram/transport";
 
 export const BOT_COMMANDS = [
@@ -111,6 +112,8 @@ export async function createBot(
   // 真实群组自动登记（v1.1.1 统一实现，与 multi-runtime 共用）：
   // my_chat_member / chat_join_request / 群消息兜底 → chat-registry（只补充群名，不覆盖验证配置）
   registerChatTracking(bot, token);
+  // v2.1.2 邀请链接台账：任何路径 createChatInviteLink 成功后统一落库（群组管理可查看/撤销）
+  registerInviteLinkTracking(bot, token);
 
   bot.on("chat_join_request", handleJoinRequest);
 

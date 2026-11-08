@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { opsFetch } from "@/lib/remote-ops";
 import { AlertTriangle, Check, Loader2, RefreshCw } from "lucide-react";
@@ -24,7 +24,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { TgAppSimulator, type AppSimGroup } from "@/components/admin/tg-app-simulator";
+import { TgAppSimulator, type AppSimGroup, type RealChatMessage } from "@/components/admin/tg-app-simulator";
 import { useRealGroups } from "@/components/admin/use-real-groups";
 import type { BotMenuConfig } from "@/services/menu-config";
 
@@ -198,6 +198,75 @@ export function TestingClient({
   }, []);
   // 弹窗「确认配置」暂存的验证 API 配置，点击「申请加入群组」时随请求保存到群组绑定
   const [pendingJoinConfig, setPendingJoinConfig] = useState<JoinApiConfig | null>(null);
+
+  // —— v2.1.2 真实群消息（按 bot 权限视角）：拉取 chat_messages 台账 ——
+  // v2.1.3 D1 读额度保护：废除 v2.1.2 的 10s 轮询（轮询 100 行/次 × 6 次/分 × 挂机时长，
+  // 长时间挂机会烧掉 D1 免费层 500 万行读/天的大头）。现在只在「展现时」获取一次：
+  // 点击群组打开聊天 / 私聊验证后返回群聊视图，各拉取一次；其余时间提供手动刷新按钮。
+  const [realMessages, setRealMessages] = useState<RealChatMessage[]>([]);
+  const [realMessagesState, setRealMessagesState] = useState<{
+    loading: boolean;
+    fetchedAt: string | null;
+    error: string | null;
+  }>({ loading: false, fetchedAt: null, error: null });
+
+  const loadRealMessages = useCallback(async (chatId: string, botId: string): Promise<void> => {
+    setRealMessagesState((prev) => ({ ...prev, loading: true }));
+    try {
+      const params = new URLSearchParams({ chat_id: chatId, bot_id: botId, limit: "100" });
+      const response = await fetch(`/api/admin/telegram/chat-messages?${params.toString()}`, {
+        cache: "no-store",
+      });
+      const payload = (await response.json()) as {
+        ok: boolean;
+        error?: string;
+        data?: { messages: RealChatMessage[] };
+      };
+      if (!payload.ok) {
+        setRealMessagesState({ loading: false, fetchedAt: null, error: payload.error ?? "读取失败" });
+        return;
+      }
+      setRealMessages(payload.data?.messages ?? []);
+      setRealMessagesState({ loading: false, fetchedAt: new Date().toISOString(), error: null });
+    } catch (error) {
+      setRealMessagesState({
+        loading: false,
+        fetchedAt: null,
+        error: error instanceof Error ? error.message : "网络错误",
+      });
+    }
+  }, []);
+
+  // 展现时获取（去重守卫）：同一 (bot, chat, 视图) 只自动拉取一次 ——
+  // React StrictMode 下 effect 双触发不会重复打库；视图切换（私聊→群聊）算新一次展现
+  const lastRealMessagesKeyRef = useRef<string>("");
+  const fetchRealMessagesOnDisplay = useCallback(
+    async (chatId: string, botId: string): Promise<void> => {
+      const key = `${botId}:${chatId}:${simView}`;
+      if (lastRealMessagesKeyRef.current === key) return;
+      lastRealMessagesKeyRef.current = key;
+      await loadRealMessages(chatId, botId);
+    },
+    [loadRealMessages, simView],
+  );
+
+  useEffect(() => {
+    if (!selectedChatId || !selectedBotId) {
+      setRealMessages([]);
+      setRealMessagesState({ loading: false, fetchedAt: null, error: null });
+      lastRealMessagesKeyRef.current = "";
+      return;
+    }
+    // v2.1.3 只在展现时获取：群聊视图可见（simView=group）时拉一次，无任何轮询
+    if (simView !== "group") return;
+    void fetchRealMessagesOnDisplay(selectedChatId, selectedBotId);
+  }, [selectedChatId, selectedBotId, simView, fetchRealMessagesOnDisplay]);
+
+  // 手动刷新（聊天区同步胶囊上的刷新按钮）：绕过去重守卫强制拉取
+  const refreshRealMessages = useCallback((): Promise<void> => {
+    if (!selectedChatId || !selectedBotId) return Promise.resolve();
+    return loadRealMessages(selectedChatId, selectedBotId);
+  }, [selectedChatId, selectedBotId, loadRealMessages]);
 
   const selectedBot = bots.find((bot) => bot.id === selectedBotId) ?? null;
 
@@ -723,6 +792,9 @@ export function TestingClient({
               deployingChatId={deployingChatId}
               onSimulateJoinForGroup={handleRequestJoinForGroup}
               onSettingsSaved={refreshPageData}
+              realMessages={realMessages}
+              realMessagesState={realMessagesState}
+              onRefreshRealMessages={refreshRealMessages}
               bots={bots.map((bot) => ({
                 id: bot.id,
                 name: bot.name,

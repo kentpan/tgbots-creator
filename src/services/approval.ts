@@ -1,4 +1,4 @@
-import { Bot, GrammyError, InlineKeyboard } from "grammy";
+import { Bot, GrammyError, InlineKeyboard, type Api } from "grammy";
 import { config } from "@/config/settings";
 import { telegramBotClientOptions } from "@/lib/telegram/transport";
 import {
@@ -19,6 +19,17 @@ const TELEGRAM_ERRORS: Record<string, string> = {
   not_enough_rights: "机器人权限不足",
   deactivated: "用户已注销",
 };
+
+/** Telegram 幂等容错信号（v2.1.1）：申请已不存在 / 用户已是群成员 —— 按预期结果处理，绝不当作失败 */
+export function isTelegramRequestAlreadyHandled(error: unknown): "already_participant" | "request_gone" | null {
+  if (!(error instanceof GrammyError)) return null;
+  const text = (error.description || error.message || "").toLowerCase();
+  if (text.includes("user_already_participant")) return "already_participant";
+  if (text.includes("request_not_found") || text.includes("request to join chat not found")) {
+    return "request_gone";
+  }
+  return null;
+}
 
 export class ApprovalResult {
   constructor(
@@ -58,13 +69,30 @@ export function getBot(context?: BotResolutionContext): Bot {
  * 必须由「该群绑定的启用 bot」执行；此前固定用主 bot（config.toml token），主 bot 无 token
  * 或不在群内时审批永远失败。
  *
- * 解析顺序：
- * 1. group_bot_admins × bots 联查该群绑定的启用 bot（getActiveBotForChat，updated_time 最新），
+ * 解析顺序（v2.1.1 重构）：
+ * 1. **事件接收 bot（eventApi，收到本次 Telegram 更新的机器人实例）** —— 加群申请/验证码
+ *    输入都是特定 bot 收到的实时事件：它必然在群内且为管理员（Telegram 只向群内管理员
+ *    推送 chat_join_request/chat_member），用它执行审批/禁言/踢出最可靠；
+ * 2. group_bot_admins × bots 联查该群绑定的启用 bot（getActiveBotForChat，updated_time 最新），
  *    Bot 实例复用 telegram-sync 的 botByToken（Map<token, Bot> 缓存，仅调用 .api，不启动轮询）；
- * 2. 无绑定 / token 为空 → 回落主 bot getBot()（保持旧行为兼容）；
- * 3. 主 bot 也无 token → getBot() 抛出带场景/chatId/userId 的错误（禁止吞错、禁止静默跳过）。
+ * 3. 无绑定 / token 为空 → 回落主 bot getBot()（保持旧行为兼容）；
+ * 4. 主 bot 也无 token → getBot() 抛出带场景/chatId/userId 的错误（禁止吞错、禁止静默跳过）。
+ *
+ * v2.1.1 根因修复：旧实现无 eventApi 概念，群组绑定缺失时直接回落主 bot —— edge 部署
+ * 未配置主 bot token 时 getBot() 抛错 → 加群申请审批失败 → 群内验证静默回落私聊、
+ * 私聊验证「输入验证码后不真实进群」（autoApproveUser 同一断点）。事件接收 bot 优先后
+ * 全链路不再依赖绑定行与主 bot token。
  */
-async function resolveBotForChat(scenario: string, chatId: bigint, userId: bigint): Promise<Bot> {
+async function resolveBotForChat(
+  scenario: string,
+  chatId: bigint,
+  userId: bigint,
+  eventApi?: Api,
+): Promise<Bot> {
+  if (eventApi) {
+    // 事件接收 bot：包装为轻量 Bot 形态（仅用 .api；telegram-sync 的 botByToken 缓存外实例）
+    return { api: eventApi } as Bot;
+  }
   const binding = await getActiveBotForChat(chatId);
   const boundToken = binding?.token.trim() ?? "";
   if (binding && boundToken) {
@@ -100,13 +128,18 @@ export function describeTelegramError(error: unknown): string | null {
   return null;
 }
 
-export async function dismissJoinRequest(chatId: bigint, userId: bigint): Promise<boolean> {
+export async function dismissJoinRequest(chatId: bigint, userId: bigint, eventApi?: Api): Promise<boolean> {
   try {
-    const bot = await resolveBotForChat("dismissJoinRequest", chatId, userId);
+    const bot = await resolveBotForChat("dismissJoinRequest", chatId, userId, eventApi);
     await bot.api.declineChatJoinRequest(Number(chatId), Number(userId));
     console.log(`Dismissed join request: user ${userId} for chat ${chatId}`);
     return true;
   } catch (error) {
+    // v2.1.1：申请已不存在（已被 TG 客户端处理/用户已撤回）= 语义上已拒绝，按成功处理
+    if (isTelegramRequestAlreadyHandled(error) === "request_gone") {
+      console.log(`Join request already gone on Telegram side: user ${userId} for chat ${chatId}`);
+      return true;
+    }
     if (error instanceof GrammyError && error.error_code === 400) {
       const reason = describeTelegramError(error) ?? "Telegram API错误";
       console.warn(`Skip dismiss for user ${userId} (chat ${chatId}): ${reason} (${error.description})`);
@@ -122,9 +155,9 @@ export async function dismissJoinRequest(chatId: bigint, userId: bigint): Promis
  * 踢出未验证成员（v1.1.3，直连入群防线）：ban + unban = 仅移出群组（不封禁），
  * 用户之后仍可通过入群申请链接重新申请。需要机器人拥有「封禁用户」管理员权限。
  */
-export async function kickUnverifiedMember(chatId: bigint, userId: bigint): Promise<boolean> {
+export async function kickUnverifiedMember(chatId: bigint, userId: bigint, eventApi?: Api): Promise<boolean> {
   try {
-    const bot = await resolveBotForChat("kickUnverifiedMember", chatId, userId);
+    const bot = await resolveBotForChat("kickUnverifiedMember", chatId, userId, eventApi);
     await bot.api.banChatMember(Number(chatId), Number(userId));
     await bot.api.unbanChatMember(Number(chatId), Number(userId), { only_if_banned: true });
     console.log(`Kicked unverified member: user ${userId} from chat ${chatId}`);
@@ -209,7 +242,7 @@ async function sendWelcomeMessage(bot: Bot, chatId: bigint, userId: bigint): Pro
   }
 }
 
-export async function autoApproveUser(verificationToken: string): Promise<ApprovalResult> {
+export async function autoApproveUser(verificationToken: string, eventApi?: Api): Promise<ApprovalResult> {
   try {
     const joinRequest = await getJoinRequestByToken(verificationToken);
     if (!joinRequest) {
@@ -227,18 +260,27 @@ export async function autoApproveUser(verificationToken: string): Promise<Approv
       return new ApprovalResult(false, "无效的群组ID");
     }
 
-    const bot = await resolveBotForChat("autoApproveUser", joinRequest.chatId, joinRequest.userId);
+    const bot = await resolveBotForChat("autoApproveUser", joinRequest.chatId, joinRequest.userId, eventApi);
     try {
       await bot.api.approveChatJoinRequest(Number(joinRequest.chatId), Number(joinRequest.userId));
     } catch (error) {
-      if (error instanceof GrammyError && error.error_code === 400) {
+      // v2.1.1：用户已是群成员（群内验证 bootstrap 已批准过/在 TG 客户端已被其它管理员
+      // 批准/重复点击）= 用户确实已在群内，审批目的已达成 —— 按成功继续落库，
+      // 绝不当作失败（旧实现直接报错，导致「输入验证码后不真实进群」与
+      // 管理端「通过申请 USER_ALREADY_PARTICIPANT」两类线上故障）
+      if (isTelegramRequestAlreadyHandled(error) === "already_participant") {
+        console.log(
+          `User ${joinRequest.userId} already participant of chat ${joinRequest.chatId} — treat approval as done`,
+        );
+      } else if (error instanceof GrammyError && error.error_code === 400) {
         const reason = describeTelegramError(error);
         console.warn(
           `Telegram rejected approval of user ${joinRequest.userId} for chat ${joinRequest.chatId}: ${error.description}`,
         );
         return new ApprovalResult(false, reason ?? `Telegram API错误：${error.description}`);
+      } else {
+        throw error;
       }
-      throw error;
     }
 
     const updated = await approveJoinRequest(verificationToken);
@@ -268,6 +310,7 @@ export async function autoApproveUser(verificationToken: string): Promise<Approv
  */
 export async function completeDirectJoinVerification(
   verificationToken: string,
+  eventApi?: Api,
 ): Promise<ApprovalResult> {
   try {
     const joinRequest = await getJoinRequestByToken(verificationToken);
@@ -284,7 +327,7 @@ export async function completeDirectJoinVerification(
     // 不做任何数据库写入（fail-fast，避免「库已批准但返回失败」的半完成状态）
     const bot =
       joinRequest.chatId !== 0n
-        ? await resolveBotForChat("directJoinWelcome", joinRequest.chatId, joinRequest.userId)
+        ? await resolveBotForChat("directJoinWelcome", joinRequest.chatId, joinRequest.userId, eventApi)
         : null;
 
     const updated = await approveJoinRequest(verificationToken);
@@ -357,13 +400,23 @@ const MUTED_PERMISSIONS = {
 export async function approveTelegramJoinRequest(
   chatId: bigint,
   userId: bigint,
+  eventApi?: Api,
 ): Promise<ApprovalResult> {
   try {
-    const bot = await resolveBotForChat("approveTelegramJoinRequest", chatId, userId);
+    const bot = await resolveBotForChat("approveTelegramJoinRequest", chatId, userId, eventApi);
     await bot.api.approveChatJoinRequest(Number(chatId), Number(userId));
     console.log(`Approved Telegram join request: user ${userId} for chat ${chatId}`);
     return new ApprovalResult(true);
   } catch (error) {
+    // v2.1.1：用户已是群成员 = 本次 bootstrap 的「批准入群」目的已达成（群内验证继续），
+    // 绝不当作失败 —— 旧实现把该幂等场景当失败后静默回落私聊验证，用户端表现是
+    // 「申请加群后机器人完全没反应」
+    if (isTelegramRequestAlreadyHandled(error) === "already_participant") {
+      console.log(
+        `Join request approval skipped (already participant): user ${userId} for chat ${chatId}`,
+      );
+      return new ApprovalResult(true);
+    }
     if (error instanceof GrammyError && error.error_code === 400) {
       const reason = describeTelegramError(error);
       console.warn(
@@ -386,9 +439,10 @@ export async function muteUnverifiedMember(
   chatId: bigint,
   userId: bigint,
   untilDate: Date,
+  eventApi?: Api,
 ): Promise<boolean> {
   try {
-    const bot = await resolveBotForChat("muteUnverifiedMember", chatId, userId);
+    const bot = await resolveBotForChat("muteUnverifiedMember", chatId, userId, eventApi);
     // until_date 硬上限 366 天（Telegram 约束），下限 30 秒（Telegram 约束最短 30s）
     const untilSeconds = Math.min(
       Math.max(Math.floor(untilDate.getTime() / 1000), Math.floor(Date.now() / 1000) + 30),
@@ -410,9 +464,9 @@ export async function muteUnverifiedMember(
 }
 
 /** 解除禁言（验证通过）：恢复标准成员发言权限；未禁言/无权限时静默成功 */
-export async function unmuteGroupMember(chatId: bigint, userId: bigint): Promise<boolean> {
+export async function unmuteGroupMember(chatId: bigint, userId: bigint, eventApi?: Api): Promise<boolean> {
   try {
-    const bot = await resolveBotForChat("unmuteGroupMember", chatId, userId);
+    const bot = await resolveBotForChat("unmuteGroupMember", chatId, userId, eventApi);
     await bot.api.restrictChatMember(Number(chatId), Number(userId), { ...MEMBER_SEND_PERMISSIONS });
     console.log(`Unmuted member after verification: user ${userId} in chat ${chatId}`);
     return true;
@@ -424,13 +478,13 @@ export async function unmuteGroupMember(chatId: bigint, userId: bigint): Promise
 }
 
 /** 删除指定会话的群内验证提示消息（验证通过/失败/超时后清理群内痕迹） */
-export async function deleteSessionPromptMessage(token: string): Promise<boolean> {
+export async function deleteSessionPromptMessage(token: string, eventApi?: Api): Promise<boolean> {
   try {
     const session = await getVerificationSession(token);
     if (!session || !session.promptMessageId || session.chatId === 0n) {
       return false;
     }
-    const bot = await resolveBotForChat("deleteSessionPromptMessage", session.chatId, session.userId);
+    const bot = await resolveBotForChat("deleteSessionPromptMessage", session.chatId, session.userId, eventApi);
     await bot.api.deleteMessage(Number(session.chatId), session.promptMessageId);
     return true;
   } catch (error) {
@@ -461,9 +515,10 @@ export async function sendGroupWelcome(
   firstName: string,
   lastName: string | null,
   successText: string,
+  eventApi?: Api,
 ): Promise<boolean> {
   try {
-    const bot = await resolveBotForChat("sendGroupWelcome", chatId, userId);
+    const bot = await resolveBotForChat("sendGroupWelcome", chatId, userId, eventApi);
     const mention = userMentionHTML({
       id: Number(userId),
       username,
@@ -490,9 +545,10 @@ export async function sendGroupTimeoutNotice(
   chatId: bigint,
   userId: bigint,
   options?: { kicked?: boolean },
+  eventApi?: Api,
 ): Promise<boolean> {
   try {
-    const bot = await resolveBotForChat("sendGroupTimeoutNotice", chatId, userId);
+    const bot = await resolveBotForChat("sendGroupTimeoutNotice", chatId, userId, eventApi);
     const mention = userMentionHTML({ id: Number(userId), first_name: "该成员" });
     const text =
       options?.kicked === false
@@ -514,9 +570,13 @@ export async function sendGroupTimeoutNotice(
  *
  * 适用于：入群申请链接用户（bootstrap 已在 Telegram 侧批准，无需再调
  * approveChatJoinRequest）与直连入群用户（无需审批动作）。
+ *
+ * v2.1.1：eventApi（事件接收 bot）优先 —— 解禁/删提示/欢迎全部由收到本次
+ * 验证事件的机器人执行，不再依赖绑定行与主 bot token（完整原因见 resolveBotForChat）。
  */
 export async function completeGroupVerification(
   verificationToken: string,
+  eventApi?: Api,
 ): Promise<ApprovalResult> {
   try {
     const joinRequest = await getJoinRequestByToken(verificationToken);
@@ -546,6 +606,7 @@ export async function completeGroupVerification(
       "completeGroupVerification",
       joinRequest.chatId,
       joinRequest.userId,
+      eventApi,
     );
 
     // Telegram 侧入群兜底：极少数场景（bootstrap 审批失败回落私聊验证的群渠道会话）
@@ -574,7 +635,7 @@ export async function completeGroupVerification(
     }
 
     // 解禁 + 删除群内验证消息（均 best effort，失败不影响验证通过结论）
-    await unmuteGroupMember(joinRequest.chatId, joinRequest.userId);
+    await unmuteGroupMember(joinRequest.chatId, joinRequest.userId, eventApi);
     const session = await getVerificationSession(verificationToken);
     if (session?.promptMessageId) {
       const deleted = await bot.api
@@ -603,6 +664,7 @@ export async function completeGroupVerification(
       joinRequest.firstName,
       joinRequest.lastName,
       settings?.successText ?? "✅ 验证成功，欢迎加入！",
+      eventApi,
     );
 
     console.log(

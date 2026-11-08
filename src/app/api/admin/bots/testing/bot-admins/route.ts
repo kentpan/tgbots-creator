@@ -54,6 +54,64 @@ export async function GET(request: Request): Promise<NextResponse> {
     return NextResponse.json({ ok: false, error: "群组 Chat ID 不合法" }, { status: 400 });
   }
 
+  // v2.1.1 实时模式：?chat_id=X&bot_id=Y&live=1 → 直读 Telegram 真实状态（不再回显本地保存的假数据）。
+  // 管理员弹窗打开/切换机器人时调用：权限勾选 = getChatMember 实际权限；
+  // 「审批新成员」等群级开关 = getChat 的 join_request/join_to_send 真实字段
+  // （Bot API 官方只读，无法远程修改 —— 弹窗如实展示，绝不提供假开关）。
+  const liveBotIdRaw = url.searchParams.get("bot_id") ?? "";
+  const live = url.searchParams.get("live") === "1";
+  if (live && /^\d+$/.test(liveBotIdRaw)) {
+    const bot = await getBot(BigInt(liveBotIdRaw));
+    if (!bot) {
+      return NextResponse.json({ ok: false, error: "机器人不存在" }, { status: 404 });
+    }
+    try {
+      const api = botByToken(bot.token).api;
+      const me = await withTelegramTimeout(getMeCached(api, bot.token));
+      const member = await withTelegramTimeout(api.getChatMember(Number(chatId), me.id));
+      const isAdministrator = member.status === "administrator";
+      // Bot API 7.3+：ChatFullInfo.join_to_send / join_request —— 官方定义为
+      // 「Optional. True, if ...」的只真布尔：字段缺失/False 均表示未开启（Bot API
+      // 对可选布尔一律省略假值）。getChat 整体失败时置 null（前端按「不可知」展示，
+      // 与「读取成功但未开启」严格区分）。
+      let joinRequestFlag: boolean | null = false;
+      let joinToSendFlag: boolean | null = false;
+      try {
+        const chat = await withTelegramTimeout(api.getChat(Number(chatId)));
+        const flags = chat as { join_request?: unknown; join_to_send?: unknown };
+        joinRequestFlag = flags.join_request === true;
+        joinToSendFlag = flags.join_to_send === true;
+      } catch {
+        /* getChat 失败不阻塞权限回显，仅群级开关标记为不可知 */
+        joinRequestFlag = null;
+        joinToSendFlag = null;
+      }
+      return NextResponse.json({
+        ok: true,
+        data: {
+          live: true,
+          bot_id: String(bot.id),
+          bot_name: bot.name,
+          bot_username: me.username ?? bot.username ?? null,
+          status: member.status,
+          is_admin: isAdministrator,
+          rights: isAdministrator ? actualRightsFromMember(member) : null,
+          group_flags: {
+            join_request: joinRequestFlag,
+            join_to_send: joinToSendFlag,
+          },
+        },
+      });
+    } catch (error) {
+      // 实时读取失败必须明确暴露（绝不静默回退到本地数据冒充真实状态）
+      const detail =
+        error instanceof GrammyError && error.error_code === 401
+          ? INVALID_TOKEN_GUIDE
+          : describeSyncError(error);
+      return NextResponse.json({ ok: false, error: detail }, { status: 200 });
+    }
+  }
+
   const admins = await listGroupBotAdmins(chatId);
   const entries: {
     id: string;

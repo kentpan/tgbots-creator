@@ -273,7 +273,20 @@ function DoodleWallpaper() {
   );
 }
 
-type Screen = "chat" | "settings" | "admins" | "proxy" | "newgroup";
+type Screen = "chat" | "settings" | "admins" | "proxy" | "newgroup" | "apiconfig";
+
+/** v2.1.2 真实群消息（chat_messages 台账，/api/admin/telegram/chat-messages 返回项） */
+export interface RealChatMessage {
+  id: string;
+  message_id: number | null;
+  user_id: string | null;
+  username: string | null;
+  first_name: string | null;
+  from_bot: boolean;
+  kind: string;
+  text: string | null;
+  message_time: string | null;
+}
 
 export function TgAppSimulator({
   config,
@@ -299,6 +312,9 @@ export function TgAppSimulator({
   onSimulateJoinForGroup,
   onSettingsSaved,
   bots,
+  realMessages,
+  realMessagesState,
+  onRefreshRealMessages,
 }: {
   config: BotMenuConfig;
   botName: string;
@@ -338,6 +354,12 @@ export function TgAppSimulator({
   onSettingsSaved: () => void;
   /** v2.0.15 新建群组流程的机器人列表（已有机器人，替代 APP「选择用户」） */
   bots: NewGroupBot[];
+  /** v2.1.2 真实群消息（父组件按 bot 权限视角拉取的 chat_messages 台账） */
+  realMessages?: RealChatMessage[];
+  /** 真实消息加载状态（v2.1.3 起父组件只在展现时获取，无轮询） */
+  realMessagesState?: { loading: boolean; fetchedAt: string | null; error: string | null };
+  /** v2.1.3 手动刷新真实群消息（聊天区同步胶囊刷新按钮，绕过展现去重强制拉取） */
+  onRefreshRealMessages?: () => void | Promise<void>;
 }) {
   // —— 浮层屏幕：chat=聊天区（默认初始界面），settings=群组设置，admins=机器人权限 ——
   const [screen, setScreen] = useState<Screen>("chat");
@@ -684,6 +706,190 @@ export function TgAppSimulator({
     if (screen === "settings" && activeChatId) void loadGroupSettings(activeChatId);
   }, [screen, activeChatId, loadGroupSettings]);
 
+  // —— v2.1.2 外部验证 API 配置浮层（验证渠道 code_api 分支入口，iOS 风格页） ——
+  const [apiConfigLoading, setApiConfigLoading] = useState(false);
+  const [apiConfigSaving, setApiConfigSaving] = useState(false);
+  const [apiConfigMethodId, setApiConfigMethodId] = useState<string | null>(null);
+  const [apiConfigMethodName, setApiConfigMethodName] = useState<string | null>(null);
+  const [apiForm, setApiForm] = useState({
+    url: "",
+    http_method: "POST" as "GET" | "POST",
+    api_key: "",
+    code_field: "code",
+    body_template: "",
+    success_status: "200",
+    success_field: "success",
+    success_value: "true",
+    timeout_seconds: "30",
+  });
+  const [testCode, setTestCode] = useState("");
+  const [testRunning, setTestRunning] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const loadApiConfig = useCallback(
+    async (chatId: string): Promise<void> => {
+      setApiConfigLoading(true);
+      setTestResult(null);
+      try {
+        const response = await opsFetch(
+          `/api/admin/bots/testing/method-config?chat_id=${encodeURIComponent(chatId)}`,
+          { cache: "no-store" },
+        );
+        const payload = await readJson<{
+          ok: boolean;
+          error?: string;
+          data?: {
+            method_id: string | null;
+            method_name: string | null;
+            config: {
+              url: string;
+              api_key: string;
+              http_method: string;
+              code_field?: string;
+              body_template?: string;
+              success_status: number;
+              success_field?: string;
+              success_value: string;
+              timeout_seconds: number;
+            } | null;
+          };
+        }>(response);
+        if (!payload) {
+          showFlash(false, `服务返回异常（HTTP ${response.status}）`);
+          return;
+        }
+        if (!payload.ok || !payload.data) {
+          showFlash(false, payload.error ?? "读取验证 API 配置失败");
+          return;
+        }
+        setApiConfigMethodId(payload.data.method_id);
+        setApiConfigMethodName(payload.data.method_name);
+        const config = payload.data.config;
+        setApiForm({
+          url: config?.url ?? "",
+          http_method: config?.http_method === "GET" ? "GET" : "POST",
+          api_key: config?.api_key ?? "",
+          code_field: config?.code_field ?? "code",
+          body_template: config?.body_template ?? "",
+          success_status: String(config?.success_status ?? 200),
+          success_field: config?.success_field ?? "success",
+          success_value: config?.success_value ?? "true",
+          timeout_seconds: String(config?.timeout_seconds ?? 30),
+        });
+      } catch (error) {
+        showFlash(false, error instanceof Error ? error.message : "读取验证 API 配置失败");
+      } finally {
+        setApiConfigLoading(false);
+      }
+    },
+    [showFlash],
+  );
+
+  // 打开 API 配置浮层时加载该群当前绑定的配置（未绑定过时展示默认模板）
+  useEffect(() => {
+    if (screen === "apiconfig" && activeChatId) void loadApiConfig(activeChatId);
+  }, [screen, activeChatId, loadApiConfig]);
+
+  const saveApiConfig = useCallback(async (): Promise<void> => {
+    if (!activeChatId || apiConfigSaving) return;
+    const url = apiForm.url.trim();
+    const apiKey = apiForm.api_key.trim();
+    if (!/^https?:\/\/\S+$/i.test(url)) {
+      showFlash(false, "验证 API 地址不合法（需 http/https 开头）");
+      return;
+    }
+    if (!apiKey) {
+      showFlash(false, "请填写 Bearer API Key");
+      return;
+    }
+    setApiConfigSaving(true);
+    try {
+      const response = await opsFetch("/api/admin/bots/testing/method-config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: activeChatId,
+          config: {
+            url,
+            api_key: apiKey,
+            http_method: apiForm.http_method,
+            code_field: apiForm.code_field.trim() || "code",
+            ...(apiForm.http_method === "POST" && apiForm.body_template.trim()
+              ? { body_template: apiForm.body_template.trim() }
+              : {}),
+            success_status: Number(apiForm.success_status) || 200,
+            success_field: apiForm.success_field.trim() || "success",
+            success_value: apiForm.success_value.trim() || "true",
+            timeout_seconds: Math.min(Math.max(Number(apiForm.timeout_seconds) || 30, 5), 60),
+          },
+        }),
+      });
+      const payload = await readJson<{
+        ok: boolean;
+        error?: string;
+        data?: { method_id: string; method_name: string };
+      }>(response);
+      if (!payload) {
+        showFlash(false, `服务返回异常（HTTP ${response.status}）`);
+        return;
+      }
+      if (!payload.ok || !payload.data) {
+        showFlash(false, payload.error ?? "保存失败");
+        return;
+      }
+      setApiConfigMethodId(payload.data.method_id);
+      setApiConfigMethodName(payload.data.method_name);
+      // 同步群设置表单的绑定下拉（验证方式=code_api、绑定该方法），保证设置页回显一致
+      setForm((prev) => ({ ...prev, method: "code_api", method_id: payload.data?.method_id ?? prev.method_id }));
+      showFlash(true, "验证 API 配置已保存（与「验证方式」页同一数据源，仿真与真实验证共用）");
+      onSettingsSaved();
+    } catch (error) {
+      showFlash(false, error instanceof Error ? error.message : "保存失败");
+    } finally {
+      setApiConfigSaving(false);
+    }
+  }, [activeChatId, apiConfigSaving, apiForm, showFlash, onSettingsSaved]);
+
+  const runApiTest = useCallback(async (): Promise<void> => {
+    if (!activeChatId || testRunning) return;
+    const code = testCode.trim();
+    if (!code) {
+      setTestResult({ ok: false, text: "请输入测试验证码" });
+      return;
+    }
+    setTestRunning(true);
+    setTestResult(null);
+    try {
+      const response = await opsFetch("/api/admin/bots/testing/method-config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: activeChatId, code }),
+      });
+      const payload = await readJson<{
+        ok: boolean;
+        error?: string;
+        data?: { ok: boolean; message: string; network_error?: boolean };
+      }>(response);
+      if (!payload) {
+        setTestResult({ ok: false, text: `服务返回异常（HTTP ${response.status}）` });
+        return;
+      }
+      if (!payload.ok) {
+        setTestResult({ ok: false, text: payload.error ?? "测试失败" });
+        return;
+      }
+      const result = payload.data;
+      setTestResult({
+        ok: result?.ok === true,
+        text: result?.ok ? `✓ 验证通过：${result.message}` : `✗ ${result?.message ?? "验证未通过"}`,
+      });
+    } catch (error) {
+      setTestResult({ ok: false, text: error instanceof Error ? error.message : "测试失败" });
+    } finally {
+      setTestRunning(false);
+    }
+  }, [activeChatId, testCode, testRunning]);
+
   // —— 机器人权限浮层状态 ——
   const [adminsLoading, setAdminsLoading] = useState(false);
   const [adminsSaving, setAdminsSaving] = useState(false);
@@ -938,6 +1144,23 @@ export function TgAppSimulator({
                       </option>
                     ))}
                   </select>
+                  {/* v2.1.2 验证 API 配置入口：URL + apikey + 传参 + 响应解析 + 联调测试（与「验证方式」页同源） */}
+                  <button
+                    type="button"
+                    onClick={() => setScreen("apiconfig")}
+                    className="mt-2 flex w-full cursor-pointer items-center gap-2 rounded-lg bg-[#3390ec]/10 px-3 py-2.5 text-left transition-transform active:scale-[0.99]"
+                  >
+                    <Settings2 className="h-4 w-4 shrink-0 text-[#3390ec]" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[15px] font-medium text-[#3390ec]">配置外部验证 API</span>
+                      <span className="block truncate text-[12px] text-[#8e8e93]">
+                        {apiConfigMethodName
+                          ? `${apiConfigMethodName}（方法 #${apiConfigMethodId ?? "-"}）· 点击修改`
+                          : "验证 API 地址 / Bearer apikey / 传参 / 响应解析 / 超时"}
+                      </span>
+                    </span>
+                    <ChevronRight className="h-4 w-4 shrink-0 text-[#c7c7cc]" />
+                  </button>
                 </div>
               ) : null}
               <div className="flex items-center justify-between border-t border-black/[0.06] px-4 py-2.5">
@@ -1199,6 +1422,218 @@ export function TgAppSimulator({
     </div>
   );
 
+  // —— v2.1.2 外部验证 API 配置浮层（iOS 风格页：URL/apikey/传参/响应解析/超时 + 联调测试） ——
+  const apiConfigOverlay = (
+    <div className="flex h-full flex-col" style={{ backgroundColor: IOS_GRAY_BG }}>
+      <div className="flex items-center justify-between border-b border-black/[0.06] bg-white/85 px-3 py-2 backdrop-blur">
+        <button
+          type="button"
+          onClick={() => setScreen("settings")}
+          aria-label="返回群组设置"
+          className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] text-black transition-transform active:scale-95"
+        >
+          <X className="h-5 w-5" />
+        </button>
+        <span className="text-[17px] font-semibold text-black">外部验证 API</span>
+        <button
+          type="button"
+          onClick={() => void saveApiConfig()}
+          disabled={apiConfigSaving || apiConfigLoading}
+          aria-label="保存验证 API 配置"
+          className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-full text-white transition-transform active:scale-95 disabled:opacity-60"
+          style={{ backgroundColor: IOS_GREEN }}
+        >
+          {apiConfigSaving ? <Loader2 className="h-5 w-5 animate-spin" /> : <span className="text-lg font-bold leading-none">✓</span>}
+        </button>
+      </div>
+
+      <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+        {apiConfigLoading ? (
+          <div className="flex justify-center py-8">
+            <Loader2 className="h-6 w-6 animate-spin text-[#8e8e93]" />
+          </div>
+        ) : (
+          <>
+            <p className="px-1 text-[13px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+              用户输入验证码后，机器人携带 <span className="font-mono">Authorization: Bearer &lt;apikey&gt;</span>{" "}
+              调用下方 API 完成核验；配置保存在「验证方式」库（{apiConfigMethodName ?? "保存时自动创建"}），仿真与真实验证共用。
+            </p>
+
+            <div className="space-y-3 rounded-xl bg-white px-4 py-3">
+              <label className="block">
+                <span className="mb-1 block text-[13px] font-medium text-[#3b4a54]">验证 API 地址 *</span>
+                <input
+                  value={apiForm.url}
+                  onChange={(event) => setApiForm((prev) => ({ ...prev, url: event.target.value }))}
+                  placeholder="https://your-api.example.com/verify"
+                  className="w-full rounded-lg bg-black/[0.04] px-3 py-2 font-mono text-[13px] text-black outline-none"
+                  aria-label="验证 API 地址"
+                />
+              </label>
+
+              <div>
+                <span className="mb-1 block text-[13px] font-medium text-[#3b4a54]">请求方式</span>
+                <div className="flex rounded-lg bg-black/[0.05] p-0.5">
+                  {([
+                    { value: "GET", label: "GET（参数拼 URL）" },
+                    { value: "POST", label: "POST（JSON 请求体）" },
+                  ] as const).map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => setApiForm((prev) => ({ ...prev, http_method: option.value }))}
+                      className={`flex-1 rounded-[7px] py-1.5 text-[13px] font-medium transition-all ${
+                        apiForm.http_method === option.value
+                          ? "bg-white text-black shadow-sm"
+                          : "text-[#8e8e93]"
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <label className="block">
+                <span className="mb-1 block text-[13px] font-medium text-[#3b4a54]">Bearer API Key *</span>
+                <input
+                  value={apiForm.api_key}
+                  onChange={(event) => setApiForm((prev) => ({ ...prev, api_key: event.target.value }))}
+                  placeholder="sk-xxxx / xyk_xxxx"
+                  autoComplete="off"
+                  className="w-full rounded-lg bg-black/[0.04] px-3 py-2 font-mono text-[13px] text-black outline-none"
+                  aria-label="Bearer API Key"
+                />
+              </label>
+
+              <label className="block">
+                <span className="mb-1 block text-[13px] font-medium text-[#3b4a54]">验证码字段名（传参）</span>
+                <input
+                  value={apiForm.code_field}
+                  onChange={(event) => setApiForm((prev) => ({ ...prev, code_field: event.target.value }))}
+                  placeholder="code（兼容 card / key 等自定义字段名）"
+                  className="w-full rounded-lg bg-black/[0.04] px-3 py-2 font-mono text-[13px] text-black outline-none"
+                  aria-label="验证码字段名"
+                />
+              </label>
+
+              {apiForm.http_method === "POST" ? (
+                <label className="block">
+                  <span className="mb-1 block text-[13px] font-medium text-[#3b4a54]">
+                    请求体模板（可选，{"{{code}} {{user_id}} {{username}}"} 自动替换）
+                  </span>
+                  <textarea
+                    value={apiForm.body_template}
+                    onChange={(event) => setApiForm((prev) => ({ ...prev, body_template: event.target.value }))}
+                    rows={3}
+                    placeholder='{"key":"{{code}}","uid":{{user_id}}}'
+                    className="w-full resize-none rounded-lg bg-black/[0.04] px-3 py-2 font-mono text-[13px] leading-relaxed text-black outline-none"
+                    aria-label="请求体模板"
+                  />
+                  <span className="mt-1 block text-[12px]" style={{ color: IOS_TEXT_SECONDARY }}>
+                    留空时默认发送 {"{ \"" + (apiForm.code_field.trim() || "code") + "\": \"{{code}}\" }"}
+                  </span>
+                </label>
+              ) : null}
+
+              <div className="grid grid-cols-3 gap-2">
+                <label className="block">
+                  <span className="mb-1 block text-[13px] font-medium text-[#3b4a54]">成功状态码</span>
+                  <input
+                    value={apiForm.success_status}
+                    onChange={(event) => setApiForm((prev) => ({ ...prev, success_status: event.target.value }))}
+                    inputMode="numeric"
+                    className="w-full rounded-lg bg-black/[0.04] px-2 py-2 text-center font-mono text-[13px] text-black outline-none"
+                    aria-label="成功状态码"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-[13px] font-medium text-[#3b4a54]">判定字段</span>
+                  <input
+                    value={apiForm.success_field}
+                    onChange={(event) => setApiForm((prev) => ({ ...prev, success_field: event.target.value }))}
+                    placeholder="success"
+                    className="w-full rounded-lg bg-black/[0.04] px-2 py-2 font-mono text-[13px] text-black outline-none"
+                    aria-label="判定字段"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-[13px] font-medium text-[#3b4a54]">判定值</span>
+                  <input
+                    value={apiForm.success_value}
+                    onChange={(event) => setApiForm((prev) => ({ ...prev, success_value: event.target.value }))}
+                    placeholder="true"
+                    className="w-full rounded-lg bg-black/[0.04] px-2 py-2 font-mono text-[13px] text-black outline-none"
+                    aria-label="判定值"
+                  />
+                </label>
+              </div>
+
+              <label className="block">
+                <span className="mb-1 block text-[13px] font-medium text-[#3b4a54]">超时（秒，5~60）</span>
+                <input
+                  value={apiForm.timeout_seconds}
+                  onChange={(event) => setApiForm((prev) => ({ ...prev, timeout_seconds: event.target.value }))}
+                  inputMode="numeric"
+                  className="w-24 rounded-lg bg-black/[0.04] px-2 py-2 text-center font-mono text-[13px] text-black outline-none"
+                  aria-label="超时秒数"
+                />
+              </label>
+            </div>
+
+            {/* 请求预览 */}
+            <div className="rounded-xl bg-white px-4 py-3">
+              <p className="mb-2 text-[13px] font-medium text-[#3b4a54]">请求预览</p>
+              <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-black/[0.04] p-2 font-mono text-[11px] leading-relaxed text-[#3b4a54]">
+                {apiForm.http_method === "POST"
+                  ? `POST ${apiForm.url.trim() || "https://…"}\nAuthorization: Bearer ${apiForm.api_key.trim() || "…"}\nContent-Type: application/json\n\n${apiForm.body_template.trim() || JSON.stringify({ [apiForm.code_field.trim() || "code"]: "{{code}}" })}`
+                  : `GET ${apiForm.url.trim() || "https://…"}?user_id=777000&${apiForm.code_field.trim() || "code"}={{code}}&username=preview_user\nAuthorization: Bearer ${apiForm.api_key.trim() || "…"}`}
+              </pre>
+              <p className="mt-2 text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+                判定规则：HTTP 状态等于「成功状态码」且响应 JSON 中「判定字段」等于「判定值」即验证通过；
+                失败原因（error/msg/message 字段）会透传给用户。
+              </p>
+            </div>
+
+            {/* 联调测试 */}
+            <div className="space-y-2 rounded-xl bg-white px-4 py-3">
+              <p className="text-[13px] font-medium text-[#3b4a54]">联调测试（保存后可真实调用一次外部 API）</p>
+              <div className="flex gap-2">
+                <input
+                  value={testCode}
+                  onChange={(event) => setTestCode(event.target.value)}
+                  placeholder="输入要测试的验证码/卡密"
+                  className="h-9 min-w-0 flex-1 rounded-lg bg-black/[0.04] px-3 text-[14px] text-black outline-none"
+                  aria-label="测试验证码"
+                />
+                <button
+                  type="button"
+                  onClick={() => void runApiTest()}
+                  disabled={testRunning || !testCode.trim()}
+                  className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-4 text-[14px] font-medium text-white transition-transform active:scale-[0.98] disabled:opacity-60"
+                  style={{ backgroundColor: IOS_BLUE }}
+                >
+                  {testRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                  测试
+                </button>
+              </div>
+              {testResult ? (
+                <p
+                  className={`rounded-lg px-3 py-2 text-[13px] leading-relaxed ${
+                    testResult.ok ? "bg-[#34c759]/12 text-[#1e8e3e]" : "bg-[#eb5545]/12 text-[#eb5545]"
+                  }`}
+                  role="status"
+                >
+                  {testResult.text}
+                </p>
+              ) : null}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+
   const joinPanelOverlay = joinPanel ? (
     <div className="flex h-full flex-col" style={{ backgroundColor: IOS_GRAY_BG }}>
       <div className="flex items-center justify-between border-b border-black/[0.06] bg-white/85 px-3 py-2 backdrop-blur">
@@ -1300,6 +1735,9 @@ export function TgAppSimulator({
             onBackToList={onBackToList}
             pendingJoinCount={view === "private" ? 0 : (activeGroup?.unread ?? 0)}
             onOpenJoinRequests={openJoinRequests}
+            realMessages={view === "private" ? [] : (realMessages ?? [])}
+            realMessagesState={realMessagesState}
+            onRefreshRealMessages={onRefreshRealMessages}
           />
         </div>
 
@@ -1329,6 +1767,20 @@ export function TgAppSimulator({
               className="absolute inset-0 z-40"
             >
               {adminsOverlay}
+            </motion.div>
+          ) : null}
+          {/* v2.1.2 外部验证 API 配置浮层 */}
+          {screen === "apiconfig" ? (
+            <motion.div
+              key="apiconfig"
+              variants={OVERLAY_VARIANTS}
+              initial="enter"
+              animate="center"
+              exit="exit"
+              transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+              className="absolute inset-0 z-40"
+            >
+              {apiConfigOverlay}
             </motion.div>
           ) : null}
           {/* v2.0.16 加群申请上滑面板（真实 APP：标题条横幅点击 → 底部滑出申请列表） */}

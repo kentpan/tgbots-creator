@@ -1,6 +1,7 @@
 import type { Bot } from "grammy";
 import type { BotContext } from "./context";
 import { ensureChatRegistered } from "@/services/chat-registry";
+import { recordChatMessageFromContext } from "@/services/chat-log";
 
 /**
  * 真实群组自动登记（v1.1.1 修复「获取不到已加入的群组」）：
@@ -66,6 +67,8 @@ export function registerChatTracking(bot: Bot<BotContext>, token: string): void 
   });
 
   // 3) 群消息兜底登记（进程内去重）：把机器人拉进群后随便在群里发一条消息即可被发现
+  //    v2.1.2：群消息同时落库 chat_messages 台账（按 bot 权限视角 = bot 实际收到的更新），
+  //    供仿真屏右侧对话区展示真实群消息；落库失败静默，绝不影响 update 处理链
   bot.on(["message", "channel_post"], async (ctx, next) => {
     const chat = ctx.chat;
     if (chat && (chat.type === "group" || chat.type === "supergroup")) {
@@ -78,6 +81,8 @@ export function registerChatTracking(bot: Bot<BotContext>, token: string): void 
       } catch {
         /* 消息链路上的登记失败静默（my_chat_member 仍是主通道） */
       }
+      const kind = ctx.channelPost ? "channel_post" : "message";
+      await recordChatMessageFromContext(ctx, token, kind).catch(() => undefined);
     }
     await next();
   });

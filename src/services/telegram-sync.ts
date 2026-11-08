@@ -1,10 +1,11 @@
 import { Bot, GrammyError } from "grammy";
-import { describeTelegramError } from "./approval";
+import { describeTelegramError, isTelegramRequestAlreadyHandled } from "./approval";
 import {
   tgRawCall,
   telegramBotClientOptions,
   type TgOutboundDiagnostics,
 } from "@/lib/telegram/transport";
+import { registerInviteLinkTracking } from "@/bot/invite-link-tracking";
 import {
   deleteGroupBotAdminsByChat,
   listBots,
@@ -72,6 +73,8 @@ export function botByToken(token: string): Bot {
   const cached = botCache.get(token);
   if (cached) return cached;
   const bot = new Bot(token, telegramBotClientOptions());
+  // v2.1.2 邀请链接台账：管理动作（审批补发链接等 resolveBotForChat 路径）创建的链接同样落库
+  registerInviteLinkTracking(bot, token);
   botCache.set(token, bot);
   return bot;
 }
@@ -79,6 +82,8 @@ export function botByToken(token: string): Bot {
 export interface SyncActionResult {
   ok: boolean;
   error: string | null;
+  /** v2.1.1：幂等容错说明（如「用户已在群组中」），供调用方拼进结果提示 */
+  note?: string | null;
 }
 
 /** 将 Telegram API 错误翻译为可读中文（网络不可达 / 超时 / Bot API 业务错误） */
@@ -153,7 +158,14 @@ export async function sendChatMessage(
   }
 }
 
-/** 真实批准加群申请（仿真用户在 Telegram 中无待审申请时由 Telegram 拒绝并透传原因） */
+/** 真实批准加群申请（仿真用户在 Telegram 中无待审申请时由 Telegram 拒绝并透传原因）
+ *
+ * v2.1.1 幂等容错（修「通过申请报错 USER_ALREADY_PARTICIPANT」）：
+ * - 用户已是群成员（群内验证 bootstrap 此前已批准过 / 在 TG 客户端已被其它管理员批准）
+ *   → 按成功处理并附说明 —— 用户确实已在群里，审批目的已达成，绝不让记录永远卡在待处理；
+ * - 申请已在 Telegram 侧不存在（REQUEST_NOT_FOUND，已被客户端处理/用户撤回）
+ *   → 同样按成功处理并附说明，让管理端能正常落库清理。
+ */
 export async function approveJoinRequestRemote(
   token: string,
   chatId: bigint,
@@ -165,11 +177,27 @@ export async function approveJoinRequestRemote(
     );
     return { ok: true, error: null };
   } catch (error) {
+    const handled = isTelegramRequestAlreadyHandled(error);
+    if (handled === "already_participant") {
+      return {
+        ok: true,
+        error: null,
+        note: "用户已在群组中（Telegram 侧申请此前已被批准或用户已直接入群），本次按已通过处理",
+      };
+    }
+    if (handled === "request_gone") {
+      return {
+        ok: true,
+        error: null,
+        note: "Telegram 侧已无此加群申请（可能已在 TG 客户端处理或被用户撤回），本次按当前动作落库",
+      };
+    }
     return { ok: false, error: describeSyncError(error) };
   }
 }
 
-/** 真实拒绝加群申请（v2.0.16 仿真屏加群申请列表「拒绝申请」按钮：declineChatJoinRequest） */
+/** 真实拒绝加群申请（v2.0.16 仿真屏加群申请列表「拒绝申请」按钮：declineChatJoinRequest）
+ * v2.1.1：申请已不存在/用户已是成员时按成功落库（附说明），不再报错卡死记录 */
 export async function declineJoinRequestRemote(
   token: string,
   chatId: bigint,
@@ -181,6 +209,21 @@ export async function declineJoinRequestRemote(
     );
     return { ok: true, error: null };
   } catch (error) {
+    const handled = isTelegramRequestAlreadyHandled(error);
+    if (handled === "request_gone") {
+      return {
+        ok: true,
+        error: null,
+        note: "Telegram 侧已无此加群申请（可能已在 TG 客户端处理或被用户撤回），本次按当前动作落库",
+      };
+    }
+    if (handled === "already_participant") {
+      return {
+        ok: true,
+        error: null,
+        note: "用户已在群组中，Telegram 侧无待审申请可拒绝；本次仅更新本地状态（如需移出该成员请在 TG 客户端操作或由验证超时清理处理）",
+      };
+    }
     return { ok: false, error: describeSyncError(error) };
   }
 }

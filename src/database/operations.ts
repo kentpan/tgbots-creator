@@ -24,6 +24,20 @@ const BOT_ROW_CACHE_MS = 60_000;
 const BOT_LIST_CACHE_MS = 60_000;
 const BOT_COMMANDS_CACHE_MS = 60_000;
 
+/**
+ * v2.1.3 D1 读行额度优化：管理后台会话缓存。
+ * 每个 /api/admin/* 请求 + 每个 RSC 页面都会 getCurrentAdmin →
+ * getAdminSession = 1 条三表 JOIN + 角色权限/角色两条点查（每次≈30-60 行读）。
+ * 管理后台一次页面加载会并行发出多个请求，10s 进程内 memo 把爆发收敛为一次；
+ * 登出/角色权限/用户变更立即失效（见各写路径 invalidateAdminSessionMemos）。
+ */
+const ADMIN_SESSION_CACHE_MS = 10_000;
+const ADMIN_SESSION_MEMO_PREFIX = "admin-session:";
+
+function invalidateAdminSessionMemos(): void {
+  invalidateMemoByPrefix(ADMIN_SESSION_MEMO_PREFIX);
+}
+
 export const RequestStatus = {
   PENDING: "pending",
   APPROVED: "approved",
@@ -1102,6 +1116,7 @@ export async function updateRole(
   if (sets.length === 0) return getRole(id);
   params.push(Number(id));
   await executeRun(`UPDATE roles SET ${sets.join(", ")} WHERE id = ? AND is_builtin = 0`, params);
+  invalidateAdminSessionMemos();
   return getRole(id);
 }
 
@@ -1111,6 +1126,7 @@ export async function deleteRole(id: bigint): Promise<boolean> {
   await executeRun(`DELETE FROM role_permissions WHERE role_id = ?`, [Number(id)]);
   await executeRun(`UPDATE admin_users SET role_id = 2 WHERE role_id = ?`, [Number(id)]);
   await executeRun(`DELETE FROM roles WHERE id = ?`, [Number(id)]);
+  invalidateAdminSessionMemos();
   return true;
 }
 
@@ -1141,6 +1157,8 @@ export async function setRolePermissions(
       [Number(roleId), Number(row.id)],
     );
   }
+  // v2.1.3：权限变更立即失效管理会话缓存（新权限不等待 10s memo 过期）
+  invalidateAdminSessionMemos();
 }
 
 export async function listAdminUsers(): Promise<(AdminUserRow & { roleName: string; roleCode: string })[]> {
@@ -1219,6 +1237,8 @@ export async function updateAdminUser(
   if (sets.length > 0) {
     params.push(Number(id));
     await executeRun(`UPDATE admin_users SET ${sets.join(", ")} WHERE id = ?`, params);
+    // v2.1.3：用户角色/状态变更立即失效管理会话缓存（禁用/降权不等 10s memo 过期）
+    invalidateAdminSessionMemos();
   }
   return getAdminUserById(id);
 }
@@ -1228,6 +1248,7 @@ export async function deleteAdminUser(id: bigint): Promise<boolean> {
   if (!user || user.username === "admin") return false;
   await executeRun(`DELETE FROM admin_sessions WHERE user_id = ?`, [Number(id)]);
   await executeRun(`DELETE FROM admin_users WHERE id = ?`, [Number(id)]);
+  invalidateAdminSessionMemos();
   return true;
 }
 
@@ -1261,6 +1282,17 @@ export async function createAdminSession(input: {
 export async function getAdminSession(
   tokenHash: string,
 ): Promise<AdminSessionContext | null> {
+  // v2.1.3 D1 读行额度优化：10s 进程内 memo —— 管理后台一次页面加载（RSC +
+  // 多个 API 请求）此前每次都重复执行三表 JOIN + 权限点查；命中期间读行为 0。
+  // 缓存 null（未登录/已过期）防反复打库；登出/角色/用户变更立即失效。
+  return memoTtl<AdminSessionContext | null>(
+    `${ADMIN_SESSION_MEMO_PREFIX}${tokenHash}`,
+    ADMIN_SESSION_CACHE_MS,
+    async () => loadAdminSession(tokenHash),
+  );
+}
+
+async function loadAdminSession(tokenHash: string): Promise<AdminSessionContext | null> {
   const row = await queryOne<Record<string, unknown>>(
     `SELECT s.id AS session_id, s.user_id, s.token_hash, s.expires_at, s.ip_address, s.user_agent,
             u.id AS admin_id, u.username, u.password_hash, u.display_name, u.role_id, u.status,
@@ -1308,6 +1340,7 @@ export async function getAdminSession(
 
 export async function deleteAdminSession(tokenHash: string): Promise<void> {
   await executeRun(`DELETE FROM admin_sessions WHERE token_hash = ?`, [tokenHash]);
+  invalidateMemo(`${ADMIN_SESSION_MEMO_PREFIX}${tokenHash}`);
 }
 
 export async function deleteExpiredAdminSessions(): Promise<number> {
@@ -2345,4 +2378,230 @@ export async function listBotCommandsByIds(
       return rows.map(mapBotCommand);
     },
   );
+}
+
+// ============ v2.1.2 邀请链接台账（invite_links） ============
+
+export interface InviteLinkRow {
+  id: bigint;
+  botId: bigint | null;
+  chatId: bigint;
+  link: string;
+  name: string | null;
+  createsJoinRequest: boolean;
+  isRevoked: boolean;
+  /** api=bot 运行时创建自动落库 / manual=管理后台手动登记 */
+  source: string;
+  createdTime: Date;
+  updatedTime: Date;
+}
+
+function mapInviteLink(row: Record<string, unknown>): InviteLinkRow {
+  return {
+    id: toBigInt(row.id),
+    botId: toBigIntOrNull(row.bot_id),
+    chatId: toBigInt(row.chat_id),
+    link: (row.link as string) ?? "",
+    name: (row.name as string) ?? null,
+    createsJoinRequest: Number(row.creates_join_request ?? 0) === 1,
+    isRevoked: Number(row.is_revoked ?? 0) === 1,
+    source: (row.source as string) ?? "api",
+    createdTime: toDate(row.created_time),
+    updatedTime: toDate(row.updated_time),
+  };
+}
+
+/**
+ * 记录一条邀请链接（幂等 upsert，按 link 唯一键）：
+ * bot 运行时 transformer（invite-link-tracking）创建成功后调用；
+ * 管理后台手动登记也走本函数。已存在的链接刷新 updated_time 并回填 bot_id（若原本为空）。
+ */
+export async function upsertInviteLink(input: {
+  botId: bigint | null;
+  chatId: bigint;
+  link: string;
+  name?: string | null;
+  createsJoinRequest?: boolean;
+  source?: string;
+}): Promise<void> {
+  const now = dateText(new Date());
+  await executeRun(
+    `INSERT INTO invite_links (bot_id, chat_id, link, name, creates_join_request, is_revoked, source, created_time, updated_time)
+     VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+     ON CONFLICT(link) DO UPDATE SET
+       bot_id = COALESCE(excluded.bot_id, invite_links.bot_id),
+       chat_id = excluded.chat_id,
+       name = COALESCE(excluded.name, invite_links.name),
+       creates_join_request = excluded.creates_join_request,
+       updated_time = excluded.updated_time`,
+    [
+      input.botId === null ? null : Number(input.botId),
+      Number(input.chatId),
+      input.link,
+      input.name ?? null,
+      input.createsJoinRequest ? 1 : 0,
+      input.source ?? "api",
+      now,
+      now,
+    ],
+  );
+}
+
+/** 列出某群组的邀请链接记录；botId 提供时优先按 (bot_id = ? OR bot_id IS NULL) 过滤 */
+export async function listInviteLinks(chatId: bigint, botId?: bigint | null): Promise<InviteLinkRow[]> {
+  const rows =
+    botId === undefined || botId === null
+      ? await queryAll<Record<string, unknown>>(
+          `SELECT * FROM invite_links WHERE chat_id = ? ORDER BY id DESC`,
+          [Number(chatId)],
+        )
+      : await queryAll<Record<string, unknown>>(
+          `SELECT * FROM invite_links
+           WHERE chat_id = ? AND (bot_id = ? OR bot_id IS NULL)
+           ORDER BY id DESC`,
+          [Number(chatId), Number(botId)],
+        );
+  return rows.map(mapInviteLink);
+}
+
+export async function getInviteLinkByLink(link: string): Promise<InviteLinkRow | null> {
+  const row = await queryOne<Record<string, unknown>>(
+    `SELECT * FROM invite_links WHERE link = ?`,
+    [link],
+  );
+  return row ? mapInviteLink(row) : null;
+}
+
+/** 标记链接为已撤销（Telegram revokeChatInviteLink 成功后 / 确认链接已失效时） */
+export async function markInviteLinkRevoked(id: bigint): Promise<boolean> {
+  const result = await executeRun(
+    `UPDATE invite_links SET is_revoked = 1, updated_time = ? WHERE id = ?`,
+    [dateText(new Date()), Number(id)],
+  );
+  return result.changes > 0;
+}
+
+/** 删除本地台账记录（不影响 Telegram 侧；彻底清理用「撤销」） */
+export async function deleteInviteLink(id: bigint): Promise<boolean> {
+  const result = await executeRun(`DELETE FROM invite_links WHERE id = ?`, [Number(id)]);
+  return result.changes > 0;
+}
+
+// ============ v2.1.2 群消息台账（chat_messages） ============
+
+export interface ChatMessageRow {
+  id: bigint;
+  botId: bigint | null;
+  chatId: bigint;
+  messageId: number | null;
+  userId: bigint | null;
+  username: string | null;
+  firstName: string | null;
+  /** true = 消息由机器人自身发出 */
+  fromBot: boolean;
+  /** message=普通消息 / channel_post=频道帖子 */
+  kind: string;
+  text: string | null;
+  messageTime: Date | null;
+  createdTime: Date;
+}
+
+function mapChatMessage(row: Record<string, unknown>): ChatMessageRow {
+  return {
+    id: toBigInt(row.id),
+    botId: toBigIntOrNull(row.bot_id),
+    chatId: toBigInt(row.chat_id),
+    messageId: row.message_id === null || row.message_id === undefined ? null : Number(row.message_id),
+    userId: toBigIntOrNull(row.user_id),
+    username: (row.username as string) ?? null,
+    firstName: (row.first_name as string) ?? null,
+    fromBot: Number(row.from_bot ?? 0) === 1,
+    kind: (row.kind as string) ?? "message",
+    text: (row.text as string) ?? null,
+    messageTime: toDateOrNull(row.message_time),
+    createdTime: toDate(row.created_time),
+  };
+}
+
+/**
+ * 追加一条群消息（webhook 热路径）：
+ * INSERT OR IGNORE —— webhook 重复投递/多 isolate 并发时按 (chat_id, bot_id, message_id) 幂等去重。
+ * 每群保留最近 CHAT_MESSAGES_KEEP_PER_CHAT 条，进程内计数达到阈值间隔时触发一次清理（写额度保护）。
+ */
+const CHAT_MESSAGES_KEEP_PER_CHAT = 200;
+const CHAT_MESSAGES_CLEANUP_EVERY = 50;
+let chatMessageInsertCounter = 0;
+
+export async function appendChatMessage(input: {
+  botId: bigint | null;
+  chatId: bigint;
+  messageId: number | null;
+  userId: bigint | null;
+  username: string | null;
+  firstName: string | null;
+  fromBot: boolean;
+  kind: string;
+  text: string | null;
+  messageTime: Date | null;
+}): Promise<boolean> {
+  const result = await executeRun(
+    `INSERT OR IGNORE INTO chat_messages
+       (bot_id, chat_id, message_id, user_id, username, first_name, from_bot, kind, text, message_time, created_time)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      input.botId === null ? null : Number(input.botId),
+      Number(input.chatId),
+      input.messageId,
+      input.userId === null ? null : Number(input.userId),
+      input.username,
+      input.firstName,
+      input.fromBot ? 1 : 0,
+      input.kind,
+      input.text,
+      input.messageTime ? dateText(input.messageTime) : null,
+      dateText(new Date()),
+    ],
+  );
+  chatMessageInsertCounter += 1;
+  if (chatMessageInsertCounter >= CHAT_MESSAGES_CLEANUP_EVERY) {
+    chatMessageInsertCounter = 0;
+    try {
+      await executeRun(
+        `DELETE FROM chat_messages
+         WHERE chat_id = ? AND id <= (
+           SELECT id FROM chat_messages WHERE chat_id = ?
+           ORDER BY id DESC LIMIT 1 OFFSET ?
+         )`,
+        [
+          Number(input.chatId),
+          Number(input.chatId),
+          CHAT_MESSAGES_KEEP_PER_CHAT,
+        ],
+      );
+    } catch {
+      /* 清理失败静默（尽力而为，不影响消息主链路） */
+    }
+  }
+  return result.changes > 0;
+}
+
+/** 按群组（可选按 bot 视角）读取最近的群消息，时间正序返回 */
+export async function listChatMessages(
+  chatId: bigint,
+  options?: { botId?: bigint | null; limit?: number },
+): Promise<ChatMessageRow[]> {
+  const limit = Math.min(Math.max(options?.limit ?? 100, 1), 300);
+  const rows =
+    options?.botId === undefined || options?.botId === null
+      ? await queryAll<Record<string, unknown>>(
+          `SELECT * FROM chat_messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?`,
+          [Number(chatId), limit],
+        )
+      : await queryAll<Record<string, unknown>>(
+          `SELECT * FROM chat_messages
+           WHERE chat_id = ? AND (bot_id = ? OR bot_id IS NULL)
+           ORDER BY id DESC LIMIT ?`,
+          [Number(chatId), Number(options.botId), limit],
+        );
+  return rows.map(mapChatMessage).reverse();
 }

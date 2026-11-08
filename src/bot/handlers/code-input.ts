@@ -89,11 +89,16 @@ export async function processCodeAnswer(
     }
   }
 
+  // v2.1.1：ctx.api（事件接收 bot）透传 —— 验证通过后的审批（approveChatJoinRequest）
+  // 由收到本次输码的机器人执行，不再依赖群组绑定行与主 bot token。
+  // 旧实现断点：绑定缺失时回落主 bot，edge 未配置主 token 时 autoApproveUser 抛错 →
+  // 「输入验证码后不真实进群」（用户收到成功文案但 Telegram 侧申请从未被批准）。
   const result = await evaluateSubmittedCode({
     userId: BigInt(from.id),
     username: from.username ?? null,
     code: codeText,
     preloaded: preloaded ?? undefined,
+    eventApi: ctx.api,
     onNetworkRetry: async () => {
       await ctx.api.sendMessage(from.id, NETWORK_RETRY_NOTICE);
     },
@@ -162,6 +167,7 @@ export async function processCodeAnswer(
           kicked = await kickUnverifiedMember(
             BigInt(result.reapplyChatId),
             BigInt(from.id),
+            ctx.api,
           );
         } catch (error) {
           console.error(`Failed to kick unverified direct-join user ${from.id}:`, error);

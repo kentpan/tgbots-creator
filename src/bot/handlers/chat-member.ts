@@ -59,11 +59,12 @@ interface BootstrapResult {
 }
 
 /**
- * 群内验证模式 bootstrap（v2.0.5）：
- * 1. 幂等守卫：同一用户同群已有未完成会话（申请批准后的 chat_member 抖动/重复投递）
- *    不重复创建会话、不重复发群内消息；
- * 2. join_request：先批准 Telegram 侧入群申请让用户进群（join_requests.status 保持
+ * 群内验证模式 bootstrap（v2.0.5，v2.1.1 顺序修正）：
+ * 1. join_request：先批准 Telegram 侧入群申请让用户进群（join_requests.status 保持
  *    pending —— 超时清理/统计依赖该语义），批准失败回落私聊验证旧行为；
+ *    审批必须在幂等守卫之前（守卫短路会让重复申请永远无人批准，v2.1.1 修复）；
+ * 2. 幂等守卫：同一用户同群已有未完成会话（申请批准后的 chat_member 抖动/重复投递）
+ *    不重复创建会话、不重复发群内消息；
  * 3. 创建验证会话 → 禁言 → 群内验证消息（按钮按验证方式组装）。
  */
 async function bootstrapGroupVerification(
@@ -74,6 +75,31 @@ async function bootstrapGroupVerification(
   runtime: RuntimeSettings,
   groupSettings: NonNullable<Awaited<ReturnType<typeof getGroupSettings>>>,
 ): Promise<BootstrapResult> {
+  // v2.1.1 顺序修复：Telegram 侧审批必须在幂等守卫**之前**执行。
+  // 旧实现守卫在前 —— 用户第一次申请时若审批失败回落了私聊验证（留下 pending 会话），
+  // 之后每次重新申请都会被守卫直接短路返回，Telegram 侧申请永远无人批准，
+  // 用户端表现就是「反复申请加群机器人完全没反应」。
+  // 审批本身幂等（重复批准 Telegram 会返回 already_participant，v2.1.1 已按成功处理），
+  // 先批不会产生副作用。
+  //
+  // 入群申请链接用户：先批准进群（群内验证的前提）；批准失败 → 回落私聊验证。
+  // v2.1.1：优先由收到本次 chat_join_request 的机器人（api）执行审批 ——
+  // 它必然是本群管理员（Telegram 只向群内管理员推送申请事件），不再依赖
+  // 群组绑定行与主 bot token（edge 未配置主 token 时旧实现审批必败 →
+  // 静默回落私聊 → 用户端「机器人完全没反应」）
+  if (requestType === "telegram") {
+    const approval = await approveTelegramJoinRequest(BigInt(chat.id), BigInt(user.id), api);
+    if (!approval.success) {
+      console.warn(
+        `Group-channel join request approval failed (chat ${chat.id}, user ${user.id}): ` +
+          `${approval.error ?? "unknown"} — falling back to DM verification`,
+      );
+      return bootstrapDmVerification(api, user, chat, requestType, runtime, groupSettings);
+    }
+  }
+
+  // 幂等守卫：同一用户同群已有未完成会话（申请批准后的 chat_member 抖动/重复投递）
+  // 不重复创建会话、不重复发群内消息
   const existing = await getPendingSessionForUserChat(BigInt(user.id), BigInt(chat.id));
   if (existing) {
     console.log(
@@ -85,18 +111,6 @@ async function bootstrapGroupVerification(
       promptDelivered: true,
       method: existing.method as BootstrapResult["method"],
     };
-  }
-
-  // 入群申请链接用户：先批准进群（群内验证的前提）；批准失败 → 回落私聊验证
-  if (requestType === "telegram") {
-    const approval = await approveTelegramJoinRequest(BigInt(chat.id), BigInt(user.id));
-    if (!approval.success) {
-      console.warn(
-        `Group-channel join request approval failed (chat ${chat.id}, user ${user.id}): ` +
-          `${approval.error ?? "unknown"} — falling back to DM verification`,
-      );
-      return bootstrapDmVerification(api, user, chat, requestType, runtime, groupSettings);
-    }
   }
 
   // 验证方式解析（与私聊模式同一套规则：code_api 必须绑定启用中的验证方法）

@@ -129,7 +129,8 @@ export async function muteAndSendGroupPrompt(
   verifyButtonText: string,
 ): Promise<GroupPromptOutcome> {
   // 1. 禁言（验证通过前无法发言；until_date 已在服务内做 30s~366d 边界钳制）
-  await muteUnverifiedMember(BigInt(chat.id), BigInt(user.id), session.expiresAt);
+  // v2.1.1：禁言也由事件接收 bot（api）执行，不再依赖绑定行/主 bot token
+  await muteUnverifiedMember(BigInt(chat.id), BigInt(user.id), session.expiresAt, api);
 
   // 2. 组装回复键盘：captcha/code_api → URL 按钮打开验证网页；code_self → 4 选 1
   let replyMarkup: InlineKeyboard;

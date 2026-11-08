@@ -24,6 +24,7 @@ import { registerAiSupport, type AiSupportConfig } from "./handlers/ai-support";
 import { registerBuiltinCommandHandlers } from "./handlers/builtin-commands";
 import { buildSessionMiddleware } from "./session-storage";
 import { registerChatTracking } from "./chat-tracking";
+import { registerInviteLinkTracking } from "./invite-link-tracking";
 import { handleJoinRequest, handleChatMemberUpdate } from "./handlers/chat-member";
 import { handleVerificationChoice } from "./handlers/group-verification";
 import { handleCodeInput } from "./handlers/code-input";
@@ -224,6 +225,8 @@ async function createMenuBot(row: BotRow, menuConfig: BotMenuConfig, mode: Effec
   // 真实群组自动登记（v1.1.1）：被拉进群/收到群事件即登记 chat_id / 群名，
   // 管理后台「同步真实群组」与机器人测试页才能看到机器人真实所在的群组
   registerChatTracking(bot, row.token);
+  // v2.1.2 邀请链接台账：任何路径 createChatInviteLink 成功后统一落库（群组管理可查看/撤销）
+  registerInviteLinkTracking(bot, row.token);
   // 官方 @grammyjs/menu 菜单插件（v1.1.1）：回调路由/子菜单导航/过期恢复全由插件处理
   const instanceMenu = installBotMenu(bot, menuConfig);
   // 实例菜单注入（ctx.botMenu）：官方插件约束 Menu 实例只能发给安装它的 bot，

@@ -15,6 +15,7 @@ import {
   type VerificationSessionRow,
 } from "@/database/operations";
 import { parseCodeApiConfig, verifyCodeExternally } from "./external-verify";
+import type { Api } from "grammy";
 import {
   autoApproveUser,
   completeDirectJoinVerification,
@@ -71,6 +72,12 @@ export interface CodeCheckInput {
   code: string;
   /** 预加载的待验证上下文（机器人路径由 getPendingCodeContext 提供；仿真路径按 token 直查） */
   preloaded?: PendingContext | null;
+  /**
+   * v2.1.1 事件接收 bot：收到本次验证事件（输码/点选）的机器人 API 实例。
+   * 验证通过后的审批/解禁/欢迎全部优先由它执行 —— 该 bot 必然在群内且为管理员，
+   * 不依赖群组绑定行与主 bot token（edge 部署主 bot 未配置时旧实现直接断裂）。
+   */
+  eventApi?: Api;
   /**
    * 验证接口网络错误、服务端即将发起重试时触发一次
    * （bot 路径传入私聊发送回调，立即私聊发送「网络波动，正在重试...」；仿真路径不传）。
@@ -195,10 +202,10 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
         realTelegramJoin &&
         settings?.verificationChannel === "group"
       ) {
-        await deleteSessionPromptMessage(session.token);
+        await deleteSessionPromptMessage(session.token, input.eventApi);
         if (kickAllowed) {
           try {
-            await kickUnverifiedMember(joinRequest.chatId, joinRequest.userId);
+            await kickUnverifiedMember(joinRequest.chatId, joinRequest.userId, input.eventApi);
           } catch (error) {
             console.error(
               `Failed to kick unverified group user ${joinRequest.userId} (chat ${joinRequest.chatId}):`,
@@ -208,7 +215,7 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
         } else {
           // 保留在群内：主动解禁（best effort），并记录决策日志
           try {
-            await unmuteGroupMember(joinRequest.chatId, joinRequest.userId);
+            await unmuteGroupMember(joinRequest.chatId, joinRequest.userId, input.eventApi);
           } catch (error) {
             console.warn(
               `Failed to unmute stayed direct-join user ${joinRequest.userId} (chat ${joinRequest.chatId}):`,
@@ -223,7 +230,7 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
       } else if (joinRequest.requestType === "telegram" && joinRequest.chatId !== 0n) {
         try {
           const { dismissJoinRequest } = await import("./approval");
-          await dismissJoinRequest(joinRequest.chatId, joinRequest.userId);
+          await dismissJoinRequest(joinRequest.chatId, joinRequest.userId, input.eventApi);
         } catch (error) {
           console.warn("Failed to dismiss join request after max attempts:", error);
         }
@@ -273,7 +280,7 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
       : "仿真环境：加群申请状态更新失败";
     console.log(`Simulator join request auto-approved for token ${session.token.slice(0, 8)}...`);
   } else if (groupChannel) {
-    const completion = await completeGroupVerification(session.token);
+    const completion = await completeGroupVerification(session.token, input.eventApi);
     approved = completion.success;
     if (!completion.success) {
       approvalNote = completion.error ?? undefined;
@@ -281,14 +288,14 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
     }
   } else if (joinRequest.requestType === "direct") {
     // 直连入群路径（v1.1.3，私聊模式）：用户已物理在群内，无需 Telegram 审批，落库标记通过 + 私聊祝贺
-    const completion = await completeDirectJoinVerification(session.token);
+    const completion = await completeDirectJoinVerification(session.token, input.eventApi);
     approved = completion.success;
     if (!completion.success) {
       approvalNote = completion.error ?? undefined;
       console.warn(`Direct-join completion failed after code verification: ${completion.error}`);
     }
   } else {
-    const approval = await autoApproveUser(session.token);
+    const approval = await autoApproveUser(session.token, input.eventApi);
     approved = approval.success;
     if (!approval.success) {
       approvalNote = approval.error ?? undefined;

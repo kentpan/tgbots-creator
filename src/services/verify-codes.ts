@@ -1,4 +1,4 @@
-import { getAppSetting } from "@/database/operations";
+import { getCachedAppSettings } from "@/database/operations";
 
 const KEYS_SETTING = "verify_codes.api_keys";
 export const DEFAULT_VERIFY_API_KEY = "sk-tguard-v108";
@@ -7,10 +7,16 @@ export const DEFAULT_VERIFY_API_KEY = "sk-tguard-v108";
  * 发码/验码开放接口（/api/verify-codes/*）的 Bearer apikey 鉴权。
  * 允许多个 Key：存储于 app_settings.verify_codes.api_keys（JSON 数组）。
  * 未配置时回落到内置演示 Key，保证开箱即可全流程联调。
+ *
+ * v2.1.3 D1 读行额度优化：getAppSetting（每次直读 1 行）→ getCachedAppSettings
+ * （120s 全量缓存 + 进程内 memo，写路径 setAppSetting 已 invalidateCache）——
+ * 外部验码是最高频的开放接口，鉴权读不再逐次打库；Key 变更最大延迟 = 其他
+ * isolate 120s 追平（与全局运行时设置同一生效语义）。
  */
 export async function listVerifyApiKeys(): Promise<string[]> {
   try {
-    const raw = await getAppSetting(KEYS_SETTING);
+    const settings = await getCachedAppSettings();
+    const raw = (settings[KEYS_SETTING] ?? "").trim();
     if (!raw) return [DEFAULT_VERIFY_API_KEY];
     const parsed = JSON.parse(raw) as unknown;
     if (Array.isArray(parsed)) {

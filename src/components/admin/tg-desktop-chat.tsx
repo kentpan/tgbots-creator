@@ -7,6 +7,7 @@ import {
   Mic,
   MoreVertical,
   Paperclip,
+  RefreshCw,
   Search,
   SendHorizontal,
   Smile,
@@ -206,6 +207,32 @@ function BubbleTime({ outgoing, time }: { outgoing: boolean; time: string }) {
 const AVATAR_SIZE = 34;
 const AVATAR_GAP = 8;
 
+/** v2.1.2 真实群消息（chat_messages 台账，父组件按 bot 权限视角拉取） */
+export interface RealChatMessage {
+  id: string;
+  message_id: number | null;
+  user_id: string | null;
+  username: string | null;
+  first_name: string | null;
+  from_bot: boolean;
+  kind: string;
+  text: string | null;
+  message_time: string | null;
+}
+
+/** 真实消息时间（北京时间 HH:mm）：数据由父组件 fetch 后传入（客户端渲染），无水合风险 */
+function realMessageTime(iso: string | null): string {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
 export function TgDesktopChat({
   config,
   botName,
@@ -222,6 +249,9 @@ export function TgDesktopChat({
   onBackToList,
   pendingJoinCount = 0,
   onOpenJoinRequests,
+  realMessages = [],
+  realMessagesState,
+  onRefreshRealMessages,
 }: {
   config: BotMenuConfig;
   botName: string;
@@ -251,6 +281,12 @@ export function TgDesktopChat({
   pendingJoinCount?: number;
   /** v2.0.16 点击加群申请横幅 → 打开上滑加群申请列表（由外壳组件承载） */
   onOpenJoinRequests?: () => void;
+  /** v2.1.2 真实群消息（chat_messages 台账：按 bot 权限视角，v2.1.3 起只在展现时获取） */
+  realMessages?: RealChatMessage[];
+  /** 真实消息加载状态（v2.1.3 起父组件只在展现时获取，无轮询） */
+  realMessagesState?: { loading: boolean; fetchedAt: string | null; error: string | null };
+  /** v2.1.3 手动刷新真实群消息（同步胶囊刷新按钮，D1 读额度友好：按需拉取不轮询） */
+  onRefreshRealMessages?: () => void | Promise<void>;
 }) {
   const clock = useSyncExternalStore(subscribeClock, getClockSnapshot, getServerClockSnapshot);
   const history = useRef<string[]>([]);
@@ -300,7 +336,7 @@ export function TgDesktopChat({
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [visibleMessages.length, isPrivate, nodeId]);
+  }, [visibleMessages.length, isPrivate, nodeId, realMessages.length]);
 
   /** 向指定消息流追加消息（group=群组聊天，dm=与机器人的私聊） */
   const appendStream = (target: "group" | "dm", message: Omit<SimMessage, "id" | "time">): void => {
@@ -643,6 +679,80 @@ export function TgDesktopChat({
                 <InlineKeyboard node={currentNode} pressedId={pressed} onButtonClick={handleButtonClick} />
               </div>
             </div>
+          ) : null}
+
+          {/* v2.1.2 真实群消息（按 bot 权限视角；v2.1.3 起只在展现时获取一次，无轮询） */}
+          {!isPrivate ? (
+            <>
+              {/* 分隔胶囊：同步状态（loading/error/最近同步时间 + 手动刷新） */}
+              <div className="flex justify-center py-1">
+                <span className="flex max-w-[86%] items-center gap-2 rounded-full bg-black/25 px-3 py-1 text-center text-[11px] leading-relaxed text-white backdrop-blur-sm">
+                  {realMessagesState?.error
+                    ? `⚠ 真实群消息同步失败：${realMessagesState.error}`
+                    : realMessagesState?.loading && realMessages.length === 0
+                      ? "正在同步 Bot 可见的真实群消息…"
+                      : `── 以下为 Bot 实际收到的真实群消息（打开会话时获取${realMessagesState?.fetchedAt ? ` · 更新于 ${realMessageTime(realMessagesState.fetchedAt)}` : ""}）──`}
+                  {onRefreshRealMessages ? (
+                    <button
+                      type="button"
+                      onClick={() => void onRefreshRealMessages?.()}
+                      disabled={realMessagesState?.loading}
+                      aria-label="刷新真实群消息"
+                      title="重新获取真实群消息（按需拉取，不自动轮询 —— 节省 D1 读额度）"
+                      className="shrink-0 rounded-full p-0.5 text-white/75 transition hover:bg-white/15 hover:text-white disabled:opacity-50"
+                    >
+                      {realMessagesState?.loading ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <RefreshCw className="h-3 w-3" />
+                      )}
+                    </button>
+                  ) : null}
+                </span>
+              </div>
+              {realMessages.length === 0 && !realMessagesState?.loading && !realMessagesState?.error ? (
+                <div className="flex justify-center py-1">
+                  <span className="max-w-[86%] rounded-2xl bg-black/25 px-3.5 py-1.5 text-center text-xs leading-relaxed text-white backdrop-blur-sm">
+                    暂无真实消息：机器人收到的群消息会自动记录（隐私模式下仅能收到指令/回复等可见消息；
+                    Bot API 无法拉取历史消息，台账只包含启用后新到达的消息）
+                  </span>
+                </div>
+              ) : null}
+              {realMessages.map((entry) => {
+                const sender =
+                  entry.from_bot
+                    ? botName
+                    : entry.first_name?.trim() ||
+                      (entry.username ? `@${entry.username}` : `用户 ${entry.user_id ?? "?"}`);
+                const time = realMessageTime(entry.message_time);
+                return (
+                  <div key={entry.id} className="flex items-end gap-2">
+                    <div className="shrink-0" style={{ width: AVATAR_SIZE }}>
+                      <ChatAvatar name={sender} size={AVATAR_SIZE} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="w-full rounded-2xl rounded-bl-md bg-white px-3 py-2 shadow-sm">
+                        <div className="mb-0.5 flex items-center gap-1.5">
+                          <p className="truncate text-[14px] font-semibold" style={{ color: nameColor(sender) }}>
+                            {sender}
+                          </p>
+                          {entry.from_bot ? (
+                            <span className="shrink-0 rounded bg-[#e3fdd0] px-1.5 py-[1px] text-[11px] font-medium text-[#4a8a4f]">
+                              管理员
+                            </span>
+                          ) : null}
+                        </div>
+                        <BubbleTime outgoing={false} time={time} />
+                        <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-[#0f0f0f]">
+                          {entry.text?.trim() || "（无可展示内容）"}
+                        </p>
+                        <span className="clear-both block h-0" />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </>
           ) : null}
 
           {/* 动态消息流（用户/机器人/服务消息） */}
