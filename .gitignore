@@ -55,6 +55,7 @@ server.log
 /download/
 
 # SQLite WAL 临时文件（本地开发库运行时产物）
+prisma/*.db
 prisma/*.db-shm
 prisma/*.db-wal
 

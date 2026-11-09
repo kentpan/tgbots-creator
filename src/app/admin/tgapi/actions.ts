@@ -12,7 +12,14 @@ import {
   createBotRecord,
 } from "@/database/operations";
 import { logOperation, requirePermission } from "@/lib/auth";
-import { parseBotProfile, restartMenuBot, stopMenuBot } from "@/bot/multi-runtime";
+import {
+  parseBotProfile,
+  restartMenuBot,
+  stopMenuBot,
+  getMenuBotDeployState,
+  waitForMenuBotDeployConfirmation,
+} from "@/bot/multi-runtime";
+import { getTelegramRuntimeSettings, resolveBotRuntime } from "@/services/bot-transport";
 import {
   TGAPI_APP_PLATFORMS,
   TGAPI_TEXT_FIELD_KEYS,
@@ -24,6 +31,67 @@ import {
 function tgapiPath(params: Record<string, string>): string {
   const query = new URLSearchParams(params).toString();
   return query ? `/admin/tgapi?${query}` : "/admin/tgapi";
+}
+
+/** 部署结果（真实结果，非预期值）随 redirect 传回页面展示 */
+interface TgApiDeployOutcome {
+  state: "ok" | "fail" | "pending" | "stopped";
+  message: string;
+}
+
+const DEPLOY_CONFIRM_TIMEOUT_MS = 12000;
+
+function truncateDeployMessage(message: string): string {
+  return message.length > 300 ? `${message.slice(0, 300)}…` : message;
+}
+
+/**
+ * 保存/启停后的真实部署确认：await 运行实例重启（不再 fire-and-forget），
+ * 按生效传输模式取真实结果：
+ * - webhook：setWebhook 注册结果（startMenuBot 返回时已定）
+ * - polling：有界等待 getMe 确认（onStart）/ 失败退出（onExit），超时如实报 pending
+ * 部署失败绝不静默：原因随 redirect 回显到页面横幅。
+ */
+async function deployTgApiBotAndReport(botId: bigint, enabled: boolean): Promise<TgApiDeployOutcome> {
+  if (!enabled) {
+    return { state: "stopped", message: "机器人已停用，运行实例已停止" };
+  }
+  try {
+    await restartMenuBot(botId);
+  } catch (error) {
+    console.error(`[tgapi] 机器人 #${String(botId)} 部署（重启运行实例）失败:`, error);
+    return {
+      state: "fail",
+      message: truncateDeployMessage(error instanceof Error ? error.message : String(error)),
+    };
+  }
+  await waitForMenuBotDeployConfirmation(botId, DEPLOY_CONFIRM_TIMEOUT_MS);
+  const row = await getBot(botId);
+  if (!row) {
+    return { state: "fail", message: "部署失败：机器人记录不存在" };
+  }
+  const global = await getTelegramRuntimeSettings();
+  const runtime = resolveBotRuntime(String(botId), row.config, global);
+  const state = getMenuBotDeployState(botId);
+  if (runtime.mode === "webhook") {
+    if (state.transportOk === true) {
+      return { state: "ok", message: `部署成功：Webhook 已注册（${state.transportUrl ?? "回调地址已生效"}）` };
+    }
+    if (state.transportOk === false) {
+      return { state: "fail", message: `部署失败：${truncateDeployMessage(state.transportError ?? "Webhook 注册失败")}` };
+    }
+    return { state: "pending", message: "部署确认中：Webhook 注册尚未返回，请稍后刷新本页查看部署状态" };
+  }
+  if (state.started) {
+    return { state: "ok", message: `部署成功：长轮询运行中（${state.transportUrl ?? "已连接 Telegram"}）` };
+  }
+  if (!state.running) {
+    return {
+      state: "fail",
+      message: `部署失败：${truncateDeployMessage(state.startError ?? state.transportError ?? "轮询未启动，详见服务器日志")}`,
+    };
+  }
+  return { state: "pending", message: "部署确认中：长轮询启动尚未确认，请稍后刷新本页查看部署状态" };
 }
 
 function parsePlatforms(formData: FormData): string[] {
@@ -121,21 +189,15 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
       enabled,
       config: configJson,
     });
-    if (enabled) {
-      void restartMenuBot(BigInt(idRaw)).catch((error: unknown) => {
-        console.error(`[tgapi] 机器人 #${idRaw} 保存后重启运行实例失败:`, error);
-      });
-    } else {
-      void stopMenuBot(BigInt(idRaw)).catch((error: unknown) => {
-        console.error(`[tgapi] 机器人 #${idRaw} 保存后停止运行实例失败:`, error);
-      });
-    }
+    const deploy = await deployTgApiBotAndReport(BigInt(idRaw), enabled);
     await logOperation(admin, {
       action: "保存TGAPI申请机器人",
       target: name,
-      detail: `状态：${enabled ? "启用" : "停用"}`,
+      detail: `状态：${enabled ? "启用" : "停用"}；部署结果：${deploy.message}`,
       headers: await headers(),
     });
+    revalidatePath("/admin/tgapi");
+    redirect(tgapiPath({ saved: "1", deploy: deploy.state, deploy_msg: deploy.message }));
   } else {
     const created = await createBotRecord({
       name,
@@ -144,20 +206,16 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
       config: configJson,
     });
     if (!created) redirect(tgapiPath({ error: "duplicate-token" }));
-    if (enabled) {
-      void restartMenuBot(created.id).catch((error: unknown) => {
-        console.error(`[tgapi] 新建机器人 #${String(created.id)} 启动运行实例失败:`, error);
-      });
-    }
+    const deploy = await deployTgApiBotAndReport(created.id, enabled);
     await logOperation(admin, {
       action: "创建TGAPI申请机器人",
       target: name,
-      detail: `Token 尾号：${token.slice(-6)}`,
+      detail: `Token 尾号：${token.slice(-6)}；部署结果：${deploy.message}`,
       headers: await headers(),
     });
+    revalidatePath("/admin/tgapi");
+    redirect(tgapiPath({ saved: "1", deploy: deploy.state, deploy_msg: deploy.message }));
   }
-  revalidatePath("/admin/tgapi");
-  redirect(tgapiPath({ saved: "1" }));
 }
 
 export async function toggleTgApiBotAction(formData: FormData): Promise<void> {
@@ -168,22 +226,21 @@ export async function toggleTgApiBotAction(formData: FormData): Promise<void> {
   const bot = await getBot(BigInt(idRaw));
   if (!bot) redirect(tgapiPath({ error: "invalid-id" }));
   await updateBotRecord(BigInt(idRaw), { enabled: enable });
-  if (enable) {
-    void restartMenuBot(BigInt(idRaw)).catch((error: unknown) => {
-      console.error(`[tgapi] 机器人 #${idRaw} 启用失败:`, error);
-    });
-  } else {
-    void stopMenuBot(BigInt(idRaw)).catch((error: unknown) => {
-      console.error(`[tgapi] 机器人 #${idRaw} 停用失败:`, error);
-    });
-  }
+  const deploy = await deployTgApiBotAndReport(BigInt(idRaw), enable);
   await logOperation(admin, {
     action: enable ? "启用TGAPI申请机器人" : "停用TGAPI申请机器人",
     target: bot.name,
+    detail: `部署结果：${deploy.message}`,
     headers: await headers(),
   });
   revalidatePath("/admin/tgapi");
-  redirect(tgapiPath({ saved: enable ? "enabled" : "disabled" }));
+  redirect(
+    tgapiPath({
+      saved: enable ? "enabled" : "disabled",
+      deploy: deploy.state,
+      deploy_msg: deploy.message,
+    }),
+  );
 }
 
 export async function deleteTgApiBotAction(formData: FormData): Promise<void> {

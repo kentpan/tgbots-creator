@@ -68,6 +68,12 @@ export interface PollingAutoRestartOptions {
   shouldContinue?: (error: unknown) => boolean;
   /** 循环退出（受控停止或放弃重启）后的状态清理；仅实例仍注册时由调用方幂等清理 */
   onExit?: () => void;
+  /**
+   * 每次轮询致命错误（含 401/409/网络失败）回调，在任何 return 分支之前触发：
+   * 调用方（multi-runtime）据此把最近一次错误记到实例上供部署状态展示 ——
+   * 409 让位分支不会走 shouldContinue，必须有本回调才能拿到失败原因。
+   */
+  onError?: (error: unknown) => void;
 }
 
 /**
@@ -86,6 +92,8 @@ export async function runPollingWithAutoRestart(
       opts.onExit?.();
       return;
     } catch (error) {
+      // 先上报再处理（409/shouldContinue=false 等提前 return 的分支也需要拿到错误详情）
+      opts.onError?.(error);
       // 绝不吞错：完整记录错误详情（grammY 官方要求调用方捕获 start() 的错误，
       // 官方 runner 语义为失败后自动重启 source）
       console.error(

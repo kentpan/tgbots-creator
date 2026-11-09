@@ -6,6 +6,10 @@ import {
 } from "@/database/operations";
 import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { requirePermission } from "@/lib/auth";
+import { tgRawCall } from "@/lib/telegram/transport";
+import { withTelegramTimeout } from "@/services/telegram-sync";
+import { getTelegramRuntimeSettings, resolveBotRuntime } from "@/services/bot-transport";
+import { getMenuBotDeployState } from "@/bot/multi-runtime";
 import {
   parseTgApiBotConfig,
   TGAPI_APP_PLATFORMS,
@@ -68,6 +72,84 @@ function UnlockModeBadge({ mode }: { mode: string }) {
       }`}
     >
       {isStars ? "⭐ 星星解锁" : "🔐 验证码解锁"}
+    </span>
+  );
+}
+
+/** 真实部署状态（webhook=Telegram 侧 getWebhookInfo 权威值；polling=本进程运行实例权威值） */
+type DeployCheck =
+  | { key: "disabled" }
+  | { key: "deployed"; detail: string }
+  | { key: "undeployed" }
+  | { key: "mismatch"; detail: string }
+  | { key: "deploying" }
+  | { key: "unknown"; detail: string };
+
+/**
+ * 逐机器人探测真实部署状态：
+ * - webhook 模式：Telegram 侧 getWebhookInfo（跨 isolate/跨环境权威，不依赖本进程内存）
+ * - polling 模式：本进程运行实例状态（长轮询只存在于本进程，内存即权威）
+ * 探测失败/指向异常都如实展示，绝不兜底成“已部署”。
+ */
+async function probeTgApiBotDeployState(bot: BotRow): Promise<DeployCheck> {
+  if (!bot.enabled) return { key: "disabled" };
+  const global = await getTelegramRuntimeSettings();
+  const runtime = resolveBotRuntime(String(bot.id), bot.config, global);
+  if (runtime.mode === "webhook") {
+    try {
+      const res = await withTelegramTimeout(
+        tgRawCall<{ ok: boolean; description?: string; result?: { url?: string } }>(
+          bot.token,
+          "getWebhookInfo",
+        ),
+      );
+      if (!res.ok) {
+        return { key: "unknown", detail: res.description ?? "Telegram API 返回错误" };
+      }
+      const url = (res.result?.url ?? "").trim();
+      if (!url) return { key: "undeployed" };
+      if (runtime.webhookUrl && url !== runtime.webhookUrl) {
+        return { key: "mismatch", detail: url };
+      }
+      return { key: "deployed", detail: "Webhook" };
+    } catch (error) {
+      return {
+        key: "unknown",
+        detail: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+  const state = getMenuBotDeployState(bot.id);
+  if (state.present && state.started) {
+    return { key: "deployed", detail: `长轮询${state.transportUrl ?? ""}` };
+  }
+  if (state.present && state.running) return { key: "deploying" };
+  return { key: "undeployed" };
+}
+
+function DeployStateBadge({ check }: { check: DeployCheck }) {
+  const styles: Record<DeployCheck["key"], string> = {
+    deployed: "border-green-200 bg-green-50 text-green-700",
+    undeployed: "border-red-200 bg-red-50 text-red-700",
+    mismatch: "border-amber-200 bg-amber-50 text-amber-700",
+    deploying: "border-amber-200 bg-amber-50 text-amber-700",
+    unknown: "border-amber-200 bg-amber-50 text-amber-700",
+    disabled: "border-gray-200 bg-gray-50 text-gray-500",
+  };
+  const labels: Record<DeployCheck["key"], string> = {
+    deployed: "已部署",
+    undeployed: "未部署",
+    mismatch: "Webhook 指向异常",
+    deploying: "启动确认中",
+    unknown: "状态未知",
+    disabled: "已停用",
+  };
+  return (
+    <span
+      className={`inline-flex rounded-full border px-2 py-0.5 text-sm ${styles[check.key]}`}
+      title={"detail" in check ? check.detail : undefined}
+    >
+      {labels[check.key]}
     </span>
   );
 }
@@ -326,6 +408,8 @@ export default async function TgApiPage({
     bot?: string;
     saved?: string;
     error?: string;
+    deploy?: string;
+    deploy_msg?: string;
   }>;
 }) {
   await requirePermission("tgapi:view");
@@ -340,6 +424,8 @@ export default async function TgApiPage({
     enabled: method.enabled,
     type: method.type,
   }));
+  // 真实部署状态逐 bot 并行探测（webhook=Telegram 侧权威值；polling=本进程运行实例）
+  const deployChecks = await Promise.all(tgapiBots.map((bot) => probeTgApiBotDeployState(bot)));
 
   const selectedBotId =
     params.bot && /^\d+$/.test(params.bot) ? params.bot : null;
@@ -382,6 +468,25 @@ export default async function TgApiPage({
           {ERRORS[params.error]}
         </div>
       ) : null}
+      {params.deploy && params.deploy_msg ? (
+        params.deploy === "ok" ? (
+          <div className="rounded-md border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">
+            🚀 {params.deploy_msg}
+          </div>
+        ) : params.deploy === "fail" ? (
+          <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            ❌ {params.deploy_msg}
+          </div>
+        ) : params.deploy === "pending" ? (
+          <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+            ⏳ {params.deploy_msg}
+          </div>
+        ) : (
+          <div className="rounded-md border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-600">
+            {params.deploy_msg}
+          </div>
+        )
+      ) : null}
 
       <div className="rounded-xl border bg-card">
         <div className="overflow-x-auto">
@@ -395,18 +500,19 @@ export default async function TgApiPage({
                 <th className="px-4 py-3 font-medium">解锁配置</th>
                 <th className="px-4 py-3 font-medium">APP 参数</th>
                 <th className="px-4 py-3 font-medium">状态</th>
+                <th className="px-4 py-3 font-medium">部署状态</th>
                 <th className="px-4 py-3 font-medium">操作</th>
               </tr>
             </thead>
             <tbody>
               {tgapiBots.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-sm text-muted-foreground">
+                  <td colSpan={9} className="px-4 py-8 text-center text-sm text-muted-foreground">
                     还没有 TGAPI 申请机器人，点击右上角「新增 TGAPI 申请机器人」创建
                   </td>
                 </tr>
               ) : (
-                tgapiBots.map((bot) => {
+                tgapiBots.map((bot, index) => {
                   const cfg = parseTgApiBotConfig(bot.config);
                   const methodName = cfg.verificationMethodId
                     ? methodById.get(String(cfg.verificationMethodId))?.name ?? `#${cfg.verificationMethodId}`
@@ -439,6 +545,9 @@ export default async function TgApiPage({
                         >
                           {bot.enabled ? "启用" : "停用"}
                         </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <DeployStateBadge check={deployChecks[index] ?? { key: "unknown", detail: "探测结果缺失" }} />
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex flex-wrap items-center gap-2">

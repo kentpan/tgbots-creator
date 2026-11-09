@@ -91,6 +91,17 @@ interface MenuBotInstance {
    * （2026-11-03 webhook 全链路实测抓到）。所有入 registry 的实例必须为 true。
    */
   capabilitiesReady: boolean;
+  /**
+   * 传输层部署结果（真实结果，非预期值）：webhook 模式 = setWebhook 注册结果；
+   * polling 模式 = 轮询启动确认（onStart 成功置 ok）。
+   * 此前该结果只进 console 日志，管理后台完全看不到部署成败 ——
+   * TGAPI 申请机器人保存后部署失败（如 Webhook Base URL 未配置）用户毫无感知。
+   */
+  transportState: { ok: boolean; error?: string; url?: string } | null;
+  /** polling 模式：getMe 成功、轮询确认运行的 Telegram 侧确认信号 */
+  started: boolean;
+  /** polling 模式最近一次轮询致命错误消息（onError 记录，绝不静默） */
+  startError: string | null;
 }
 
 type MenuBotRegistry = Map<number, MenuBotInstance>;
@@ -112,6 +123,72 @@ function runningTokens(): Set<string> {
     globalForBots.tguardMenuBotTokens = new Set();
   }
   return globalForBots.tguardMenuBotTokens;
+}
+
+export interface MenuBotDeployState {
+  /** 本进程 registry 中是否存在该机器人实例 */
+  present: boolean;
+  /** 轮询循环是否在运行（webhook 模式恒 false —— 本进程不轮询） */
+  running: boolean;
+  mode: EffectiveTransport | null;
+  /** polling 模式：Telegram 侧确认启动成功（getMe 已过） */
+  started: boolean;
+  /** 传输层部署结果：true/false = 已确认成败；null = 尚未返回 */
+  transportOk: boolean | null;
+  transportError: string | null;
+  /** webhook 注册成功的回调地址 / polling 启动成功的 @用户名 */
+  transportUrl: string | null;
+  /** polling 最近一次轮询致命错误消息 */
+  startError: string | null;
+}
+
+/**
+ * 读取机器人的真实部署状态（本进程 registry 权威值）。
+ * 注意：Edge 环境 isolate 不共享内存，跨请求渲染的页面请用 Telegram 侧
+ * getWebhookInfo（webhook 模式）或本接口（polling 模式，同进程内权威）。
+ */
+export function getMenuBotDeployState(botId: bigint): MenuBotDeployState {
+  const instance = registry().get(Number(botId));
+  if (!instance) {
+    return {
+      present: false,
+      running: false,
+      mode: null,
+      started: false,
+      transportOk: null,
+      transportError: null,
+      transportUrl: null,
+      startError: null,
+    };
+  }
+  return {
+    present: true,
+    running: instance.running,
+    mode: instance.mode,
+    started: instance.started,
+    transportOk: instance.transportState ? instance.transportState.ok : null,
+    transportError: instance.transportState?.error ?? null,
+    transportUrl: instance.transportState?.url ?? null,
+    startError: instance.startError,
+  };
+}
+
+/**
+ * 有界等待轮询部署确认：polling 模式下 startMenuBot 返回时 getMe 尚未完成，
+ * 轮询等待 started=true（成功）或 running=false（失败退出）。
+ * webhook 模式结果在 startMenuBot 返回时已定（setWebhook 同步 await），无需等待。
+ * 实例消失（停用/被移除）立即返回，由调用方按未部署报告。
+ */
+export async function waitForMenuBotDeployConfirmation(botId: bigint, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const instance = registry().get(Number(botId));
+    if (!instance) return;
+    if (instance.mode !== "polling") return;
+    if (instance.started || !instance.running) return;
+    if (Date.now() >= deadline) return;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
 }
 
 export function parseBotProfile(raw: string): BotProfileConfig {
@@ -243,7 +320,15 @@ async function createMenuBot(row: BotRow, menuConfig: BotMenuConfig, mode: Effec
   bot.catch((error) => {
     console.error(`Menu bot #${row.id} update error:`, error.error);
   });
-  return { bot, running: false, mode, capabilitiesReady: false };
+  return {
+    bot,
+    running: false,
+    mode,
+    capabilitiesReady: false,
+    transportState: null,
+    started: false,
+    startError: null,
+  };
 }
 
 /**
@@ -419,7 +504,7 @@ async function startMenuBot(row: BotRow, options: StartMenuBotOptions = {}): Pro
         }
         runningTokens().delete(row.token);
       }
-      instance = { ...existing, mode: "webhook", running: false };
+      instance = { ...existing, mode: "webhook", running: false, transportState: null, started: false, startError: null };
     } else {
       instance = await createMenuBot(row, parseBotMenuConfig(row.menuConfig), "webhook");
     }
@@ -431,6 +516,8 @@ async function startMenuBot(row: BotRow, options: StartMenuBotOptions = {}): Pro
       "webhook",
       global.webhookBaseUrl,
     );
+    // 部署结果必须落到实例上（此前只进 console，管理后台完全看不到成败）
+    instance.transportState = { ok: applied.ok, error: applied.error, url: applied.url };
     console.log(
       `Menu bot #${row.id} transport=webhook ${applied.ok ? `registered: ${applied.url}` : `register failed: ${applied.error ?? "?"}`}`,
     );
@@ -529,11 +616,18 @@ async function startMenuBot(row: BotRow, options: StartMenuBotOptions = {}): Pro
       // 实测 timeout>0 的 getUpdates 在代理侧被随机抬断，bot 显示已启动却收不到任何更新
       timeout: LONG_POLL_TIMEOUT_SECONDS,
       onStart: (me) => {
+        // Telegram 侧确认启动成功（getMe 已过）：部署状态以此为凭，不预先假报成功
+        instance.started = true;
+        instance.transportState = { ok: true, url: `@${me.username ?? row.id}` };
         console.log(`Menu bot #${row.id} started: @${me.username}`);
       },
     },
     {
       label: `Menu bot #${row.id}`,
+      // 每次轮询致命错误（401/409/网络）都记录到实例（部署状态展示与日志双出口，绝不静默）
+      onError: (error) => {
+        instance.startError = error instanceof Error ? error.message : String(error);
+      },
       shouldContinue: (error) =>
         // 实例已被替换/移除（stopMenuBot / restartMenuBot / 同 token 去重）→ 交由新实例接管
         instances.get(Number(row.id)) === instance &&
