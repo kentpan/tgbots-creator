@@ -82,12 +82,17 @@ export function resolveBotRuntime(
  *
  * 可靠性（v2.0.10 实测教训）：沙盒/受限网络下 getWebhookInfo 偶发超时/网络失败 ——
  * 初版「失败=null=放行」策略在探测失败时让本地抢占并删掉线上 Webhook（事故复发）。
- * 现改为失败自动重试（共 3 次尝试，间隔 2s），全部失败才返回 null 并由调用方打
- * 警告日志 —— 显著降低网络抖动导致的误放行。
+ * 现改为失败自动重试（共 3 次尝试，间隔 2s），全部失败返回 status="unknown"
+ * 并由调用方打警告日志 —— 显著降低网络抖动导致的误判。
+ * v2.1.9 语义收紧：status="unknown"（无法判定）时调用方严禁删除任何 Webhook ——
+ * 盲删会直接掐断线上事件推送（「沙盒弄死线上」事故类源头加固）。
  */
-export async function probeRemoteWebhook(
-  token: string,
-): Promise<{ url: string; pendingUpdateCount: number } | null> {
+export type RemoteWebhookProbeResult =
+  | { status: "active"; url: string; pendingUpdateCount: number }
+  | { status: "none" }
+  | { status: "unknown" };
+
+export async function probeRemoteWebhook(token: string): Promise<RemoteWebhookProbeResult> {
   const { tgRawCall } = await import("@/lib/telegram/transport");
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -98,26 +103,30 @@ export async function probeRemoteWebhook(
       }>(token, "getWebhookInfo");
       // 请求成功：明确判定（url 非空 = 远程消费者存在；空 = 无 webhook）
       const url = res?.ok ? (res.result?.url ?? "").trim() : "";
-      if (!url) return null;
-      return { url, pendingUpdateCount: res?.result?.pending_update_count ?? 0 };
+      if (!url) return { status: "none" };
+      return { status: "active", url, pendingUpdateCount: res?.result?.pending_update_count ?? 0 };
     } catch {
-      // 网络失败：重试（最后一次仍失败 → null，调用方按「未探测到」处理并告警）
+      // 网络失败：重试（最后一次仍失败 → unknown，调用方按「无法判定」处理并告警）
       if (attempt < maxAttempts) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
       }
     }
   }
-  return null;
+  return { status: "unknown" };
 }
 
 /**
  * 注册/更新机器人的 Webhook（setWebhook）或关闭它（deleteWebhook）。
  * 仅在 transport 生效模式变化或首次启用时调用；幂等可重复执行。
+ *
+ * v2.1.9：轮询模式支持 deleteWebhook:false —— 远程 Webhook 探测失败（无法判定
+ * 是否存在线上消费者）时调用方必须跳过删除，绝不允许盲删掐断线上事件流。
  */
 export async function applyBotTransport(
   params: { token: string; botId: string },
   mode: EffectiveTransport,
   webhookBaseUrl: string,
+  options: { deleteWebhook?: boolean } = {},
 ): Promise<{ ok: boolean; error?: string; url?: string }> {
   const { botByToken, withTelegramTimeout } = await import("@/services/telegram-sync");
   try {
@@ -136,6 +145,11 @@ export async function applyBotTransport(
         }),
       );
       return { ok: true, url };
+    }
+    if (options.deleteWebhook === false) {
+      // 探测失败（无法判定远程消费者）的保护路径：不碰任何 Webhook；
+      // 若线上确有 Webhook，本地轮询会被 Telegram 409 拒绝并自动让位
+      return { ok: true };
     }
     await withTelegramTimeout(bot.api.deleteWebhook({ drop_pending_updates: false }));
     return { ok: true };

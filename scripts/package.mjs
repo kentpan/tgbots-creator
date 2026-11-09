@@ -81,7 +81,7 @@ for (const dbFile of ["prisma/bot-groups.db", "db/custom.db"]) {
 //     此后每次打包必须完整打印即将随包分发的全局配置与验证方式，人工核对无误才允许交付。
 //     读取失败直接抛错中止（绝不静默跳过）。
 function dumpShippedConfig(dbFile) {
-  const abs = path.join(root, dbFile);
+  const abs = dbFile;
   if (!existsSync(abs)) return;
   const db = new DatabaseSync(abs, { readOnly: true });
   const tables = db
@@ -120,8 +120,47 @@ function dumpShippedConfig(dbFile) {
     console.log(`   · #${m.id} ${m.name} type=${m.type} enabled=${m.enabled}`);
   }
 }
-dumpShippedConfig("prisma/bot-groups.db");
-dumpShippedConfig("db/custom.db");
+dumpShippedConfig(path.join(root, "prisma/bot-groups.db"));
+dumpShippedConfig(path.join(root, "db/custom.db"));
+
+/**
+ * 沙盒运行时残留键（v2.1.9 打包闸门强制化）：
+ * v1.1.3/v1.1.4 事故：沙盒遗留的 telegram.transport_mode=polling 随包分发，用户部署后
+ * 自己的全局传输配置被包内 DB 覆盖成轮询（2026-11-03 用户暴怒投诉）。此前
+ * dumpShippedConfig 只能事后打印供人工核对 —— v2.1.9 起在 staging 副本上直接强制
+ * 清除下列键（只影响包内副本，沙盒本地库不受任何影响）:
+ * - telegram.transport_mode：删除 → 运行时取产品默认 auto（按部署形态自适应 Webhook/轮询）
+ * - telegram.pending_groups：沙盒建群向导的临时待绑定态，随包分发无意义
+ * 清洗结果与随包配置一并打印，交付前逐项核对。
+ */
+const SANDBOX_RESIDUE_KEYS = ["telegram.transport_mode", "telegram.pending_groups"];
+
+function sanitizeShippedDb(dbFile) {
+  if (!existsSync(dbFile)) return;
+  const db = new DatabaseSync(dbFile);
+  try {
+    const tables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+      .all()
+      .map((row) => row.name);
+    if (!tables.includes("app_settings")) return;
+    for (const key of SANDBOX_RESIDUE_KEYS) {
+      const row = db.prepare("SELECT value FROM app_settings WHERE key = ?").get(key);
+      if (row === undefined) continue;
+      const deleted = db.prepare("DELETE FROM app_settings WHERE key = ?").run(key);
+      console.log(
+        `   🧹 已清洗沙盒残留 ${key}（原值：${row.value}）→ 运行时取产品默认`,
+      );
+      if (deleted.changes !== 1) {
+        console.error(`   ❌ 清洗 ${key} 失败（changes=${deleted.changes}），中止打包`);
+        db.close();
+        process.exit(1);
+      }
+    }
+  } finally {
+    db.close();
+  }
+}
 
 // 4. 组装 staging
 const includeRootFiles = [
@@ -168,6 +207,13 @@ for (const d of includeDirs) {
       return true;
     },
   });
+}
+
+// 4.5 沙盒残留清洗（staging 副本上执行，绝不写回沙盒本地库），随后从副本读出
+//     随包全局配置/验证方式打印 —— 这里才是真正随包分发的最终数据，交付前逐项核对
+for (const dbFile of ["prisma/bot-groups.db", "db/custom.db"]) {
+  sanitizeShippedDb(path.join(stage, dbFile));
+  dumpShippedConfig(path.join(stage, dbFile));
 }
 
 // 5. 产品默认 .env。沙盒本地 .env 不入包。

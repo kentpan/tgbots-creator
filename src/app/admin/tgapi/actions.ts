@@ -46,11 +46,14 @@ function truncateDeployMessage(message: string): string {
 }
 
 /**
- * 保存/启停后的真实部署确认：await 运行实例重启（不再 fire-and-forget），
+ * 部署后的真实结果确认：await 运行实例重启（不再 fire-and-forget），
  * 按生效传输模式取真实结果：
  * - webhook：setWebhook 注册结果（startMenuBot 返回时已定）
  * - polling：有界等待 getMe 确认（onStart）/ 失败退出（onExit），超时如实报 pending
  * 部署失败绝不静默：原因随 redirect 回显到页面横幅。
+ *
+ * v2.1.9 部署与保存分离：本流程不再由保存动作自动触发，唯一入口是
+ * 列表「部署」按钮（deployTgApiBotAction）与启停开关（toggleTgApiBotAction）。
  */
 async function deployTgApiBotAndReport(botId: bigint, enabled: boolean): Promise<TgApiDeployOutcome> {
   if (!enabled) {
@@ -182,6 +185,8 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
   profile.tgapi = buildTgApiConfig(formData);
   const configJson = JSON.stringify(profile);
 
+  // v2.1.9 部署与保存分离：保存只落库，绝不自动触碰运行实例（更不会删了正在
+  // 工作的 Webhook 再重注册）——上线/更新运行实例是列表「部署」按钮的显式动作。
   if (isEdit) {
     await updateBotRecord(BigInt(idRaw), {
       name,
@@ -189,15 +194,14 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
       enabled,
       config: configJson,
     });
-    const deploy = await deployTgApiBotAndReport(BigInt(idRaw), enabled);
     await logOperation(admin, {
       action: "保存TGAPI申请机器人",
       target: name,
-      detail: `状态：${enabled ? "启用" : "停用"}；部署结果：${deploy.message}`,
+      detail: `状态：${enabled ? "启用" : "停用"}（仅保存配置，未部署）`,
       headers: await headers(),
     });
     revalidatePath("/admin/tgapi");
-    redirect(tgapiPath({ saved: "1", deploy: deploy.state, deploy_msg: deploy.message }));
+    redirect(tgapiPath({ saved: "1" }));
   } else {
     const created = await createBotRecord({
       name,
@@ -206,16 +210,45 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
       config: configJson,
     });
     if (!created) redirect(tgapiPath({ error: "duplicate-token" }));
-    const deploy = await deployTgApiBotAndReport(created.id, enabled);
     await logOperation(admin, {
       action: "创建TGAPI申请机器人",
       target: name,
-      detail: `Token 尾号：${token.slice(-6)}；部署结果：${deploy.message}`,
+      detail: `Token 尾号：${token.slice(-6)}（仅保存配置，未部署）`,
       headers: await headers(),
     });
     revalidatePath("/admin/tgapi");
-    redirect(tgapiPath({ saved: "1", deploy: deploy.state, deploy_msg: deploy.message }));
+    redirect(tgapiPath({ saved: "1" }));
   }
+}
+
+/**
+ * 列表「🚀 部署」按钮（v2.1.9）：唯一的显式部署入口。
+ * 重启运行实例并按生效传输模式取真实结果（webhook=setWebhook 注册结果 /
+ * polling=getMe 确认），成败原因随 redirect 回显到页面横幅；停用状态下拒绝部署。
+ */
+export async function deployTgApiBotAction(formData: FormData): Promise<void> {
+  const admin = await requirePermission("tgapi:manage");
+  const idRaw = String(formData.get("id") ?? "").trim();
+  if (!idRaw || !/^\d+$/.test(idRaw)) redirect(tgapiPath({ error: "invalid-id" }));
+  const bot = await getBot(BigInt(idRaw));
+  if (!bot) redirect(tgapiPath({ error: "invalid-id" }));
+  if (!bot.enabled) {
+    redirect(
+      tgapiPath({
+        deploy: "fail",
+        deploy_msg: "机器人已停用：请先在列表中「启用」再部署",
+      }),
+    );
+  }
+  const deploy = await deployTgApiBotAndReport(BigInt(idRaw), true);
+  await logOperation(admin, {
+    action: "部署TGAPI申请机器人",
+    target: bot.name,
+    detail: deploy.message,
+    headers: await headers(),
+  });
+  revalidatePath("/admin/tgapi");
+  redirect(tgapiPath({ deploy: deploy.state, deploy_msg: deploy.message }));
 }
 
 export async function toggleTgApiBotAction(formData: FormData): Promise<void> {

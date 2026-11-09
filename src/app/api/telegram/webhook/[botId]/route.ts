@@ -1,9 +1,10 @@
 import { timingSafeEqual } from "@/utils/crypto";
 import { NextResponse } from "next/server";
-import { getBot } from "@/database/operations";
+import { getBot, listEnabledBots } from "@/database/operations";
 import { config } from "@/config/settings";
 import { acquireMenuBot } from "@/bot/multi-runtime";
 import { botWebhookSecret } from "@/lib/telegram/runtime-mode";
+import type { BotRow } from "@/database/operations";
 
 /**
  * 按机器人 Webhook 回调入口：POST /api/telegram/webhook/<botId>
@@ -12,6 +13,16 @@ import { botWebhookSecret } from "@/lib/telegram/runtime-mode";
  *
  * 安全：校验 x-telegram-bot-api-secret-token 头与确定性派生密钥
  * （botWebhookSecret(botId, token)，注册 Webhook 时由 setWebhook 写入 Telegram）。
+ *
+ * v2.1.9 回调密钥自愈（2026-11-09「TGAPI 申请机器人线上彻底静默」事故根因修复）：
+ * Telegram 侧注册的回调 URL 内嵌的是注册当时的 bots 行 id；数据库恢复/重建后同一
+ * Token 的行 id 可能漂移（实测：Telegram 指向 /webhook/4，行已变成 id=5），旧路径
+ * getBot(4) 查无此行 → 404 拒收 → 该机器人所有更新永久无人处理、毫无感知。
+ * 修复：回调密钥本身就是「路径 id + Token」的确定性摘要 —— 路径 id 与当前行 id
+ * 不一致（行不存在 / 行 Token 对不上密钥）时，用密钥对全部启用机器人的
+ * botWebhookSecret(路径id, row.token) 做常数时间比对，反查出真实行并照常处理；
+ * 同时打日志提示在管理后台点「部署」重新注册规范回调地址。密钥匹配要求持有
+ * 确切 Token 才可能通过，不构成可枚举面；id 一致的正常机器人行为完全不变。
  */
 export async function POST(
   request: Request,
@@ -30,16 +41,55 @@ export async function POST(
       token = null;
     }
   }
-  if (!token) {
-    return NextResponse.json({ detail: "机器人不存在或 Token 未配置" }, { status: 404 });
-  }
 
-  const expected = botWebhookSecret(botId, token);
   const provided = request.headers.get("x-telegram-bot-api-secret-token");
-  const a = Buffer.from(expected);
-  const b = Buffer.from(provided ?? "");
-  if (a.length !== b.length || !timingSafeEqual(a, b)) {
-    return NextResponse.json({ detail: "Webhook 密钥校验失败" }, { status: 401 });
+  const providedBuf = Buffer.from(provided ?? "");
+
+  /** 常数时间比对派生密钥与 Telegram 回调头（长度不等直接 false） */
+  const secretMatches = (pathBotId: string, candidateToken: string): boolean => {
+    const expected = Buffer.from(botWebhookSecret(pathBotId, candidateToken));
+    if (expected.length !== providedBuf.length) return false;
+    return timingSafeEqual(expected, providedBuf);
+  };
+
+  let matchedRow: BotRow | null = null;
+
+  if (botId === "main") {
+    if (!token) {
+      return NextResponse.json({ detail: "主机器人 Token 未配置" }, { status: 404 });
+    }
+    if (!secretMatches(botId, token)) {
+      return NextResponse.json({ detail: "Webhook 密钥校验失败" }, { status: 401 });
+    }
+  } else if (/^\d+$/.test(botId)) {
+    const directRow = await getBot(BigInt(botId)).catch(() => null);
+    if (directRow && secretMatches(botId, directRow.token)) {
+      // 常规路径：行 id 与回调 URL 一致且密钥匹配
+      matchedRow = directRow;
+    } else {
+      // 自愈路径：行不存在（id 漂移）或行 Token 对不上密钥 —— 按密钥反查真实行
+      // （仅启用中的机器人参与反查；密钥匹配要求持有确切 Token，不构成可枚举面）
+      const candidates = await listEnabledBots().catch((error: unknown) => {
+        console.error(`[webhook] 机器人 ${botId} 密钥自愈反查失败:`, error);
+        return [];
+      });
+      matchedRow = candidates.find((row) => secretMatches(botId, row.token)) ?? null;
+      if (matchedRow) {
+        console.warn(
+          `[webhook] 回调地址指向旧 id ${botId}，已按回调密钥自愈匹配到机器人 #${String(matchedRow.id)}` +
+            `${matchedRow.username ? ` (@${matchedRow.username})` : ""} —— 请在管理后台对该机器人点「部署」重新注册规范回调地址。`,
+        );
+      }
+    }
+    if (!matchedRow) {
+      return NextResponse.json(
+        { detail: directRow ? "Webhook 密钥校验失败" : "机器人不存在或 Token 未配置" },
+        { status: directRow ? 401 : 404 },
+      );
+    }
+    token = matchedRow.token;
+  } else {
+    return NextResponse.json({ detail: "机器人不存在或 Token 未配置" }, { status: 404 });
   }
 
   let update: unknown;
@@ -65,8 +115,9 @@ export async function POST(
       const mainBot = globalForWebhook.tguardMainWebhookBot;
       if (!mainBot.isInited()) await mainBot.init();
       await mainBot.handleUpdate(update as Parameters<typeof mainBot.handleUpdate>[0]);
-    } else {
-      const handle = await acquireMenuBot(BigInt(botId));
+    } else if (matchedRow) {
+      // 自愈/常规路径统一按真实行 id 取实例（自愈时真实 id ≠ 路径 id）
+      const handle = await acquireMenuBot(matchedRow.id);
       if (!handle) {
         return NextResponse.json({ detail: "机器人不可用" }, { status: 503 });
       }
