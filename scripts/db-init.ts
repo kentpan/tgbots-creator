@@ -373,8 +373,30 @@ async function ensureMigrations(): Promise<void> {
   await executeRun(
     `CREATE INDEX IF NOT EXISTS "idx_tgapi_unlocks_bot" ON "tgapi_unlocks"("bot_id")`,
   );
+  // v2.1.16 TGAPI申请：机器人用户台账（/start 最新菜单消息 id 旧消息过时失效 +
+  // 已创建 APP 结果 api_id/api_hash 持久化 —— 「我的API」查看与「创建API」前置检测）
+  await executeRun(
+    `CREATE TABLE IF NOT EXISTS "tgapi_bot_users" (
+      "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      "bot_id" INTEGER NOT NULL,
+      "user_id" BIGINT NOT NULL,
+      "username" TEXT,
+      "menu_message_id" INTEGER,
+      "app_phone" TEXT,
+      "app_id" TEXT,
+      "app_hash" TEXT,
+      "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`,
+  );
+  await executeRun(
+    `CREATE UNIQUE INDEX IF NOT EXISTS "tgapi_bot_users_bot_user_key" ON "tgapi_bot_users"("bot_id", "user_id")`,
+  );
+  await executeRun(
+    `CREATE INDEX IF NOT EXISTS "idx_tgapi_bot_users_bot" ON "tgapi_bot_users"("bot_id")`,
+  );
   console.log(
-    "Migrations ensured: bots, developer_accounts, group_bot_admins, bot_commands, privacy_mode, require_approval, xianyu_products, xianyu_delivery_logs, verify_codes, ai_providers, ai_usage_logs, bot_sessions, invite_links, chat_messages, tgapi_unlocks",
+    "Migrations ensured: bots, developer_accounts, group_bot_admins, bot_commands, privacy_mode, require_approval, xianyu_products, xianyu_delivery_logs, verify_codes, ai_providers, ai_usage_logs, bot_sessions, invite_links, chat_messages, tgapi_unlocks, tgapi_bot_users",
   );
 }
 

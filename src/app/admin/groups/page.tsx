@@ -8,6 +8,7 @@ import {
   type GroupSettingsRow,
 } from "@/database/operations";
 import { requirePermission } from "@/lib/auth";
+import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import { FormDialog } from "@/components/admin/form-dialog";
 import { inputClass, labelClass, selectClass } from "@/components/admin/form-styles";
 import { SwitchField } from "@/components/admin/switch-field";
@@ -188,8 +189,8 @@ function GroupFormDialog({
       />
       <SwitchField
         name="privacy_mode"
-        label="隐私模式（Privacy Mode）"
-        description="开启：验证码必须以「回复验证问题消息」的方式提交（stateless-question），机器人在 Telegram 隐私模式开启的群组中无需任何额外权限即可完成验证。关闭：宽松模式，任意文本消息都会触发验证码校验，需要机器人已关闭隐私模式或为群管理员。"
+        label="隐私模式（机器人在群里怎么收验证码）"
+        description="开启（默认）：入群者必须「回复」机器人发出的验证消息来提交验证码 —— 机器人只收得到回复，不需要读取群内普通消息的权限，BotFather 默认隐私模式开着即可正常验证。关闭（宽松）：入群者直接在群里发验证码也能通过，但机器人必须能读到群内全部消息（需在 BotFather 关闭隐私模式，或将机器人设为群管理员），否则机器人收不到消息、验证无法进行。"
         defaultChecked={group ? group.privacyMode : true}
         id={`privacy-${group?.chatId ?? "new"}`}
       />
@@ -377,15 +378,14 @@ export default async function GroupsPage({
                             trigger="🔗 邀请链接"
                             triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
                           />
-                          <form action={deleteGroupAction}>
-                            <input type="hidden" name="chat_id" value={chatKey} />
-                            <button
-                              type="submit"
-                              className="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
-                            >
-                              删除
-                            </button>
-                          </form>
+                          <ConfirmDialog
+                            trigger="删除"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
+                            title={`删除群组验证配置 · ${group.chatTitle ?? chatKey}`}
+                            description={`将删除该群组的验证配置与全部机器人关联记录（Chat ID ${chatKey}），Telegram 侧群组本身不受影响。此操作不可撤销，确定继续？`}
+                            action={deleteGroupAction}
+                            fields={{ chat_id: chatKey }}
+                          />
                         </div>
                       </td>
                     </tr>

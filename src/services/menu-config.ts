@@ -29,7 +29,47 @@ export type MenuActionType =
   | "web_app"
   | "switch_inline"
   | "switch_inline_current"
-  | "command";
+  | "command"
+  | "language"
+  | "tgapi_func";
+
+/**
+ * TGAPI 申请机器人内置功能（v2.1.16）：内嵌按钮「交互」下拉框的可选项，
+ * 与 TGAPI 机器人真实具备的功能一一对应（运行时由 registerTgApiHandlers 注入执行器）。
+ * label 即管理端下拉框展示文案（指令 /xxx : 描述格式）。
+ */
+export const TGAPI_MENU_FUNCS = [
+  {
+    func: "start",
+    label: "指令 /start : 启动机器人",
+    hint: "重新发送一条新的初始消息+内嵌按钮，之前的消息和内嵌按钮过时失效",
+  },
+  {
+    func: "create",
+    label: "指令 /createapi : 创建API",
+    hint: "先检测是否已创建过 → 未解锁时进入验证码验证流程 → 通过后自动进入创建流程（手机号 → 登录码 → api_id/api_hash）",
+  },
+  {
+    func: "my",
+    label: "指令 /myapi : 我的API",
+    hint: "查看已创建的 api_id 与 api_hash（号码 / api_id / api_hash 三行格式）",
+  },
+] as const;
+
+export type TgApiMenuFunc = (typeof TGAPI_MENU_FUNCS)[number]["func"];
+
+const TGAPI_MENU_FUNC_SET: Set<string> = new Set(TGAPI_MENU_FUNCS.map((item) => item.func));
+
+/** 判断是否合法的 TGAPI 内置功能名（parseAction 校验与 validateMenuConfig 校验共用） */
+export function isValidTgApiMenuFunc(func: string | undefined | null): boolean {
+  return typeof func === "string" && TGAPI_MENU_FUNC_SET.has(func);
+}
+
+/** 按钮级响应配置（v2.1.16）：点击按钮后机器人先发送的提示消息（中英双语，支持 {{变量}} 占位符） */
+export interface MenuTgApiResponse {
+  zh: string;
+  en: string;
+}
 
 /**
  * 外部验证 API 按钮配置（v2.1.12）：与「验证方式」库 / 群组外部 API 验证同一机制 ——
@@ -60,6 +100,12 @@ export interface MenuButtonAction {
   switch_query?: string;
   /** command 类型专用：点击后真实执行的指令名（不含 /；内置或自定义指令） */
   target?: string;
+  /** tgapi_func 类型专用：TGAPI 内置功能名（start=create/create/my，见 TGAPI_MENU_FUNCS） */
+  tgapi_func?: string;
+  /** tgapi_func 类型专用：首次对话解锁门禁（true=未解锁用户点击先进入验证码验证流程） */
+  tgapi_unlock?: boolean;
+  /** tgapi_func 类型专用：点击后的响应提示消息（中英双语，先于功能执行发送） */
+  tgapi_response?: MenuTgApiResponse;
 }
 
 export interface MenuButton {
@@ -93,6 +139,72 @@ export function emptyMenuConfig(): BotMenuConfig {
   return { content: emptyContent(), root: { rows: [] } };
 }
 
+/**
+ * TGAPI 申请机器人图 1 默认按钮（v2.1.16）：存量机器人首次打开新弹窗时按钮区按此生成
+ * （不迁移旧 menu_config 的按钮文案）；消息正文不在此处（正文沿用其已自定义的欢迎语 texts.start）。
+ * 🗝 创建API 默认开启首次对话解锁门禁；💎 我的API / 🌐 切换语言 不开启。
+ */
+export function defaultTgApiMenuRoot(): MenuNode {
+  const row = (buttons: MenuButton[]): MenuRow => ({
+    id: `row${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+    buttons,
+  });
+  return {
+    rows: [
+      row([
+        {
+          id: "btn-create-api",
+          text: "🗝 创建API",
+          action: {
+            type: "tgapi_func",
+            tgapi_func: "create",
+            tgapi_unlock: true,
+            tgapi_response: {
+              zh: "🗝 正在为你创建 API，请稍候…",
+              en: "🗝 Creating your API, please wait…",
+            },
+          },
+        },
+      ]),
+      row([
+        {
+          id: "btn-my-api",
+          text: "💎 我的API",
+          action: {
+            type: "tgapi_func",
+            tgapi_func: "my",
+            tgapi_response: {
+              zh: "💎 正在查询你的 API 信息…",
+              en: "💎 Looking up your API info…",
+            },
+          },
+        },
+      ]),
+      row([
+        {
+          id: "btn-language",
+          text: "🌐 切换语言",
+          action: { type: "language" },
+        },
+      ]),
+    ],
+  };
+}
+
+/** TGAPI 设计器保存标记（menu_config JSON 顶层字段）：true = 按钮配置来自新设计器弹窗 */
+export const TGAPI_DESIGNER_FLAG = "tgapiDesigner";
+
+/** 判断 menu_config JSON 是否由 TGAPI 新设计器保存过（存量旧配置返回 false） */
+export function isTgApiDesignerConfig(raw: string | null | undefined): boolean {
+  if (!raw || !raw.trim()) return false;
+  try {
+    const data = JSON.parse(raw) as Record<string, unknown>;
+    return data[TGAPI_DESIGNER_FLAG] === true;
+  } catch {
+    return false;
+  }
+}
+
 const CONTENT_TYPES: MenuContentType[] = ["text", "photo", "video", "media_group"];
 const ACTION_TYPES: MenuActionType[] = [
   "reply",
@@ -104,6 +216,8 @@ const ACTION_TYPES: MenuActionType[] = [
   "switch_inline",
   "switch_inline_current",
   "command",
+  "language",
+  "tgapi_func",
 ];
 
 export function isHttpUrl(value: string): boolean {
@@ -175,6 +289,29 @@ function parseAction(raw: unknown): MenuButtonAction {
   if (typeof source.target === "string") action.target = source.target;
   const verify = parseVerify(source.verify);
   if (verify) action.verify = verify;
+  // v2.1.16 TGAPI 按钮：功能名仅接受内置功能清单；响应配置中英文都空时不落库
+  if (
+    source.type === "tgapi_func" &&
+    typeof source.tgapi_func === "string" &&
+    TGAPI_MENU_FUNC_SET.has(source.tgapi_func)
+  ) {
+    action.tgapi_func = source.tgapi_func;
+    if (source.tgapi_unlock === true) action.tgapi_unlock = true;
+    const response = source.tgapi_response;
+    if (
+      typeof response === "object" &&
+      response !== null &&
+      ((typeof (response as Partial<MenuTgApiResponse>).zh === "string" &&
+        (response as Partial<MenuTgApiResponse>).zh !== "") ||
+        (typeof (response as Partial<MenuTgApiResponse>).en === "string" &&
+          (response as Partial<MenuTgApiResponse>).en !== ""))
+    ) {
+      action.tgapi_response = {
+        zh: typeof response.zh === "string" ? response.zh : "",
+        en: typeof response.en === "string" ? response.en : "",
+      };
+    }
+  }
   const content = parseContent(source.content);
   if (source.type === "reply" && (content.type !== "text" || content.text)) {
     action.content = content;

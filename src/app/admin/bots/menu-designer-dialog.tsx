@@ -51,11 +51,11 @@ interface DesignerBot {
   menuText: string;
   username: string | null;
   privacyMode: boolean;
-  /** TGAPI申请 机器人（v2.1.10）：指令选择器额外提供内置 start/language */
+  /** TGAPI申请 机器人（v2.1.10）：v2.1.14 起仅影响「语言切换」按钮类型可见性 */
   isTgApi?: boolean;
 }
 
-/** 指令选择器可选项（v2.1.10）：内置指令 = 指令管理启用内置项 / TGAPI 机器人自有指令 */
+/** 指令选择器可选项（v2.1.10）：内置指令 = 指令管理启用内置项（唯一来源指令库） */
 export interface MenuCommandOption {
   name: string;
   label: string;
@@ -144,6 +144,12 @@ const ACTION_OPTIONS: { value: MenuActionType; label: string }[] = [
   { value: "verify", label: "外部验证 API（点击后要求回复验证码核验）" },
   { value: "switch_inline", label: "切换到其他聊天的内联查询" },
   { value: "switch_inline_current", label: "在当前聊天输入框预填内容" },
+];
+
+/** TGAPI 申请机器人专属交互（v2.1.14）：语言切换按钮（原 /language 指令按钮化，不再注册指令） */
+const TGAPI_ACTION_OPTIONS: { value: MenuActionType; label: string }[] = [
+  ...ACTION_OPTIONS,
+  { value: "language", label: "语言切换（中文/English，点击即切换）" },
 ];
 
 /** 验证方式库条目（绑定验证方法下拉选项；code_api 类型才能用于菜单验证） */
@@ -551,7 +557,7 @@ function SelectedButtonPanel({ state }: { state: DesignerState }) {
             onChange={(event) => actions.changeActionType(selected.path, selected.buttonId, event.target.value as MenuActionType)}
             className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
           >
-            {ACTION_OPTIONS.map((option) => (
+            {(state.isTgApi ? TGAPI_ACTION_OPTIONS : ACTION_OPTIONS).map((option) => (
               <option key={option.value} value={option.value}>
                 {option.label}
               </option>
@@ -619,6 +625,13 @@ function SelectedButtonPanel({ state }: { state: DesignerState }) {
       {action.type === "back" ? (
         <p className="text-sm text-muted-foreground">
           返回按钮将回到进入当前菜单前的上一级菜单（主菜单层级默认回到主菜单）。
+        </p>
+      ) : null}
+
+      {action.type === "language" ? (
+        <p className="text-sm text-muted-foreground">
+          语言切换按钮（TGAPI 申请机器人）：点击后在 中文/English 之间切换并回复切换结果；
+          语言偏好按会话记忆，新会话按用户 Telegram 语言自动识别。
         </p>
       ) : null}
 
@@ -759,7 +772,9 @@ interface DesignerState {
   config: BotMenuConfig;
   selected: { path: string[]; buttonId: string } | null;
   storageKind: "cloudflare-r2" | "local";
-  /** 内置指令可选项（v2.1.10）：普通机器人=指令管理启用内置项；TGAPI=start/language */
+  /** TGAPI申请 机器人（v2.1.14）：true 时按钮交互额外提供「语言切换」类型 */
+  isTgApi: boolean;
+  /** 内置指令可选项（唯一来源指令库启用内置项；/start 勾选后按 TGAPI 语义注册） */
   builtinCommands: MenuCommandOption[];
   /** 自定义指令可选项（v2.1.10）：指令管理中启用的自定义指令 */
   customCommands: MenuCommandOption[];
@@ -793,7 +808,7 @@ export function MenuDesignerDialog({
   bot: DesignerBot;
   groups: { chatId: string; chatTitle: string | null }[];
   storageKind: "cloudflare-r2" | "local";
-  /** 内置指令库（指令管理 → 内置指令，仅启用项；TGAPI 机器人 = start/language 自有指令） */
+  /** 内置指令库（指令管理 → 内置指令，仅启用项；唯一来源指令库） */
   builtinCommands: MenuCommandOption[];
   /** 自定义指令库（指令管理 → 自定义指令，仅启用项）：供按钮「执行指令」选择 */
   customCommands: MenuCommandOption[];
@@ -945,6 +960,7 @@ export function MenuDesignerDialog({
     config,
     selected,
     storageKind,
+    isTgApi: bot.isTgApi === true,
     builtinCommands,
     customCommands,
     verificationMethods,

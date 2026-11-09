@@ -67,9 +67,21 @@ export function registerInviteLinkTracking<TContext extends Context>(
   bot.api.config.use(async (prev, method, payload, signal) => {
     const result = await prev(method, payload, signal);
     if (method === "createChatInviteLink") {
+      // grammY transformer 语义（out/core/client.js callApi）：transformer 链内
+      // prev() 返回完整响应信封 { ok, result }，解包（data.result）发生在链外的
+      // callApi —— 必须读 envelope.result 才是 ChatInviteLink 本体。
+      // v2.1.2~v2.1.14 误读信封导致 fields 恒为 null → 静默跳过 → 台账从未
+      // 自动登记任何 API 创建的链接（2026-11-09 线上实测证实）。
+      const envelope = result as { result?: unknown } | undefined;
+      const inviteLink = envelope?.result as ChatInviteLink | undefined;
       const chatId = chatIdFromPayload(payload);
-      const fields = inviteLinkFields(result as unknown as ChatInviteLink | undefined);
-      if (chatId !== null && fields) {
+      const fields = inviteLinkFields(inviteLink);
+      // 解析失败绝不静默：宁可刷日志也不能让台账悄悄漏登记
+      if (chatId === null || fields === null) {
+        console.warn(
+          `[invite-link-tracking] createChatInviteLink 响应解析失败（chat=${String(chatId)}，token=${token.slice(0, 8)}…），台账未登记`,
+        );
+      } else {
         try {
           const botId = await resolveBotIdByToken(token);
           await upsertInviteLink({

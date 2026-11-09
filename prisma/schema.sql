@@ -287,6 +287,18 @@ CREATE TABLE "tgapi_unlocks" (
       "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+CREATE TABLE "tgapi_bot_users" (
+      "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      "bot_id" INTEGER NOT NULL,
+      "user_id" BIGINT NOT NULL,
+      "username" TEXT,
+      "menu_message_id" INTEGER,
+      "app_phone" TEXT,
+      "app_id" TEXT,
+      "app_hash" TEXT,
+      "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
 CREATE UNIQUE INDEX "admin_users_username_key" ON "admin_users"("username");
 CREATE UNIQUE INDEX "bot_commands_type_name_key" ON "bot_commands"("type", "name");
 CREATE UNIQUE INDEX "bot_sessions_scope_key" ON "bot_sessions"("scope", "session_key");
@@ -309,6 +321,8 @@ CREATE INDEX 'idx_join_requests_status_chat' ON 'join_requests'('status', 'chat_
 CREATE INDEX "idx_join_requests_user_id" ON "join_requests"("user_id");
 CREATE INDEX "idx_operation_logs_created_time" ON "operation_logs"("created_time");
 CREATE INDEX "idx_tgapi_unlocks_bot" ON "tgapi_unlocks"("bot_id");
+CREATE UNIQUE INDEX "tgapi_bot_users_bot_user_key" ON "tgapi_bot_users"("bot_id", "user_id");
+CREATE INDEX "idx_tgapi_bot_users_bot" ON "tgapi_bot_users"("bot_id");
 CREATE INDEX 'idx_verification_sessions_created' ON 'verification_sessions'('created_time');
 CREATE INDEX 'idx_verification_sessions_expires' ON 'verification_sessions'('expires_at');
 CREATE INDEX 'idx_verification_sessions_user_chat' ON 'verification_sessions'('user_id', 'chat_id', 'captcha_completed');

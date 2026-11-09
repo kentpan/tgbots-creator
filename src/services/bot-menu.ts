@@ -5,6 +5,7 @@ import type { BotContext } from "@/bot/context";
 import {
   countMenuStats,
   isHttpUrl,
+  isValidTgApiMenuFunc,
   MENU_MAX_BUTTONS_PER_ROW,
   MENU_MAX_BUTTONS_TOTAL,
   MENU_MAX_DEPTH,
@@ -16,6 +17,7 @@ import {
   type MenuButton,
   type MenuMessageContent,
   type MenuNode,
+  type MenuTgApiResponse,
 } from "@/services/menu-config";
 import { startMenuVerifyFlow } from "@/bot/handlers/menu-verify";
 
@@ -68,6 +70,22 @@ export type MenuCommandRunner = (ctx: Context) => Promise<void>;
 
 export interface MenuCommandRegistry {
   runners: Map<string, MenuCommandRunner>;
+  /**
+   * 语言切换运行器（v2.1.14）：菜单按钮 action.type="language" 点击时调用。
+   * 由 TGAPI 申请机器人在能力注册阶段注入（语言切换已从 /language 指令改为
+   * 消息内嵌按钮）；其他机器人类型不注入 —— 点击时回复明确提示，绝不静默。
+   */
+  languageRunner?: MenuCommandRunner;
+  /**
+   * TGAPI 内置功能执行器（v2.1.16）：菜单按钮 action.type="tgapi_func" 点击时调用，
+   * 由 TGAPI 申请机器人在能力注册阶段注入（start/create/my 三个功能统一入口）。
+   * 按钮级配置（unlock 门禁开关 / response 响应文案）随 action 原样透传，
+   * 门禁检测与已创建检测都在执行器内完成。未注入时点击回复明确提示。
+   */
+  tgapiFuncRunner?: (
+    ctx: Context,
+    action: { func: string; unlock: boolean; response?: MenuTgApiResponse },
+  ) => Promise<void>;
 }
 
 export function createMenuCommandRegistry(): MenuCommandRegistry {
@@ -156,6 +174,37 @@ function appendButton(
         await ctx.reply(
           `⚠️ 指令 /${commandName || "（未指定）"} 不存在或未在「指令菜单」中勾选：请在机器人管理页打开「⌨️ 指令菜单」，勾选该指令并保存。`,
         );
+      });
+      return;
+    }
+    case "language": {
+      // v2.1.14：语言切换按钮（TGAPI 申请机器人）—— 原 /language 指令按钮化，
+      // 管理端在「消息内嵌按钮」配置；运行器由 TGAPI 实例注入 registry.languageRunner，
+      // 点击时查找（注入晚于菜单安装，同一注册表对象引用）。未注入时明确提示。
+      menu.text(button.text, async (ctx) => {
+        if (registry?.languageRunner) {
+          await registry.languageRunner(ctx);
+          return;
+        }
+        await ctx.reply("⚠️ 语言切换按钮仅 TGAPI 申请机器人支持：请在机器人配置中启用 TGAPI 申请。");
+      });
+      return;
+    }
+    case "tgapi_func": {
+      // v2.1.16：TGAPI 内置功能按钮（启动/创建API/我的API）—— 执行器由 TGAPI 实例
+      // 注入 registry.tgapiFuncRunner；按钮级门禁/响应配置随 action 透传，
+      // 过期拦截/门禁检测/已创建检测全部在执行器内完成。
+      const func = (action.tgapi_func ?? "").trim();
+      const unlock = action.tgapi_unlock === true;
+      const response = action.tgapi_response;
+      menu.text(button.text, async (ctx) => {
+        if (!func || !registry?.tgapiFuncRunner) {
+          await ctx.reply(
+            "⚠️ TGAPI 功能按钮仅 TGAPI 申请机器人支持：请在机器人配置中启用 TGAPI 申请。",
+          );
+          return;
+        }
+        await registry.tgapiFuncRunner(ctx, { func, unlock, response });
       });
       return;
     }
@@ -338,6 +387,9 @@ export function validateMenuConfig(config: BotMenuConfig): MenuValidationResult 
         }
         if (button.action.type === "verify" && !button.action.verify?.method_id?.trim()) {
           return `按钮「${button.text}」还没有绑定验证方法`;
+        }
+        if (button.action.type === "tgapi_func" && !isValidTgApiMenuFunc(button.action.tgapi_func)) {
+          return `按钮「${button.text}」还没有选择 TGAPI 功能`;
         }
         if (
           (button.action.type === "url" || button.action.type === "web_app") &&

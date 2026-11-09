@@ -216,6 +216,67 @@ for (const dbFile of ["prisma/bot-groups.db", "db/custom.db"]) {
   dumpShippedConfig(path.join(stage, dbFile));
 }
 
+// 4.6 遗留文件清理清单（upgrade-cleanup.txt）：
+//     发布包解压覆盖升级时，历史版本中「后来被删除」的文件会以幽灵文件残留在
+//     部署目录 —— 如 v2.1.12 已删除的 src/app/api/admin/bots/preview/route.ts
+//     仍 import 已移除的 executeMenuApi，导致 Cloudflare CI next build 失败。
+//     打包时从主线 git 历史提取「曾存在、现已删除」且位于发布分发范围内的路径
+//     随包分发；构建前 scripts/prebuild-clean.mjs 据此自动清除。
+//     安全硬边界：仅限发布分发目录/根文件；数据库/.env/日志/构建产物一律不入清单。
+const SENSITIVE_DIR_TOPS = ["db", "download", "node_modules", ".next", ".open-next", ".vercel", ".package-stage"];
+
+function isSensitivePath(rel) {
+  const top = rel.split(path.sep)[0];
+  if (SENSITIVE_DIR_TOPS.includes(top)) return true;
+  if (/\.(db|db-wal|db-shm)$/.test(rel)) return true;
+  if (/(^|[\\/])\.env/.test(rel)) return true;
+  if (/\.log$/.test(rel)) return true;
+  return false;
+}
+
+function isPackagedPath(rel) {
+  const top = rel.split(path.sep)[0];
+  return includeDirs.includes(top) || includeRootFiles.includes(rel);
+}
+
+function collectLegacyGhosts() {
+  const gitOutput = execSync("git -c core.quotepath=false log HEAD --pretty=format: --name-only", {
+    cwd: root,
+    encoding: "utf-8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  const ghosts = new Set();
+  for (const raw of gitOutput.split("\n")) {
+    const rel = raw.trim();
+    if (!rel || rel.includes("\t")) continue;
+    const normalized = rel.split("/").join(path.sep);
+    if (path.isAbsolute(normalized)) continue;
+    const abs = path.join(root, normalized);
+    if (path.relative(root, abs).startsWith("..")) continue;
+    if (existsSync(abs)) continue;
+    if (!isPackagedPath(normalized)) continue;
+    if (isSensitivePath(normalized)) continue;
+    ghosts.add(normalized);
+  }
+  return [...ghosts].sort();
+}
+
+const legacyGhosts = collectLegacyGhosts();
+writeFileSync(
+  path.join(stage, "upgrade-cleanup.txt"),
+  [
+    `# upgrade-cleanup.txt —— 解压覆盖升级遗留文件清理清单（v${pkg.version} 打包时自动生成）`,
+    "# 由 scripts/prebuild-clean.mjs 在每次 npm run build 最前读取执行：",
+    "# 清除历史版本遗留、当前版本已不存在的幽灵文件（如旧路由 import 已移除导出导致构建失败）。",
+    "# 本文件随包自动生成，禁止手工编辑；清理范围仅限发布分发文件，绝不涉及数据库/.env/日志。",
+    "",
+    ...legacyGhosts,
+    "",
+  ].join("\n"),
+);
+console.log(`   ── upgrade-cleanup.txt：${legacyGhosts.length} 条历史遗留路径入清单 ──`);
+for (const g of legacyGhosts) console.log(`   · ${g}`);
+
 // 5. 产品默认 .env。沙盒本地 .env 不入包。
 writeFileSync(
   path.join(stage, ".env"),

@@ -2789,3 +2789,87 @@ export async function deleteTgApiUnlock(id: bigint): Promise<boolean> {
   const result = await executeRun(`DELETE FROM tgapi_unlocks WHERE id = ?`, [Number(id)]);
   return result.changes > 0;
 }
+
+// ---------------------------------------------------------------------------
+// TGAPI申请（v2.1.16）— 机器人用户台账（最新菜单消息 id + 已创建 APP 结果）
+// ---------------------------------------------------------------------------
+
+export interface TgApiBotUserRow {
+  id: bigint;
+  botId: bigint;
+  userId: bigint;
+  username: string | null;
+  /** 该用户最新一条 /start 初始菜单消息的 message_id（旧消息按钮点击提示已过期） */
+  menuMessageId: number | null;
+  /** 已创建 APP：申请人手机号 / api_id / api_hash（「我的API」展示 + 「创建API」前置检测） */
+  appPhone: string | null;
+  appId: string | null;
+  appHash: string | null;
+  createdTime: Date;
+  updatedTime: Date;
+}
+
+function mapTgApiBotUser(row: Record<string, unknown>): TgApiBotUserRow {
+  return {
+    id: toBigInt(row.id),
+    botId: toBigInt(row.bot_id),
+    userId: toBigInt(row.user_id),
+    username: (row.username as string | null) ?? null,
+    menuMessageId: typeof row.menu_message_id === "number" ? row.menu_message_id : null,
+    appPhone: (row.app_phone as string | null) ?? null,
+    appId: (row.app_id as string | null) ?? null,
+    appHash: (row.app_hash as string | null) ?? null,
+    createdTime: toDate(row.created_time),
+    updatedTime: toDate(row.updated_time),
+  };
+}
+
+/** 查询 TGAPI 机器人的用户台账（无记录返回 null） */
+export async function getTgApiBotUser(
+  botId: bigint,
+  userId: bigint,
+): Promise<TgApiBotUserRow | null> {
+  const row = await queryOne<Record<string, unknown>>(
+    `SELECT * FROM tgapi_bot_users WHERE bot_id = ? AND user_id = ?`,
+    [Number(botId), Number(userId)],
+  );
+  return row ? mapTgApiBotUser(row) : null;
+}
+
+/**
+ * 更新 TGAPI 机器人用户台账（upsert：同一机器人同一用户仅一行）。
+ * 仅覆盖显式传入的字段（undefined = 保留原值），menuMessageId/app 结果按需单独更新。
+ */
+export async function saveTgApiBotUser(input: {
+  botId: bigint;
+  userId: bigint;
+  username?: string | null;
+  menuMessageId?: number | null;
+  appPhone?: string | null;
+  appId?: string | null;
+  appHash?: string | null;
+}): Promise<TgApiBotUserRow | null> {
+  await executeRun(
+    `INSERT INTO tgapi_bot_users (bot_id, user_id, username, menu_message_id, app_phone, app_id, app_hash, created_time, updated_time)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(bot_id, user_id) DO UPDATE SET
+       username = COALESCE(excluded.username, tgapi_bot_users.username),
+       menu_message_id = COALESCE(excluded.menu_message_id, tgapi_bot_users.menu_message_id),
+       app_phone = COALESCE(excluded.app_phone, tgapi_bot_users.app_phone),
+       app_id = COALESCE(excluded.app_id, tgapi_bot_users.app_id),
+       app_hash = COALESCE(excluded.app_hash, tgapi_bot_users.app_hash),
+       updated_time = excluded.updated_time`,
+    [
+      Number(input.botId),
+      Number(input.userId),
+      input.username ?? null,
+      input.menuMessageId ?? null,
+      input.appPhone ?? null,
+      input.appId ?? null,
+      input.appHash ?? null,
+      dateText(new Date()),
+      dateText(new Date()),
+    ],
+  );
+  return getTgApiBotUser(input.botId, input.userId);
+}

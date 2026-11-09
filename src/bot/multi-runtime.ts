@@ -14,6 +14,7 @@ import {
   listEnabledBots,
   getBot,
   listBotCommandsByIds,
+  getTgApiBotUser,
   type BotRow,
 } from "@/database/operations";
 import { installBotMenu, parseBotMenuConfig, createMenuCommandRegistry, scopeCommandRunnerToGroup, type BotMenuConfig, type MenuCommandRegistry, type MenuCommandRunner } from "@/services/bot-menu";
@@ -314,6 +315,29 @@ async function createMenuBot(row: BotRow, menuConfig: BotMenuConfig, mode: Effec
   registerChatTracking(bot, row.token);
   // v2.1.2 邀请链接台账：任何路径 createChatInviteLink 成功后统一落库（群组管理可查看/撤销）
   registerInviteLinkTracking(bot, row.token);
+  // v2.1.16 TGAPI 机器人菜单按钮过期拦截（需求4：旧消息内嵌按钮过时失效）：
+  // /start 每次发新初始消息并移除旧键盘（台账记录最新菜单消息 id）；超 Telegram 48h
+  // 编辑窗口无法移除的旧消息按钮，点击时按台账比对 message_id 提示已过期并引导重新 /start。
+  // 必须装在菜单插件之前：菜单按钮 callback_data 以菜单 id（tg: 前缀）+ "/" 分段，
+  // 授权认证/动态功能按钮等自有 callback 不含 "/" 不会被误拦。
+  if (profile.tgapi?.enabled) {
+    const guardedBotId = row.id;
+    bot.use(async (ctx, next) => {
+      const data = ctx.callbackQuery?.data ?? "";
+      if (data.startsWith("tg:") && data.includes("/") && ctx.from) {
+        const messageId = ctx.callbackQuery.message?.message_id;
+        const botUser = await getTgApiBotUser(guardedBotId, BigInt(ctx.from.id));
+        if (botUser?.menuMessageId && messageId && botUser.menuMessageId !== messageId) {
+          await ctx.answerCallbackQuery({
+            text: "此菜单已过期，请发送 /start 获取最新菜单",
+            show_alert: true,
+          });
+          return;
+        }
+      }
+      await next();
+    });
+  }
   // 官方 @grammyjs/menu 菜单插件（v1.1.1）：回调路由/子菜单导航/过期恢复全由插件处理
   // v2.1.10：同实例创建「执行指令」按钮注册表（能力注册阶段按指令菜单弹窗勾选填充）
   const menuCommands = createMenuCommandRegistry();

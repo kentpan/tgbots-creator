@@ -6,6 +6,7 @@ import {
   Check,
   ChevronRight,
   CircleUserRound,
+  Copy,
   Hand,
   Heart,
   Info,
@@ -20,6 +21,7 @@ import {
   Rocket,
   Search,
   Settings2,
+  ShieldBan,
   ShieldCheck,
   SquarePen,
   Trash2,
@@ -678,7 +680,13 @@ export function TgAppSimulator({
   }, [showFlash]);
 
   const saveGroupSettings = useCallback(async (): Promise<void> => {
-    if (!activeChatId || settingsSaving) return;
+    if (settingsSaving) return;
+    if (!activeChatId) {
+      // 绝不静默：无法保存时必须给出明确反馈（否则用户点击 ✓ 后无任何反应，
+      // 误以为已保存 —— 2026-11-09 用户投诉「保存后重进验证渠道仍为自动」）
+      showFlash(false, "未选中群组，无法保存：请先在会话列表选择一个群组再进设置");
+      return;
+    }
     setSettingsSaving(true);
     try {
       const response = await opsFetch("/api/admin/bots/testing/group-settings", {
@@ -713,6 +721,8 @@ export function TgAppSimulator({
       }
       showFlash(true, "群组配置已保存（与群组管理同源生效）");
       onSettingsSaved();
+      // iOS 群组信息语义：右上角 ✓ = 保存并返回上一页（聊天区）
+      setScreen("chat");
     } catch (error) {
       showFlash(false, error instanceof Error ? error.message : "保存失败");
     } finally {
@@ -1060,6 +1070,111 @@ export function TgAppSimulator({
     }
   }, [screen, activeChatId, loadBotAdmins, loadInviteLinks]);
 
+  // —— 邀请链接聚合面板（群组信息「邀请链接」行上滑；与群组管理弹窗同一台账 API） ——
+  // 全创建者视角：不带 bot_id 过滤，列出该群全部已创建链接（真实台账数据，
+  // Telegram APP「邀请链接」页语义 = 按创建者管理员平铺展示 + 撤销）
+  const [inviteSheetOpen, setInviteSheetOpen] = useState(false);
+  const [allInviteLinks, setAllInviteLinks] = useState<SimInviteLinkEntry[]>([]);
+  const [allInviteLoading, setAllInviteLoading] = useState(false);
+  const [sheetBusyId, setSheetBusyId] = useState<string | null>(null);
+  const [copiedLinkId, setCopiedLinkId] = useState<string | null>(null);
+
+  const loadAllInviteLinks = useCallback(
+    async (chatId: string): Promise<void> => {
+      setAllInviteLoading(true);
+      try {
+        const response = await opsFetch(
+          `/api/admin/telegram/invite-links?chat_id=${encodeURIComponent(chatId)}`,
+          { cache: "no-store" },
+        );
+        const payload = await readJson<{ ok: boolean; error?: string; data?: { links: SimInviteLinkEntry[] } }>(response);
+        if (!payload) {
+          showFlash(false, `服务返回异常（HTTP ${response.status}），请查看服务端日志后重试`);
+          return;
+        }
+        if (!payload.ok) {
+          showFlash(false, payload.error ?? "读取邀请链接失败");
+          return;
+        }
+        setAllInviteLinks(payload.data?.links ?? []);
+      } catch (error) {
+        showFlash(false, error instanceof Error ? error.message : "读取邀请链接失败");
+      } finally {
+        setAllInviteLoading(false);
+      }
+    },
+    [showFlash],
+  );
+
+  // 打开群组信息浮层时加载全部邀请链接（行右侧真实条数 + 上滑面板同源数据）
+  useEffect(() => {
+    if (screen === "settings" && activeChatId) void loadAllInviteLinks(activeChatId);
+  }, [screen, activeChatId, loadAllInviteLinks]);
+
+  // 每次上滑面板打开时重新拉取台账（台账是活数据：期间可能新增/撤销了链接）
+  useEffect(() => {
+    if (inviteSheetOpen && activeChatId) void loadAllInviteLinks(activeChatId);
+  }, [inviteSheetOpen, activeChatId, loadAllInviteLinks]);
+
+  // 面板动作（撤销/删除）：bot_id 优先取台账记录的创建者，未登记时回退当前选中机器人
+  const actOnInviteLink = useCallback(
+    async (action: "revoke" | "delete", entry: SimInviteLinkEntry): Promise<void> => {
+      if (!activeChatId || sheetBusyId) return;
+      setSheetBusyId(entry.id);
+      try {
+        const response = await opsFetch("/api/admin/telegram/invite-links", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: activeChatId,
+            bot_id: entry.bot_id ?? selectedBotId,
+            action,
+            link_id: entry.id,
+          }),
+        });
+        const payload = await readJson<{ ok: boolean; error?: string; data?: { message?: string } }>(response);
+        if (!payload) {
+          showFlash(false, `服务返回异常（HTTP ${response.status}），请查看服务端日志后重试`);
+          return;
+        }
+        if (!payload.ok) {
+          showFlash(false, payload.error ?? (action === "revoke" ? "撤销失败" : "删除失败"));
+          return;
+        }
+        showFlash(true, payload.data?.message ?? (action === "revoke" ? "链接已撤销" : "记录已删除"));
+        await loadAllInviteLinks(activeChatId);
+      } catch (error) {
+        showFlash(false, error instanceof Error ? error.message : "操作失败");
+      } finally {
+        setSheetBusyId(null);
+      }
+    },
+    [activeChatId, sheetBusyId, selectedBotId, showFlash, loadAllInviteLinks],
+  );
+
+  const copyInviteLink = useCallback((entry: SimInviteLinkEntry): void => {
+    void navigator.clipboard.writeText(entry.link).then(() => {
+      setCopiedLinkId(entry.id);
+      window.setTimeout(() => setCopiedLinkId(null), 1500);
+    });
+  }, []);
+
+  // 按创建者管理员平铺（真实 APP 邀请链接页语义：同创建者的链接归组展示）
+  const inviteSheetGroups = useMemo(() => {
+    const byCreator = new Map<string, SimInviteLinkEntry[]>();
+    for (const entry of allInviteLinks) {
+      const key = entry.bot_id ?? "";
+      const list = byCreator.get(key) ?? [];
+      list.push(entry);
+      byCreator.set(key, list);
+    }
+    return [...byCreator.entries()].map(([key, items]) => ({
+      key,
+      label: key ? (bots.find((bot) => bot.id === key)?.name ?? `机器人 #${key}`) : "未登记创建者",
+      items,
+    }));
+  }, [allInviteLinks, bots]);
+
   const activeGroup = useMemo(
     () => groups.find((group) => group.chatId === activeChatId) ?? null,
     [groups, activeChatId],
@@ -1102,7 +1217,7 @@ export function TgAppSimulator({
           onClick={() => void saveGroupSettings()}
           disabled={settingsSaving || settingsLoading}
           aria-label="保存群组配置"
-          className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-full text-white transition-transform active:scale-95 disabled:opacity-60"
+          className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full text-white transition-transform active:scale-95 disabled:opacity-60"
           style={{ backgroundColor: IOS_GREEN }}
         >
           {settingsSaving ? <Loader2 className="h-5 w-5 animate-spin" /> : <span className="text-lg font-bold leading-none">✓</span>}
@@ -1295,7 +1410,9 @@ export function TgAppSimulator({
               <div className="flex items-center justify-between border-t border-black/[0.06] px-4 py-2.5">
                 <span className="text-[17px] leading-snug text-black">
                   隐私模式
-                  <span className="block text-[12px] text-[#8e8e93]">验证码须回复机器人的验证问题</span>
+                  <span className="block text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+                    机器人在群里怎么收验证码。开启（默认）：入群者「回复」机器人发的验证消息提交验证码，机器人只收得到回复，无需读取群内普通消息的权限；关闭：入群者直接在群里发验证码，但机器人必须能读到群内全部消息（需 BotFather 关闭隐私模式或设为群管理员）
+                  </span>
                 </span>
                 <Switch
                   checked={form.privacy_mode}
@@ -1356,14 +1473,7 @@ export function TgAppSimulator({
               </div>
               <button
                 type="button"
-                onClick={() =>
-                  showFlash(
-                    activeGroup?.deployed === true,
-                    activeGroup?.deployed
-                      ? "该群已生成申请制入群链接（一键部署产物）"
-                      : "尚未部署：点击群组列表的「一键部署」生成申请制入群链接",
-                  )
-                }
+                onClick={() => setInviteSheetOpen(true)}
                 className="flex w-full cursor-pointer items-center gap-3 border-b border-black/[0.06] px-4 py-2.5 text-left"
               >
                 <IosRowIcon bg="#f5a623">
@@ -1371,7 +1481,7 @@ export function TgAppSimulator({
                 </IosRowIcon>
                 <span className="flex-1 text-[17px] text-black">邀请链接</span>
                 <span className="text-[17px]" style={{ color: IOS_TEXT_SECONDARY }}>
-                  {activeGroup?.deployed ? "1" : "0"}
+                  {allInviteLoading ? "…" : String(allInviteLinks.length)}
                 </span>
                 <ChevronRight className="h-4 w-4 text-[#c7c7cc]" />
               </button>
@@ -2487,6 +2597,128 @@ export function TgAppSimulator({
               >
                 知道了
               </button>
+            </motion.div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+
+      {/* 邀请链接聚合面板（真实 APP「邀请链接」页：底部上滑，按创建者管理员平铺） */}
+      <AnimatePresence>
+        {inviteSheetOpen ? (
+          <motion.div
+            key="invite-links-sheet"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.18 }}
+            className="absolute inset-0 z-50 flex items-end justify-center bg-black/40"
+            onClick={() => setInviteSheetOpen(false)}
+          >
+            <motion.div
+              initial={{ y: "100%" }}
+              animate={{ y: 0 }}
+              exit={{ y: "100%" }}
+              transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+              className="flex max-h-[82%] w-full flex-col overflow-hidden rounded-t-2xl bg-white"
+              onClick={(event) => event.stopPropagation()}
+              role="dialog"
+              aria-label="邀请链接列表"
+            >
+              <div className="mx-auto mt-3 h-1 w-10 shrink-0 rounded-full bg-black/15" aria-hidden />
+              <div className="flex shrink-0 items-center justify-between px-4 py-3">
+                <span className="text-[17px] font-semibold text-black">邀请链接</span>
+                <span className="text-[13px]" style={{ color: IOS_TEXT_SECONDARY }}>
+                  {allInviteLinks.length} 条 · 按创建者管理员
+                </span>
+              </div>
+              <div className="flex-1 overflow-y-auto px-4 pb-6">
+                {allInviteLoading ? (
+                  <div className="flex justify-center py-10">
+                    <Loader2 className="h-6 w-6 animate-spin text-[#8e8e93]" />
+                  </div>
+                ) : inviteSheetGroups.length === 0 ? (
+                  <div className="px-2 py-10 text-center text-[14px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+                    暂无邀请链接记录：机器人在该群创建邀请链接后会自动登记；
+                    历史遗留链接可在「群组管理 → 邀请链接」弹窗手动登记后一并管理。
+                  </div>
+                ) : (
+                  <>
+                    {inviteSheetGroups.map((creator) => (
+                      <div key={creator.key || "unassigned"} className="mt-3 first:mt-0">
+                        <div className="mb-1.5 flex items-center gap-2">
+                          <IosRowIcon bg="#3390ec">
+                            <Users className="h-3.5 w-3.5" />
+                          </IosRowIcon>
+                          <span className="text-[15px] font-semibold text-black">{creator.label}</span>
+                          <span className="text-[12px]" style={{ color: IOS_TEXT_SECONDARY }}>
+                            {creator.items.length} 条
+                          </span>
+                        </div>
+                        <div className="space-y-2">
+                          {creator.items.map((entry) => (
+                            <div
+                              key={entry.id}
+                              className="rounded-xl border border-black/[0.06] bg-black/[0.02] px-3 py-2.5"
+                            >
+                              <p className="truncate font-mono text-[13px] text-black" title={entry.link}>
+                                {entry.link}
+                              </p>
+                              <p className="mt-0.5 truncate text-[12px]" style={{ color: IOS_TEXT_SECONDARY }}>
+                                <ListTime iso={entry.created_time} />
+                                {" · "}
+                                {entry.is_revoked ? "已撤销/失效" : entry.creates_join_request ? "有效 · 申请制" : "有效"}
+                                {entry.source === "deploy" ? " · 部署生成" : entry.source === "manual" ? " · 手动登记" : ""}
+                                {entry.name ? ` · ${entry.name}` : ""}
+                              </p>
+                              <div className="mt-2 flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => copyInviteLink(entry)}
+                                  className="inline-flex cursor-pointer items-center gap-1 rounded-full bg-black/[0.06] px-3 py-1.5 text-[12px] font-medium text-black transition-transform active:scale-95"
+                                  aria-label="复制邀请链接"
+                                >
+                                  <Copy className="h-3 w-3" />
+                                  {copiedLinkId === entry.id ? "已复制" : "复制"}
+                                </button>
+                                {!entry.is_revoked ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => void actOnInviteLink("revoke", entry)}
+                                    disabled={sheetBusyId === entry.id}
+                                    className="inline-flex cursor-pointer items-center gap-1 rounded-full bg-[#f5a623]/15 px-3 py-1.5 text-[12px] font-medium text-[#b45309] transition-transform active:scale-95 disabled:opacity-50"
+                                    aria-label="撤销邀请链接（Telegram 侧真实作废）"
+                                  >
+                                    {sheetBusyId === entry.id ? (
+                                      <Loader2 className="h-3 w-3 animate-spin" />
+                                    ) : (
+                                      <ShieldBan className="h-3 w-3" />
+                                    )}
+                                    撤销
+                                  </button>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  onClick={() => void actOnInviteLink("delete", entry)}
+                                  disabled={sheetBusyId === entry.id}
+                                  className="inline-flex cursor-pointer items-center gap-1 rounded-full bg-[#ff3b30]/10 px-3 py-1.5 text-[12px] font-medium text-[#ff3b30] transition-transform active:scale-95 disabled:opacity-50"
+                                  aria-label="删除邀请链接台账记录"
+                                >
+                                  <Trash2 className="h-3 w-3" />
+                                  删除
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    <p className="mt-3 px-1 text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+                      撤销 = 调用 Telegram revokeChatInviteLink 真实作废（立即失效，已持有者无法再使用）；
+                      删除 = 仅移除台账记录，Telegram 侧状态不变。
+                    </p>
+                  </>
+                )}
+              </div>
             </motion.div>
           </motion.div>
         ) : null}

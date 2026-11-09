@@ -14,6 +14,7 @@ import {
 import { logOperation, requirePermission } from "@/lib/auth";
 import { parseBotProfile, stopMenuBot } from "@/bot/multi-runtime";
 import { deployBotAndReport } from "@/services/bot-deploy";
+import { parseBotMenuConfig } from "@/services/menu-config";
 import {
   TGAPI_APP_PLATFORMS,
   TGAPI_TEXT_FIELD_KEYS,
@@ -132,6 +133,26 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
   profile.tgapi = buildTgApiConfig(formData);
   const configJson = JSON.stringify(profile);
 
+  // v2.1.16：内嵌按钮配置随弹窗一并保存（bots.menu_config，含 tgapiDesigner 标记）——
+  // 运行实例 /start 初始消息的按钮来自这份配置；轻校验只要求可解析（按钮数为空合法，
+  // 运行时回落「🔐 授权认证」单按钮），不走 validateMenuConfig 的「至少一个按钮」门槛。
+  const menuConfigRaw = String(formData.get("menu_config") ?? "").trim();
+  let menuConfigJson: string | null = null;
+  let menuTextValue: string | null = null;
+  if (menuConfigRaw) {
+    try {
+      const parsed = parseBotMenuConfig(menuConfigRaw);
+      menuConfigJson = JSON.stringify({
+        tgapiDesigner: true,
+        content: parsed.content,
+        root: parsed.root,
+      });
+      menuTextValue = parsed.content.text;
+    } catch {
+      redirect(tgapiPath({ error: "invalid-menu" }));
+    }
+  }
+
   // v2.1.9 部署与保存分离：保存只落库，绝不自动触碰运行实例（更不会删了正在
   // 工作的 Webhook 再重注册）——上线/更新运行实例是列表「部署」按钮的显式动作。
   if (isEdit) {
@@ -140,6 +161,7 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
       token: token || existing!.token,
       enabled,
       config: configJson,
+      ...(menuConfigJson ? { menuConfig: menuConfigJson, menuText: menuTextValue ?? "" } : {}),
     });
     await logOperation(admin, {
       action: "保存TGAPI申请机器人",
@@ -155,6 +177,7 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
       token,
       enabled,
       config: configJson,
+      ...(menuConfigJson ? { menuConfig: menuConfigJson, menuText: menuTextValue ?? "" } : {}),
     });
     if (!created) redirect(tgapiPath({ error: "duplicate-token" }));
     await logOperation(admin, {

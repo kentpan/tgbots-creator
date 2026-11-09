@@ -266,58 +266,55 @@ export default async function BotsPage({
                               🚀 部署
                             </button>
                           </form>
-                          <MenuDesignerDialog
-                            bot={{
-                              id: String(bot.id),
-                              name: bot.name,
-                              menuConfig: bot.menuConfig,
-                              menuText: bot.menuText,
-                              username: bot.username,
-                              privacyMode: parseBotPrivacyMode(profile),
-                              isTgApi: Boolean(profile.tgapi?.enabled),
-                            }}
-                            builtinCommands={
-                              profile.tgapi?.enabled
-                                ? [
-                                    // TGAPI 自有 /start /language（不依赖勾选，始终可用）+
-                                    // 指令库内置项：「执行指令」按钮点击后按「⌨️ 指令菜单」
-                                    // 弹窗勾选（bots.config.commandIds）注册的同一处理器执行
-                                    ...commandLibrary
-                                      .filter((item) => item.type === "builtin" && item.name !== "start")
-                                      .map((item) => ({
-                                        name: item.name,
-                                        label: `/${item.name} — ${item.description}`,
-                                      })),
-                                    { name: "start", label: "/start — 开始 TGAPI 申请（机器人内置）" },
-                                    { name: "language", label: "/language — 切换中文/English（机器人内置）" },
-                                  ]
-                                : commandLibrary
-                                    .filter((item) => item.type === "builtin")
-                                    .map((item) => ({
-                                      name: item.name,
-                                      label: `/${item.name} — ${item.description}`,
-                                    }))
-                            }
-                            customCommands={visibleCommands
-                              .filter((item) => item.type === "custom")
-                              .map((item) => ({
-                                name: item.name,
-                                label: `/${item.name} — ${item.description}`,
+                          {Boolean(profile.tgapi?.enabled) ? (
+                            /* v2.1.16：TGAPI 申请机器人的内嵌按钮在「TGAPI申请」页面
+                               的设计器弹窗中配置（仿真屏+消息配置+按钮配置一体化），
+                               通用菜单设计器不再适用 —— 点击直接跳转 */
+                            <a
+                              href={`/admin/tgapi?bot=${bot.id}&edit=1`}
+                              title="TGAPI 申请机器人：跳转到「TGAPI申请」页面的设计器弹窗配置消息与内嵌按钮"
+                              className="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
+                            >
+                              ⚙️ 消息内嵌按钮
+                            </a>
+                          ) : (
+                            <MenuDesignerDialog
+                              bot={{
+                                id: String(bot.id),
+                                name: bot.name,
+                                menuConfig: bot.menuConfig,
+                                menuText: bot.menuText,
+                                username: bot.username,
+                                privacyMode: parseBotPrivacyMode(profile),
+                                isTgApi: false,
+                              }}
+                              builtinCommands={commandLibrary
+                                .filter((item) => item.type === "builtin")
+                                .map((item) => ({
+                                  name: item.name,
+                                  label: `/${item.name} — ${item.description}`,
+                                }))}
+                              customCommands={visibleCommands
+                                .filter((item) => item.type === "custom")
+                                .map((item) => ({
+                                  name: item.name,
+                                  label: `/${item.name} — ${item.description}`,
+                                }))}
+                              verificationMethods={verificationMethods.map((method) => ({
+                                id: String(method.id),
+                                name: method.name,
+                                type: method.type,
+                                enabled: method.enabled,
                               }))}
-                            verificationMethods={verificationMethods.map((method) => ({
-                              id: String(method.id),
-                              name: method.name,
-                              type: method.type,
-                              enabled: method.enabled,
-                            }))}
-                            groups={groups.map((group) => ({
-                              chatId: String(group.chatId),
-                              chatTitle: group.chatTitle,
-                            }))}
-                            storageKind={getStorage().kind}
-                            trigger="⚙️ 消息内嵌按钮"
-                            triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
-                          />
+                              groups={groups.map((group) => ({
+                                chatId: String(group.chatId),
+                                chatTitle: group.chatTitle,
+                              }))}
+                              storageKind={getStorage().kind}
+                              trigger="⚙️ 消息内嵌按钮"
+                              triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
+                            />
+                          )}
                           {/* ⌨️ 指令菜单弹窗：全部机器人类型统一入口（含 TGAPI申请机器人）——
                               勾选保存（bots.config.commandIds）后热更新注册并同步 Telegram，
                               是指令注册唯一来源；未勾选的指令不注册、不响应 */}

@@ -1,10 +1,10 @@
 {
   "name": "tgbots-creator",
-  "version": "2.1.14",
+  "version": "2.1.15",
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build && node scripts/post-build.mjs",
+    "build": "node scripts/prebuild-clean.mjs && next build && node scripts/post-build.mjs",
     "start": "next start",
     "start:standalone": "NODE_ENV=production node .next/standalone/server.js",
     "lint": "eslint .",

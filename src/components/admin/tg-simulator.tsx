@@ -388,6 +388,21 @@ export function TgSimulator({
       });
       return;
     }
+    if (action.type === "language") {
+      // v2.1.14 仿真预览：语言切换按钮（TGAPI 申请机器人）—— 真实机器人点击后
+      // 在 中文/English 之间切换并回复切换结果（语言偏好按会话记忆）
+      appendMessage({
+        from: "bot",
+        sender: botName,
+        content: {
+          type: "text",
+          text: "✅ 语言已切换 / Language switched：中文 ⇄ English\n（真实机器人点击后在 中文/English 之间切换并回复切换结果）",
+          mediaUrl: "",
+          items: [],
+        },
+      });
+      return;
+    }
   };
 
   const sendText = async (rawText: string): Promise<void> => {

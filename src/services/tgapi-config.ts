@@ -7,7 +7,8 @@
  *
  * v2.1.7 变更：
  * - 对话文案只支持中文/英文两套（内置双语文案 + 按用户 language_code 自动识别，
- *   /language 指令手动切换）；文案覆盖从单语言改为按语言（zh/en）覆盖，
+ *   v2.1.14 起语言切换为消息内嵌按钮「语言切换」（action.type=language），
+ *   不再提供 /language 指令）；文案覆盖从单语言改为按语言（zh/en）覆盖，
  *   旧版扁平 texts 覆盖自动迁移为 zh 覆盖（兼容既有机器人配置）。
  * - 新增 askAppDetails：申请人可自定义 APP 名称（title）与描述（description），
  *   跳过（/skip）时回落下方 APP 创建默认参数。
@@ -137,8 +138,8 @@ export interface TgApiSystemTexts {
   sessionLost: string;
   requestLoginCodeFail: (error: string) => string;
   pipelineFail: (error: string) => string;
+  /** 语言切换按钮（v2.1.14 起 /language 指令已移除）点击后的切换确认文案 */
   languageHelp: (current: string) => string;
-  languageInvalid: string;
   titleInvalid: string;
   descriptionInvalid: string;
 }
@@ -162,9 +163,7 @@ export const TGAPI_SYSTEM_TEXTS: Record<TgApiLang, TgApiSystemTexts> = {
       `请求登录码失败：${error}\n\n请重新发送手机号（国际格式，如 +8613800138000）。`,
     pipelineFail: (error) => `处理失败：${error}`,
     languageHelp: (current) =>
-      `🌐 当前语言 / Current language：${current === "zh" ? "中文" : "English"}\n\n` +
-      "切换语言 / Switch language：/language zh 或 /language en",
-    languageInvalid: "未识别的语言，请使用 /language zh 或 /language en",
+      `✅ 语言已切换 / Language switched：${current === "zh" ? "中文" : "English"}`,
     titleInvalid: "APP 名称不合法：请输入 1-32 个字符，或发送 /skip 使用默认值。",
     descriptionInvalid: "APP 描述不合法：请输入 1-200 个字符，或发送 /skip 使用默认值。",
   },
@@ -192,9 +191,7 @@ export const TGAPI_SYSTEM_TEXTS: Record<TgApiLang, TgApiSystemTexts> = {
       `Failed to request the login code: ${error}\n\nPlease send your phone number again (international format, e.g. +14155552671).`,
     pipelineFail: (error) => `Processing failed: ${error}`,
     languageHelp: (current) =>
-      `🌐 当前语言 / Current language：${current === "zh" ? "中文" : "English"}\n\n` +
-      "切换语言 / Switch language：/language zh 或 /language en",
-    languageInvalid: "Unrecognized language. Please use /language zh or /language en",
+      `✅ 语言已切换 / Language switched：${current === "zh" ? "中文" : "English"}`,
     titleInvalid:
       "Invalid App title: please send 1-32 characters, or send /skip to use the default.",
     descriptionInvalid:

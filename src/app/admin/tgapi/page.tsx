@@ -2,30 +2,17 @@ import {
   listBots,
   listTgApiUnlocks,
   listVerificationMethods,
-  type BotRow,
 } from "@/database/operations";
 import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { requirePermission } from "@/lib/auth";
 import { probeBotDeployState } from "@/services/bot-deploy";
 import { BotDeployBadge, briefDeployDetail } from "@/components/admin/bot-deploy-badge";
-import {
-  parseTgApiBotConfig,
-  TGAPI_APP_PLATFORMS,
-  TGAPI_DEFAULT_APP,
-  TGAPI_TEXT_FIELD_KEYS,
-  TGAPI_TEXTS_EN,
-  TGAPI_TEXTS_ZH,
-  type TgApiBotConfig,
-} from "@/services/tgapi-config";
-import { FormDialog } from "@/components/admin/form-dialog";
-import { inputClass, labelClass, selectClass } from "@/components/admin/form-styles";
-import { TgApiUnlockMethodBinding } from "@/components/admin/tgapi-unlock-api-config";
+import { parseTgApiBotConfig, type TgApiBotConfig } from "@/services/tgapi-config";
 import { TgApiApplyWizard } from "@/components/admin/tgapi-apply-wizard";
-import { TgApiBotGroupsPanel } from "@/components/admin/tgapi-bot-groups-panel";
+import { TgApiBotDesignerDialog } from "./bot-designer-dialog";
 import {
   deleteTgApiBotAction,
   revokeTgApiUnlockAction,
-  saveTgApiBotAction,
   toggleTgApiBotAction,
 } from "./actions";
 
@@ -45,22 +32,7 @@ const ERRORS: Record<string, string> = {
   "invalid-id": "记录不存在",
   "method-required": "验证码解锁模式必须绑定一个外部 API 验证方式",
   "invalid-stars": "星星解锁金额必须是大于等于 1 的整数",
-};
-
-const PLATFORM_LABELS: Record<string, string> = {
-  android: "Android",
-  ios: "iOS",
-  wp: "Windows Phone",
-  bb: "BlackBerry",
-  desktop: "桌面端",
-  web: "Web",
-  ubp: "Ubiquitous",
-  other: "其他",
-};
-
-const LANG_LABELS: Record<"zh" | "en", string> = {
-  zh: "中文文案（已预填内置默认值，可直接修改；改回默认值 = 恢复使用内置文案）",
-  en: "English 文案（已预填内置默认值，可直接修改；改回默认值 = 恢复使用内置文案）",
+  "invalid-menu": "内嵌按钮配置不合法（请重新打开弹窗后保存）",
 };
 
 function UnlockModeBadge({ mode }: { mode: string }) {
@@ -86,259 +58,6 @@ function UnlockModeBadge({ mode }: { mode: string }) {
  * 本页不再保留独立部署动作；部署状态徽章继续真实探测（部署后自动同步）。
  */
 
-function TgApiBotFormDialog({
-  bot,
-  methods,
-  trigger,
-  triggerClassName,
-}: {
-  bot?: BotRow;
-  methods: { id: number; name: string; enabled: boolean; type: string }[];
-  trigger: React.ReactNode;
-  triggerClassName?: string;
-}) {
-  const cfg: TgApiBotConfig = bot
-    ? parseTgApiBotConfig(bot.config)
-    : {
-        enabled: false,
-        unlockMode: "captcha",
-        askAppDetails: true,
-        ...TGAPI_DEFAULT_APP,
-      };
-  const suffix = bot ? String(bot.id) : "new";
-  const selectedPlatforms = new Set(cfg.appPlatforms);
-  return (
-    <FormDialog
-      trigger={trigger}
-      triggerClassName={triggerClassName}
-      title={bot ? `编辑 TGAPI 申请机器人 · ${bot.name}` : "新增 TGAPI 申请机器人"}
-      description="私聊发送 APP 名称/描述 → 手机号 → Telegram 登录码 → 抓取/创建 my.telegram.org APP，返回 API ID / API HASH。中英文双语（按用户语言自动识别，/language 切换）；首次对话需解锁，解锁一次永久有效。"
-      action={saveTgApiBotAction}
-      submitLabel="保存机器人"
-      contentClassName="sm:max-w-2xl"
-    >
-      <input type="hidden" name="id" value={bot ? String(bot.id) : ""} />
-      <div className="grid gap-4 md:grid-cols-2">
-        <div className="space-y-1">
-          <label className={labelClass} htmlFor={`name-${suffix}`}>
-            名称 *
-          </label>
-          <input
-            id={`name-${suffix}`}
-            name="name"
-            required
-            defaultValue={bot?.name ?? "TGAPI申请机器人"}
-            placeholder="例如：TGAPI申请机器人"
-            className={inputClass}
-          />
-        </div>
-        <div className="space-y-1">
-          <label className={labelClass} htmlFor={`token-${suffix}`}>
-            Bot Token {bot ? "（留空保留原值）" : "*"}
-          </label>
-          <input
-            id={`token-${suffix}`}
-            name="token"
-            defaultValue=""
-            placeholder={bot ? "留空保留原 Token" : "从 @BotFather 获取：123456:AA..."}
-            className={inputClass}
-            autoComplete="off"
-          />
-        </div>
-      </div>
-      <div className="flex items-center gap-2">
-        <input
-          id={`enabled-${suffix}`}
-          name="enabled"
-          type="checkbox"
-          value="1"
-          defaultChecked={bot ? bot.enabled : true}
-          className="h-4 w-4"
-        />
-        <label className={labelClass} htmlFor={`enabled-${suffix}`}>
-          启用机器人（保存仅落库配置；上线/更新运行实例请到「仿真APP」页面部署）
-        </label>
-      </div>
-
-      {bot ? (
-        <TgApiBotGroupsPanel botId={String(bot.id)} />
-      ) : (
-        <p className="rounded-md border border-dashed bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-          🧭 机器人所在真实群组：保存后再次打开本弹窗即可查看与同步（真实调用 Bot API 发现）。
-        </p>
-      )}
-
-      <div className="rounded-lg border bg-muted/20 p-4 space-y-4">
-        <p className="text-sm font-semibold">🔓 首次对话解锁门禁（解锁一次，永久有效）</p>
-        <div className="grid gap-4 md:grid-cols-2">
-          <div className="space-y-1">
-            <label className={labelClass} htmlFor={`unlock-mode-${suffix}`}>
-              解锁方式
-            </label>
-            <select
-              id={`unlock-mode-${suffix}`}
-              name="unlock_mode"
-              defaultValue={cfg.unlockMode}
-              className={selectClass}
-            >
-              <option value="captcha">验证码解锁（外部 API 核验，同加群验证）</option>
-              <option value="stars">星星解锁（Telegram Stars 支付）</option>
-            </select>
-          </div>
-          <div className="space-y-1">
-            <label className={labelClass} htmlFor={`stars-${suffix}`}>
-              星星解锁金额（⭐，星星解锁模式使用）
-            </label>
-            <input
-              id={`stars-${suffix}`}
-              name="stars_amount"
-              type="number"
-              min="1"
-              step="1"
-              defaultValue={cfg.starsAmount ?? 100}
-              className={inputClass}
-            />
-          </div>
-        </div>
-        <TgApiUnlockMethodBinding
-          initialMethods={methods}
-          initialMethodId={cfg.verificationMethodId ?? null}
-        />
-        <div className="space-y-1">
-          <label className={labelClass} htmlFor={`stars-title-${suffix}`}>
-            发票标题（星星解锁模式使用）
-          </label>
-          <input
-            id={`stars-title-${suffix}`}
-            name="stars_title"
-            defaultValue={cfg.starsTitle ?? ""}
-            placeholder="默认：TGAPI 解锁"
-            className={inputClass}
-          />
-        </div>
-      </div>
-
-      <div className="rounded-lg border bg-muted/20 p-4 space-y-4">
-        <p className="text-sm font-semibold">📱 my.telegram.org APP 创建参数（原版 config.env 对应项）</p>
-        <div className="flex items-center gap-2">
-          <input
-            id={`ask-app-details-${suffix}`}
-            name="ask_app_details"
-            type="checkbox"
-            value="1"
-            defaultChecked={cfg.askAppDetails}
-            className="h-4 w-4"
-          />
-          <label className={labelClass} htmlFor={`ask-app-details-${suffix}`}>
-            申请人自定义 APP 名称与描述（开启后对话中先收集，/skip 使用默认；关闭则直接使用下方默认参数）
-          </label>
-        </div>
-        <div className="grid gap-4 md:grid-cols-2">
-          <div className="space-y-1">
-            <label className={labelClass} htmlFor={`app-title-${suffix}`}>
-              APP_TITLE（默认值）
-            </label>
-            <input
-              id={`app-title-${suffix}`}
-              name="app_title"
-              defaultValue={cfg.appTitle}
-              className={inputClass}
-            />
-          </div>
-          <div className="space-y-1">
-            <label className={labelClass} htmlFor={`app-short-name-${suffix}`}>
-              APP_SHORT_NAME
-            </label>
-            <input
-              id={`app-short-name-${suffix}`}
-              name="app_short_name"
-              defaultValue={cfg.appShortName}
-              className={inputClass}
-            />
-          </div>
-          <div className="space-y-1">
-            <label className={labelClass} htmlFor={`app-url-${suffix}`}>
-              APP_URL
-            </label>
-            <input
-              id={`app-url-${suffix}`}
-              name="app_url"
-              defaultValue={cfg.appUrl}
-              className={inputClass}
-            />
-          </div>
-          <div className="space-y-1">
-            <label className={labelClass} htmlFor={`footer-${suffix}`}>
-              页脚署名（FTEXT）
-            </label>
-            <input
-              id={`footer-${suffix}`}
-              name="footer_text"
-              defaultValue={cfg.footerText}
-              className={inputClass}
-            />
-          </div>
-        </div>
-        <div className="space-y-1">
-          <label className={labelClass} htmlFor={`app-desc-${suffix}`}>
-            APP_DESCRIPTION（默认值）
-          </label>
-          <textarea
-            id={`app-desc-${suffix}`}
-            name="app_description"
-            rows={2}
-            defaultValue={cfg.appDescription}
-            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-          />
-        </div>
-        <div className="space-y-2">
-          <p className={labelClass}>APP_PLATFORM（创建时随机选一，对应原 random.choice）</p>
-          <div className="flex flex-wrap gap-3">
-            {TGAPI_APP_PLATFORMS.map((platform) => (
-              <label key={platform} className="inline-flex items-center gap-1.5 text-sm">
-                <input
-                  type="checkbox"
-                  name="app_platforms"
-                  value={platform}
-                  defaultChecked={selectedPlatforms.has(platform)}
-                  className="h-4 w-4"
-                />
-                {PLATFORM_LABELS[platform] ?? platform}
-              </label>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      {(["zh", "en"] as const).map((lang) => {
-        const langTexts = lang === "zh" ? cfg.texts?.zh : cfg.texts?.en;
-        return (
-          <div key={lang} className="rounded-lg border bg-muted/20 p-4 space-y-3">
-            <p className="text-sm font-semibold">💬 {LANG_LABELS[lang]}</p>
-            {TGAPI_TEXT_FIELD_KEYS.map((field) => (
-              <div key={field.name} className="space-y-1">
-                <label className={labelClass} htmlFor={`text-${lang}-${field.name}-${suffix}`}>
-                  {field.label}
-                </label>
-                <textarea
-                  id={`text-${lang}-${field.name}-${suffix}`}
-                  name={`text_${lang}_${field.name}`}
-                  rows={2}
-                  defaultValue={
-                    langTexts?.[field.name] ??
-                    (lang === "zh" ? TGAPI_TEXTS_ZH : TGAPI_TEXTS_EN)[field.name]
-                  }
-                  className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"
-                />
-              </div>
-            ))}
-          </div>
-        );
-      })}
-    </FormDialog>
-  );
-}
-
 export default async function TgApiPage({
   searchParams,
 }: {
@@ -348,6 +67,7 @@ export default async function TgApiPage({
     error?: string;
     deploy?: string;
     deploy_msg?: string;
+    edit?: string;
   }>;
 }) {
   await requirePermission("tgapi:view");
@@ -380,13 +100,13 @@ export default async function TgApiPage({
           <p className="text-sm text-muted-foreground">
             用户私聊发送 APP 名称/描述 → 手机号 → Telegram 发送登录码 → 机器人登录
             my.telegram.org 抓取/自动创建 APP → 返回 API ID 与 API HASH。
-            中英文双语（按用户语言自动识别，/language 切换）。首次对话需要解锁（外部 API
+            中英文双语（按用户语言自动识别，消息内嵌按钮「语言切换」可手动切换）。首次对话需要解锁（外部 API
             验证码或 Telegram 星星支付，可切换），解锁一次永久有效，重复申请无需再次解锁。
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <TgApiApplyWizard />
-          <TgApiBotFormDialog
+          <TgApiBotDesignerDialog
             methods={methodOptions}
             trigger="+ 新增 TGAPI 申请机器人"
             triggerClassName="inline-flex h-10 shrink-0 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
@@ -502,12 +222,27 @@ export default async function TgApiPage({
                           >
                             🚀 部署
                           </a>
-                          <TgApiBotFormDialog
-                            bot={bot}
+                          <TgApiBotDesignerDialog
+                            bot={{
+                              id: String(bot.id),
+                              name: bot.name,
+                              username: bot.username,
+                              enabled: bot.enabled,
+                              config: bot.config,
+                              menuConfig: bot.menuConfig,
+                            }}
                             methods={methodOptions}
+                            defaultOpen={params.edit === "1" && String(bot.id) === selectedBotId}
                             trigger="编辑"
                             triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
                           />
+                          <a
+                            href={`/admin/tgapi?bot=${String(bot.id)}&edit=1`}
+                            title="在 TGAPI 设计器弹窗中配置初始消息与内嵌按钮"
+                            className="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm font-medium text-primary hover:bg-primary/10"
+                          >
+                            ⚙️ 消息与按钮
+                          </a>
                           <a
                             href={`/admin/tgapi?bot=${String(bot.id)}`}
                             className="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
