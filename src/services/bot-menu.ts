@@ -4,7 +4,6 @@ import { Menu } from "@grammyjs/menu";
 import type { BotContext } from "@/bot/context";
 import {
   countMenuStats,
-  executeMenuApi,
   isHttpUrl,
   MENU_MAX_BUTTONS_PER_ROW,
   MENU_MAX_BUTTONS_TOTAL,
@@ -18,6 +17,7 @@ import {
   type MenuMessageContent,
   type MenuNode,
 } from "@/services/menu-config";
+import { startMenuVerifyFlow } from "@/bot/handlers/menu-verify";
 
 export * from "@/services/menu-config";
 
@@ -72,6 +72,30 @@ export interface MenuCommandRegistry {
 
 export function createMenuCommandRegistry(): MenuCommandRegistry {
   return { runners: new Map() };
+}
+
+/**
+ * 群组私有指令运行器包装（v2.1.13）：自定义指令归属 group_settings.chat_id 时，
+ * 注册仍是机器人级（Telegram 指令注册无群组维度），但真实执行仅限绑定群组内；
+ * 其他聊天（私聊/其他群组/菜单按钮点击）统一给出明确归属提示，避免与全局指令混淆。
+ * groupId 为 null（全局/机器人私有）时原样返回运行器，零额外开销。
+ */
+export function scopeCommandRunnerToGroup(
+  groupId: bigint | null,
+  commandName: string,
+  runner: MenuCommandRunner,
+): MenuCommandRunner {
+  if (groupId === null) return runner;
+  const boundChatId = Number(groupId);
+  return async (ctx) => {
+    if (ctx.chat?.id === boundChatId) {
+      await runner(ctx);
+      return;
+    }
+    await ctx.reply(
+      `⚠️ /${commandName} 是群组私有指令，仅在绑定的群组（ID ${boundChatId}）内可用。`,
+    );
+  };
 }
 
 function appendButton(
@@ -130,7 +154,7 @@ function appendButton(
           return;
         }
         await ctx.reply(
-          `⚠️ 指令 /${commandName || "（未指定）"} 不存在或未启用：请在「指令管理」确认该指令已启用，并在菜单设计器中重新选择。`,
+          `⚠️ 指令 /${commandName || "（未指定）"} 不存在或未在「指令菜单」中勾选：请在机器人管理页打开「⌨️ 指令菜单」，勾选该指令并保存。`,
         );
       });
       return;
@@ -144,16 +168,22 @@ function appendButton(
       menu.text(button.text, (ctx) => ctx.reply("已在主菜单"));
       return;
     }
-    case "api": {
-      const apiConfig = action.api;
-      if (!apiConfig) {
-        menu.text(button.text, (ctx) => ctx.reply("⚠️ 该按钮还没有配置接口"));
+    case "verify": {
+      // v2.1.12：外部验证 API 按钮 —— 与群组外部 API 验证同一机制（复用验证方式库）。
+      // 点击后 force-reply 要求在输入框回复验证码，verifyCodeExternally 真实核验，
+      // 提示/成功/失败文案可自定义（menu-verify.ts 全链路处理）。
+      const verify = action.verify;
+      if (!verify?.method_id) {
+        menu.text(button.text, (ctx) =>
+          ctx.reply("⚠️ 该按钮还没有绑定验证方法，请在管理后台菜单设计器中配置"),
+        );
         return;
       }
-      menu.text(button.text, async (ctx) => {
-        const result = await executeMenuApi(apiConfig, varsFromContext(ctx));
-        await ctx.reply(result.ok ? result.text : `⚠️ ${result.text}`);
-      });
+      menu.text(button.text, (ctx) =>
+        // 菜单插件回调 ctx 为 Context & MenuFlavor 交叉类型；运行实例的会话中间件
+        // 先于菜单安装，真实回调必然携带 session —— 类型层面经 unknown 收窄
+        startMenuVerifyFlow(ctx as unknown as BotContext, verify),
+      );
       return;
     }
     case "reply":
@@ -258,7 +288,9 @@ async function sendContent(ctx: Context, content: MenuMessageContent): Promise<v
     return;
   }
   const text = renderMenuTemplate(content.text, varsFromContext(ctx));
-  await ctx.reply(text || "（未配置回复内容）");
+  // v2.1.14：文案为空时不发送空消息（保存时 validateMenuConfig 已拦截空文案，此处兜运行时旧数据）
+  if (!text.trim()) return;
+  await ctx.reply(text);
 }
 
 export function validateMenuConfig(config: BotMenuConfig): MenuValidationResult {
@@ -304,8 +336,8 @@ export function validateMenuConfig(config: BotMenuConfig): MenuValidationResult 
             return `按钮「${button.text}」的相册至少需要一个图片或视频`;
           }
         }
-        if (button.action.type === "api" && (!button.action.api || !isHttpUrl(button.action.api.url))) {
-          return `按钮「${button.text}」的接口地址不合法`;
+        if (button.action.type === "verify" && !button.action.verify?.method_id?.trim()) {
+          return `按钮「${button.text}」还没有绑定验证方法`;
         }
         if (
           (button.action.type === "url" || button.action.type === "web_app") &&

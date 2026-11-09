@@ -5,16 +5,18 @@ import { ChevronRight, Loader2, Settings2, X } from "lucide-react";
 import { inputClass, labelClass, selectClass } from "@/components/admin/form-styles";
 
 /**
- * TGAPI申请 解锁门禁「绑定验证方法 + 配置外部验证 API」（v2.1.7，管理后台表单内嵌组件）：
+ * 「绑定验证方法 + 配置外部验证 API」（v2.1.7，管理后台表单内嵌组件）：
  *
- * 与机器人测试仿真屏「验证方式 → 外部API」同款交互：
+ * 与机器人测试仿真屏「验证方式 → 外部API」同款交互（图 2 红框入口卡）：
  * - 绑定验证方法下拉：列出验证方式库全部方法（#id 名称（启用/停用）），不再只显示启用的；
  * - 「配置外部验证 API」入口卡：点击展开内联编辑器（URL / Bearer apikey / GET·POST /
  *   验证码字段名 / 请求体模板 / 响应解析 / 超时），保存写入「验证方式」库同一数据源；
- *   未绑定方法时保存自动创建（TGAPI解锁核验（外部API））；
+ *   未绑定方法时保存自动创建（默认名 TGAPI解锁核验（外部API），可用 autoCreateName 定制）；
  * - 联调测试：用编辑器当前配置真实调用一次外部 API。
  *
- * 绑定结果通过 hidden input（verification_method_id）随外层表单一起提交。
+ * 绑定结果通过 hidden input（verification_method_id）随外层表单一起提交；
+ * 非表单场景（v2.1.13 菜单设计器「外部验证 API」按钮）可通过 onChange 回调
+ * 同步绑定结果到受控状态，此时 hidden input 无害（目标 action 不读该字段）。
  */
 
 interface MethodOption {
@@ -91,11 +93,26 @@ function formStateFromConfig(config: Record<string, unknown> | null): MethodApiC
 export function TgApiUnlockMethodBinding({
   initialMethods,
   initialMethodId,
+  /** 绑定结果同步回调（v2.1.13）：下拉切换/保存成功后回传当前方法 id（null = 未绑定），供受控状态场景使用 */
+  onChange,
+  /** 未绑定时保存自动创建的方法名（v2.1.13，默认 TGAPI解锁核验（外部API）） */
+  autoCreateName,
+  /** 方法类型过滤（v2.1.13，如 "code_api"）：下拉与保存后刷新均只保留该类型 */
+  typeFilter,
+  /** 调用来源（v2.1.13）：随 PUT body 传给 method-config API，日志按来源区分 */
+  source,
 }: {
   initialMethods: MethodOption[];
   initialMethodId: number | null;
+  onChange?: (methodId: number | null) => void;
+  autoCreateName?: string;
+  typeFilter?: string;
+  source?: string;
 }) {
-  const [methods, setMethods] = useState<MethodOption[]>(initialMethods);
+  // 类型过滤统一应用：初始列表与保存后刷新列表同一谓词，保证下拉选项稳定
+  const filterMethods = (methods: MethodOption[]): MethodOption[] =>
+    typeFilter ? methods.filter((method) => method.type === typeFilter) : methods;
+  const [methods, setMethods] = useState<MethodOption[]>(() => filterMethods(initialMethods));
   const [methodId, setMethodId] = useState<string>(initialMethodId ? String(initialMethodId) : "");
   const [editorOpen, setEditorOpen] = useState(false);
   const [apiForm, setApiForm] = useState<MethodApiConfigForm>({ ...EMPTY_API_FORM });
@@ -107,6 +124,12 @@ export function TgApiUnlockMethodBinding({
   const [status, setStatus] = useState<StatusMessage>(null);
 
   const selected = methods.find((method) => String(method.id) === methodId) ?? null;
+
+  /** 绑定变化统一出口：受控场景经 onChange 同步外层状态 */
+  const notifyChange = (nextId: string): void => {
+    setMethodId(nextId);
+    onChange?.(nextId ? Number(nextId) : null);
+  };
 
   const updateField = (patch: Partial<MethodApiConfigForm>): void => {
     setApiForm((prev) => ({ ...prev, ...patch }));
@@ -159,8 +182,9 @@ export function TgApiUnlockMethodBinding({
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         method_id: methodId || undefined,
-        method_name: newMethodName.trim() || undefined,
+        method_name: newMethodName.trim() || autoCreateName || undefined,
         config: apiConfigPayload(),
+        ...(source ? { source } : {}),
       }),
     });
     setSaving(false);
@@ -168,8 +192,8 @@ export function TgApiUnlockMethodBinding({
       setStatus({ kind: "error", text: result.error ?? "保存失败" });
       return;
     }
-    setMethods(result.data.methods);
-    setMethodId(result.data.method_id);
+    setMethods(filterMethods(result.data.methods));
+    notifyChange(result.data.method_id);
     setApiForm(formStateFromConfig(result.data.config));
     setNewMethodName("");
     setStatus({ kind: "ok", text: `已保存并绑定验证方式：${result.data.method_name}（方法 #${result.data.method_id}）` });
@@ -216,7 +240,7 @@ export function TgApiUnlockMethodBinding({
         id="tgapi-unlock-method-binding"
         value={methodId}
         onChange={(event) => {
-          setMethodId(event.target.value);
+          notifyChange(event.target.value);
           setEditorOpen(false);
           setStatus(null);
         }}

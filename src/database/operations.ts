@@ -2229,6 +2229,18 @@ export interface BotCommandRow {
   intro: string;
   enabled: boolean;
   sortOrder: number;
+  /**
+   * 指令归属（v2.1.13，与 groupId 互斥，应用层保证不同时非空）：
+   * 机器人私有 = bots.id（仅该机器人的运行实例可注册响应）；
+   * NULL = 不限定机器人（全局指令或群组私有指令）。内置指令恒为 NULL。
+   */
+  botId: bigint | null;
+  /**
+   * 指令归属（v2.1.13，与 botId 互斥）：群组私有 = group_settings.chat_id
+   * （注册仍是机器人级，运行时仅在绑定群组内真实执行）；
+   * NULL = 不限定群组（全局指令或机器人私有指令）。
+   */
+  groupId: bigint | null;
   createdTime: Date;
   updatedTime: Date;
 }
@@ -2242,6 +2254,8 @@ function mapBotCommand(row: Record<string, unknown>): BotCommandRow {
     intro: (row.intro as string) ?? "",
     enabled: toBoolean(row.enabled),
     sortOrder: toNumber(row.sort_order ?? 0),
+    botId: toBigIntOrNull(row.bot_id),
+    groupId: toBigIntOrNull(row.group_id),
     createdTime: toDate(row.created_time),
     updatedTime: toDate(row.updated_time),
   };
@@ -2315,10 +2329,14 @@ export async function createBotCommand(input: {
   intro?: string;
   enabled?: boolean;
   sortOrder?: number;
+  /** 归属（v2.1.13）：机器人私有 = bots.id；与 groupId 互斥；默认 NULL = 全局 */
+  botId?: bigint | null;
+  /** 归属（v2.1.13）：群组私有 = group_settings.chat_id；与 botId 互斥；默认 NULL = 全局 */
+  groupId?: bigint | null;
 }): Promise<bigint | null> {
   const result = await executeRun(
-    `INSERT INTO bot_commands (type, name, description, intro, enabled, sort_order, created_time, updated_time)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO bot_commands (type, name, description, intro, enabled, sort_order, bot_id, group_id, created_time, updated_time)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       input.type,
       input.name,
@@ -2326,6 +2344,8 @@ export async function createBotCommand(input: {
       input.intro ?? "",
       input.enabled === false ? 0 : 1,
       input.sortOrder ?? 0,
+      input.botId != null ? Number(input.botId) : null,
+      input.groupId != null ? Number(input.groupId) : null,
       dateText(new Date()),
       dateText(new Date()),
     ],
@@ -2342,26 +2362,41 @@ export async function updateBotCommand(
     intro?: string;
     enabled?: boolean;
     sortOrder?: number;
+    /** 归属三态（v2.1.13）：undefined=不改动（部分更新安全）；null=清空（恢复全局）；bigint=设为机器人私有 */
+    botId?: bigint | null;
+    /** 归属三态（v2.1.13）：undefined=不改动；null=清空（恢复全局）；bigint=设为群组私有 */
+    groupId?: bigint | null;
   },
 ): Promise<boolean> {
+  // botId/groupId 需要「显式置空」能力，COALESCE 无法区分「未传」与「清空」，
+  // 故归属列不参与 COALESCE，按三态动态拼入 SET 子句
+  const assignments = [
+    "name = COALESCE(?, name)",
+    "description = COALESCE(?, description)",
+    "intro = COALESCE(?, intro)",
+    "enabled = COALESCE(?, enabled)",
+    "sort_order = COALESCE(?, sort_order)",
+  ];
+  const params: SqlParam[] = [
+    input.name ?? null,
+    input.description ?? null,
+    input.intro ?? null,
+    input.enabled === undefined ? null : input.enabled ? 1 : 0,
+    input.sortOrder ?? null,
+  ];
+  if (input.botId !== undefined) {
+    assignments.push("bot_id = ?");
+    params.push(input.botId != null ? Number(input.botId) : null);
+  }
+  if (input.groupId !== undefined) {
+    assignments.push("group_id = ?");
+    params.push(input.groupId != null ? Number(input.groupId) : null);
+  }
+  assignments.push("updated_time = ?");
+  params.push(dateText(new Date()), Number(id));
   const result = await executeRun(
-    `UPDATE bot_commands SET
-       name = COALESCE(?, name),
-       description = COALESCE(?, description),
-       intro = COALESCE(?, intro),
-       enabled = COALESCE(?, enabled),
-       sort_order = COALESCE(?, sort_order),
-       updated_time = ?
-     WHERE id = ?`,
-    [
-      input.name ?? null,
-      input.description ?? null,
-      input.intro ?? null,
-      input.enabled === undefined ? null : input.enabled ? 1 : 0,
-      input.sortOrder ?? null,
-      dateText(new Date()),
-      Number(id),
-    ],
+    `UPDATE bot_commands SET ${assignments.join(", ")} WHERE id = ?`,
+    params,
   );
   invalidateBotCommandMemos();
   return result.changes > 0;
@@ -2415,19 +2450,34 @@ export async function moveBotCommand(
 /** 查询机器人指令菜单选中的指令（返回 Telegram BotCommand 结构），供 setMyCommands 同步 */
 export async function listBotCommandsByIds(
   ids: bigint[],
+  /** 指令归属过滤（v2.1.13）：传入当前机器人 id 后仅返回 全局 + 群组私有 + 本机器人私有 条目 */
+  options?: { botId?: bigint },
 ): Promise<BotCommandRow[]> {
   if (ids.length === 0) return [];
   // v2.0.6 D1 优化：registerBotCapabilities 冷实例热路径，60s 进程内缓存
   const sortedKey = [...ids].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",");
+  const botScope = options?.botId;
+  const cacheKey =
+    botScope !== undefined
+      ? `botcmd:ids:${sortedKey}:${Number(botScope)}`
+      : `botcmd:ids:${sortedKey}`;
   return memoTtl<BotCommandRow[]>(
-    `botcmd:ids:${sortedKey}`,
+    cacheKey,
     BOT_COMMANDS_CACHE_MS,
     async () => {
       const placeholders = ids.map(() => "?").join(",");
+      // 机器人级注册按归属过滤：bot_id IS NULL = 全局/群组私有（注册是机器人级，
+      // 群组私有指令的群组限制由运行时 runner 校验），bot_id = 当前机器人 = 机器人私有
+      const scoped = botScope !== undefined;
       const rows = await queryAll<Record<string, unknown>>(
-        `SELECT * FROM bot_commands WHERE id IN (${placeholders}) AND enabled = 1
+        scoped
+          ? `SELECT * FROM bot_commands WHERE id IN (${placeholders}) AND enabled = 1 AND (bot_id IS NULL OR bot_id = ?)
+         ORDER BY sort_order, id`
+          : `SELECT * FROM bot_commands WHERE id IN (${placeholders}) AND enabled = 1
          ORDER BY sort_order, id`,
-        ids.map((id) => Number(id)),
+        scoped
+          ? [...ids.map((id) => Number(id)), Number(botScope)]
+          : ids.map((id) => Number(id)),
       );
       return rows.map(mapBotCommand);
     },

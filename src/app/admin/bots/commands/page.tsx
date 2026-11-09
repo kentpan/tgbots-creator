@@ -1,7 +1,9 @@
 import Link from "next/link";
 import { formatBeijingDateTime } from "@/utils/datetime";
 import {
+  listBots,
   listBotCommands,
+  listGroupSettings,
   type BotCommandRow,
   type BotCommandType,
 } from "@/database/operations";
@@ -28,6 +30,8 @@ const ERRORS: Record<string, string> = {
   "invalid-description": "指令描述不能为空且不超过 256 字符",
   "duplicate-name": "同名指令已存在",
   "invalid-id": "指令不存在或已被删除",
+  "invalid-scope": "指令归属不合法：机器人私有与群组私有不能同时选择",
+  "invalid-scope-target": "归属对象不存在：请重新选择所属机器人或群组",
 };
 
 const TABS: { key: BotCommandType; label: string }[] = [
@@ -50,6 +54,15 @@ export default async function BotCommandsPage({
   const page = Math.max(1, Number(params.page ?? "1") || 1);
 
   const result = await listBotCommands({ type: tab, page, pageSize: PAGE_SIZE });
+  // 归属列映射（v2.1.13）：bot_id → 机器人名，group_id → 群组名
+  const [bots, groups] = await Promise.all([listBots(), listGroupSettings()]);
+  const botNameById = new Map(bots.map((bot) => [String(bot.id), bot.name]));
+  const groupTitleById = new Map(groups.map((group) => [String(group.chatId), group.chatTitle]));
+  const scopeBotOptions = bots.map((bot) => ({ id: String(bot.id), name: bot.name }));
+  const scopeGroupOptions = groups.map((group) => ({
+    chatId: String(group.chatId),
+    chatTitle: group.chatTitle,
+  }));
 
   return (
     <div className="space-y-6">
@@ -62,6 +75,8 @@ export default async function BotCommandsPage({
         </div>
         <CommandFormDialog
           type={tab}
+          bots={scopeBotOptions}
+          groups={scopeGroupOptions}
           trigger={`+ 新增${tab === "builtin" ? "内置" : "自定义"}指令`}
           triggerClassName="inline-flex h-10 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
         />
@@ -106,6 +121,7 @@ export default async function BotCommandsPage({
               <th className="px-4 py-3 font-medium">描述</th>
               <th className="px-4 py-3 font-medium">{tab === "builtin" ? "中文介绍" : "详细介绍"}</th>
               <th className="px-4 py-3 font-medium">排序</th>
+              <th className="px-4 py-3 font-medium">归属</th>
               <th className="px-4 py-3 font-medium">状态</th>
               <th className="px-4 py-3 font-medium">更新时间</th>
               <th className="px-4 py-3 text-right font-medium">操作</th>
@@ -120,11 +136,15 @@ export default async function BotCommandsPage({
                 page={result.page}
                 isFirst={index === 0 && page === 1}
                 isLast={index === result.rows.length - 1 && page >= result.totalPages}
+                botNameById={botNameById}
+                groupTitleById={groupTitleById}
+                scopeBotOptions={scopeBotOptions}
+                scopeGroupOptions={scopeGroupOptions}
               />
             ))}
             {result.rows.length === 0 ? (
               <tr>
-                <td colSpan={8} className="px-4 py-10 text-center text-muted-foreground">
+                <td colSpan={9} className="px-4 py-10 text-center text-muted-foreground">
                   暂无{tab === "builtin" ? "内置" : "自定义"}指令，点击右上角新增。
                 </td>
               </tr>
@@ -187,18 +207,59 @@ function CustomGuide() {
   );
 }
 
+/** 归属徽标（v2.1.13）：全局 / 机器人私有 / 群组私有，机器人与群组两个维度绝不混淆 */
+function CommandScopeBadge({
+  row,
+  botNameById,
+  groupTitleById,
+}: {
+  row: BotCommandRow;
+  botNameById: Map<string, string>;
+  groupTitleById: Map<string, string | null>;
+}) {
+  if (row.botId !== null) {
+    const name = botNameById.get(String(row.botId)) ?? `ID ${String(row.botId)}`;
+    return (
+      <span className="inline-flex items-center rounded-full bg-violet-100 px-2 py-0.5 text-xs font-medium text-violet-700">
+        🤖 {name} 私有
+      </span>
+    );
+  }
+  if (row.groupId !== null) {
+    const title = groupTitleById.get(String(row.groupId)) ?? `ID ${String(row.groupId)}`;
+    return (
+      <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700">
+        👥 {title}
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">
+      🌐 全局
+    </span>
+  );
+}
+
 function CommandRow({
   row,
   tab,
   page,
   isFirst,
   isLast,
+  botNameById,
+  groupTitleById,
+  scopeBotOptions,
+  scopeGroupOptions,
 }: {
   row: BotCommandRow;
   tab: BotCommandType;
   page: number;
   isFirst: boolean;
   isLast: boolean;
+  botNameById: Map<string, string>;
+  groupTitleById: Map<string, string | null>;
+  scopeBotOptions: { id: string; name: string }[];
+  scopeGroupOptions: { chatId: string; chatTitle: string | null }[];
 }) {
   return (
     <tr className="align-top hover:bg-muted/20">
@@ -246,6 +307,9 @@ function CommandRow({
         </div>
       </td>
       <td className="px-4 py-3">
+        <CommandScopeBadge row={row} botNameById={botNameById} groupTitleById={groupTitleById} />
+      </td>
+      <td className="px-4 py-3">
         <span
           className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
             row.enabled
@@ -270,8 +334,12 @@ function CommandRow({
               intro: row.intro,
               enabled: row.enabled,
               sortOrder: row.sortOrder,
+              botId: row.botId === null ? null : String(row.botId),
+              groupId: row.groupId === null ? null : String(row.groupId),
             }}
             type={row.type}
+            bots={scopeBotOptions}
+            groups={scopeGroupOptions}
             trigger="编辑"
             triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-xs font-medium hover:bg-accent"
           />

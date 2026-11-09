@@ -1,4 +1,9 @@
-import { listBots, listBotCommands, listGroupSettings } from "@/database/operations";
+import {
+  listBots,
+  listBotCommands,
+  listGroupSettings,
+  listVerificationMethods,
+} from "@/database/operations";
 import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { getStorage } from "@/database/bindings";
 import { countMenuStats, parseBotMenuConfig } from "@/services/menu-config";
@@ -55,11 +60,12 @@ export default async function BotsPage({
 }) {
   await requirePermission("bots:view");
   const params = await searchParams;
-  const [bots, groups, builtinCommands, customCommands] = await Promise.all([
+  const [bots, groups, builtinCommands, customCommands, verificationMethods] = await Promise.all([
     listBots(),
     listGroupSettings(),
     listBotCommands({ type: "builtin", enabledOnly: true }),
     listBotCommands({ type: "custom", enabledOnly: true }),
+    listVerificationMethods(),
   ]);
   const commandLibrary = [...builtinCommands.rows, ...customCommands.rows].map((row) => ({
     id: String(row.id),
@@ -67,6 +73,9 @@ export default async function BotsPage({
     description: row.description,
     intro: row.intro,
     type: row.type,
+    // 指令归属（v2.1.13）：机器人私有 / 群组私有 / 全局，供各机器人按归属过滤与标注
+    botId: row.botId === null ? null : String(row.botId),
+    groupId: row.groupId === null ? null : String(row.groupId),
   }));
   const runtimeGlobal = await getTelegramRuntimeSettings();
   const isEdge = isEdgeRuntime();
@@ -167,6 +176,21 @@ export default async function BotsPage({
                 bots.map((bot, botIndex) => {
                   const stats = countMenuStats(parseBotMenuConfig(bot.menuConfig).root);
                   const profile = parseBotProfile(bot.config);
+                  // 指令归属过滤（v2.1.13）：本机器人可见的自定义指令 = 全局 + 群组私有 + 本机器人私有；
+                  // 其他机器人私有指令对本机器人完全不可见（勾选/按钮/指令菜单三处同一规则）
+                  const visibleCommands = commandLibrary.filter(
+                    (item) =>
+                      item.type === "builtin" || item.botId === null || item.botId === String(bot.id),
+                  );
+                  const scopeLabelOf = (item: (typeof visibleCommands)[number]): string | undefined => {
+                    if (item.type !== "custom") return undefined;
+                    if (item.botId !== null) return `🤖 ${bot.name} 私有`;
+                    if (item.groupId !== null) {
+                      const title = groups.find((g) => String(g.chatId) === item.groupId)?.chatTitle;
+                      return `👥 群组私有${title ? `（${title}）` : ""}`;
+                    }
+                    return undefined;
+                  };
                   return (
                     <tr key={bot.id} className="border-b last:border-0">
                       <td className="px-4 py-3 text-sm font-mono">{bot.id}</td>
@@ -255,9 +279,9 @@ export default async function BotsPage({
                             builtinCommands={
                               profile.tgapi?.enabled
                                 ? [
-                                    // v2.1.11：TGAPI 机器人同样注册指令库内置指令（排除 /start，
-                                    // 流程自有重入语义）+ 自有 /language —— 选项与运行时真实注册
-                                    // 同源（见 tgapi.ts registerTgApiHandlers）
+                                    // TGAPI 自有 /start /language（不依赖勾选，始终可用）+
+                                    // 指令库内置项：「执行指令」按钮点击后按「⌨️ 指令菜单」
+                                    // 弹窗勾选（bots.config.commandIds）注册的同一处理器执行
                                     ...commandLibrary
                                       .filter((item) => item.type === "builtin" && item.name !== "start")
                                       .map((item) => ({
@@ -274,12 +298,18 @@ export default async function BotsPage({
                                       label: `/${item.name} — ${item.description}`,
                                     }))
                             }
-                            customCommands={commandLibrary
+                            customCommands={visibleCommands
                               .filter((item) => item.type === "custom")
                               .map((item) => ({
                                 name: item.name,
                                 label: `/${item.name} — ${item.description}`,
                               }))}
+                            verificationMethods={verificationMethods.map((method) => ({
+                              id: String(method.id),
+                              name: method.name,
+                              type: method.type,
+                              enabled: method.enabled,
+                            }))}
                             groups={groups.map((group) => ({
                               chatId: String(group.chatId),
                               chatTitle: group.chatTitle,
@@ -288,24 +318,29 @@ export default async function BotsPage({
                             trigger="⚙️ 消息内嵌按钮"
                             triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
                           />
-                          {/* v2.1.11：TGAPI 机器人的 Telegram 指令菜单由 TGAPI 流程自管
-                              （/start + /language + 内置启用项 + 全部自定义指令，见 tgapi.ts），
-                              逐机器人勾选 commandIds 对其无效 —— 隐藏无效入口，避免误导 */}
-                          {!profile.tgapi?.enabled ? (
-                            <CommandMenuDialog
-                              bot={{
-                                id: String(bot.id),
-                                name: bot.name,
-                                privacyMode: parseBotPrivacyMode(profile),
-                                selectedCommandIds: Array.isArray(profile.commandIds)
-                                  ? profile.commandIds
-                                  : [],
-                              }}
-                              library={commandLibrary}
-                              trigger="⌨️ 指令菜单"
-                              triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
-                            />
-                          ) : null}
+                          {/* ⌨️ 指令菜单弹窗：全部机器人类型统一入口（含 TGAPI申请机器人）——
+                              勾选保存（bots.config.commandIds）后热更新注册并同步 Telegram，
+                              是指令注册唯一来源；未勾选的指令不注册、不响应 */}
+                          <CommandMenuDialog
+                            bot={{
+                              id: String(bot.id),
+                              name: bot.name,
+                              privacyMode: parseBotPrivacyMode(profile),
+                              selectedCommandIds: Array.isArray(profile.commandIds)
+                                ? profile.commandIds
+                                : [],
+                            }}
+                            library={visibleCommands.map((item) => ({
+                              id: item.id,
+                              name: item.name,
+                              description: item.description,
+                              intro: item.intro,
+                              type: item.type,
+                              scopeLabel: scopeLabelOf(item),
+                            }))}
+                            trigger="⌨️ 指令菜单"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
+                          />
                           <BotRuntimeDialog
                             bot={{
                               id: String(bot.id),

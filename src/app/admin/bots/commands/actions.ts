@@ -6,7 +6,9 @@ import { headers } from "next/headers";
 import {
   createBotCommand,
   deleteBotCommand,
+  getBot,
   getBotCommand,
+  getGroupSettings,
   moveBotCommand,
   updateBotCommand,
   type BotCommandType,
@@ -19,9 +21,42 @@ function commandsPath(params: Record<string, string>): string {
 }
 
 /**
+ * 解析指令归属表单字段（v2.1.13）：botId/groupId 均为可选字符串，
+ * 空 = 不限定；两者互斥，同时非空返回 null 由调用方报 invalid-scope。
+ * 返回 bigint | null：null = 全局/清空归属。
+ */
+async function parseCommandScope(
+  formData: FormData,
+): Promise<{ botId: bigint | null; groupId: bigint | null; error: string | null }> {
+  const botIdRaw = String(formData.get("botId") ?? "").trim();
+  const groupIdRaw = String(formData.get("groupId") ?? "").trim();
+  if (botIdRaw && groupIdRaw) {
+    return { botId: null, groupId: null, error: "invalid-scope" };
+  }
+  let botId: bigint | null = null;
+  let groupId: bigint | null = null;
+  if (botIdRaw) {
+    if (!/^\d+$/.test(botIdRaw)) return { botId: null, groupId: null, error: "invalid-scope-target" };
+    // 归属对象必须真实存在：机器人下拉来自 bots 表，群组下拉来自 group_settings 表，
+    // 两个维度绝不允许混淆（机器人 id 与群组 chat_id 是不同的键空间）
+    const bot = await getBot(BigInt(botIdRaw));
+    if (!bot) return { botId: null, groupId: null, error: "invalid-scope-target" };
+    botId = bot.id;
+  }
+  if (groupIdRaw) {
+    if (!/^-?\d+$/.test(groupIdRaw)) return { botId: null, groupId: null, error: "invalid-scope-target" };
+    const group = await getGroupSettings(BigInt(groupIdRaw));
+    if (!group) return { botId: null, groupId: null, error: "invalid-scope-target" };
+    groupId = group.chatId;
+  }
+  return { botId, groupId, error: null };
+}
+
+/**
  * 保存指令（内置指令与自定义指令共用）。
  * 指令名遵循 Telegram Bot API 限制：1-32 个字符，仅小写字母、数字与下划线；
  * 描述 1-256 字符（setMyCommands 的硬性要求）。
+ * 归属（v2.1.13）：仅自定义指令提供机器人私有/群组私有（互斥），内置指令恒为全局。
  */
 export async function saveBotCommandAction(formData: FormData): Promise<void> {
   const admin = await requirePermission("bots:manage");
@@ -43,6 +78,11 @@ export async function saveBotCommandAction(formData: FormData): Promise<void> {
   if (!description || description.length > 256) {
     redirect(commandsPath({ tab, error: "invalid-description" }));
   }
+  // 归属解析与互斥/存在性校验：内置指令恒为全局（不读表单归属字段）
+  const scope = type === "custom" ? await parseCommandScope(formData) : { botId: null, groupId: null, error: null };
+  if (scope.error) {
+    redirect(commandsPath({ tab, error: scope.error }));
+  }
 
   const requestHeaders = await headers();
   const isEdit = Boolean(idRaw && /^\d+$/.test(idRaw));
@@ -56,11 +96,18 @@ export async function saveBotCommandAction(formData: FormData): Promise<void> {
       intro,
       enabled,
       sortOrder,
+      ...(existing.type === "custom" ? { botId: scope.botId, groupId: scope.groupId } : {}),
     });
+    const scopeLabel =
+      scope.botId !== null
+        ? `机器人私有 #${String(scope.botId)}`
+        : scope.groupId !== null
+          ? `群组私有 ${String(scope.groupId)}`
+          : "全局";
     await logOperation(admin, {
       action: existing.type === "builtin" ? "编辑内置指令" : "编辑自定义指令",
       target: `/${existing.name}`,
-      detail: `状态：${enabled ? "启用" : "停用"}`,
+      detail: `状态：${enabled ? "启用" : "停用"}；归属：${scopeLabel}`,
       headers: requestHeaders,
     });
   } else {
@@ -71,6 +118,7 @@ export async function saveBotCommandAction(formData: FormData): Promise<void> {
       intro,
       enabled,
       sortOrder,
+      ...(type === "custom" ? { botId: scope.botId, groupId: scope.groupId } : {}),
     });
     if (!created) redirect(commandsPath({ tab, error: "duplicate-name" }));
     await logOperation(admin, {

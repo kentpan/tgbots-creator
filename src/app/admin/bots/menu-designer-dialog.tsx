@@ -33,7 +33,6 @@ import {
   parseBotMenuConfig,
   type BotMenuConfig,
   type MenuActionType,
-  type MenuApiConfig,
   type MenuButton,
   type MenuButtonAction,
   type MenuMediaItem,
@@ -43,6 +42,7 @@ import {
 import { saveBotMenuAction } from "./actions";
 import { Switch } from "@/components/ui/switch";
 import { SelfContainedTabs } from "@/components/admin/self-contained-tabs";
+import { TgApiUnlockMethodBinding } from "@/components/admin/tgapi-unlock-api-config";
 
 interface DesignerBot {
   id: string;
@@ -141,10 +141,18 @@ const ACTION_OPTIONS: { value: MenuActionType; label: string }[] = [
   { value: "url", label: "打开链接（URL 按钮）" },
   { value: "web_app", label: "打开 WebApp" },
   { value: "command", label: "执行指令（点击等同用户发送 /指令）" },
-  { value: "api", label: "调用外部接口并播报结果" },
+  { value: "verify", label: "外部验证 API（点击后要求回复验证码核验）" },
   { value: "switch_inline", label: "切换到其他聊天的内联查询" },
   { value: "switch_inline_current", label: "在当前聊天输入框预填内容" },
 ];
+
+/** 验证方式库条目（绑定验证方法下拉选项；code_api 类型才能用于菜单验证） */
+export interface VerificationMethodOption {
+  id: string;
+  name: string;
+  type: string;
+  enabled: boolean;
+}
 
 function uid(prefix: string, counter: { current: number }): string {
   counter.current += 1;
@@ -358,9 +366,7 @@ function NodeEditor({
   state: DesignerState;
   isRoot: boolean;
 }) {
-  const { config, selected, actions, builtinCommands, customCommands } = state;
-  // 「从指令添加按钮」选择器（v2.1.10）：选中内置/自定义指令一键变成执行指令按钮
-  const [pickedCommand, setPickedCommand] = useState("");
+  const { selected, actions } = state;
   return (
     <div className="space-y-3">
       <div className="space-y-3 rounded-xl border bg-card p-4">
@@ -401,34 +407,6 @@ function NodeEditor({
             </button>
           </div>
         </div>
-
-        {builtinCommands.length > 0 || customCommands.length > 0 ? (
-          <div className="space-y-2 rounded-lg border border-dashed bg-muted/30 p-3">
-            <span className="text-sm font-medium">从指令添加按钮：</span>
-            <CommandPicker
-              builtinCommands={builtinCommands}
-              customCommands={customCommands}
-              value={pickedCommand}
-              onChange={setPickedCommand}
-            />
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                disabled={!pickedCommand}
-                onClick={() => {
-                  actions.addCommandButton(path, pickedCommand);
-                  setPickedCommand("");
-                }}
-                className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-              >
-                + 添加为按钮
-              </button>
-              <span className="text-xs text-muted-foreground">
-                按钮点击后机器人真实执行对应 /指令；指令在「指令管理」中维护
-              </span>
-            </div>
-          </div>
-        ) : null}
 
         {node.rows.length === 0 ? (
           <p className="rounded-lg border border-dashed p-6 text-center text-sm text-muted-foreground">
@@ -520,7 +498,11 @@ function NodeEditor({
         ))}
       </div>
 
-      {selected && selected.path.join("/") === path.join("/") ? <SelectedButtonPanel state={state} /> : null}
+      {/* key=按钮 id：切换选中按钮时强制重挂载 —— 内部「绑定验证方法」是非受控 state，
+          不重挂载会把上一按钮的绑定带到新按钮上 */}
+      {selected && selected.path.join("/") === path.join("/") ? (
+        <SelectedButtonPanel key={selected.buttonId} state={state} />
+      ) : null}
     </div>
   );
 }
@@ -669,156 +651,92 @@ function SelectedButtonPanel({ state }: { state: DesignerState }) {
         </div>
       ) : null}
 
-      {action.type === "api" && action.api ? (
+      {action.type === "verify" ? (
         <div className="space-y-3">
-          <div className="grid gap-3 md:grid-cols-[110px_1fr_110px_110px]">
-            <div className="space-y-1">
-              <label className="block text-sm font-medium">方法</label>
-              <select
-                value={action.api.method}
-                onChange={(event) =>
-                  update((draft) => {
-                    if (draft.action.api) {
-                      draft.action.api.method = event.target.value as MenuApiConfig["method"];
-                    }
-                  })
+          {/* v2.1.13：复用图2红框同款「绑定验证方法 + 配置外部验证 API」组件（验证方式库同一数据源），
+              入口卡 + 内联编辑器 + 联调测试 + 保存全部同源，禁止重复实现；
+              绑定结果经 onChange 同步回菜单按钮 action.verify.method_id 随菜单配置一并保存 */}
+          <TgApiUnlockMethodBinding
+            initialMethods={state.verificationMethods.map((method) => ({
+              id: Number(method.id),
+              name: method.name,
+              enabled: method.enabled,
+              type: method.type,
+            }))}
+            initialMethodId={action.verify?.method_id ? Number(action.verify.method_id) : null}
+            typeFilter="code_api"
+            autoCreateName="菜单验证核验（外部API）"
+            source="menu"
+            onChange={(methodId) =>
+              update((draft) => {
+                if (draft.action.verify) {
+                  draft.action.verify.method_id = methodId === null ? "" : String(methodId);
                 }
-                className="h-10 w-full rounded-md border border-input bg-background px-2 text-sm"
-              >
-                {["GET", "POST", "PUT", "DELETE"].map((method) => (
-                  <option key={method} value={method}>
-                    {method}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="space-y-1">
-              <label className="block text-sm font-medium">接口地址</label>
-              <input
-                value={action.api.url}
-                onChange={(event) =>
-                  update((draft) => {
-                    if (draft.action.api) draft.action.api.url = event.target.value;
-                  })
-                }
-                placeholder="https://api.example.com/data"
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="block text-sm font-medium">期望状态码</label>
-              <input
-                type="number"
-                value={action.api.success_status}
-                onChange={(event) =>
-                  update((draft) => {
-                    if (draft.action.api) {
-                      draft.action.api.success_status = Number(event.target.value) || 200;
-                    }
-                  })
-                }
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="block text-sm font-medium">超时（秒）</label>
-              <input
-                type="number"
-                value={action.api.timeout_seconds}
-                onChange={(event) =>
-                  update((draft) => {
-                    if (draft.action.api) {
-                      draft.action.api.timeout_seconds = Number(event.target.value) || 10;
-                    }
-                  })
-                }
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-              />
-            </div>
-          </div>
+              })
+            }
+          />
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            与群组外部 API 验证同一机制：验证 API 地址 / Bearer apikey / 传参 / 响应解析 /
+            超时在上方「配置外部验证 API」中编辑并保存到「验证方式」库（同一数据源）；
+            点击按钮后在输入框回复验证码真实核验。
+          </p>
           <div className="space-y-1">
-            <div className="flex items-center justify-between">
-              <label className="block text-sm font-medium">请求头</label>
-              <button
-                type="button"
-                onClick={() =>
-                  update((draft) => {
-                    if (draft.action.api) draft.action.api.headers.push({ key: "", value: "" });
-                  })
-                }
-                className="rounded border px-2 py-1 text-sm hover:bg-accent"
-              >
-                + 请求头
-              </button>
-            </div>
-            {action.api.headers.map((header, index) => (
-              <div key={index} className="flex items-center gap-2">
-                <input
-                  value={header.key}
-                  onChange={(event) =>
-                    update((draft) => {
-                      if (draft.action.api) draft.action.api.headers[index].key = event.target.value;
-                    })
-                  }
-                  placeholder="Header"
-                  className="flex h-9 w-44 rounded-md border border-input bg-background px-3 text-sm"
-                />
-                <input
-                  value={header.value}
-                  onChange={(event) =>
-                    update((draft) => {
-                      if (draft.action.api) draft.action.api.headers[index].value = event.target.value;
-                    })
-                  }
-                  placeholder="值（支持变量）"
-                  className="flex h-9 flex-1 rounded-md border border-input bg-background px-3 text-sm"
-                />
-                <button
-                  type="button"
-                  onClick={() =>
-                    update((draft) => {
-                      if (draft.action.api) draft.action.api.headers.splice(index, 1);
-                    })
-                  }
-                  className="rounded border border-red-200 px-2 py-1 text-sm text-red-600 hover:bg-red-50"
-                >
-                  删
-                </button>
-              </div>
-            ))}
-          </div>
-          <div className="space-y-1">
-            <label className="block text-sm font-medium">请求体模板（GET 时作为查询串追加）</label>
+            <label className="block text-sm font-medium">输入提示文案（点击按钮后先发送的提示）</label>
             <textarea
-              value={action.api.body_template}
+              value={action.verify?.input_hint_text ?? ""}
               onChange={(event) =>
                 update((draft) => {
-                  if (draft.action.api) draft.action.api.body_template = event.target.value;
+                  if (draft.action.verify) draft.action.verify.input_hint_text = event.target.value;
                 })
               }
               rows={2}
-              placeholder='{"chat_id":"{{chat_id}}"}'
-              className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
+              placeholder="✍🏻 请在下方的输入框进行输入:（留空用默认）"
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
             />
           </div>
           <div className="space-y-1">
-            <label className="block text-sm font-medium">
-              响应播报模板（把接口返回数据渲染成新消息发到群组）
-            </label>
+            <label className="block text-sm font-medium">提示文案（force-reply 输入框提示）</label>
             <textarea
-              value={action.api.response_template}
+              value={action.verify?.prompt_text ?? ""}
               onChange={(event) =>
                 update((draft) => {
-                  if (draft.action.api) draft.action.api.response_template = event.target.value;
+                  if (draft.action.verify) draft.action.verify.prompt_text = event.target.value;
                 })
               }
-              rows={3}
-              placeholder="今日价格：{{res.data.price}}\n明细：{{res.data.list}}"
+              rows={2}
+              placeholder="🔐 请回复本消息并输入验证码完成验证（留空用默认）"
               className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
             />
-            <p className="text-sm text-muted-foreground">
-              用 {"{{res.路径.字段}}"} 提取接口 JSON 返回；{"{{res}}"} 输出完整响应。
-            </p>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="space-y-1">
+              <label className="block text-sm font-medium">成功文案</label>
+              <textarea
+                value={action.verify?.success_text ?? ""}
+                onChange={(event) =>
+                  update((draft) => {
+                    if (draft.action.verify) draft.action.verify.success_text = event.target.value;
+                  })
+                }
+                rows={2}
+                placeholder="✅ 验证成功！（留空用默认）"
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="block text-sm font-medium">失败文案</label>
+              <textarea
+                value={action.verify?.fail_text ?? ""}
+                onChange={(event) =>
+                  update((draft) => {
+                    if (draft.action.verify) draft.action.verify.fail_text = event.target.value;
+                  })
+                }
+                rows={2}
+                placeholder="❌ 验证失败（留空用默认，自动附带核验未通过原因与剩余次数）"
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              />
+            </div>
           </div>
         </div>
       ) : null}
@@ -845,12 +763,13 @@ interface DesignerState {
   builtinCommands: MenuCommandOption[];
   /** 自定义指令可选项（v2.1.10）：指令管理中启用的自定义指令 */
   customCommands: MenuCommandOption[];
+  /** 验证方式库（v2.1.12）：「外部验证 API」按钮绑定验证方法的下拉选项 */
+  verificationMethods: VerificationMethodOption[];
   actions: {
     addRow: (path: string[]) => void;
     moveRow: (path: string[], rowIndex: number, direction: -1 | 1) => void;
     deleteRow: (path: string[], rowId: string) => void;
     addButton: (path: string[], rowId: string) => void;
-    addCommandButton: (path: string[], commandName: string) => void;
     selectButton: (path: string[], buttonId: string) => void;
     updateButton: (path: string[], buttonId: string, mutator: (draft: MenuButton) => void) => void;
     deleteButton: (path: string[], buttonId: string) => void;
@@ -867,6 +786,7 @@ export function MenuDesignerDialog({
   storageKind,
   builtinCommands,
   customCommands,
+  verificationMethods,
   trigger,
   triggerClassName,
 }: {
@@ -875,8 +795,10 @@ export function MenuDesignerDialog({
   storageKind: "cloudflare-r2" | "local";
   /** 内置指令库（指令管理 → 内置指令，仅启用项；TGAPI 机器人 = start/language 自有指令） */
   builtinCommands: MenuCommandOption[];
-  /** 自定义指令库（指令管理 → 自定义指令，仅启用项）：供「从指令添加按钮」选择 */
+  /** 自定义指令库（指令管理 → 自定义指令，仅启用项）：供按钮「执行指令」选择 */
   customCommands: MenuCommandOption[];
+  /** 验证方式库（v2.1.12）：「外部验证 API」按钮绑定验证方法下拉选项 */
+  verificationMethods: VerificationMethodOption[];
   trigger: React.ReactNode;
   triggerClassName?: string;
 }) {
@@ -940,32 +862,6 @@ export function MenuDesignerDialog({
         });
         setSelected({ path, buttonId: id });
       },
-      // v2.1.10「从指令添加按钮」：选中的指令一键变成「执行指令」按钮
-      //（追加到末行有空位则追加，否则新建一行；按钮文本默认指令名，可后续改名）
-      addCommandButton: (path, commandName) => {
-        if (!commandName) return;
-        const id = uid("b", counter);
-        mutateConfig((draft) => {
-          const node = findNode(draft.root, path);
-          let targetRow = node.rows[node.rows.length - 1];
-          if (targetRow && targetRow.buttons.length < MENU_MAX_BUTTONS_PER_ROW) {
-            targetRow.buttons.push({
-              id,
-              text: commandName,
-              action: { type: "command", target: commandName },
-            });
-            return;
-          }
-          targetRow = { id: uid("r", counter), buttons: [] };
-          node.rows.push(targetRow);
-          targetRow.buttons.push({
-            id,
-            text: commandName,
-            action: { type: "command", target: commandName },
-          });
-        });
-        setSelected({ path, buttonId: id });
-      },
       selectButton: (path, buttonId) => setSelected({ path, buttonId }),
       updateButton: (path, buttonId, mutator) => {
         mutateConfig((draft) => {
@@ -998,15 +894,13 @@ export function MenuDesignerDialog({
               nextAction.text = "你好！";
               nextAction.content = { type: "text", text: "你好！", mediaUrl: "", items: [] };
             }
-            if (type === "api") {
-              nextAction.api = {
-                method: "GET",
-                url: "",
-                headers: [{ key: "Authorization", value: "Bearer " }],
-                body_template: "",
-                success_status: 200,
-                timeout_seconds: 10,
-                response_template: "接口返回：{{res}}",
+            if (type === "verify") {
+              nextAction.verify = {
+                method_id: "",
+                input_hint_text: "",
+                prompt_text: "",
+                success_text: "",
+                fail_text: "",
               };
             }
             if (type === "url" || type === "web_app") nextAction.url = "https://";
@@ -1053,6 +947,7 @@ export function MenuDesignerDialog({
     storageKind,
     builtinCommands,
     customCommands,
+    verificationMethods,
     actions,
   };
   const stats = countMenuStats(config.root);
@@ -1073,19 +968,6 @@ export function MenuDesignerDialog({
     walk(config.root, 1);
     return found || 1;
   }, [config, nodeId]);
-
-  const previewApi = async (api: MenuApiConfig) => {
-    if (!api || !api.url) return { ok: false, text: "接口未配置" };
-    const response = await fetch("/api/admin/bots/preview", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ api }),
-    });
-    if (!response.ok) {
-      return { ok: false, text: `预览请求失败（${response.status}）` };
-    }
-    return (await response.json()) as { ok: boolean; text: string };
-  };
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -1162,7 +1044,6 @@ export function MenuDesignerDialog({
                   botName={bot.username ? `@${bot.username}` : bot.name}
                   nodeId={nodeId}
                   onNodeNavigate={setNodeId}
-                  onApiCall={previewApi}
                 />
                 <p className="mt-2 text-sm text-muted-foreground">
                   当前预览：{nodeId === "root" ? "主菜单" : "子菜单"}（第 {previewDepth} 级）·

@@ -13,6 +13,8 @@ export interface CommandLibraryItem {
   description: string;
   intro: string;
   type: "builtin" | "custom";
+  /** 指令归属标注（v2.1.13）：🤖 机器人私有 / 👥 群组私有；全局/内置指令无标注 */
+  scopeLabel?: string;
 }
 
 /**
@@ -62,7 +64,7 @@ export function CommandMenuDialog({
       trigger={trigger}
       triggerClassName={triggerClassName}
       title={`指令菜单 · ${bot.name}`}
-      description="从指令库中勾选要应用到该机器人的指令，保存后立即调用 setMyCommands 同步到 Telegram 用户指令菜单。"
+      description="指令注册的唯一来源：勾选要应用到该机器人的指令，保存后立即注册响应（按钮点击与手输 /指令 同源）并同步到 Telegram 指令菜单；未勾选的指令不注册、不响应。"
       action={saveBotCommandMenuAction}
       contentClassName="sm:max-w-2xl"
     >
@@ -154,6 +156,11 @@ export function CommandMenuDialog({
                         <span className="min-w-0 flex-1">
                           <span className="flex items-center gap-2">
                             <code className="rounded bg-muted px-1 text-xs">/{item.name}</code>
+                            {item.scopeLabel ? (
+                              <span className="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
+                                {item.scopeLabel}
+                              </span>
+                            ) : null}
                             <span className="truncate text-xs text-muted-foreground">
                               {item.description}
                             </span>

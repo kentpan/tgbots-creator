@@ -149,6 +149,15 @@ async function ensureMigrations(): Promise<void> {
   await executeRun(
     `CREATE UNIQUE INDEX IF NOT EXISTS "bot_commands_type_name_key" ON "bot_commands"("type", "name")`,
   );
+  // 旧库补列：bot_commands.bot_id / group_id（v2.1.13 指令归属：机器人私有 / 群组私有，
+  // 两列互斥由应用层保证，均 NULL = 全局指令；内置指令恒为全局）
+  const botCommandCols = await queryAll<{ name: string }>(`PRAGMA table_info(bot_commands)`);
+  if (botCommandCols.length > 0 && !botCommandCols.some((c) => c.name === "bot_id")) {
+    await executeRun(`ALTER TABLE "bot_commands" ADD COLUMN "bot_id" INTEGER`);
+  }
+  if (botCommandCols.length > 0 && !botCommandCols.some((c) => c.name === "group_id")) {
+    await executeRun(`ALTER TABLE "bot_commands" ADD COLUMN "group_id" INTEGER`);
+  }
   // 旧库补列：group_settings.privacy_mode（v1.0.7 隐私模式通用功能）
   const groupCols = await queryAll<{ name: string }>(`PRAGMA table_info(group_settings)`);
   if (groupCols.length > 0 && !groupCols.some((c) => c.name === "privacy_mode")) {

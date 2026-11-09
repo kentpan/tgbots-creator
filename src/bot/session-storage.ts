@@ -738,6 +738,17 @@ export interface BotSessionData {
   tgapiLang?: "zh" | "en";
   /** TGAPI 星星解锁发票已发送（防任意文本重复弹发票） */
   tgapiStarsInvoiceSent?: boolean;
+  /**
+   * 菜单「外部验证 API」按钮验证会话（v2.1.12）：点击按钮时写入（绑定方法+自定义
+   * 文案+已试次数），verifyCodeExternally 核验出结果后清除；成功/达到尝试上限清除，
+   * 网络故障保留（不计次）。与群组验证 verification_sessions（DB）互不影响。
+   */
+  menuVerify?: {
+    methodId: string;
+    successText: string;
+    failText: string;
+    attempts: number;
+  };
 }
 
 export type BotSessionContext = BotContext;

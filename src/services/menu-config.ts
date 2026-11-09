@@ -22,7 +22,7 @@ export interface MenuMessageContent {
 
 export type MenuActionType =
   | "reply"
-  | "api"
+  | "verify"
   | "submenu"
   | "back"
   | "url"
@@ -31,26 +31,31 @@ export type MenuActionType =
   | "switch_inline_current"
   | "command";
 
-export interface MenuApiHeader {
-  key: string;
-  value: string;
-}
-
-export interface MenuApiConfig {
-  method: "GET" | "POST" | "PUT" | "DELETE";
-  url: string;
-  headers: MenuApiHeader[];
-  body_template: string;
-  success_status: number;
-  timeout_seconds: number;
-  response_template: string;
+/**
+ * 外部验证 API 按钮配置（v2.1.12）：与「验证方式」库 / 群组外部 API 验证同一机制 ——
+ * 绑定验证方式库中的验证方法（code_api：验证 API 地址 / Bearer apikey / 传参 /
+ * 响应解析 / 超时均在验证方式中统一配置，此处直接复用），点击按钮后要求在输入框
+ * 回复验证码并真实核验；提示/成功/失败文案可自定义（留空用默认文案）。
+ */
+export interface MenuVerifyConfig {
+  /** 绑定的验证方式 id（verification_methods.id，type=code_api） */
+  method_id: string;
+  /** 输入提示文案（v2.1.14：点击按钮后先发送的提示；留空用默认「✍🏻 请在下方的输入框进行输入:」） */
+  input_hint_text?: string;
+  /** 提示文案（force-reply 消息；留空用默认） */
+  prompt_text?: string;
+  /** 成功文案（留空用默认） */
+  success_text?: string;
+  /** 失败文案（留空用默认） */
+  fail_text?: string;
 }
 
 export interface MenuButtonAction {
   type: MenuActionType;
   text?: string;
   content?: MenuMessageContent;
-  api?: MenuApiConfig;
+  /** verify 类型专用：绑定的验证方法与自定义文案 */
+  verify?: MenuVerifyConfig;
   url?: string;
   switch_query?: string;
   /** command 类型专用：点击后真实执行的指令名（不含 /；内置或自定义指令） */
@@ -91,7 +96,7 @@ export function emptyMenuConfig(): BotMenuConfig {
 const CONTENT_TYPES: MenuContentType[] = ["text", "photo", "video", "media_group"];
 const ACTION_TYPES: MenuActionType[] = [
   "reply",
-  "api",
+  "verify",
   "submenu",
   "back",
   "url",
@@ -143,26 +148,18 @@ function parseContent(raw: unknown): MenuMessageContent {
   return content;
 }
 
-function parseApi(raw: unknown): MenuApiConfig | undefined {
+function parseVerify(raw: unknown): MenuVerifyConfig | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
-  const api = raw as Partial<MenuApiConfig>;
+  const verify = raw as Partial<MenuVerifyConfig>;
+  const methodId = typeof verify.method_id === "string" ? verify.method_id.trim() : "";
+  if (!methodId) return undefined;
+  const text = (value: unknown): string => (typeof value === "string" ? value : "");
   return {
-    method: (["GET", "POST", "PUT", "DELETE"] as const).includes(api.method as MenuApiConfig["method"])
-      ? (api.method as MenuApiConfig["method"])
-      : "GET",
-    url: typeof api.url === "string" ? api.url : "",
-    headers: Array.isArray(api.headers)
-      ? api.headers
-          .filter(
-            (h): h is MenuApiHeader =>
-              typeof h === "object" && h !== null && typeof (h as MenuApiHeader).key === "string",
-          )
-          .map((h) => ({ key: String(h.key), value: String(h.value ?? "") }))
-      : [],
-    body_template: typeof api.body_template === "string" ? api.body_template : "",
-    success_status: typeof api.success_status === "number" && api.success_status > 0 ? api.success_status : 200,
-    timeout_seconds: typeof api.timeout_seconds === "number" && api.timeout_seconds > 0 ? api.timeout_seconds : 10,
-    response_template: typeof api.response_template === "string" ? api.response_template : "",
+    method_id: methodId,
+    input_hint_text: text(verify.input_hint_text),
+    prompt_text: text(verify.prompt_text),
+    success_text: text(verify.success_text),
+    fail_text: text(verify.fail_text),
   };
 }
 
@@ -176,8 +173,8 @@ function parseAction(raw: unknown): MenuButtonAction {
   if (typeof source.url === "string") action.url = source.url;
   if (typeof source.switch_query === "string") action.switch_query = source.switch_query;
   if (typeof source.target === "string") action.target = source.target;
-  const api = parseApi(source.api);
-  if (api) action.api = api;
+  const verify = parseVerify(source.verify);
+  if (verify) action.verify = verify;
   const content = parseContent(source.content);
   if (source.type === "reply" && (content.type !== "text" || content.text)) {
     action.content = content;
@@ -330,80 +327,6 @@ export function renderMenuTemplate(template: string, vars: Record<string, unknow
       return String(value);
     }
   });
-}
-
-export interface MenuApiResult {
-  ok: boolean;
-  text: string;
-  status: number;
-}
-
-export async function executeMenuApi(
-  api: MenuApiConfig,
-  vars: MenuTemplateVars,
-): Promise<MenuApiResult> {
-  if (!api.url.trim()) {
-    return { ok: false, text: "接口地址未配置", status: 0 };
-  }
-  const headers: Record<string, string> = {};
-  for (const header of api.headers ?? []) {
-    const key = header.key.trim();
-    if (!key) continue;
-    headers[key] = renderMenuTemplate(header.value, vars);
-  }
-  const method = api.method ?? "GET";
-  let url = renderMenuTemplate(api.url, vars);
-  let body: string | undefined;
-  if (method === "GET") {
-    if (api.body_template?.trim()) {
-      const query = renderMenuTemplate(api.body_template, vars);
-      url = `${url}${url.includes("?") ? "&" : "?"}${query}`;
-    }
-  } else {
-    if (!headers["Content-Type"]) headers["Content-Type"] = "application/json";
-    body = api.body_template?.trim() ? renderMenuTemplate(api.body_template, vars) : JSON.stringify({});
-  }
-
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method,
-      headers,
-      body,
-      signal: AbortSignal.timeout((api.timeout_seconds ?? 10) * 1000),
-    });
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    return { ok: false, text: `接口请求失败：${detail}`, status: 0 };
-  }
-
-  const raw = await response.text();
-  let payload: unknown = null;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
-    payload = raw;
-  }
-
-  if (response.status !== (api.success_status ?? 200)) {
-    const apiError =
-      payload && typeof payload === "object" && "error" in payload
-        ? String((payload as Record<string, unknown>).error)
-        : "";
-    return {
-      ok: false,
-      text: apiError || `接口返回状态码 ${response.status}`,
-      status: response.status,
-    };
-  }
-
-  const template = api.response_template?.trim();
-  const text = template
-    ? renderMenuTemplate(template, { ...vars, res: payload })
-    : typeof payload === "string"
-      ? payload
-      : JSON.stringify(payload, null, 2);
-  return { ok: true, text: text || "（接口返回空内容）", status: response.status };
 }
 
 export function varsFromContext(context: {

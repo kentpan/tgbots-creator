@@ -170,6 +170,8 @@ CREATE TABLE "bot_commands" (
       "intro" TEXT NOT NULL DEFAULT '',
       "enabled" BOOLEAN NOT NULL DEFAULT true,
       "sort_order" INTEGER NOT NULL DEFAULT 0,
+      "bot_id" INTEGER,
+      "group_id" INTEGER,
       "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );

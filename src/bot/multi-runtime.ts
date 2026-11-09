@@ -14,10 +14,9 @@ import {
   listEnabledBots,
   getBot,
   listBotCommandsByIds,
-  listBotCommands,
   type BotRow,
 } from "@/database/operations";
-import { installBotMenu, parseBotMenuConfig, createMenuCommandRegistry, type BotMenuConfig, type MenuCommandRegistry, type MenuCommandRunner } from "@/services/bot-menu";
+import { installBotMenu, parseBotMenuConfig, createMenuCommandRegistry, scopeCommandRunnerToGroup, type BotMenuConfig, type MenuCommandRegistry, type MenuCommandRunner } from "@/services/bot-menu";
 import { CommandGroup } from "@grammyjs/commands";
 import { codeQuestion } from "./verification-question";
 import { registerAiSupport, type AiSupportConfig } from "./handlers/ai-support";
@@ -30,6 +29,7 @@ import { registerInviteLinkTracking } from "./invite-link-tracking";
 import { handleJoinRequest, handleChatMemberUpdate } from "./handlers/chat-member";
 import { handleVerificationChoice } from "./handlers/group-verification";
 import { handleCodeInput } from "./handlers/code-input";
+import { menuVerifyQuestion } from "./handlers/menu-verify";
 import type { BotContext } from "./context";
 import { config } from "@/config/settings";
 import { POLLING_ALLOWED_UPDATES } from "@/lib/telegram/runtime-mode";
@@ -50,7 +50,7 @@ interface BotProfileConfig {
   privacyModeSetting?: "inherit" | "on" | "off";
   /** 传输模式单项配置：inherit=跟随全局 / polling=长轮询 / webhook=Webhook */
   transportMode?: "inherit" | "polling" | "webhook";
-  /** 机器人指令菜单：应用的指令库 id 列表；未配置时默认应用全部已启用指令 */
+  /** 机器人指令菜单：「⌨️ 指令菜单」弹窗勾选的指令库 id 列表（指令注册唯一来源；未勾选 = 不注册任何指令） */
   commandIds?: number[];
   /** 菜单按钮 setChatMenuButton（真实 API 配置） */
   menuButton?: { type: "default" | "commands" | "web_app"; text?: string; url?: string };
@@ -104,7 +104,8 @@ interface MenuBotInstance {
   startError: string | null;
   /**
    * 菜单「执行指令」按钮注册表（v2.1.10）：createMenuBot 创建并注入菜单插件，
-   * registerBotCapabilities 在能力注册阶段按指令库填充（内置 + 自定义指令）。
+   * registerBotCapabilities 在能力注册阶段按「⌨️ 指令菜单」弹窗勾选填充
+   * （bots.config.commandIds；未勾选 = 空，运行时不自行补注册）。
    */
   menuCommands: MenuCommandRegistry;
 }
@@ -314,9 +315,13 @@ async function createMenuBot(row: BotRow, menuConfig: BotMenuConfig, mode: Effec
   // v2.1.2 邀请链接台账：任何路径 createChatInviteLink 成功后统一落库（群组管理可查看/撤销）
   registerInviteLinkTracking(bot, row.token);
   // 官方 @grammyjs/menu 菜单插件（v1.1.1）：回调路由/子菜单导航/过期恢复全由插件处理
-  // v2.1.10：同实例创建「执行指令」按钮注册表（能力注册阶段按指令库填充）
+  // v2.1.10：同实例创建「执行指令」按钮注册表（能力注册阶段按指令菜单弹窗勾选填充）
   const menuCommands = createMenuCommandRegistry();
   const instanceMenu = installBotMenu(bot, menuConfig, menuCommands);
+  // v2.1.12 菜单「外部验证 API」按钮：验证码回复通道（force-reply StatelessQuestion）。
+  // 必须装在会话中间件之后（handler 读写 ctx.session.menuVerify）；与群组验证
+  // codeQuestion（tgcode）并列独立问题，按消息内嵌 id 精确路由互不串扰。
+  bot.use(menuVerifyQuestion.middleware());
   // 实例菜单注入（ctx.botMenu）：官方插件约束 Menu 实例只能发给安装它的 bot，
   // cmdStart/cmdMenu 优先用本实例菜单，避免误发主 bot 的全局 mainMenu 而抛
   // "Cannot send menu"（轮询/Webhook 下菜单 bot 私聊 /start 均命中）
@@ -342,7 +347,8 @@ async function createMenuBot(row: BotRow, menuConfig: BotMenuConfig, mode: Effec
 /**
  * 为机器人实例注册验证与指令能力（真实生效）：
  * - stateless-question 中间件：加群验证码的隐私模式兼容输入通道
- * - 内置指令：按指令库启用状态注册官方内置指令真实处理器（start/help/menu/… 共 23 条）
+ * - 内置/自定义指令：仅注册「⌨️ 指令菜单」弹窗勾选的指令库条目（bots.config.commandIds；
+ *   未勾选 = 不注册任何指令，运行时绝不按指令库启用状态自行补注册）
  * - 自定义指令：按隐私模式开关选择严格/宽松匹配策略（@grammyjs/commands）
  *
  * v1.1.1 性能修复：本函数只做中间件注册 + 库读取（毫秒级），不再同步等待
@@ -375,6 +381,9 @@ async function registerBotCapabilities(
       {
         menuConfig: menuConfig ?? parseBotMenuConfig(undefined),
         registry: menuCommands ?? createMenuCommandRegistry(),
+        // 「⌨️ 指令菜单」弹窗勾选（bots.config.commandIds）：TGAPI 实例据此注册指令，
+        // 弹窗保存后经 restartMenuBot 热更新生效；运行时绝不按指令库自行补注册
+        commandIds: Array.isArray(profile.commandIds) ? profile.commandIds : [],
       },
     );
   }
@@ -397,20 +406,18 @@ async function registerBotCapabilities(
   // 此前 multi-runtime 未注册该入口，菜单 bot 在宽松隐私模式/手动回复场景丢失验证码通道。
   bot.on("message:text", handleCodeInput);
 
-  // 指令菜单：选中的指令同步到 Telegram 用户菜单（setMyCommands）并注册响应
-  const selectedIds =
-    Array.isArray(profile.commandIds) && profile.commandIds.length > 0
-      ? profile.commandIds.map((id) => BigInt(id))
-      : null;
-  const library = selectedIds
-    ? await listBotCommandsByIds(selectedIds)
-    : (
-        await Promise.all([
-          listBotCommands({ type: "builtin", enabledOnly: true }),
-          listBotCommands({ type: "custom", enabledOnly: true }),
-        ])
-      ).flatMap((page) => page.rows);
-
+  // 指令菜单：「⌨️ 指令菜单」弹窗勾选的指令库条目（bots.config.commandIds）是唯一注册来源
+  // —— 未勾选/清空 = 该机器人不注册任何指令（运行时绝不按指令库启用状态自行补注册）；
+  // 弹窗保存后经 restartMenuBot 热更新，注册与 Telegram 指令菜单同步始终同源。
+  const selectedIds = Array.isArray(profile.commandIds)
+    ? profile.commandIds.map((id) => BigInt(id))
+    : [];
+  // 指令归属过滤（v2.1.13）：机器人私有指令（bot_commands.bot_id）仅本机器人可注册；
+  // 群组私有指令注册仍是机器人级，群组限制由 runner 校验（scopeCommandRunnerToGroup）
+  const library =
+    selectedIds.length > 0
+      ? await listBotCommandsByIds(selectedIds, botId !== undefined ? { botId } : undefined)
+      : [];
   // 内置指令：注册真实处理器（含 adminOnly/私聊限定包装；库中未实现的条目回退为介绍回复）
   // v2.1.10：同步填充菜单「执行指令」按钮注册表 —— 内置指令按钮点击与手输 /指令 同源
   registerBuiltinCommandHandlers(
@@ -430,9 +437,14 @@ async function registerBotCapabilities(
     for (const item of customItems) {
       const commandName = item.name;
       const intro = item.intro || item.description;
-      const runner: MenuCommandRunner = async (ctx) => {
-        await ctx.reply(`⌨️ /${commandName}\n\n${intro}`);
-      };
+      // v2.1.13 群组私有指令：非绑定群组内不执行（含菜单按钮点击同一运行器）
+      const runner: MenuCommandRunner = scopeCommandRunnerToGroup(
+        item.groupId,
+        commandName,
+        async (ctx) => {
+          await ctx.reply(`⌨️ /${commandName}\n\n${intro}`);
+        },
+      );
       // v2.1.10：同一运行器同步填充菜单「执行指令」按钮注册表 ——
       // 按钮点击与手输 /指令 完全同源真实执行
       menuCommands?.runners.set(commandName, runner);
@@ -808,18 +820,13 @@ export async function syncBotCommandsToTelegram(botId: bigint): Promise<{
     return { ok: false, count: 0, error: "机器人不存在" };
   }
   const profile = parseBotProfile(row.config);
-  const selectedIds =
-    Array.isArray(profile.commandIds) && profile.commandIds.length > 0
-      ? profile.commandIds.map((id) => BigInt(id))
-      : null;
-  const library = selectedIds
-    ? await listBotCommandsByIds(selectedIds)
-    : (
-        await Promise.all([
-          listBotCommands({ type: "builtin", enabledOnly: true }),
-          listBotCommands({ type: "custom", enabledOnly: true }),
-        ])
-      ).flatMap((page) => page.rows);
+  // 唯一来源：「⌨️ 指令菜单」弹窗勾选（bots.config.commandIds）；未勾选 = 清空 Telegram 指令菜单
+  // 指令归属过滤（v2.1.13）：机器人私有指令不出现在其他机器人的 Telegram 指令菜单
+  const selectedIds = Array.isArray(profile.commandIds)
+    ? profile.commandIds.map((id) => BigInt(id))
+    : [];
+  const library =
+    selectedIds.length > 0 ? await listBotCommandsByIds(selectedIds, { botId }) : [];
   const menuCommands = library.map((item) => ({
     command: item.name,
     description: item.description.slice(0, 256),

@@ -14,7 +14,6 @@ import {
   UserRoundPlus,
 } from "lucide-react";
 import {
-  executeMenuApi,
   renderMenuTemplate,
   type BotMenuConfig,
   type MenuButton,
@@ -405,32 +404,24 @@ export function TgDesktopChat({
       appendStream(stream, { from: "bot", sender: botName, content });
       return;
     }
-    if (action.type === "api" && action.api) {
-      const loadingId = nextId.current;
+    if (action.type === "verify") {
+      // v2.1.12 仿真预览：外部验证 API 按钮 —— 真实 Telegram 中点击后 force-reply
+      // 要求在输入框回复验证码，按绑定的验证方法真实核验（仿真屏无法输入真实验证码）
+      const methodId = action.verify?.method_id?.trim() ?? "";
+      const prompt = action.verify?.prompt_text?.trim() || "🔐 请回复本消息并输入验证码完成验证";
       appendStream(stream, {
         from: "bot",
         sender: botName,
-        content: { type: "text", text: "", mediaUrl: "", items: [] },
-        loading: true,
+        content: {
+          type: "text",
+          text: methodId
+            ? `${prompt}\n\n（外部验证 API 按钮：真实 Telegram 中点击后将在输入框要求回复验证码，按绑定的验证方法真实核验）`
+            : "⚠️ 该按钮还没有绑定验证方法：请在按钮配置中选择绑定的验证方法",
+          mediaUrl: "",
+          items: [],
+        },
       });
-      try {
-        const result = await executeMenuApi(action.api, vars);
-        patchStream(stream, loadingId, {
-          loading: false,
-          content: {
-            type: "text",
-            text: result.ok ? result.text : `⚠️ ${result.text}`,
-            mediaUrl: "",
-            items: [],
-          },
-        });
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        patchStream(stream, loadingId, {
-          loading: false,
-          content: { type: "text", text: `⚠️ ${detail}`, mediaUrl: "", items: [] },
-        });
-      }
+      return;
     }
   };
 

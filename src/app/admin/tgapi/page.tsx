@@ -112,7 +112,7 @@ function TgApiBotFormDialog({
       trigger={trigger}
       triggerClassName={triggerClassName}
       title={bot ? `编辑 TGAPI 申请机器人 · ${bot.name}` : "新增 TGAPI 申请机器人"}
-      description="grammY 复刻 SpEcHiDe/MyTelegramOrgRoBot：私聊发送 APP 名称/描述 → 手机号 → Telegram 登录码 → 抓取/创建 my.telegram.org APP，返回 API ID / API HASH。中英文双语（按用户语言自动识别，/language 切换）；首次对话需解锁，解锁一次永久有效。"
+      description="私聊发送 APP 名称/描述 → 手机号 → Telegram 登录码 → 抓取/创建 my.telegram.org APP，返回 API ID / API HASH。中英文双语（按用户语言自动识别，/language 切换）；首次对话需解锁，解锁一次永久有效。"
       action={saveTgApiBotAction}
       submitLabel="保存机器人"
       contentClassName="sm:max-w-2xl"
@@ -378,8 +378,6 @@ export default async function TgApiPage({
         <div className="min-w-0 flex-1">
           <h1 className="text-2xl font-bold">TGAPI申请</h1>
           <p className="text-sm text-muted-foreground">
-            grammY 原样复刻 <span className="font-mono">SpEcHiDe/MyTelegramOrgRoBot</span>
-            （源码已克隆至 <span className="font-mono">upload/MyTelegramOrgRoBot</span>）：
             用户私聊发送 APP 名称/描述 → 手机号 → Telegram 发送登录码 → 机器人登录
             my.telegram.org 抓取/自动创建 APP → 返回 API ID 与 API HASH。
             中英文双语（按用户语言自动识别，/language 切换）。首次对话需要解锁（外部 API

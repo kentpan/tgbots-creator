@@ -3,10 +3,8 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Mic, Paperclip, Pin, Search, SendHorizontal, Smile, MoreVertical } from "lucide-react";
 import {
-  executeMenuApi,
   renderMenuTemplate,
   type BotMenuConfig,
-  type MenuApiConfig,
   type MenuButton,
   type MenuMediaItem,
   type MenuMessageContent,
@@ -199,7 +197,6 @@ export function TgSimulator({
   groupTitle = "测试群组",
   nodeId,
   onNodeNavigate,
-  onApiCall,
   systemNote,
   templateVars,
   promptMessage,
@@ -218,7 +215,6 @@ export function TgSimulator({
   groupTitle?: string;
   nodeId: string;
   onNodeNavigate: (nodeId: string) => void;
-  onApiCall?: (api: MenuApiConfig) => Promise<{ ok: boolean; text: string }>;
   /** 顶部提示条文案（默认：菜单预览提示） */
   systemNote?: string;
   /** 覆盖菜单模板变量（如真实的 chat_id / user_id），供机器人测试页传入仿真群组上下文 */
@@ -373,49 +369,24 @@ export function TgSimulator({
       });
       return;
     }
-    if (action.type === "api" && action.api) {
-      // appendStream 立即分配 id：loading 消息将拿到当前 nextId
-      const loadingId = nextId.current;
+    if (action.type === "verify") {
+      // v2.1.12 仿真预览：外部验证 API 按钮 —— 真实 Telegram 中点击后 force-reply
+      // 要求在输入框回复验证码，按绑定的验证方法真实核验（仿真屏无法输入真实验证码）
+      const methodId = action.verify?.method_id?.trim() ?? "";
+      const prompt = action.verify?.prompt_text?.trim() || "🔐 请回复本消息并输入验证码完成验证";
       appendMessage({
         from: "bot",
         sender: botName,
-        content: { type: "text", text: "", mediaUrl: "", items: [] },
-        loading: true,
+        content: {
+          type: "text",
+          text: methodId
+            ? `${prompt}\n\n（外部验证 API 按钮：真实 Telegram 中点击后将在输入框要求回复验证码，按绑定的验证方法真实核验）`
+            : "⚠️ 该按钮还没有绑定验证方法：请在按钮配置中选择绑定的验证方法",
+          mediaUrl: "",
+          items: [],
+        },
       });
-      try {
-        const result = onApiCall
-          ? await onApiCall(action.api)
-          : await executeMenuApi(action.api, vars);
-        setMessages((prev) =>
-          prev.map((message) =>
-            message.id === loadingId
-              ? {
-                  ...message,
-                  loading: false,
-                  content: {
-                    type: "text",
-                    text: result.ok ? result.text : `⚠️ ${result.text}`,
-                    mediaUrl: "",
-                    items: [],
-                  },
-                }
-              : message,
-          ),
-        );
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        setMessages((prev) =>
-          prev.map((message) =>
-            message.id === loadingId
-              ? {
-                  ...message,
-                  loading: false,
-                  content: { type: "text", text: `⚠️ ${detail}`, mediaUrl: "", items: [] },
-                }
-              : message,
-          ),
-        );
-      }
+      return;
     }
   };
 

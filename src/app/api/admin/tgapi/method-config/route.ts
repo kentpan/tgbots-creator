@@ -129,7 +129,14 @@ export async function PUT(request: Request): Promise<NextResponse> {
     );
   }
 
-  let payload: { method_id?: string | number; method_name?: string; config?: MethodApiConfigInput; enabled?: boolean };
+  let payload: {
+    method_id?: string | number;
+    method_name?: string;
+    config?: MethodApiConfigInput;
+    enabled?: boolean;
+    /** 调用来源（v2.1.13）：menu = 菜单设计器「外部验证 API」按钮，日志文案区分来源 */
+    source?: string;
+  };
   try {
     payload = (await request.json()) as typeof payload;
   } catch {
@@ -174,8 +181,13 @@ export async function PUT(request: Request): Promise<NextResponse> {
   }
 
   const requestHeaders = await headers();
+  // v2.1.13：按调用来源区分日志文案（menu = 菜单设计器「外部验证 API」按钮配置）
+  const source = String(payload.source ?? "").trim();
+  const sourceLabel = source === "menu" ? "菜单验证" : "TGAPI解锁";
   await logOperation(admin, {
-    action: created ? "TGAPI解锁创建外部验证API配置" : "TGAPI解锁更新外部验证API配置",
+    action: created
+      ? `${sourceLabel}创建外部验证API配置`
+      : `${sourceLabel}更新外部验证API配置`,
     target: `method=#${String(method.id)} ${method.name}`,
     detail: `URL=${config.url}`,
     headers: requestHeaders,

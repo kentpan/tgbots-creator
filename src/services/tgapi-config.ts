@@ -123,6 +123,8 @@ export const TGAPI_TEXTS_EN: TgApiBotTexts = {
  */
 export interface TgApiSystemTexts {
   networkRetry: string;
+  /** 输入提示（v2.1.14：需要用户在输入框输入的交互，force-reply 提问前先发送） */
+  inputHint: string;
   /** 网络故障后追加的说明（外部 API 核验网络错误不计入任何代价） */
   unlockNetworkRetry: string;
   switchedToStars: string;
@@ -144,6 +146,7 @@ export interface TgApiSystemTexts {
 export const TGAPI_SYSTEM_TEXTS: Record<TgApiLang, TgApiSystemTexts> = {
   zh: {
     networkRetry: "🌐 网络波动，正在重试...",
+    inputHint: "✍🏻 请在下方的输入框进行输入:",
     unlockNetworkRetry: "本次未消耗任何额度，请重新发送解锁验证码。",
     switchedToStars: "当前解锁方式已切换为星星支付，请发送 /start 获取支付发票。",
     methodMissing: "机器人尚未配置解锁验证方式，请联系管理员。",
@@ -167,6 +170,7 @@ export const TGAPI_SYSTEM_TEXTS: Record<TgApiLang, TgApiSystemTexts> = {
   },
   en: {
     networkRetry: "🌐 Network fluctuation, retrying...",
+    inputHint: "✍🏻 Please type in the input field below:",
     unlockNetworkRetry:
       "Nothing was consumed this time. Please send your unlock code again.",
     switchedToStars:

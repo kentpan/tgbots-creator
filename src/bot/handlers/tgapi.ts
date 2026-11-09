@@ -7,9 +7,8 @@ import { htmlEscape } from "@/utils/html";
 import {
   getTgApiUnlock,
   getVerificationMethod,
-  listBotCommands,
+  listBotCommandsByIds,
   saveTgApiUnlock,
-  type BotCommandRow,
 } from "@/database/operations";
 import {
   parseCodeApiConfig,
@@ -18,6 +17,7 @@ import {
 import {
   countMenuStats,
   renderMenuMarkup,
+  scopeCommandRunnerToGroup,
   type MenuCommandRegistry,
   type MenuCommandRunner,
 } from "@/services/bot-menu";
@@ -58,8 +58,8 @@ import { registerBuiltinCommandHandlers } from "./builtin-commands";
  * /start（未解锁）──▶ 欢迎文案 + 「🔐 授权认证」内嵌按钮
  * 点按钮 ──▶ force-reply 要求在输入框输入验证码 ──▶ 外部 API 核验
  * 通过   ──▶ 验证成功消息 + 管理端「消息内嵌按钮」配置渲染的菜单键盘
- * （每个按钮对应一个 /xxx 指令：内置 start/language + 指令管理自定义指令，
- * 点击等同手输指令；需要输入的在输入框输入，可选择的用内嵌按钮列出）。
+ * （每个按钮对应一个 /xxx 指令，点击等同手输指令；需要输入的在输入框输入，
+ * 可选择的用内嵌按钮列出；指令只在「⌨️ 指令菜单」弹窗勾选后才注册响应）。
  * 群组 /start@本机器人 同样响应欢迎消息（群内授权引导私聊完成）。
  *
  * v2.1.10 文案与默认值全面中性化：不再携带原项目作者 SpEcHlDe/UseTGxBot
@@ -150,17 +150,21 @@ function briefError(error: unknown): string {
  * - 点「授权认证」→ force-reply 要求在输入框输入验证码（需要输入的在输入框输入）；
  * - 核验通过 → 验证成功消息 + 管理端「消息内嵌按钮」配置真实渲染的菜单键盘
  *   （图4：每个按钮对应一个 /xxx 指令，可以选择的用内嵌按钮列出供选择）；
- * - 「执行指令」按钮点击等同用户手输 /指令：与自定义指令库同源真实执行；
+ * - 「执行指令」按钮点击等同用户手输 /指令：与「⌨️ 指令菜单」弹窗勾选同源真实执行
+ *   （v2.1.11：指令注册唯一来源 = 指令菜单弹窗勾选，bots.config.commandIds；
+ *   运行时绝不按指令库启用状态自行补注册，未勾选的指令一律不响应）；
  * - /start（群组）：同样响应欢迎消息（v2.1.10 修复群里 /start@机器人无响应），
  *   群内点「授权认证」引导私聊完成（验证码绝不在群里输入，避免泄露）。
  *
- * 返回指令同步任务（/start + /language + 自定义指令同步到 Telegram 指令菜单）。
+ * 返回指令同步任务（/start + /language + 弹窗勾选指令同步到 Telegram 指令菜单）。
  */
 export interface TgApiHandlerOptions {
   /** 该机器人「消息内嵌按钮」配置（bots.menu_config）：解锁成功后随消息真实渲染 */
   menuConfig: BotMenuConfig;
   /** 菜单「执行指令」按钮的指令运行器注册表（multi-runtime 按实例创建） */
   registry: MenuCommandRegistry;
+  /** 「⌨️ 指令菜单」弹窗勾选的指令库条目 id（bots.config.commandIds）：指令注册唯一来源 */
+  commandIds: number[];
 }
 
 export async function registerTgApiHandlers(
@@ -600,6 +604,8 @@ export async function registerTgApiHandlers(
           // 此处兜底任意文本直接进入核验（与加群验证私聊输码同款宽松通道）
           await handleUnlockAttempt(ctx, lang, messageText.trim());
         } else {
+          // v2.1.14：需要用户在输入框输入的交互，先发输入提示再发 force-reply 提问
+          await ctx.reply(sys.inputHint);
           await unlockQuestion.replyWithHTML(ctx, htmlEscape(texts.unlockPrompt));
         }
         return;
@@ -693,7 +699,9 @@ export async function registerTgApiHandlers(
     await ctx.answerCallbackQuery();
     if (chatType === "private") {
       if (cfg.unlockMode === "captcha") {
-        // 点击后发送消息要求在输入框输入验证码（StatelessQuestion force-reply）
+        // 点击后发送消息要求在输入框输入验证码（StatelessQuestion force-reply）；
+        // v2.1.14：先发输入提示再发提问，引导用户去输入框输入
+        await ctx.reply(sys.inputHint);
         await unlockQuestion.replyWithHTML(ctx, htmlEscape(texts.unlockPrompt));
       } else {
         await sendStarsInvoice(ctx, lang);
@@ -725,21 +733,46 @@ export async function registerTgApiHandlers(
     );
   });
 
-  // 自定义指令（指令管理 → 自定义指令，仅启用项）：
+  // ---------------------------------------------------------------------------
+  // 指令注册（唯一来源：机器人管理页「⌨️ 指令菜单」弹窗勾选，bots.config.commandIds）
+  // ---------------------------------------------------------------------------
+  // 管理员在「指令菜单」弹窗勾选并保存后，实例经 restartMenuBot 热更新按勾选注册；
+  // 运行时绝不按指令库启用状态自行补注册 —— 未勾选的指令一律不响应。TGAPI 自有
+  // 指令 /start /language（流程重入/语言切换）不依赖勾选，始终可用。
+  const selectedIds = options.commandIds
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id) && id > 0)
+    .map((id) => BigInt(id));
+  // 指令归属过滤（v2.1.13）：机器人私有指令仅本 TGAPI 机器人可注册；
+  // 群组私有指令注册是机器人级，群组限制由 runner 校验（scopeCommandRunnerToGroup）
+  const selectedItems =
+    selectedIds.length > 0
+      ? await listBotCommandsByIds(selectedIds, { botId })
+      : [];
+
+  // 内置指令：仅注册勾选项（排除 /start —— TGAPI 流程自有重入语义，避免双响应）。
+  // registerBuiltinCommandHandlers 同步填充菜单「执行指令」按钮注册表（真实处理器，
+  // adminOnly 闭包自校验防越权）并注册 bot.command（手输 /指令 同源）。
+  const selectedBuiltin = selectedItems
+    .filter((item) => item.type === "builtin" && item.name !== "start")
+    .map((item) => ({ name: item.name, intro: item.intro, description: item.description }));
+  registerBuiltinCommandHandlers(bot, selectedBuiltin, registry);
+
+  // 自定义指令：仅注册勾选启用项 ——
   // 1) /xxx 手输响应（CommandGroup，宽松匹配 + 定向指令支持，群内 /xxx@本机器人 同样可用）；
   // 2) 填充菜单「执行指令」按钮注册表 —— 按钮点击与手输 /指令 完全同源
-  const customItems: BotCommandRow[] = [];
-  for (let page = 1; ; page += 1) {
-    const result = await listBotCommands({ type: "custom", enabledOnly: true, page, pageSize: 100 });
-    customItems.push(...result.rows);
-    if (page >= result.totalPages) break;
-  }
+  const customItems = selectedItems.filter((item) => item.type === "custom");
   for (const item of customItems) {
     const intro = item.intro || item.description;
     const commandName = item.name;
-    const runner: MenuCommandRunner = async (ctx) => {
-      await ctx.reply(`⌨️ /${commandName}\n\n${intro}`);
-    };
+    // v2.1.13 群组私有指令：非绑定群组内不执行（含菜单按钮点击同一运行器）
+    const runner: MenuCommandRunner = scopeCommandRunnerToGroup(
+      item.groupId,
+      commandName,
+      async (ctx) => {
+        await ctx.reply(`⌨️ /${commandName}\n\n${intro}`);
+      },
+    );
     registry.runners.set(commandName, runner);
   }
   if (customItems.length > 0) {
@@ -761,30 +794,7 @@ export async function registerTgApiHandlers(
     bot.use(group);
   }
   console.log(
-    `TGAPI bot #${botId} custom commands registered: [${customItems.map((item) => item.name).join(", ") || "none"}]`,
-  );
-
-  // v2.1.11：指令库「内置指令」启用项同样注册到 TGAPI 机器人（排除 /start —— TGAPI
-  // 流程自有 /start 重入语义，避免双响应）。图4 按钮组的「帮助」等内置指令按钮
-  // 由此与手输 /指令 同源真实执行；运行器闭包自校验 adminOnly，菜单按钮无法越权。
-  const builtinItems: BotCommandRow[] = [];
-  for (let page = 1; ; page += 1) {
-    const result = await listBotCommands({ type: "builtin", enabledOnly: true, page, pageSize: 100 });
-    builtinItems.push(...result.rows);
-    if (page >= result.totalPages) break;
-  }
-  const tgapiBuiltinItems = builtinItems.filter((item) => item.name !== "start");
-  registerBuiltinCommandHandlers(
-    bot,
-    tgapiBuiltinItems.map((item) => ({
-      name: item.name,
-      intro: item.intro,
-      description: item.description,
-    })),
-    registry,
-  );
-  console.log(
-    `TGAPI bot #${botId} builtin commands registered: [${tgapiBuiltinItems.map((item) => item.name).join(", ") || "none"}]`,
+    `TGAPI bot #${botId} commands registered (menu selection only): builtin=[${selectedBuiltin.map((item) => item.name).join(", ") || "none"}] custom=[${customItems.map((item) => item.name).join(", ") || "none"}]`,
   );
 
   // 菜单「执行指令」按钮注册表：TGAPI 机器人自有指令（/start /language）同源可点。
@@ -853,13 +863,14 @@ export async function registerTgApiHandlers(
     );
   });
 
-  // 指令同步：/start + /language + 内置指令启用项（不含 /start）+ 全部启用的自定义指令
-  //（真实写入 Telegram 指令菜单；Telegram 上限 100 条，超出部分按顺序截断）
-  const fixedCommandCount = 2 + tgapiBuiltinItems.length;
+  // 指令同步：/start + /language（TGAPI 自有）+「⌨️ 指令菜单」弹窗勾选的内置
+  //（不含 /start）与自定义指令（真实写入 Telegram 指令菜单；Telegram 上限 100 条，
+  // 超出部分按顺序截断）—— 与注册同源，未勾选的指令不进 Telegram 指令菜单。
+  const fixedCommandCount = 2 + selectedBuiltin.length;
   const myCommands = [
     { command: "start", description: "开始 TGAPI 申请 / Start" },
     { command: "language", description: "切换中文/English" },
-    ...tgapiBuiltinItems.map((item) => ({
+    ...selectedBuiltin.map((item) => ({
       command: item.name,
       description: (item.description || item.intro || item.name).slice(0, 256),
     })),
