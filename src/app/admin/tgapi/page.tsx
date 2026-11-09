@@ -15,6 +15,7 @@ import {
 import { FormDialog } from "@/components/admin/form-dialog";
 import { inputClass, labelClass, selectClass } from "@/components/admin/form-styles";
 import { TgApiUnlockMethodBinding } from "@/components/admin/tgapi-unlock-api-config";
+import { TgApiApplyWizard } from "@/components/admin/tgapi-apply-wizard";
 import {
   deleteTgApiBotAction,
   revokeTgApiUnlockAction,
@@ -361,11 +362,14 @@ export default async function TgApiPage({
             验证码或 Telegram 星星支付，可切换），解锁一次永久有效，重复申请无需再次解锁。
           </p>
         </div>
-        <TgApiBotFormDialog
-          methods={methodOptions}
-          trigger="+ 新增 TGAPI 申请机器人"
-          triggerClassName="inline-flex h-10 shrink-0 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
-        />
+        <div className="flex shrink-0 items-center gap-2">
+          <TgApiApplyWizard />
+          <TgApiBotFormDialog
+            methods={methodOptions}
+            trigger="+ 新增 TGAPI 申请机器人"
+            triggerClassName="inline-flex h-10 shrink-0 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+          />
+        </div>
       </div>
 
       {params.saved && NOTICES[params.saved] ? (

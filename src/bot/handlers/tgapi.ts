@@ -23,6 +23,7 @@ import {
 } from "@/services/tgapi-config";
 import {
   createNewTgApp,
+  extractTgWebLoginCode,
   loginStepGetStelCookie,
   requestTgCodeGetRandomHash,
   scrapeTgExistingApp,
@@ -68,24 +69,6 @@ const TGAPI_UNLOCK_QUESTION_ID = "tgapi-unlock";
 /** 申请人自定义 APP 名称/描述的长度上限（my.telegram.org 表单约束） */
 const APP_TITLE_MAX_LENGTH = 32;
 const APP_DESCRIPTION_MAX_LENGTH = 200;
-
-/**
- * extract_code_imn_ges 原样移植：从用户消息提取 Telegram Web 登录码。
- * - 消息含 "web login code"（不区分大小写）→ 取第二行（原作者的试错结论）；
- * - 其他多行消息 → 无法识别；
- * - 单行消息 → 整行即验证码。
- */
-function extractTgWebLoginCode(messageText: string): string | null {
-  const lower = messageText.toLowerCase();
-  if (lower.includes("web login code")) {
-    const lines = messageText.split("\n");
-    return lines.length >= 2 ? (lines[1] ?? "").trim() : null;
-  }
-  if (messageText.includes("\n")) {
-    return null;
-  }
-  return messageText.trim();
-}
 
 /**
  * get_phno_imn_ges 原样移植：提取国际格式手机号。
@@ -221,14 +204,15 @@ export function registerTgApiHandlers(
       },
     );
     if (!result.ok) {
-      // 与验证码输入通道同口径：网络故障不计入用户侧任何代价，明确说明
+      // 与验证码输入通道同口径：网络故障不计入用户侧任何代价，明确说明；
+      // v2.1.8：网络故障附带具体原因（如「连接被拒绝（验证接口服务未启动）」），便于管理员排查
       await ctx.reply(
         result.networkError
-          ? `${result.message}\n${sys.unlockNetworkRetry}`
+          ? `${result.message}${result.detail ? `\n原因：${result.detail}` : ""}\n${sys.unlockNetworkRetry}`
           : result.message,
       );
       console.log(
-        `TGAPI bot #${botId} unlock rejected: user ${from.id} networkError=${result.networkError} reason=${result.message}`,
+        `TGAPI bot #${botId} unlock rejected: user ${from.id} networkError=${result.networkError} reason=${result.message}${result.detail ? ` detail=${result.detail}` : ""}`,
       );
       return;
     }
@@ -392,6 +376,10 @@ export function registerTgApiHandlers(
     };
 
     const providedCode = extractTgWebLoginCode(messageText);
+    // v2.1.8：记录消息来源（是否转发）与提取结果，验证「直接转发服务通知消息可正确提取验证码」
+    console.log(
+      `TGAPI bot #${botId} login code message received: user ${from.id} forwarded=${ctx.message?.forward_origin ? "yes" : "no"} extracted=${providedCode ? "yes" : "no"}`,
+    );
     if (!providedCode) {
       // 原实现：IN_VALID_CODE_PVDED 并回退 INPUT_PHONE_NUMBER（要求重新输手机号）
       await editProgress(texts.invalidCode, true);

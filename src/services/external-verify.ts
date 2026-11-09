@@ -31,6 +31,11 @@ export interface ExternalVerifyResult {
    * 与「卡密核验未通过」有本质区别：调用方绝不应计入用户尝试次数。
    */
   networkError: boolean;
+  /**
+   * v2.1.8：网络故障的具体原因（供调用方在提示中展示，便于管理员排查配置）。
+   * 仅 networkError=true 时可能有值；不含验证接口 URL（避免泄露内部拓扑）。
+   */
+  detail?: string;
 }
 
 export interface ExternalVerifyHooks {
@@ -41,11 +46,59 @@ export interface ExternalVerifyHooks {
   onNetworkRetry?: () => void | Promise<void>;
 }
 
-/** 验证接口网络错误的服务端自动重试次数（用户需求：最多 3 次，3 次都失败才返回网络异常） */
-export const VERIFY_NETWORK_RETRY_ATTEMPTS = 3;
+/**
+ * 验证接口网络错误的服务端自动重试次数（连接级失败才重试；含首次共 5 次尝试，
+ * 5 次都失败才返回网络异常）。
+ *
+ * v2.1.8 由 3 次提高到 5 次 + 递增间隔（1s/2s/4s/8s，总跨度 ~15s）：实测部署环境
+ * （沙盒/受限出站网络）到验证接口的路由故障成片出现——瞬时连接失败（~0.6s 内
+ * ETIMEDOUT/ECONNRESET）与正常请求交替，坏窗口可持续数十秒；原 3 次 × 固定 1s
+ * 间隔（总跨度 ~2s）几乎必然整批落在同一坏窗口内全部失败，用户侧表现为
+ * 「一直网络波动」。递增跨窗重试后，单次验证能跨越多个坏窗口，成功率大幅提升。
+ */
+export const VERIFY_NETWORK_RETRY_ATTEMPTS = 5;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * v2.1.8：把 fetch 抛出的底层错误翻译为可读的失败原因（供管理员排查验证接口配置）。
+ * Node fetch 的 message 是笼统的 "fetch failed"，具体原因在 error.cause.code 里；
+ * 其他运行时（bun / Cloudflare workerd）的 cause.code 缺失但 message 可读，一并兼容。
+ */
+function describeNetworkError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause as { code?: string; message?: string } | undefined;
+  const code = cause?.code ?? "";
+  const causeMessage = cause?.message ?? error.message ?? "";
+  if (error.name === "TimeoutError" || code === "ABORT_ERR") {
+    return "请求超时（验证接口无响应）";
+  }
+  if (
+    code === "ECONNREFUSED" ||
+    /unable to connect|connection refused|connect ECONNREFUSED/i.test(causeMessage)
+  ) {
+    return "连接被拒绝（验证接口服务未启动或端口未监听）";
+  }
+  if (code === "ETIMEDOUT") {
+    // TCP 连接建立阶段超时（SYN 无应答 / 出站防火墙拦截），与「响应超时」（应用层
+    // AbortSignal.timeout）不同：请求根本没有发出去，属于路由不可达类故障
+    return "连接超时（到验证接口的网络路由不可达或被拦截）";
+  }
+  if (code === "ENOTFOUND" || /getaddrinfo ENOTFOUND|dns lookup/i.test(causeMessage)) {
+    return "域名解析失败（验证接口地址不可达）";
+  }
+  if (code === "ECONNRESET" || /connection (was )?reset/i.test(causeMessage)) {
+    return "连接被重置";
+  }
+  if (code === "EHOSTUNREACH" || code === "ENETUNREACH" || /host unreachable|network unreachable/i.test(causeMessage)) {
+    return "网络不可达";
+  }
+  if (code.startsWith("ERR_TLS") || code.startsWith("UNABLE_TO_VERIFY") || code === "CERT_HAS_EXPIRED" || /certificate|TLS/i.test(causeMessage)) {
+    return "TLS/证书校验失败";
+  }
+  return causeMessage || error.message;
 }
 
 export function parseCodeApiConfig(raw: string): CodeApiConfig | null {
@@ -153,10 +206,13 @@ export async function verifyCodeExternally(
 
   let response: Response | null = null;
   let lastError = "";
+  let lastNetworkError: unknown = null;
   let timedOut = false;
-  // 网络错误服务端自动重试（最多 VERIFY_NETWORK_RETRY_ATTEMPTS 次，3 次都失败才返回网络异常）：
-  // 仅对「请求确定未到达服务端」的连接级错误（fetch failed / DNS 解析失败 / 连接被拒）重试，
-  // 这类失败重试不会造成重复核销；每次重试间隔 1 秒给网络恢复留出窗口。
+  // 网络错误服务端自动重试（含首次共 VERIFY_NETWORK_RETRY_ATTEMPTS 次尝试，
+  // 全部失败才返回网络异常）：仅对「请求确定未到达服务端」的连接级错误
+  // （fetch failed / DNS 解析失败 / 连接被拒 / 连接超时）重试，这类失败重试
+  // 不会造成重复核销；重试间隔递增（1s/2s/4s/8s）跨越路由坏窗口（v2.1.8，
+  // 实测坏窗口可持续数十秒，固定 1s 间隔整批必败）。
   // 超时（TimeoutError）绝不重试：验证接口具有核销语义，请求可能已被服务端处理并核销，
   // 重试会导致重复核销（表现为「卡密已被使用」）——网络错误不计入用户尝试次数后，
   // 超时时让用户重新发送验证码即可，用户无任何损失。
@@ -165,7 +221,8 @@ export async function verifyCodeExternally(
       if (attempt === 2) {
         await hooks?.onNetworkRetry?.();
       }
-      await sleep(1000);
+      // 递增退避：1s / 2s / 4s / 8s（attempt 2..5），总跨度 ~15s
+      await sleep(1000 * Math.pow(2, attempt - 2));
     }
     try {
       // 传输通道说明（2026-11-03 实测结论，勿改回代理）：
@@ -185,6 +242,7 @@ export async function verifyCodeExternally(
       break;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
+      lastNetworkError = error;
       if (error instanceof Error && error.name === "TimeoutError") {
         timedOut = true;
         break;
@@ -192,8 +250,13 @@ export async function verifyCodeExternally(
     }
   }
   if (!response) {
+    const detail = timedOut
+      ? `验证接口响应超时（${config.timeout_seconds} 秒）`
+      : lastNetworkError
+        ? describeNetworkError(lastNetworkError)
+        : lastError || "未知错误";
     console.error(
-      `verifyCodeExternally network failure after ${VERIFY_NETWORK_RETRY_ATTEMPTS} attempts: ${timedOut ? `验证接口响应超时（${config.timeout_seconds} 秒）` : lastError || "未知错误"} (url=${config.url})`,
+      `verifyCodeExternally network failure after ${VERIFY_NETWORK_RETRY_ATTEMPTS} attempts: ${detail} (url=${config.url})`,
     );
     return {
       ok: false,
@@ -201,6 +264,7 @@ export async function verifyCodeExternally(
       message: timedOut
         ? `网络异常：验证接口响应超时（${config.timeout_seconds} 秒），请稍后重试`
         : "网络异常，请稍后重试",
+      detail,
     };
   }
 
@@ -219,6 +283,7 @@ export async function verifyCodeExternally(
       ok: false,
       networkError: true,
       message: `网络异常：验证接口服务故障（HTTP ${response.status}），请稍后重试`,
+      detail: `验证接口返回 HTTP ${response.status}`,
     };
   }
 
