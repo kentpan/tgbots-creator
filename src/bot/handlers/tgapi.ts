@@ -1,17 +1,27 @@
 import { Bot } from "grammy";
-import type { MessageEntity } from "grammy/types";
+import type { InlineKeyboardMarkup, MessageEntity } from "grammy/types";
+import { CommandGroup } from "@grammyjs/commands";
 import { StatelessQuestion } from "@grammyjs/stateless-question";
 import type { BotContext } from "../context";
 import { htmlEscape } from "@/utils/html";
 import {
   getTgApiUnlock,
   getVerificationMethod,
+  listBotCommands,
   saveTgApiUnlock,
+  type BotCommandRow,
 } from "@/database/operations";
 import {
   parseCodeApiConfig,
   verifyCodeExternally,
 } from "@/services/external-verify";
+import {
+  countMenuStats,
+  renderMenuMarkup,
+  type MenuCommandRegistry,
+  type MenuCommandRunner,
+} from "@/services/bot-menu";
+import type { BotMenuConfig } from "@/services/bot-menu";
 import {
   deriveTgApiShortName,
   detectTgApiLang,
@@ -30,34 +40,36 @@ import {
   type TgAppInfo,
   type TgOrgScrapeResult,
 } from "@/services/my-telegram-org";
+import { registerBuiltinCommandHandlers } from "./builtin-commands";
 
 /**
- * TGAPI申请 机器人（v2.1.7）—— grammY 原样复刻 SpEcHiDe/MyTelegramOrgRoBot。
+ * TGAPI申请 机器人（v2.1.10）—— my.telegram.org APP 申请对话流程 +
+ * 按钮驱动交互（参照 My-Telegram-Api-Bot 交互形态重做门禁体验）。
  *
- * 原项目：python-telegram-bot ConversationHandler（/start → INPUT_PHONE_NUMBER →
- * INPUT_TG_CODE）+ my.telegram.org 抓取。本实现 1:1 移植状态机与文案：
- *
- * /start ──▶ START_TEXT（等待手机号，INPUT_PHONE_NUMBER）
- * 手机号 ──▶ POST /auth/send_password → random_hash（GLOBAL_USERS_DICTIONARY 落会话）
- *         ──▶ AFTER_RECVD_CODE_TEXT（等待 Telegram 登录码，INPUT_TG_CODE）
+ * 申请状态机（原 SpEcHiDe/MyTelegramOrgRoBot ConversationHandler 1:1 移植）：
+ * 手机号 ──▶ POST /auth/send_password → random_hash（会话落库）
+ *         ──▶ AFTER_RECVD_CODE_TEXT（等待 Telegram 登录码）
  * 登录码 ──▶ POST /auth/login → stel_token Cookie ──▶ GET /apps 抓取
  *         ├─ 已有 APP → 解析 app_id/api_hash/MTProto 服务器 → 结果消息
  *         └─ 无 APP   → POST /apps/create（APP 参数）→ 重新抓取 → 结果消息
  * /start 在任意阶段重入（fallback 语义一致）。
  *
- * v2.1.7 变更：
- * - 中英文双语（仅 zh/en 两套内置文案）：按用户 language_code 自动识别（zh* → 中文），
- *   /language 指令手动切换（会话内记忆）。
- * - 申请人自定义 APP（askAppDetails 开启时）：/start → APP 名称（/skip 用默认）
- *   → APP 描述（/skip 用默认）→ 手机号 → 登录码；创建 APP 使用申请人提交的
- *   title/description（shortname 由 title 派生，不合法回落配置默认）。
- * - 解锁一次永久有效：解锁状态落库 tgapi_unlocks（bot_id + user_id 唯一），
- *   生成失败/重复申请均不再要求重新解锁（管理端手动「撤销解锁」除外）。
+ * v2.1.10 按钮驱动流程（详见 registerTgApiHandlers 注释）：
+ * /start（未解锁）──▶ 欢迎文案 + 「🔐 授权认证」内嵌按钮
+ * 点按钮 ──▶ force-reply 要求在输入框输入验证码 ──▶ 外部 API 核验
+ * 通过   ──▶ 验证成功消息 + 管理端「消息内嵌按钮」配置渲染的菜单键盘
+ * （每个按钮对应一个 /xxx 指令：内置 start/language + 指令管理自定义指令，
+ * 点击等同手输指令；需要输入的在输入框输入，可选择的用内嵌按钮列出）。
+ * 群组 /start@本机器人 同样响应欢迎消息（群内授权引导私聊完成）。
  *
- * v2.1.6 增值门禁（原项目没有）：首次对话需要解锁 ——
- * - captcha：回复解锁提示输入验证码，走外部 API 核验（与加群验证机器人
- *   code_api 外部 API 验证方式同一实现 verifyCodeExternally）；
- * - stars：Telegram 星星支付发票（sendInvoice XTR），支付成功即解锁。
+ * v2.1.10 文案与默认值全面中性化：不再携带原项目作者 SpEcHlDe/UseTGxBot
+ * 的推广链接、自建部署宣传与署名（历史配置中的旧垃圾常量读取时自动迁移）。
+ *
+ * 历史变更（保留语义）：
+ * - v2.1.7：中英文双语 + /language 切换；申请人自定义 APP（askAppDetails）；
+ *   解锁一次永久有效（tgapi_unlocks，管理端手动撤销除外）。
+ * - v2.1.6 增值门禁：captcha=外部 API 验证码（verifyCodeExternally）/
+ *   stars=Telegram 星星支付发票（sendInvoice XTR）两种解锁方式。
  */
 
 /** 星星支付发票 payload 前缀 */
@@ -65,6 +77,9 @@ const UNLOCK_PAYLOAD_PREFIX = "tgapi_unlock:";
 
 /** 解锁无状态问题 id（每个 TGAPI 机器人实例独立安装，互不串扰） */
 const TGAPI_UNLOCK_QUESTION_ID = "tgapi-unlock";
+
+/** 欢迎消息「🔐 授权认证」内嵌按钮 callback（v2.1.10） */
+const TGAPI_UNLOCK_CALLBACK = "tgapi:unlock";
 
 /** 申请人自定义 APP 名称/描述的长度上限（my.telegram.org 表单约束） */
 const APP_TITLE_MAX_LENGTH = 32;
@@ -130,14 +145,32 @@ function briefError(error: unknown): string {
 /**
  * 注册 TGAPI申请 机器人全部能力（multi-runtime 专用入口）。
  *
- * 返回指令同步任务（/start + /language 两条指令；TGAPI 机器人不挂指令库/
- * 群验证/AI 客服，是纯私聊对话工具机器人）。
+ * v2.1.10 按钮驱动新流程（参照 My-Telegram-Api-Bot 交互形态）：
+ * - /start（私聊，未解锁）：图3 欢迎文案 + 底部内嵌按钮「🔐 授权认证」；
+ * - 点「授权认证」→ force-reply 要求在输入框输入验证码（需要输入的在输入框输入）；
+ * - 核验通过 → 验证成功消息 + 管理端「消息内嵌按钮」配置真实渲染的菜单键盘
+ *   （图4：每个按钮对应一个 /xxx 指令，可以选择的用内嵌按钮列出供选择）；
+ * - 「执行指令」按钮点击等同用户手输 /指令：与自定义指令库同源真实执行；
+ * - /start（群组）：同样响应欢迎消息（v2.1.10 修复群里 /start@机器人无响应），
+ *   群内点「授权认证」引导私聊完成（验证码绝不在群里输入，避免泄露）。
+ *
+ * 返回指令同步任务（/start + /language + 自定义指令同步到 Telegram 指令菜单）。
  */
-export function registerTgApiHandlers(
+export interface TgApiHandlerOptions {
+  /** 该机器人「消息内嵌按钮」配置（bots.menu_config）：解锁成功后随消息真实渲染 */
+  menuConfig: BotMenuConfig;
+  /** 菜单「执行指令」按钮的指令运行器注册表（multi-runtime 按实例创建） */
+  registry: MenuCommandRegistry;
+}
+
+export async function registerTgApiHandlers(
   bot: Bot<BotContext>,
   cfg: TgApiBotConfig,
   botId: bigint,
-): () => Promise<void> {
+  options: TgApiHandlerOptions,
+): Promise<() => Promise<void>> {
+  const { menuConfig, registry } = options;
+
   /** 会话语言偏好优先，未设置按用户 language_code 自动识别（zh* → 中文） */
   function langOf(ctx: BotContext): TgApiLang {
     const remembered = ctx.session.tgapiLang;
@@ -172,7 +205,6 @@ export function registerTgApiHandlers(
     const from = ctx.from;
     if (!from) return;
     const sys = TGAPI_SYSTEM_TEXTS[lang];
-    const texts = resolveTgApiTexts(cfg, lang);
     if (cfg.unlockMode !== "captcha") {
       await ctx.reply(sys.switchedToStars);
       return;
@@ -223,8 +255,8 @@ export function registerTgApiHandlers(
       mode: "captcha",
     });
     ctx.session.tgapiStarsInvoiceSent = false;
-    await ctx.reply(texts.unlockSuccess);
-    await beginApplication(ctx, lang);
+    // v2.1.10：验证成功消息 + 图4 菜单内嵌按钮（管理端配置真实渲染）
+    await sendUnlockSuccessWithMenu(ctx, lang);
     console.log(
       `TGAPI bot #${botId} unlocked via captcha: user ${from.id} (${from.username ?? "no username"})`,
     );
@@ -256,36 +288,73 @@ export function registerTgApiHandlers(
   }
 
   /**
+   * /start 欢迎消息（未解锁用户）：图3 文案 + 底部内嵌按钮「🔐 授权认证」。
+   * 私聊与群组共用；群组点击按钮由 callback 处理器引导私聊完成。
+   */
+  async function sendUnlockEntry(ctx: BotContext, lang: TgApiLang): Promise<void> {
+    const texts = resolveTgApiTexts(cfg, lang);
+    await ctx.reply(texts.start, {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [[{ text: "🔐 授权认证", callback_data: TGAPI_UNLOCK_CALLBACK }]],
+      } satisfies InlineKeyboardMarkup,
+    });
+  }
+
+  /**
+   * 解锁成功消息（v2.1.10 图4）：验证成功文案 + 管理端「消息内嵌按钮」配置
+   * 真实渲染的菜单键盘（每个按钮对应一个 /xxx 指令，点击等同手输指令）。
+   * 管理端未配置按钮时自动进入申请流程，机器人绝不出现“没反应”状态。
+   */
+  async function sendUnlockSuccessWithMenu(ctx: BotContext, lang: TgApiLang): Promise<void> {
+    const texts = resolveTgApiTexts(cfg, lang);
+    await ctx.reply(texts.unlockSuccess);
+    if (countMenuStats(menuConfig.root).buttons === 0) {
+      console.log(
+        `TGAPI bot #${botId} menu config empty -> fallback to beginApplication after unlock`,
+      );
+      await beginApplication(ctx, lang);
+      return;
+    }
+    const markup = await renderMenuMarkup(menuConfig, bot, registry);
+    await ctx.reply(
+      lang === "zh" ? "👇 请选择下面的方式之一：" : "👇 Please choose one of the options below:",
+      { reply_markup: markup },
+    );
+  }
+
+  /**
    * 开始申请流程（已解锁用户）：askAppDetails 开启时先收集 APP 名称/描述
    * （申请人自定义，/skip 用管理端默认），否则直接进入手机号状态（原版行为）。
    */
   async function beginApplication(ctx: BotContext, lang: TgApiLang): Promise<void> {
     const texts = resolveTgApiTexts(cfg, lang);
     ctx.session.tgapi = cfg.askAppDetails ? { state: "title" } : { state: "phone" };
-    await ctx.reply(texts.start, { parse_mode: "HTML" });
     if (cfg.askAppDetails) {
       await ctx.reply(
         renderTgApiTextTemplate(texts.askAppTitle, cfg.appTitle),
         { parse_mode: "HTML" },
       );
+    } else {
+      // askAppDetails 关闭：直接进入手机号输入（需要输入的在输入框输入）
+      await ctx.reply(texts.askPhone, { parse_mode: "HTML" });
     }
   }
 
-  /** /start 入口（对应原 ConversationHandler entry_point + fallback） */
+  /** /start 入口（对应原 ConversationHandler entry_point + fallback；仅私聊） */
   async function startConversation(ctx: BotContext): Promise<void> {
     const from = ctx.from;
     if (!from || from.is_bot) return;
     const lang = langOf(ctx);
-    const texts = resolveTgApiTexts(cfg, lang);
     const sys = TGAPI_SYSTEM_TEXTS[lang];
     const unlocked = await getTgApiUnlock(botId, BigInt(from.id));
     if (unlocked) {
       await beginApplication(ctx, lang);
       return;
     }
-    // 首次对话门禁：未解锁用户先解锁（验证码 / 星星两种方式，管理后台可切换）
+    // 首次对话门禁：未解锁先授权认证（v2.1.10：欢迎文案 + 授权认证内嵌按钮）
     if (cfg.unlockMode === "captcha") {
-      await unlockQuestion.replyWithHTML(ctx, htmlEscape(texts.unlockPrompt));
+      await sendUnlockEntry(ctx, lang);
       return;
     }
     await sendStarsInvoice(ctx, lang);
@@ -438,8 +507,10 @@ export function registerTgApiHandlers(
       }
 
       if (scraped?.ok && scraped.info) {
+        // v2.1.10：footer 留空 = 不附加任何署名（不再默认拼接原项目作者推广文案）
         const resultHtml =
-          buildAppResultHTML(flow.phone, scraped.info) + "\n\n" + cfg.footerText;
+          buildAppResultHTML(flow.phone, scraped.info) +
+          (cfg.footerText ? `\n\n${cfg.footerText}` : "");
         await editProgress(resultHtml, true);
         console.log(
           `TGAPI bot #${botId} app credentials delivered: user ${from.id} app_id=${scraped.info.appId}`,
@@ -557,23 +628,32 @@ export function registerTgApiHandlers(
   }
 
   // ---------------------------------------------------------------------------
-  // 中间件装配（顺序与 multi-runtime 通用链一致：问题插件 → 指令 → 文本 → 支付）
+  // 中间件装配（顺序：问题插件 → 指令 → 授权认证 callback → 自定义指令 → 文本 → 支付）
   // ---------------------------------------------------------------------------
 
   bot.use(unlockQuestion.middleware());
 
+  // /start：私聊 = 完整对话入口；群组 = 同样响应欢迎消息（v2.1.10 修复
+  // 图5「群里 /start@机器人没反应」）。grammY 原生支持定向指令：
+  // 群内 /start@本机器人 才匹配，/start@其他机器人 不响应。
   bot.command("start", async (ctx) => {
-    if (ctx.chat?.type !== "private") return;
-    await startConversation(ctx);
+    const chatType = ctx.chat?.type;
+    if (chatType === "private") {
+      await startConversation(ctx);
+      return;
+    }
+    if (chatType === "group" || chatType === "supergroup") {
+      await sendUnlockEntry(ctx, langOf(ctx));
+    }
   });
 
   // /language：中英文切换（zh/中文/chinese → 中文；en/英文/english → 英文；
   // 无参数在两种语言间切换；会话内记忆，新会话按用户 language_code 自动识别）
-  bot.command("language", async (ctx) => {
-    if (ctx.chat?.type !== "private") return;
+  async function switchLanguage(ctx: BotContext): Promise<void> {
     const from = ctx.from;
     if (!from || from.is_bot) return;
-    const arg = (ctx.match ?? "").trim().toLowerCase();
+    // bot.command(string) 的 match 恒为 string；RegExpMatchArray 分支仅类型层存在
+    const arg = (typeof ctx.match === "string" ? ctx.match : "").trim().toLowerCase();
     let next: TgApiLang | null = null;
     if (arg === "zh" || arg === "中文" || arg === "chinese" || arg === "cn") next = "zh";
     else if (arg === "en" || arg === "英文" || arg === "english") next = "en";
@@ -587,6 +667,145 @@ export function registerTgApiHandlers(
     console.log(
       `TGAPI bot #${botId} language switched: user ${from.id} -> ${next}`,
     );
+  }
+
+  bot.command("language", async (ctx) => {
+    if (ctx.chat?.type !== "private") return;
+    await switchLanguage(ctx);
+  });
+
+  // 「🔐 授权认证」内嵌按钮：私聊 force-reply 要求在输入框输入验证码；
+  // 群组引导私聊完成（验证码绝不在群里输入，避免泄露给群成员）
+  bot.callbackQuery(TGAPI_UNLOCK_CALLBACK, async (ctx) => {
+    const lang = langOf(ctx);
+    const texts = resolveTgApiTexts(cfg, lang);
+    const sys = TGAPI_SYSTEM_TEXTS[lang];
+    const from = ctx.from;
+    const chatType = ctx.chat?.type;
+    // 已解锁用户点历史按钮：不重复核验（解锁一次永久有效）
+    if (from && !from.is_bot && (await getTgApiUnlock(botId, BigInt(from.id)))) {
+      await ctx.answerCallbackQuery({
+        text: lang === "zh" ? "已完成授权认证" : "Already authorized",
+      });
+      if (chatType === "private") await beginApplication(ctx, lang);
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    if (chatType === "private") {
+      if (cfg.unlockMode === "captcha") {
+        // 点击后发送消息要求在输入框输入验证码（StatelessQuestion force-reply）
+        await unlockQuestion.replyWithHTML(ctx, htmlEscape(texts.unlockPrompt));
+      } else {
+        await sendStarsInvoice(ctx, lang);
+        await ctx.reply(sys.starsInvoiceHint(String(cfg.starsAmount ?? "-")));
+      }
+      return;
+    }
+    if (chatType !== "group" && chatType !== "supergroup") return;
+    const username = bot.isInited() ? bot.botInfo.username : (await bot.api.getMe()).username;
+    await ctx.reply(
+      lang === "zh"
+        ? "🔐 授权认证需要在私聊中完成：点击下方按钮打开与我的私聊，发送 /start 开始。"
+        : "🔐 Authorization must be completed in a private chat: tap the button below to open a chat with me, then send /start.",
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: lang === "zh" ? "🔐 私聊我完成授权认证" : "🔐 Authorize in private chat",
+                url: `https://t.me/${username}`,
+              },
+            ],
+          ],
+        } satisfies InlineKeyboardMarkup,
+      },
+    );
+    console.log(
+      `TGAPI bot #${botId} unlock button clicked in ${chatType}: user ${from?.id ?? "?"} -> DM guidance`,
+    );
+  });
+
+  // 自定义指令（指令管理 → 自定义指令，仅启用项）：
+  // 1) /xxx 手输响应（CommandGroup，宽松匹配 + 定向指令支持，群内 /xxx@本机器人 同样可用）；
+  // 2) 填充菜单「执行指令」按钮注册表 —— 按钮点击与手输 /指令 完全同源
+  const customItems: BotCommandRow[] = [];
+  for (let page = 1; ; page += 1) {
+    const result = await listBotCommands({ type: "custom", enabledOnly: true, page, pageSize: 100 });
+    customItems.push(...result.rows);
+    if (page >= result.totalPages) break;
+  }
+  for (const item of customItems) {
+    const intro = item.intro || item.description;
+    const commandName = item.name;
+    const runner: MenuCommandRunner = async (ctx) => {
+      await ctx.reply(`⌨️ /${commandName}\n\n${intro}`);
+    };
+    registry.runners.set(commandName, runner);
+  }
+  if (customItems.length > 0) {
+    const group = new CommandGroup({
+      matchOnlyAtStart: false,
+      targetedCommands: "optional",
+    });
+    for (const item of customItems) {
+      const commandName = item.name;
+      group.command(commandName, item.description, async (ctx) => {
+        const runner = registry.runners.get(commandName);
+        if (runner) {
+          await runner(ctx);
+          return;
+        }
+        await ctx.reply(`⌨️ /${commandName}\n\n${item.intro || item.description}`);
+      });
+    }
+    bot.use(group);
+  }
+  console.log(
+    `TGAPI bot #${botId} custom commands registered: [${customItems.map((item) => item.name).join(", ") || "none"}]`,
+  );
+
+  // v2.1.11：指令库「内置指令」启用项同样注册到 TGAPI 机器人（排除 /start —— TGAPI
+  // 流程自有 /start 重入语义，避免双响应）。图4 按钮组的「帮助」等内置指令按钮
+  // 由此与手输 /指令 同源真实执行；运行器闭包自校验 adminOnly，菜单按钮无法越权。
+  const builtinItems: BotCommandRow[] = [];
+  for (let page = 1; ; page += 1) {
+    const result = await listBotCommands({ type: "builtin", enabledOnly: true, page, pageSize: 100 });
+    builtinItems.push(...result.rows);
+    if (page >= result.totalPages) break;
+  }
+  const tgapiBuiltinItems = builtinItems.filter((item) => item.name !== "start");
+  registerBuiltinCommandHandlers(
+    bot,
+    tgapiBuiltinItems.map((item) => ({
+      name: item.name,
+      intro: item.intro,
+      description: item.description,
+    })),
+    registry,
+  );
+  console.log(
+    `TGAPI bot #${botId} builtin commands registered: [${tgapiBuiltinItems.map((item) => item.name).join(", ") || "none"}]`,
+  );
+
+  // 菜单「执行指令」按钮注册表：TGAPI 机器人自有指令（/start /language）同源可点。
+  // 运行器签名是 Context（菜单插件回调上下文）；会话中间件先于菜单安装，
+  // 运行时 ctx 必然携带 session —— 与 CommandGroup 处理器同一事实，此处窄化。
+  registry.runners.set("start", async (ctx) => {
+    const chatType = ctx.chat?.type;
+    if (chatType === "private") {
+      await startConversation(ctx as BotContext);
+      return;
+    }
+    if (chatType === "group" || chatType === "supergroup") {
+      await sendUnlockEntry(ctx as BotContext, langOf(ctx as BotContext));
+    }
+  });
+  registry.runners.set("language", async (ctx) => {
+    if (ctx.chat?.type !== "private") {
+      await ctx.reply("⚠️ 该指令请在与机器人的私聊中使用。");
+      return;
+    }
+    await switchLanguage(ctx as BotContext);
   });
 
   bot.on("message:text", async (ctx) => {
@@ -620,7 +839,6 @@ export function registerTgApiHandlers(
     if (!from || from.is_bot || !payment) return;
     if (!payment.invoice_payload.startsWith(UNLOCK_PAYLOAD_PREFIX)) return;
     const lang = langOf(ctx);
-    const texts = resolveTgApiTexts(cfg, lang);
     await saveTgApiUnlock({
       botId,
       userId: BigInt(from.id),
@@ -628,22 +846,31 @@ export function registerTgApiHandlers(
       mode: "stars",
     });
     ctx.session.tgapiStarsInvoiceSent = false;
-    await ctx.reply(texts.unlockSuccess);
-    await beginApplication(ctx, lang);
+    // v2.1.10：支付成功同款 —— 验证成功消息 + 图4 菜单内嵌按钮
+    await sendUnlockSuccessWithMenu(ctx, lang);
     console.log(
       `TGAPI bot #${botId} unlocked via stars: user ${from.id} paid ${payment.total_amount} XTR (${payment.telegram_payment_charge_id})`,
     );
   });
 
-  // 指令同步：/start（开始申请）+ /language（中英文切换）
+  // 指令同步：/start + /language + 内置指令启用项（不含 /start）+ 全部启用的自定义指令
+  //（真实写入 Telegram 指令菜单；Telegram 上限 100 条，超出部分按顺序截断）
+  const fixedCommandCount = 2 + tgapiBuiltinItems.length;
+  const myCommands = [
+    { command: "start", description: "开始 TGAPI 申请 / Start" },
+    { command: "language", description: "切换中文/English" },
+    ...tgapiBuiltinItems.map((item) => ({
+      command: item.name,
+      description: (item.description || item.intro || item.name).slice(0, 256),
+    })),
+    ...customItems.slice(0, Math.max(0, 100 - fixedCommandCount)).map((item) => ({
+      command: item.name,
+      description: (item.description || item.intro || item.name).slice(0, 256),
+    })),
+  ];
   return async () => {
-    await bot.api
-      .setMyCommands([
-        { command: "start", description: "开始 TGAPI 申请 / Start" },
-        { command: "language", description: "切换中文/English" },
-      ])
-      .catch((error: unknown) => {
-        console.warn(`TGAPI bot #${botId} setMyCommands failed:`, error);
-      });
+    await bot.api.setMyCommands(myCommands).catch((error: unknown) => {
+      console.warn(`TGAPI bot #${botId} setMyCommands failed:`, error);
+    });
   };
 }

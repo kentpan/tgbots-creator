@@ -18,8 +18,15 @@ function maskToken(token: string): string {
   return `${token.slice(0, 8)}••••${token.slice(-4)}`;
 }
 
-export default async function BotTestingPage() {
+export default async function BotTestingPage({
+  searchParams,
+}: {
+  // v2.1.11：支持 ?bot=<id> 预选机器人 —— TGAPI申请页「🚀 部署」跳转本页时直接
+  // 选中目标机器人，统一在本页仿真屏部署
+  searchParams: Promise<{ bot?: string }>;
+}) {
   await requirePermission("bots:view");
+  const params = await searchParams;
 
   const [bots, groups, methods, botAdmins, pendingByChat] = await Promise.all([
     listBots(),
@@ -28,6 +35,11 @@ export default async function BotTestingPage() {
     listGroupBotAdmins(),
     countPendingJoinRequestsByChat(),
   ]);
+
+  const requestedBotId =
+    params.bot && /^\d+$/.test(params.bot) && bots.some((bot) => String(bot.id) === params.bot)
+      ? params.bot
+      : null;
 
   // 同 Token 的机器人条目归为一组（如「交付机器人」与「加群验证机器人」共用同一 Token），
   // 测试任一条目时均可使用该 Token 关联的全部群组。
@@ -75,6 +87,7 @@ export default async function BotTestingPage() {
 
   return (
     <TestingClient
+      initialBotId={requestedBotId}
       bots={bots.map((bot) => ({
         id: String(bot.id),
         name: bot.name,

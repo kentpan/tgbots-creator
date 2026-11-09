@@ -28,7 +28,8 @@ export type MenuActionType =
   | "url"
   | "web_app"
   | "switch_inline"
-  | "switch_inline_current";
+  | "switch_inline_current"
+  | "command";
 
 export interface MenuApiHeader {
   key: string;
@@ -52,6 +53,7 @@ export interface MenuButtonAction {
   api?: MenuApiConfig;
   url?: string;
   switch_query?: string;
+  /** command 类型专用：点击后真实执行的指令名（不含 /；内置或自定义指令） */
   target?: string;
 }
 
@@ -96,6 +98,7 @@ const ACTION_TYPES: MenuActionType[] = [
   "web_app",
   "switch_inline",
   "switch_inline_current",
+  "command",
 ];
 
 export function isHttpUrl(value: string): boolean {

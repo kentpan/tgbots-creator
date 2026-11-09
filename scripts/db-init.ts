@@ -73,7 +73,7 @@ const MENUS: {
     permission: "bots:view",
     children: [
       { title: "机器人管理", path: "/admin/bots", icon: "🤖", sort: 1, permission: "bots:view" },
-      { title: "机器人测试", path: "/admin/bots/testing", icon: "🧪", sort: 2, permission: "bots:view" },
+      { title: "仿真APP", path: "/admin/bots/testing", icon: "📱", sort: 2, permission: "bots:view" },
       { title: "指令管理", path: "/admin/bots/commands", icon: "⌨️", sort: 3, permission: "bots:view" },
       { title: "开发者账号", path: "/admin/developer-accounts", icon: "☎️", sort: 4, permission: "devaccounts:view" },
       { title: "TGAPI申请", path: "/admin/tgapi", icon: "🔑", sort: 5, permission: "tgapi:view" },
@@ -463,29 +463,78 @@ async function seedAdminUser(): Promise<void> {
   console.log("Super admin created: admin / admin123");
 }
 
+/**
+ * v2.1.11 TGAPI申请 机器人自定义指令种子（图4 按钮组对应的 /xxx 指令）。
+ *
+ * 此前这些指令必须先到「指令管理 → 自定义指令」手动创建，TGAPI 机器人的菜单按钮
+ * （我的 API / 设置平台 / 客服支持）才能调用 —— 现在随包预置，开箱即用；管理员仍可在
+ * 「指令管理」中编辑文案/停用。ON CONFLICT DO NOTHING：绝不覆盖管理员已编辑的自定义指令。
+ */
+const TGAPI_CUSTOM_COMMANDS: { name: string; description: string; intro: string; sort: number }[] = [
+  {
+    name: "myapi",
+    description: "查看我的 API",
+    intro:
+      "登录 my.telegram.org 后即可在 Apps 页面查看你已创建的 APP 与 api_id / api_hash。",
+    sort: 1,
+  },
+  {
+    name: "platform",
+    description: "设置 APP 平台",
+    intro:
+      "创建 APP 时会从以下平台中随机选择一个提交（与原版 MyTelegramOrgRoBot 一致）：" +
+      "Android / iOS / Windows Phone / BlackBerry / Desktop / Web / Ubiquitous / Other。" +
+      "如需调整可选平台，请联系管理员在「TGAPI申请」后台配置 APP_PLATFORM。",
+    sort: 2,
+  },
+  {
+    name: "support",
+    description: "联系客服支持",
+    intro:
+      "如在使用中遇到问题（解锁、申请流程、API 获取失败等），请联系本机器人的管理员获取支持。",
+    sort: 3,
+  },
+];
+
+async function seedTgApiCommands(): Promise<void> {
+  for (const cmd of TGAPI_CUSTOM_COMMANDS) {
+    await executeRun(
+      `INSERT INTO bot_commands (type, name, description, intro, enabled, sort_order, created_time, updated_time)
+       VALUES ('custom', ?, ?, ?, 1, ?, ?, ?)
+       ON CONFLICT(type, name) DO NOTHING`,
+      [cmd.name, cmd.description, cmd.intro, cmd.sort, new Date().toISOString(), new Date().toISOString()],
+    );
+  }
+  console.log(`TGAPI custom commands ensured: ${TGAPI_CUSTOM_COMMANDS.length}`);
+}
+
 async function seedMenus(): Promise<void> {
-  const botsRoot = await db_one(`SELECT id FROM menus WHERE path = '/admin/bots' AND parent_id = 0`);
-  if (!botsRoot) {
-    await executeRun(
-      `UPDATE menus SET sort_order = sort_order + 2 WHERE parent_id = 0 AND sort_order >= 4`,
-    );
-  }
-  // v1.1.0：老库升级——「AI 配置」菜单插入到「操作日志」之前（操作日志 sort 后移一位）
-  const aiMenu = await db_one(`SELECT id FROM menus WHERE path = '/admin/ai'`);
-  const logsMenu = await db_one(`SELECT id FROM menus WHERE path = '/admin/logs' AND parent_id = 0`);
-  if (!aiMenu && logsMenu) {
-    await executeRun(
-      `UPDATE menus SET sort_order = sort_order + 1 WHERE parent_id = 0 AND path = '/admin/logs'`,
-    );
-  }
+  // v2.1.11 种子语义修正：菜单是管理员的可编辑数据 —— 种子只做「缺了才补」的幂等引导，
+  // 绝不回写既有行。历史缺陷（用户删了 N 次顶级重复菜单每次都被还原 / 改名被还原）：
+  // ① 叶子按 path+parent_id=0 匹配，用户把菜单挪进自定义分组（如「群组」）后每次 db:init
+  //    都重新 INSERT 一份顶级重复项；② 命中已存在 root 时强制 UPDATE 回种子的
+  //    title/icon/sort —— 用户改名直接被覆盖。修正后：
+  // - 叶子菜单按 path 全树匹配（任意层级存在即跳过，用户重组结构/改名/换图标/排序均保留）；
+  // - 分组容器（无 path）按 title 在根级匹配，同样只插不改；
+  // - 排序腾位仅在真正执行 INSERT 时进行（旧库升级路径不变）。
   for (const menu of MENUS) {
     let parentId = 0;
-    // 分组菜单（path 为空）必须按 title 匹配——空 path 会误吞其他分组 root（历史 bug）；
-    // 叶子 root 按 path 匹配（title 可能因用户改名而漂移）。
     const existingRoot = menu.path
-      ? await db_one(`SELECT id FROM menus WHERE path = ? AND parent_id = 0`, [menu.path])
+      ? await db_one(`SELECT id FROM menus WHERE path = ?`, [menu.path])
       : await db_one(`SELECT id FROM menus WHERE title = ? AND parent_id = 0`, [menu.title]);
     if (!existingRoot) {
+      // 首次插入「机器人」分组：为控制台之后的叶子菜单腾位（v1.0.x 旧库排序兼容）
+      if (menu.title === "机器人") {
+        await executeRun(
+          `UPDATE menus SET sort_order = sort_order + 2 WHERE parent_id = 0 AND sort_order >= 4`,
+        );
+      }
+      // v1.1.0：老库升级——「AI 配置」插入到「操作日志」之前（操作日志 sort 后移一位）
+      if (menu.path === "/admin/ai") {
+        await executeRun(
+          `UPDATE menus SET sort_order = sort_order + 1 WHERE parent_id = 0 AND path = '/admin/logs'`,
+        );
+      }
       const result = await executeRun(
         `INSERT INTO menus (parent_id, title, path, icon, sort_order, visible, permission_code, status, created_time, updated_time)
          VALUES (0, ?, ?, ?, ?, 1, ?, 1, ?, ?)`,
@@ -502,16 +551,10 @@ async function seedMenus(): Promise<void> {
       parentId = Number(result.lastInsertRowid);
     } else {
       parentId = Number(existingRoot.id);
-      await executeRun(
-        `UPDATE menus SET title = ?, icon = ?, sort_order = ?, permission_code = ?, updated_time = ? WHERE id = ?`,
-        [menu.title, menu.icon, menu.sort, menu.permission, new Date().toISOString(), parentId],
-      );
     }
     for (const child of menu.children ?? []) {
-      const existingChild = await db_one(
-        `SELECT id FROM menus WHERE path = ? AND parent_id = ?`,
-        [child.path, parentId],
-      );
+      // 叶子按 path 全树匹配：用户把子菜单挪到其他分组/根级后不再重复插入
+      const existingChild = await db_one(`SELECT id FROM menus WHERE path = ?`, [child.path]);
       if (existingChild) continue;
       await executeRun(
         `INSERT INTO menus (parent_id, title, path, icon, sort_order, visible, permission_code, status, created_time, updated_time)
@@ -791,6 +834,7 @@ async function main(): Promise<void> {
   await seedSampleMethod();
   await seedRadsMethod();
   await seedBuiltinCommands();
+  await seedTgApiCommands();
   const info = await getDatabase();
   console.log(`Database ready at ${info.displayPath} (${info.kind} runtime)`);
 }

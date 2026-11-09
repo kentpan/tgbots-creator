@@ -6,14 +6,15 @@ import {
 } from "@/database/operations";
 import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { requirePermission } from "@/lib/auth";
-import { tgRawCall } from "@/lib/telegram/transport";
-import { withTelegramTimeout } from "@/services/telegram-sync";
-import { getTelegramRuntimeSettings, resolveBotRuntime } from "@/services/bot-transport";
-import { getMenuBotDeployState } from "@/bot/multi-runtime";
+import { probeBotDeployState } from "@/services/bot-deploy";
+import { BotDeployBadge, briefDeployDetail } from "@/components/admin/bot-deploy-badge";
 import {
   parseTgApiBotConfig,
   TGAPI_APP_PLATFORMS,
+  TGAPI_DEFAULT_APP,
   TGAPI_TEXT_FIELD_KEYS,
+  TGAPI_TEXTS_EN,
+  TGAPI_TEXTS_ZH,
   type TgApiBotConfig,
 } from "@/services/tgapi-config";
 import { FormDialog } from "@/components/admin/form-dialog";
@@ -23,7 +24,6 @@ import { TgApiApplyWizard } from "@/components/admin/tgapi-apply-wizard";
 import { TgApiBotGroupsPanel } from "@/components/admin/tgapi-bot-groups-panel";
 import {
   deleteTgApiBotAction,
-  deployTgApiBotAction,
   revokeTgApiUnlockAction,
   saveTgApiBotAction,
   toggleTgApiBotAction,
@@ -32,7 +32,7 @@ import {
 export const dynamic = "force-dynamic";
 
 const NOTICES: Record<string, string> = {
-  "1": "TGAPI 申请机器人已保存（仅配置落库，未触碰运行实例；上线/更新请点列表中的「🚀 部署」）",
+  "1": "TGAPI 申请机器人已保存（仅配置落库；上线/更新运行实例请到「仿真APP」页面点击「🚀 部署机器人」）",
   deleted: "机器人已删除",
   enabled: "机器人已启用",
   disabled: "机器人已停用",
@@ -59,8 +59,8 @@ const PLATFORM_LABELS: Record<string, string> = {
 };
 
 const LANG_LABELS: Record<"zh" | "en", string> = {
-  zh: "中文文案覆盖（留空 = 内置中文默认）",
-  en: "English 文案覆盖（留空 = 内置英文默认）",
+  zh: "中文文案（已预填内置默认值，可直接修改；改回默认值 = 恢复使用内置文案）",
+  en: "English 文案（已预填内置默认值，可直接修改；改回默认值 = 恢复使用内置文案）",
 };
 
 function UnlockModeBadge({ mode }: { mode: string }) {
@@ -78,115 +78,13 @@ function UnlockModeBadge({ mode }: { mode: string }) {
   );
 }
 
-/** 真实部署状态（webhook=Telegram 侧 getWebhookInfo 权威值；polling=本进程运行实例权威值） */
-type DeployCheck =
-  | { key: "disabled" }
-  | { key: "deployed"; detail: string }
-  | { key: "undeployed" }
-  | { key: "mismatch"; detail: string }
-  | { key: "deploying" }
-  | { key: "delivery-error"; detail: string }
-  | { key: "unknown"; detail: string };
-
-/** 页面展示用详情截断（完整原因放 title 悬浮，列表不撑破版式） */
-function briefCheckDetail(detail: string): string {
-  return detail.length > 120 ? `${detail.slice(0, 120)}…` : detail;
-}
-
 /**
- * 逐机器人探测真实部署状态：
- * - webhook 模式：Telegram 侧 getWebhookInfo（跨 isolate/跨环境权威，不依赖本进程内存）。
- *   v2.1.9 黑盒治理：除回调地址外同时读取 Telegram 自己报告的投递结果 ——
- *   last_error_message（最近一次推送失败原话）/ pending_update_count（积压条数）。
- *   「已注册但消息根本进不来」的线上静默故障（如回调 401、超时）直接在列表亮红牌。
- * - polling 模式：本进程运行实例状态（长轮询只存在于本进程，内存即权威）
- * 探测失败/指向异常都如实展示，绝不兜底成“已部署”。
+ * v2.1.10 整合：真实部署状态探测的唯一实现在 services/bot-deploy.ts
+ *（probeBotDeployState），展示徽章在 components/admin/bot-deploy-badge.tsx ——
+ * 机器人管理页列表与本页列表共用同一实现（本文件不再保留探测/徽章副本）。
+ * v2.1.11：部署入口统一收敛到「仿真APP」页面（列表「🚀 部署」改为跳转链接），
+ * 本页不再保留独立部署动作；部署状态徽章继续真实探测（部署后自动同步）。
  */
-async function probeTgApiBotDeployState(bot: BotRow): Promise<DeployCheck> {
-  if (!bot.enabled) return { key: "disabled" };
-  const global = await getTelegramRuntimeSettings();
-  const runtime = resolveBotRuntime(String(bot.id), bot.config, global);
-  if (runtime.mode === "webhook") {
-    try {
-      const res = await withTelegramTimeout(
-        tgRawCall<{
-          ok: boolean;
-          description?: string;
-          result?: {
-            url?: string;
-            last_error_message?: string;
-            last_error_date?: number;
-            pending_update_count?: number;
-          };
-        }>(bot.token, "getWebhookInfo"),
-      );
-      if (!res.ok) {
-        return { key: "unknown", detail: res.description ?? "Telegram API 返回错误" };
-      }
-      const url = (res.result?.url ?? "").trim();
-      const lastError = (res.result?.last_error_message ?? "").trim();
-      const pending = res.result?.pending_update_count ?? 0;
-      const deliverySuffix = lastError
-        ? `；Telegram 投递错误：${lastError}${pending > 0 ? `（积压 ${pending} 条未投递）` : ""}`
-        : pending > 0
-          ? `；积压 ${pending} 条待投递`
-          : "";
-      if (!url) return { key: "undeployed" };
-      if (runtime.webhookUrl && url !== runtime.webhookUrl) {
-        return { key: "mismatch", detail: `${url}${deliverySuffix}` };
-      }
-      // Webhook 已注册且指向正确，但 Telegram 自己报告过投递失败 =
-      // 消息根本进不来 / 回复发不出去 —— 线上「静默」的最常见根因，原话展示
-      if (lastError) {
-        return {
-          key: "delivery-error",
-          detail: `Webhook 已注册但 Telegram 投递失败：${lastError}${pending > 0 ? `（积压 ${pending} 条未投递）` : ""}`,
-        };
-      }
-      return { key: "deployed", detail: `Webhook${deliverySuffix}` };
-    } catch (error) {
-      return {
-        key: "unknown",
-        detail: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-  const state = getMenuBotDeployState(bot.id);
-  if (state.present && state.started) {
-    return { key: "deployed", detail: `长轮询${state.transportUrl ?? ""}` };
-  }
-  if (state.present && state.running) return { key: "deploying" };
-  return { key: "undeployed" };
-}
-
-function DeployStateBadge({ check }: { check: DeployCheck }) {
-  const styles: Record<DeployCheck["key"], string> = {
-    deployed: "border-green-200 bg-green-50 text-green-700",
-    undeployed: "border-red-200 bg-red-50 text-red-700",
-    mismatch: "border-amber-200 bg-amber-50 text-amber-700",
-    deploying: "border-amber-200 bg-amber-50 text-amber-700",
-    "delivery-error": "border-red-200 bg-red-50 text-red-700",
-    unknown: "border-amber-200 bg-amber-50 text-amber-700",
-    disabled: "border-gray-200 bg-gray-50 text-gray-500",
-  };
-  const labels: Record<DeployCheck["key"], string> = {
-    deployed: "已部署",
-    undeployed: "未部署",
-    mismatch: "Webhook 指向异常",
-    deploying: "启动确认中",
-    "delivery-error": "投递异常",
-    unknown: "状态未知",
-    disabled: "已停用",
-  };
-  return (
-    <span
-      className={`inline-flex rounded-full border px-2 py-0.5 text-sm ${styles[check.key]}`}
-      title={"detail" in check ? check.detail : undefined}
-    >
-      {labels[check.key]}
-    </span>
-  );
-}
 
 function TgApiBotFormDialog({
   bot,
@@ -205,12 +103,7 @@ function TgApiBotFormDialog({
         enabled: false,
         unlockMode: "captcha",
         askAppDetails: true,
-        appPlatforms: [...TGAPI_APP_PLATFORMS],
-        appTitle: "usetgxbot",
-        appShortName: "usetgxbot",
-        appUrl: "https://telegram.dog/UseTGxBot",
-        appDescription: "created using https://telegram.dog/UseTGxBot",
-        footerText: "❤️ @SpEcHlDe",
+        ...TGAPI_DEFAULT_APP,
       };
   const suffix = bot ? String(bot.id) : "new";
   const selectedPlatforms = new Set(cfg.appPlatforms);
@@ -263,7 +156,7 @@ function TgApiBotFormDialog({
           className="h-4 w-4"
         />
         <label className={labelClass} htmlFor={`enabled-${suffix}`}>
-          启用机器人（保存仅落库配置；上线/更新运行实例请用列表中的「🚀 部署」按钮）
+          启用机器人（保存仅落库配置；上线/更新运行实例请到「仿真APP」页面部署）
         </label>
       </div>
 
@@ -431,7 +324,10 @@ function TgApiBotFormDialog({
                   id={`text-${lang}-${field.name}-${suffix}`}
                   name={`text_${lang}_${field.name}`}
                   rows={2}
-                  defaultValue={langTexts?.[field.name] ?? ""}
+                  defaultValue={
+                    langTexts?.[field.name] ??
+                    (lang === "zh" ? TGAPI_TEXTS_ZH : TGAPI_TEXTS_EN)[field.name]
+                  }
                   className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"
                 />
               </div>
@@ -467,7 +363,7 @@ export default async function TgApiPage({
     type: method.type,
   }));
   // 真实部署状态逐 bot 并行探测（webhook=Telegram 侧权威值；polling=本进程运行实例）
-  const deployChecks = await Promise.all(tgapiBots.map((bot) => probeTgApiBotDeployState(bot)));
+  const deployChecks = await Promise.all(tgapiBots.map((bot) => probeBotDeployState(bot)));
 
   const selectedBotId =
     params.bot && /^\d+$/.test(params.bot) ? params.bot : null;
@@ -590,26 +486,24 @@ export default async function TgApiPage({
                       </td>
                       <td className="px-4 py-3">
                         <div className="max-w-56 space-y-1">
-                          <DeployStateBadge check={deployChecks[index] ?? { key: "unknown", detail: "探测结果缺失" }} />
+                          <BotDeployBadge check={deployChecks[index] ?? { key: "unknown", detail: "探测结果缺失" }} />
                           {"detail" in (deployChecks[index] ?? {}) &&
                           (deployChecks[index] as { detail?: string }).detail ? (
                             <p className="text-xs leading-snug text-muted-foreground">
-                              {briefCheckDetail((deployChecks[index] as { detail: string }).detail)}
+                              {briefDeployDetail((deployChecks[index] as { detail: string }).detail)}
                             </p>
                           ) : null}
                         </div>
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex flex-wrap items-center gap-2">
-                          <form action={deployTgApiBotAction}>
-                            <input type="hidden" name="id" value={String(bot.id)} />
-                            <button
-                              type="submit"
-                              className="inline-flex h-8 items-center rounded-md border border-emerald-200 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 hover:bg-emerald-100"
-                            >
-                              🚀 部署
-                            </button>
-                          </form>
+                          <a
+                            href={`/admin/bots/testing?bot=${String(bot.id)}`}
+                            title="统一部署入口：跳转到「仿真APP」页面，选中本机器人后点击「🚀 部署机器人」上线/更新"
+                            className="inline-flex h-8 items-center rounded-md border border-emerald-200 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 hover:bg-emerald-100"
+                          >
+                            🚀 部署
+                          </a>
                           <TgApiBotFormDialog
                             bot={bot}
                             methods={methodOptions}

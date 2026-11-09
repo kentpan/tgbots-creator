@@ -356,6 +356,23 @@ export function TgSimulator({
       appendMessage({ from: "bot", sender: botName, content });
       return;
     }
+    if (action.type === "command") {
+      // v2.1.10 仿真预览：执行指令按钮 —— 真实机器人将按指令名调用指令处理器
+      const name = (action.target ?? "").trim().replace(/^\//, "");
+      appendMessage({
+        from: "bot",
+        sender: botName,
+        content: {
+          type: "text",
+          text: name
+            ? `⌨️ /${name}\n\n（真实机器人将真实执行 /${name} 指令：内置指令或指令管理中启用的自定义指令）`
+            : "⚠️ 该按钮还没有绑定指令：请在按钮配置中选择要执行的指令",
+          mediaUrl: "",
+          items: [],
+        },
+      });
+      return;
+    }
     if (action.type === "api" && action.api) {
       // appendStream 立即分配 id：loading 消息将拿到当前 nextId
       const loadingId = nextId.current;

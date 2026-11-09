@@ -12,17 +12,13 @@ import {
   createBotRecord,
 } from "@/database/operations";
 import { logOperation, requirePermission } from "@/lib/auth";
-import {
-  parseBotProfile,
-  restartMenuBot,
-  stopMenuBot,
-  getMenuBotDeployState,
-  waitForMenuBotDeployConfirmation,
-} from "@/bot/multi-runtime";
-import { getTelegramRuntimeSettings, resolveBotRuntime } from "@/services/bot-transport";
+import { parseBotProfile, stopMenuBot } from "@/bot/multi-runtime";
+import { deployBotAndReport } from "@/services/bot-deploy";
 import {
   TGAPI_APP_PLATFORMS,
   TGAPI_TEXT_FIELD_KEYS,
+  TGAPI_TEXTS_EN,
+  TGAPI_TEXTS_ZH,
   type TgApiBotConfig,
   type TgApiBotTexts,
   type TgApiUnlockMode,
@@ -33,69 +29,12 @@ function tgapiPath(params: Record<string, string>): string {
   return query ? `/admin/tgapi?${query}` : "/admin/tgapi";
 }
 
-/** 部署结果（真实结果，非预期值）随 redirect 传回页面展示 */
-interface TgApiDeployOutcome {
-  state: "ok" | "fail" | "pending" | "stopped";
-  message: string;
-}
-
-const DEPLOY_CONFIRM_TIMEOUT_MS = 12000;
-
-function truncateDeployMessage(message: string): string {
-  return message.length > 300 ? `${message.slice(0, 300)}…` : message;
-}
-
 /**
- * 部署后的真实结果确认：await 运行实例重启（不再 fire-and-forget），
- * 按生效传输模式取真实结果：
- * - webhook：setWebhook 注册结果（startMenuBot 返回时已定）
- * - polling：有界等待 getMe 确认（onStart）/ 失败退出（onExit），超时如实报 pending
- * 部署失败绝不静默：原因随 redirect 回显到页面横幅。
- *
- * v2.1.9 部署与保存分离：本流程不再由保存动作自动触发，唯一入口是
- * 列表「部署」按钮（deployTgApiBotAction）与启停开关（toggleTgApiBotAction）。
+ * v2.1.10 整合：部署/真实结果确认的唯一实现在 services/bot-deploy.ts
+ *（deployBotAndReport）。v2.1.11：部署入口统一收敛到「仿真APP」页面 ——
+ * 本文件不再保留独立部署动作（原 deployTgApiBotAction 已移除），
+ * 启停开关保留（TGAPI 页「运行服务」职责：启用即上线/停用即下线）。
  */
-async function deployTgApiBotAndReport(botId: bigint, enabled: boolean): Promise<TgApiDeployOutcome> {
-  if (!enabled) {
-    return { state: "stopped", message: "机器人已停用，运行实例已停止" };
-  }
-  try {
-    await restartMenuBot(botId);
-  } catch (error) {
-    console.error(`[tgapi] 机器人 #${String(botId)} 部署（重启运行实例）失败:`, error);
-    return {
-      state: "fail",
-      message: truncateDeployMessage(error instanceof Error ? error.message : String(error)),
-    };
-  }
-  await waitForMenuBotDeployConfirmation(botId, DEPLOY_CONFIRM_TIMEOUT_MS);
-  const row = await getBot(botId);
-  if (!row) {
-    return { state: "fail", message: "部署失败：机器人记录不存在" };
-  }
-  const global = await getTelegramRuntimeSettings();
-  const runtime = resolveBotRuntime(String(botId), row.config, global);
-  const state = getMenuBotDeployState(botId);
-  if (runtime.mode === "webhook") {
-    if (state.transportOk === true) {
-      return { state: "ok", message: `部署成功：Webhook 已注册（${state.transportUrl ?? "回调地址已生效"}）` };
-    }
-    if (state.transportOk === false) {
-      return { state: "fail", message: `部署失败：${truncateDeployMessage(state.transportError ?? "Webhook 注册失败")}` };
-    }
-    return { state: "pending", message: "部署确认中：Webhook 注册尚未返回，请稍后刷新本页查看部署状态" };
-  }
-  if (state.started) {
-    return { state: "ok", message: `部署成功：长轮询运行中（${state.transportUrl ?? "已连接 Telegram"}）` };
-  }
-  if (!state.running) {
-    return {
-      state: "fail",
-      message: `部署失败：${truncateDeployMessage(state.startError ?? state.transportError ?? "轮询未启动，详见服务器日志")}`,
-    };
-  }
-  return { state: "pending", message: "部署确认中：长轮询启动尚未确认，请稍后刷新本页查看部署状态" };
-}
 
 function parsePlatforms(formData: FormData): string[] {
   const values = formData.getAll("app_platforms").map((item) => String(item));
@@ -125,12 +64,19 @@ function buildTgApiConfig(formData: FormData): TgApiBotConfig {
     redirect(tgapiPath({ error: "invalid-stars" }));
   }
 
-  // 按语言文案覆盖：表单字段 text_<lang>_<key>，留空 = 清除该条覆盖
+  // 按语言文案覆盖：表单字段 text_<lang>_<key>。v2.1.11 表单预填内置默认值，
+  // 保存时与内置默认逐字相同的值不落库（等价于「使用内置文案」）—— 避免默认值
+  // 被固化进 bots.config（v2.1.10 已专门迁移过此类固化垃圾数据）；
+  // 管理员真正修改过的文案照常保存为覆盖。
   const buildLangTexts = (lang: "zh" | "en"): Partial<TgApiBotTexts> | undefined => {
+    const builtin = lang === "zh" ? TGAPI_TEXTS_ZH : TGAPI_TEXTS_EN;
     const collected: Partial<TgApiBotTexts> = {};
     for (const field of TGAPI_TEXT_FIELD_KEYS) {
-      const value = String(formData.get(`text_${lang}_${field.name}`) ?? "").trim();
-      if (value) collected[field.name] = value;
+      // 浏览器 textarea 会把换行规范为 \r\n，内置默认值使用 \n —— 比较与落库前统一归一化
+      const value = String(formData.get(`text_${lang}_${field.name}`) ?? "")
+        .replace(/\r\n/g, "\n")
+        .trim();
+      if (value && value !== builtin[field.name]) collected[field.name] = value;
     }
     return Object.keys(collected).length > 0 ? collected : undefined;
   };
@@ -146,14 +92,15 @@ function buildTgApiConfig(formData: FormData): TgApiBotConfig {
       unlockMode === "stars" && Number.isFinite(starsAmount) ? Math.floor(starsAmount) : undefined,
     starsTitle: String(formData.get("stars_title") ?? "").trim() || undefined,
     askAppDetails: formData.get("ask_app_details") === "1",
-    appTitle: String(formData.get("app_title") ?? "").trim() || "usetgxbot",
-    appShortName: String(formData.get("app_short_name") ?? "").trim() || "usetgxbot",
-    appUrl: String(formData.get("app_url") ?? "").trim() || "https://telegram.dog/UseTGxBot",
+    // v2.1.10：默认值全部中性化，不再携带原项目作者推广链接/署名
+    appTitle: String(formData.get("app_title") ?? "").trim() || "usetgapibot",
+    appShortName: String(formData.get("app_short_name") ?? "").trim() || "usetgapibot",
+    appUrl: String(formData.get("app_url") ?? "").trim() || "https://www.telegram.org",
     appPlatforms: parsePlatforms(formData),
     appDescription:
-      String(formData.get("app_description") ?? "").trim() ||
-      "created using https://telegram.dog/UseTGxBot",
-    footerText: String(formData.get("footer_text") ?? "").trim() || "❤️ @SpEcHlDe",
+      String(formData.get("app_description") ?? "").trim() || "My Telegram App",
+    // footer 留空 = 结果消息不附加任何署名
+    footerText: String(formData.get("footer_text") ?? "").trim(),
     texts: {
       ...(zhTexts ? { zh: zhTexts } : {}),
       ...(enTexts ? { en: enTexts } : {}),
@@ -221,36 +168,6 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
   }
 }
 
-/**
- * 列表「🚀 部署」按钮（v2.1.9）：唯一的显式部署入口。
- * 重启运行实例并按生效传输模式取真实结果（webhook=setWebhook 注册结果 /
- * polling=getMe 确认），成败原因随 redirect 回显到页面横幅；停用状态下拒绝部署。
- */
-export async function deployTgApiBotAction(formData: FormData): Promise<void> {
-  const admin = await requirePermission("tgapi:manage");
-  const idRaw = String(formData.get("id") ?? "").trim();
-  if (!idRaw || !/^\d+$/.test(idRaw)) redirect(tgapiPath({ error: "invalid-id" }));
-  const bot = await getBot(BigInt(idRaw));
-  if (!bot) redirect(tgapiPath({ error: "invalid-id" }));
-  if (!bot.enabled) {
-    redirect(
-      tgapiPath({
-        deploy: "fail",
-        deploy_msg: "机器人已停用：请先在列表中「启用」再部署",
-      }),
-    );
-  }
-  const deploy = await deployTgApiBotAndReport(BigInt(idRaw), true);
-  await logOperation(admin, {
-    action: "部署TGAPI申请机器人",
-    target: bot.name,
-    detail: deploy.message,
-    headers: await headers(),
-  });
-  revalidatePath("/admin/tgapi");
-  redirect(tgapiPath({ deploy: deploy.state, deploy_msg: deploy.message }));
-}
-
 export async function toggleTgApiBotAction(formData: FormData): Promise<void> {
   const admin = await requirePermission("tgapi:manage");
   const idRaw = String(formData.get("id") ?? "").trim();
@@ -259,7 +176,7 @@ export async function toggleTgApiBotAction(formData: FormData): Promise<void> {
   const bot = await getBot(BigInt(idRaw));
   if (!bot) redirect(tgapiPath({ error: "invalid-id" }));
   await updateBotRecord(BigInt(idRaw), { enabled: enable });
-  const deploy = await deployTgApiBotAndReport(BigInt(idRaw), enable);
+  const deploy = await deployBotAndReport(BigInt(idRaw), enable);
   await logOperation(admin, {
     action: enable ? "启用TGAPI申请机器人" : "停用TGAPI申请机器人",
     target: bot.name,

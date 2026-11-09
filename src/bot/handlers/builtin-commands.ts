@@ -1,11 +1,12 @@
 import type { Bot } from "grammy";
 import type { BotContext } from "../context";
-import { adminOnly } from "../filters";
+import { adminOnly, isAdmin } from "../filters";
 import { mainMenu } from "../menus";
 import { cmdStart, cmdHelp, cmdStats, cmdApi } from "./admin";
 import { APP_VERSION } from "@/lib/app-version";
 import { getGlobalStats } from "@/database/operations";
 import { config } from "@/config/settings";
+import type { MenuCommandRegistry, MenuCommandRunner } from "@/services/bot-menu";
 
 /**
  * 官方内置指令真实处理器注册表（v1.1.0）。
@@ -474,33 +475,52 @@ export const BUILTIN_COMMAND_REGISTRY: Record<string, BuiltinCommandHandler> = {
  * 注册内置指令（真实生效）。
  * items 提供时按指令库条目注册（与「启用」状态联动），库中存在但注册表未实现的
  * 内置条目 → 回退为回复其中文介绍文本；缺省注册全部官方内置指令。
+ *
+ * v2.1.10：registry 提供时同步填充菜单「执行指令」按钮的指令运行器注册表 ——
+ * 按钮点击与手输 /指令 完全同源（同一 handler 闭包）。adminOnly 指令在
+ * bot.command 路径由 adminOnly 中间件校验；菜单按钮回调不经中间件链，
+ * runner 内闭包自校验（防普通用户点按钮绕过管理员权限）。
  */
 export function registerBuiltinCommandHandlers(
   bot: Bot<BotContext>,
   items?: { name: string; intro?: string; description?: string }[],
+  registry?: MenuCommandRegistry,
 ): void {
   const list: { name: string; intro?: string; description?: string }[] =
     items ?? Object.keys(BUILTIN_COMMAND_REGISTRY).map((name) => ({ name }));
   for (const item of list) {
     const entry = BUILTIN_COMMAND_REGISTRY[item.name];
+    let handler: (ctx: BotContext) => Promise<void>;
     if (!entry) {
-      bot.command(item.name, async (ctx) => {
-        await ctx.reply(`⌨️ /${item.name}\n\n${item.intro || item.description || "内置指令"}`);
-      });
-      continue;
-    }
-    let handler: (ctx: BotContext) => Promise<void> = entry.handler;
-    if (entry.privateOnly) {
-      const wrapped = handler;
+      const introText = item.intro || item.description || "内置指令";
       handler = async (ctx) => {
-        if (ctx.chat?.type !== "private") {
-          await ctx.reply("⚠️ 该指令请在与机器人的私聊中使用。");
+        await ctx.reply(`⌨️ /${item.name}\n\n${introText}`);
+      };
+    } else {
+      handler = entry.handler;
+      if (entry.privateOnly) {
+        const wrapped = handler;
+        handler = async (ctx) => {
+          if (ctx.chat?.type !== "private") {
+            await ctx.reply("⚠️ 该指令请在与机器人的私聊中使用。");
+            return;
+          }
+          await wrapped(ctx);
+        };
+      }
+    }
+    if (registry) {
+      const adminRestricted = entry?.adminOnly === true;
+      const runner: MenuCommandRunner = async (ctx) => {
+        if (adminRestricted && !isAdmin(ctx.from?.id)) {
+          await ctx.reply("⚠️ 该指令仅管理员可用。");
           return;
         }
-        await wrapped(ctx);
+        await handler(ctx as BotContext);
       };
+      registry.runners.set(item.name, runner);
     }
-    if (entry.adminOnly) {
+    if (entry?.adminOnly) {
       bot.command(item.name, adminOnly, handler);
     } else {
       bot.command(item.name, handler);

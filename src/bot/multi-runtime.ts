@@ -17,7 +17,7 @@ import {
   listBotCommands,
   type BotRow,
 } from "@/database/operations";
-import { installBotMenu, parseBotMenuConfig, type BotMenuConfig } from "@/services/bot-menu";
+import { installBotMenu, parseBotMenuConfig, createMenuCommandRegistry, type BotMenuConfig, type MenuCommandRegistry, type MenuCommandRunner } from "@/services/bot-menu";
 import { CommandGroup } from "@grammyjs/commands";
 import { codeQuestion } from "./verification-question";
 import { registerAiSupport, type AiSupportConfig } from "./handlers/ai-support";
@@ -102,6 +102,11 @@ interface MenuBotInstance {
   started: boolean;
   /** polling 模式最近一次轮询致命错误消息（onError 记录，绝不静默） */
   startError: string | null;
+  /**
+   * 菜单「执行指令」按钮注册表（v2.1.10）：createMenuBot 创建并注入菜单插件，
+   * registerBotCapabilities 在能力注册阶段按指令库填充（内置 + 自定义指令）。
+   */
+  menuCommands: MenuCommandRegistry;
 }
 
 type MenuBotRegistry = Map<number, MenuBotInstance>;
@@ -309,7 +314,9 @@ async function createMenuBot(row: BotRow, menuConfig: BotMenuConfig, mode: Effec
   // v2.1.2 邀请链接台账：任何路径 createChatInviteLink 成功后统一落库（群组管理可查看/撤销）
   registerInviteLinkTracking(bot, row.token);
   // 官方 @grammyjs/menu 菜单插件（v1.1.1）：回调路由/子菜单导航/过期恢复全由插件处理
-  const instanceMenu = installBotMenu(bot, menuConfig);
+  // v2.1.10：同实例创建「执行指令」按钮注册表（能力注册阶段按指令库填充）
+  const menuCommands = createMenuCommandRegistry();
+  const instanceMenu = installBotMenu(bot, menuConfig, menuCommands);
   // 实例菜单注入（ctx.botMenu）：官方插件约束 Menu 实例只能发给安装它的 bot，
   // cmdStart/cmdMenu 优先用本实例菜单，避免误发主 bot 的全局 mainMenu 而抛
   // "Cannot send menu"（轮询/Webhook 下菜单 bot 私聊 /start 均命中）
@@ -328,6 +335,7 @@ async function createMenuBot(row: BotRow, menuConfig: BotMenuConfig, mode: Effec
     transportState: null,
     started: false,
     startError: null,
+    menuCommands,
   };
 }
 
@@ -345,6 +353,8 @@ async function registerBotCapabilities(
   profile: BotProfileConfig,
   effectivePrivacy: boolean,
   botId?: bigint,
+  menuCommands?: MenuCommandRegistry,
+  menuConfig?: BotMenuConfig,
 ): Promise<() => Promise<void>> {
   const privacyMode = effectivePrivacy;
 
@@ -354,9 +364,19 @@ async function registerBotCapabilities(
   // 群验证 handler 对该类型机器人无意义且可能干扰）。
   // v2.1.7：传入前先 normalize（parseBotProfile 是裸 JSON.parse，这里补齐缺省字段
   // 默认值，保证运行实例与管理后台读到同一份配置语义）。
+  // v2.1.10：传入菜单配置与指令注册表 —— 按钮驱动新流程（欢迎+授权认证按钮→
+  // 输码→成功+菜单键盘）+ 菜单「执行指令」按钮与自定义指令同源。
   if (profile.tgapi?.enabled) {
     const resolvedBotId = botId ?? BigInt(0);
-    return registerTgApiHandlers(bot, normalizeTgApiSection(profile.tgapi), resolvedBotId);
+    return await registerTgApiHandlers(
+      bot,
+      normalizeTgApiSection(profile.tgapi),
+      resolvedBotId,
+      {
+        menuConfig: menuConfig ?? parseBotMenuConfig(undefined),
+        registry: menuCommands ?? createMenuCommandRegistry(),
+      },
+    );
   }
 
   // 加群验证入口：收到真实加群申请 → 群内验证（默认）/私聊验证创建验证会话
@@ -392,11 +412,13 @@ async function registerBotCapabilities(
       ).flatMap((page) => page.rows);
 
   // 内置指令：注册真实处理器（含 adminOnly/私聊限定包装；库中未实现的条目回退为介绍回复）
+  // v2.1.10：同步填充菜单「执行指令」按钮注册表 —— 内置指令按钮点击与手输 /指令 同源
   registerBuiltinCommandHandlers(
     bot,
     library
       .filter((item) => item.type === "builtin")
       .map((item) => ({ name: item.name, intro: item.intro, description: item.description })),
+    menuCommands,
   );
 
   const customItems = library.filter((item) => item.type === "custom");
@@ -406,22 +428,27 @@ async function registerBotCapabilities(
       targetedCommands: privacyMode ? "ignored" : "optional",
     });
     for (const item of customItems) {
-      group.command(item.name, item.description, async (ctx) => {
-        const intro = item.intro || item.description;
-        await ctx.reply(`⌨️ /${item.name}\n\n${intro}`);
-      });
+      const commandName = item.name;
+      const intro = item.intro || item.description;
+      const runner: MenuCommandRunner = async (ctx) => {
+        await ctx.reply(`⌨️ /${commandName}\n\n${intro}`);
+      };
+      // v2.1.10：同一运行器同步填充菜单「执行指令」按钮注册表 ——
+      // 按钮点击与手输 /指令 完全同源真实执行
+      menuCommands?.runners.set(commandName, runner);
+      group.command(commandName, item.description, runner);
     }
     bot.use(group);
   }
 
-  const menuCommands = library.map((item) => ({
+  const syncCommandList = library.map((item) => ({
     command: item.name,
     description: item.description.slice(0, 256),
   }));
   // 返回后台同步任务：setMyCommands 写入 Telegram（网络调用，不阻塞轮询启动）
   return async () => {
-    if (menuCommands.length === 0) return;
-    await bot.api.setMyCommands(menuCommands).catch((error) => {
+    if (syncCommandList.length === 0) return;
+    await bot.api.setMyCommands(syncCommandList).catch((error) => {
       console.warn("setMyCommands failed:", error);
     });
   };
@@ -440,7 +467,17 @@ async function ensureMenuBotCapabilities(
   effectivePrivacy: boolean,
 ): Promise<() => Promise<void>> {
   if (instance.capabilitiesReady) return async () => undefined;
-  const syncCommands = await registerBotCapabilities(instance.bot, profile, effectivePrivacy, row.id);
+  // v2.1.10：菜单配置 + 「执行指令」按钮注册表随能力注册一并传入
+  //（TGAPI 机器人据此安装按钮驱动新流程；普通机器人据此填充自定义指令运行器）
+  const menuConfig = parseBotMenuConfig(row.menuConfig);
+  const syncCommands = await registerBotCapabilities(
+    instance.bot,
+    profile,
+    effectivePrivacy,
+    row.id,
+    instance.menuCommands,
+    menuConfig,
+  );
   // TGAPI申请 机器人是纯私聊对话工具机器人：AI 客服等附加能力不叠加
   if (profile.aiSupport?.enabled && !profile.tgapi?.enabled) {
     registerAiSupport(instance.bot, profile.aiSupport, row.id);
@@ -553,25 +590,34 @@ async function startMenuBot(row: BotRow, options: StartMenuBotOptions = {}): Pro
   {
     const { probeRemoteWebhook } = await import("@/services/bot-transport");
     const remote = await probeRemoteWebhook(row.token);
-    if (remote) {
+    // v2.1.10 类型收窄修复：probeRemoteWebhook 恒返回对象（none/active/unknown），
+    // 旧 truthy 判断会把 status="none"（无远程消费者）误判为存在远程消费者，
+    // 导致轮询机器人永远拒绝启动（v2.1.9 遗留回归）。按 status 精确分支：
+    if (remote.status === "active") {
       const forced = process.env.TG_FORCE_LOCAL_POLLING === "1";
-      const intent = explicitPolling ? "显式配置了本地长轮询" : "隐式回退本地长轮询";
-      if (forced) {
+      const intent = explicitPolling ? "显式配置了本地长轮询" : "隐式回退本地轮询";
+      if (!forced) {
         console.warn(
-          `[multi-runtime] Menu bot #${row.id} ${intent}，检测到远程 Webhook 消费者（${remote.url}），` +
-            "但 TG_FORCE_LOCAL_POLLING=1 —— 按强制接管执行，远程 Webhook 将被删除（远程环境停止收到该机器人事件）。",
-        );
-      } else {
-        console.warn(
-          `[multi-runtime] Menu bot #${row.id} ${intent}，但检测到远程 Webhook 消费者（${remote.url}，待处理更新 ${remote.pendingUpdateCount} 条），` +
+          `[multi-runtime] Menu bot #${row.id} ${intent}，检测到远程 Webhook 消费者（${remote.url}，待处理更新 ${remote.pendingUpdateCount} 条），` +
             "本地长轮询已停用：getUpdates 与 Webhook 互斥，删除远程 Webhook 会掐断另一环境（如线上部署）的事件推送。" +
             "如需本环境接管，请设置 TG_FORCE_LOCAL_POLLING=1 或先在远程环境停用其 Webhook。",
         );
         return;
       }
+      console.warn(
+        `[multi-runtime] Menu bot #${row.id} ${intent}，检测到远程 Webhook 消费者（${remote.url}），` +
+          "但 TG_FORCE_LOCAL_POLLING=1 —— 按强制接管执行，远程 Webhook 将被删除（远程环境停止收到该机器人事件）。",
+      );
+    } else if (remote.status === "unknown") {
+      // v2.1.9 语义：探测连续失败（无法判定）时严禁删除/接管任何 Webhook —— 宁可让位
+      console.warn(
+        `[multi-runtime] Menu bot #${row.id} 远程 Webhook 探测连续失败（无法判定是否存在线上消费者），` +
+          "本地长轮询已停用：按让位处理避免掐断线上事件推送；确需本环境接管，请设置 TG_FORCE_LOCAL_POLLING=1。",
+      );
+      return;
     } else {
       console.log(
-        `[multi-runtime] Menu bot #${row.id} 未探测到远程 Webhook 消费者（无 webhook 或探测连续失败），按本地轮询启动` +
+        `[multi-runtime] Menu bot #${row.id} 未探测到远程 Webhook 消费者（无 webhook），按本地轮询启动` +
           `${explicitPolling ? "（显式配置）" : "（隐式回退）"}。`,
       );
     }

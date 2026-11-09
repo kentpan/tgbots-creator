@@ -42,6 +42,7 @@ import {
 } from "@/services/menu-config";
 import { saveBotMenuAction } from "./actions";
 import { Switch } from "@/components/ui/switch";
+import { SelfContainedTabs } from "@/components/admin/self-contained-tabs";
 
 interface DesignerBot {
   id: string;
@@ -50,6 +51,87 @@ interface DesignerBot {
   menuText: string;
   username: string | null;
   privacyMode: boolean;
+  /** TGAPI申请 机器人（v2.1.10）：指令选择器额外提供内置 start/language */
+  isTgApi?: boolean;
+}
+
+/** 指令选择器可选项（v2.1.10）：内置指令 = 指令管理启用内置项 / TGAPI 机器人自有指令 */
+export interface MenuCommandOption {
+  name: string;
+  label: string;
+}
+
+/**
+ * 指令选择器（v2.1.10）：tab 切换「内置指令 / 自定义指令」。
+ * 与「指令管理」页的双 tab 语义一致：内置 = 系统真实实现；自定义 = 指令管理中启用项。
+ * 当前值属于哪个 tab 时自动定位初始 tab；两组都为空时给出明确引导。
+ */
+function CommandPicker({
+  builtinCommands,
+  customCommands,
+  value,
+  onChange,
+}: {
+  builtinCommands: MenuCommandOption[];
+  customCommands: MenuCommandOption[];
+  value: string;
+  onChange: (name: string) => void;
+}) {
+  const valueIsBuiltin = builtinCommands.some((option) => option.name === value);
+  const valueIsCustom = customCommands.some((option) => option.name === value);
+  const [tab, setTab] = useState<string>(
+    valueIsCustom && !valueIsBuiltin ? "custom" : "builtin",
+  );
+  if (builtinCommands.length === 0 && customCommands.length === 0) {
+    return (
+      <p className="rounded-md border border-dashed bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+        暂无可用指令：请先在「指令管理」中启用内置指令或新增自定义指令。
+      </p>
+    );
+  }
+  const tabs: { key: string; label: string; options: MenuCommandOption[] }[] = [];
+  if (builtinCommands.length > 0) {
+    tabs.push({
+      key: "builtin",
+      label: `内置指令（${builtinCommands.length}）`,
+      options: builtinCommands,
+    });
+  }
+  if (customCommands.length > 0) {
+    tabs.push({
+      key: "custom",
+      label: `自定义指令（${customCommands.length}）`,
+      options: customCommands,
+    });
+  }
+  const active = tabs.find((item) => item.key === tab) ?? tabs[0];
+  return (
+    <SelfContainedTabs
+      ariaLabel="指令类型"
+      items={tabs.map((item) => ({
+        key: item.key,
+        label: item.label,
+        content: (
+          <select
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+          >
+            <option value="" disabled>
+              请选择指令…
+            </option>
+            {item.options.map((option) => (
+              <option key={option.name} value={option.name}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        ),
+      }))}
+      activeKey={active.key}
+      onActiveKeyChange={setTab}
+    />
+  );
 }
 
 const ACTION_OPTIONS: { value: MenuActionType; label: string }[] = [
@@ -58,6 +140,7 @@ const ACTION_OPTIONS: { value: MenuActionType; label: string }[] = [
   { value: "back", label: "返回上一级菜单" },
   { value: "url", label: "打开链接（URL 按钮）" },
   { value: "web_app", label: "打开 WebApp" },
+  { value: "command", label: "执行指令（点击等同用户发送 /指令）" },
   { value: "api", label: "调用外部接口并播报结果" },
   { value: "switch_inline", label: "切换到其他聊天的内联查询" },
   { value: "switch_inline_current", label: "在当前聊天输入框预填内容" },
@@ -275,7 +358,9 @@ function NodeEditor({
   state: DesignerState;
   isRoot: boolean;
 }) {
-  const { config, selected, actions } = state;
+  const { config, selected, actions, builtinCommands, customCommands } = state;
+  // 「从指令添加按钮」选择器（v2.1.10）：选中内置/自定义指令一键变成执行指令按钮
+  const [pickedCommand, setPickedCommand] = useState("");
   return (
     <div className="space-y-3">
       <div className="space-y-3 rounded-xl border bg-card p-4">
@@ -316,6 +401,34 @@ function NodeEditor({
             </button>
           </div>
         </div>
+
+        {builtinCommands.length > 0 || customCommands.length > 0 ? (
+          <div className="space-y-2 rounded-lg border border-dashed bg-muted/30 p-3">
+            <span className="text-sm font-medium">从指令添加按钮：</span>
+            <CommandPicker
+              builtinCommands={builtinCommands}
+              customCommands={customCommands}
+              value={pickedCommand}
+              onChange={setPickedCommand}
+            />
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={!pickedCommand}
+                onClick={() => {
+                  actions.addCommandButton(path, pickedCommand);
+                  setPickedCommand("");
+                }}
+                className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                + 添加为按钮
+              </button>
+              <span className="text-xs text-muted-foreground">
+                按钮点击后机器人真实执行对应 /指令；指令在「指令管理」中维护
+              </span>
+            </div>
+          </div>
+        ) : null}
 
         {node.rows.length === 0 ? (
           <p className="rounded-lg border border-dashed p-6 text-center text-sm text-muted-foreground">
@@ -527,6 +640,21 @@ function SelectedButtonPanel({ state }: { state: DesignerState }) {
         </p>
       ) : null}
 
+      {action.type === "command" ? (
+        <div className="space-y-1">
+          <label className="block text-sm font-medium">要执行的指令</label>
+          <CommandPicker
+            builtinCommands={state.builtinCommands}
+            customCommands={state.customCommands}
+            value={action.target ?? ""}
+            onChange={(name) => update((draft) => void (draft.action.target = name))}
+          />
+          <p className="text-xs text-muted-foreground">
+            点击按钮等同于用户发送 /指令：运行实例按指令名真实执行（内置指令 + 指令管理中启用的自定义指令）。
+          </p>
+        </div>
+      ) : null}
+
       {action.type === "url" || action.type === "web_app" ? (
         <div className="space-y-1">
           <label className="block text-sm font-medium">链接地址（http/https）</label>
@@ -713,11 +841,16 @@ interface DesignerState {
   config: BotMenuConfig;
   selected: { path: string[]; buttonId: string } | null;
   storageKind: "cloudflare-r2" | "local";
+  /** 内置指令可选项（v2.1.10）：普通机器人=指令管理启用内置项；TGAPI=start/language */
+  builtinCommands: MenuCommandOption[];
+  /** 自定义指令可选项（v2.1.10）：指令管理中启用的自定义指令 */
+  customCommands: MenuCommandOption[];
   actions: {
     addRow: (path: string[]) => void;
     moveRow: (path: string[], rowIndex: number, direction: -1 | 1) => void;
     deleteRow: (path: string[], rowId: string) => void;
     addButton: (path: string[], rowId: string) => void;
+    addCommandButton: (path: string[], commandName: string) => void;
     selectButton: (path: string[], buttonId: string) => void;
     updateButton: (path: string[], buttonId: string, mutator: (draft: MenuButton) => void) => void;
     deleteButton: (path: string[], buttonId: string) => void;
@@ -732,12 +865,18 @@ export function MenuDesignerDialog({
   bot,
   groups,
   storageKind,
+  builtinCommands,
+  customCommands,
   trigger,
   triggerClassName,
 }: {
   bot: DesignerBot;
   groups: { chatId: string; chatTitle: string | null }[];
   storageKind: "cloudflare-r2" | "local";
+  /** 内置指令库（指令管理 → 内置指令，仅启用项；TGAPI 机器人 = start/language 自有指令） */
+  builtinCommands: MenuCommandOption[];
+  /** 自定义指令库（指令管理 → 自定义指令，仅启用项）：供「从指令添加按钮」选择 */
+  customCommands: MenuCommandOption[];
   trigger: React.ReactNode;
   triggerClassName?: string;
 }) {
@@ -801,6 +940,32 @@ export function MenuDesignerDialog({
         });
         setSelected({ path, buttonId: id });
       },
+      // v2.1.10「从指令添加按钮」：选中的指令一键变成「执行指令」按钮
+      //（追加到末行有空位则追加，否则新建一行；按钮文本默认指令名，可后续改名）
+      addCommandButton: (path, commandName) => {
+        if (!commandName) return;
+        const id = uid("b", counter);
+        mutateConfig((draft) => {
+          const node = findNode(draft.root, path);
+          let targetRow = node.rows[node.rows.length - 1];
+          if (targetRow && targetRow.buttons.length < MENU_MAX_BUTTONS_PER_ROW) {
+            targetRow.buttons.push({
+              id,
+              text: commandName,
+              action: { type: "command", target: commandName },
+            });
+            return;
+          }
+          targetRow = { id: uid("r", counter), buttons: [] };
+          node.rows.push(targetRow);
+          targetRow.buttons.push({
+            id,
+            text: commandName,
+            action: { type: "command", target: commandName },
+          });
+        });
+        setSelected({ path, buttonId: id });
+      },
       selectButton: (path, buttonId) => setSelected({ path, buttonId }),
       updateButton: (path, buttonId, mutator) => {
         mutateConfig((draft) => {
@@ -846,6 +1011,7 @@ export function MenuDesignerDialog({
             }
             if (type === "url" || type === "web_app") nextAction.url = "https://";
             if (type === "switch_inline" || type === "switch_inline_current") nextAction.switch_query = "";
+            if (type === "command") nextAction.target = "";
             button.action = nextAction;
             button.submenu = undefined;
             break;
@@ -881,7 +1047,14 @@ export function MenuDesignerDialog({
     [nodeId],
   );
 
-  const state: DesignerState = { config, selected, storageKind, actions };
+  const state: DesignerState = {
+    config,
+    selected,
+    storageKind,
+    builtinCommands,
+    customCommands,
+    actions,
+  };
   const stats = countMenuStats(config.root);
   const previewDepth = useMemo(() => {
     if (nodeId === "root") return 1;

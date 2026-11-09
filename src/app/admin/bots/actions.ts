@@ -17,6 +17,7 @@ import {
 } from "@/database/operations";
 import { logOperation, requirePermission } from "@/lib/auth";
 import { parseBotMenuConfig, sendMenuMessage, validateMenuConfig, renderMenuMarkup } from "@/services/bot-menu";
+import { deployBotAndReport } from "@/services/bot-deploy";
 import {
   acquireMenuBot,
   applyBotProfile,
@@ -234,6 +235,32 @@ async function syncBotUsername(token: string, botId: bigint): Promise<void> {
   const me = await new Bot(token, telegramBotClientOptions()).api.getMe();
   if (!me.username) return;
   await updateBotRecord(botId, { username: me.username });
+}
+
+/**
+ * 通用显式部署（v2.1.10 整合）：唯一实现在 services/bot-deploy.ts（deployBotAndReport），
+ * 机器人管理页列表「🚀 部署」按钮与 TGAPI 申请页列表「🚀 部署」是同一实现的两个入口。
+ * 重启运行实例并按生效传输模式取真实结果（webhook=setWebhook 注册结果 /
+ * polling=getMe 确认），成败原因随 redirect 回显到页面横幅；停用状态下拒绝部署。
+ */
+export async function deployBotAction(formData: FormData): Promise<void> {
+  const admin = await requirePermission("bots:manage");
+  const idRaw = String(formData.get("id") ?? "").trim();
+  if (!idRaw || !/^\d+$/.test(idRaw)) redirect(botPath({ error: "invalid-id" }));
+  const bot = await getBot(BigInt(idRaw));
+  if (!bot) redirect(botPath({ error: "invalid-id" }));
+  if (!bot.enabled) {
+    redirect(botPath({ deploy: "fail", deploy_msg: "机器人已停用：请先启用后再部署" }));
+  }
+  const deploy = await deployBotAndReport(BigInt(idRaw), true);
+  await logOperation(admin, {
+    action: "部署机器人",
+    target: bot.name,
+    detail: deploy.message,
+    headers: await headers(),
+  });
+  revalidatePath("/admin/bots");
+  redirect(botPath({ deploy: deploy.state, deploy_msg: deploy.message }));
 }
 
 export async function deleteBotAction(formData: FormData): Promise<void> {

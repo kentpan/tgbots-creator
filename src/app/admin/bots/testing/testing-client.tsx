@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { opsFetch } from "@/lib/remote-ops";
-import { AlertTriangle, Check, Loader2, RefreshCw } from "lucide-react";
+import { AlertTriangle, Check, Loader2, RefreshCw, Rocket } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -26,6 +26,8 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TgAppSimulator, type AppSimGroup, type RealChatMessage } from "@/components/admin/tg-app-simulator";
 import { useRealGroups } from "@/components/admin/use-real-groups";
+import { BotDeployBadge } from "@/components/admin/bot-deploy-badge";
+import type { BotDeployCheck } from "@/services/bot-deploy";
 import type { BotMenuConfig } from "@/services/menu-config";
 
 interface BotOption {
@@ -105,19 +107,22 @@ export function isGroupChannelView(channel: string | null | undefined, chatId?: 
 }
 
 export function TestingClient({
+  initialBotId,
   bots,
   relatedBotIds,
   botGroupLinks,
   groups,
   menuConfigs,
 }: {
+  /** v2.1.11：?bot=<id> 预选机器人（TGAPI申请页「🚀 部署」跳转入口） */
+  initialBotId?: string | null;
   bots: BotOption[];
   relatedBotIds: Record<string, string[]>;
   botGroupLinks: { botId: string; chatId: string; deployMode: string | null; inviteLink: string | null }[];
   groups: GroupOption[];
   menuConfigs: Record<string, BotMenuConfig>;
 }) {
-  const [selectedBotId, setSelectedBotId] = useState<string>(bots[0]?.id ?? "");
+  const [selectedBotId, setSelectedBotId] = useState<string>(initialBotId ?? bots[0]?.id ?? "");
   const [selectedChatId, setSelectedChatId] = useState<string>("");
   const [session, setSession] = useState<SimSession | null>(null);
   // 模拟加群申请弹窗：验证 API 配置
@@ -176,6 +181,73 @@ export function TestingClient({
   );
 
   const [deployingChatId, setDeployingChatId] = useState<string | null>(null);
+
+  // —— v2.1.11 统一部署（机器人级运行实例上线）——
+  // 本页是全部机器人的唯一部署入口：TGAPI申请页「🚀 部署」已改为跳转本页。
+  // 实现复用 services/bot-deploy.ts 唯一实现（POST deployBotAndReport / GET probeBotDeployState），
+  // 与群组级「一键部署」（生成入群申请链接）互补；部署状态徽章真实探测，部署后自动同步。
+  const [botDeployCheck, setBotDeployCheck] = useState<BotDeployCheck | null>(null);
+  const [deployingBot, setDeployingBot] = useState(false);
+  const [deployNote, setDeployNote] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const probeBotDeploy = useCallback(async (botId: string): Promise<void> => {
+    try {
+      const response = await opsFetch(`/api/admin/bots/testing/deploy-bot?bot_id=${botId}`, {
+        cache: "no-store",
+      });
+      const payload = (await response.json()) as { ok?: boolean; data?: BotDeployCheck; error?: string };
+      if (payload.ok && payload.data) {
+        setBotDeployCheck(payload.data);
+      } else {
+        setBotDeployCheck({ key: "unknown", detail: payload.error ?? "探测失败" });
+      }
+    } catch (error) {
+      setBotDeployCheck({
+        key: "unknown",
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!selectedBotId) return;
+    void probeBotDeploy(selectedBotId);
+  }, [selectedBotId, probeBotDeploy]);
+
+  const deploySelectedBot = useCallback(async (): Promise<void> => {
+    if (!selectedBotId || deployingBot) return;
+    setDeployingBot(true);
+    setDeployNote(null);
+    try {
+      const response = await opsFetch("/api/admin/bots/testing/deploy-bot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bot_id: selectedBotId }),
+      });
+      const payload = (await response.json()) as {
+        ok?: boolean;
+        state?: string;
+        message?: string;
+        error?: string;
+      };
+      if (payload.ok) {
+        setDeployNote({
+          ok: payload.state === "ok",
+          text: payload.message ?? "部署完成",
+        });
+      } else {
+        setDeployNote({ ok: false, text: payload.error ?? "部署失败" });
+      }
+    } catch (error) {
+      setDeployNote({
+        ok: false,
+        text: error instanceof Error ? error.message : "部署失败",
+      });
+    } finally {
+      setDeployingBot(false);
+      void probeBotDeploy(selectedBotId);
+    }
+  }, [selectedBotId, deployingBot, probeBotDeploy]);
   // v2.1.0：Edge 环境代理提醒 —— 进入仿真APP页面后，若当前为 edge 环境（线上部署）
   // 且代理开关开启（edge 出站会被代理回退链改写），在仿真屏上方与选择机器人面板
   // 之间显示醒目横幅：检测到当前为Edge环境, 请关闭代理!
@@ -631,10 +703,11 @@ export function TestingClient({
   return (
     <div className="flex flex-col gap-4 lg:h-[calc(100vh-6.5rem)] lg:min-h-[680px]">
       <div className="space-y-1">
-        <h1 className="text-2xl font-bold">机器人测试</h1>
+        <h1 className="text-2xl font-bold">仿真APP</h1>
         <p className="text-sm text-muted-foreground">
           Telegram 桌面客户端仿真屏：左侧为当前机器人 Token 下的真实群组列表（点击群组在右侧打开聊天，点头像/三个点进入群组设置），
           搜索框粘贴加群链接可弹出真实加群确认面板；列表项支持一键部署与模拟加群申请，完整走通加群验证全链路。
+          全部机器人的上线/更新统一在本页「🚀 部署机器人」完成（TGAPI申请页部署入口也已跳转至此）。
         </p>
       </div>
 
@@ -667,6 +740,30 @@ export function TestingClient({
               ))}
             </SelectContent>
           </Select>
+        </div>
+
+        <div className="flex flex-col gap-1">
+          <span className="text-xs font-medium text-muted-foreground">运行部署（上线/更新机器人服务）</span>
+          <div className="flex items-center gap-2">
+            {botDeployCheck ? (
+              <BotDeployBadge check={botDeployCheck} />
+            ) : (
+              <Badge variant="outline" className="text-[11px]">
+                状态探测中…
+              </Badge>
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void deploySelectedBot()}
+              disabled={!selectedBotId || deployingBot}
+              aria-label="部署机器人（上线/更新运行实例）"
+              className="gap-1.5"
+            >
+              {deployingBot ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
+              🚀 部署机器人
+            </Button>
+          </div>
         </div>
 
         <div className="flex flex-col gap-1">
@@ -715,6 +812,14 @@ export function TestingClient({
       {syncNote ? (
         <p className={`text-xs leading-relaxed ${syncNote.ok ? "text-green-700" : "text-red-600"}`}>
           {syncNote.ok ? "✓ " : "⚠ "}{syncNote.text}
+        </p>
+      ) : null}
+      {deployNote ? (
+        <p
+          className={`text-xs leading-relaxed ${deployNote.ok ? "text-green-700" : "text-red-600"}`}
+          role={deployNote.ok ? "status" : "alert"}
+        >
+          {deployNote.ok ? "✓ " : "⚠ "}{deployNote.text}
         </p>
       ) : null}
 

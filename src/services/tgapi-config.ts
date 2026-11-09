@@ -57,14 +57,12 @@ export interface TgApiBotTexts {
   unlockSuccess: string;
 }
 
-/** 内置中文文案（v2.1.7 新增：中文用户默认中文对话） */
+/** 内置中文文案（v2.1.10 起全部重写：不再携带原项目作者 SpEcHlDe 的推广链接/署名） */
 export const TGAPI_TEXTS_ZH: TgApiBotTexts = {
   start: [
-    "你好！\n",
-    "使用前请先阅读条款：https://t.me/SpEcHlDe/889\n",
-    "感谢使用 😬\n",
-    "请发送你的 Telegram 手机号，以从 my.telegram.org 获取 APP-ID\n\n",
-    "任意阶段发送 /start 可重新输入资料",
+    "💀 欢迎使用 API 生成机器人！\n\n",
+    "本机器人可为您自己的 Telegram 账号自动生成 api_id 和 api_hash。\n\n",
+    "👇 请选择下面的方式之一：",
   ].join(""),
   askAppTitle: "📝 请发送你要申请的 APP 名称（App title，1-32 个字符）\n发送 /skip 使用默认：{default}",
   askAppDescription: "📄 请发送 APP 描述（App description）\n发送 /skip 使用默认：{default}",
@@ -72,13 +70,11 @@ export const TGAPI_TEXTS_ZH: TgApiBotTexts = {
   afterRecvdCode: [
     "收到！\n",
     "现在请发送你从 Telegram 收到的登录码！\n\n",
-    "该验证码仅用于从 my.telegram.org 获取 APP ID\n",
-    "如果你不信任本机器人的开发者，请自行部署：\n",
-    "打开 https://github.com/SpEcHiDe/MyTelegramOrgRoBot 并点击粉色按钮\n\n",
+    "该验证码仅用于从 my.telegram.org 获取 APP ID\n\n",
     "任意阶段发送 /start 可重新输入资料",
   ].join(""),
   beforeSuccLogin: "已收到验证码，正在抓取页面 ...",
-  erredPage: "出错了，获取 APP ID 失败。\n\n@SpEcHlDe",
+  erredPage: "出错了，获取 APP ID 失败。请稍后重试，或发送 /start 重新开始。",
   invalidCode: "抱歉，输入内容似乎不是有效的 Telegram 网页登录码",
   invalidPhone: "抱歉，输入内容似乎不是有效的手机号",
   unlockPrompt:
@@ -86,14 +82,12 @@ export const TGAPI_TEXTS_ZH: TgApiBotTexts = {
   unlockSuccess: "✅ 解锁成功，欢迎使用！",
 };
 
-/** 内置英文文案（原 bot/translation.py 逐字保留 + 新增提示的英文版） */
+/** 内置英文文案（v2.1.10 起同步重写：不再携带原项目作者推广链接/署名） */
 export const TGAPI_TEXTS_EN: TgApiBotTexts = {
   start: [
-    "Hi!\n",
-    "please read the TnC before proceeding: https://t.me/SpEcHlDe/889\n",
-    "Thank you for using me 😬\n",
-    "Enter your Telegram Phone Number, to get the APP-ID from my.telegram.org\n\n",
-    "/start at any stage to re-enter your details",
+    "💀 Welcome to the API Generator Bot!\n\n",
+    "This bot automatically generates api_id and api_hash for your own Telegram account.\n\n",
+    "👇 Please choose one of the options below:",
   ].join(""),
   askAppTitle:
     "📝 Please send the App title for your application (1-32 characters).\n" +
@@ -107,13 +101,12 @@ export const TGAPI_TEXTS_EN: TgApiBotTexts = {
   afterRecvdCode: [
     "I see!\n",
     "now please send the Telegram code that you received from Telegram!\n\n",
-    "this code is only used for the purpose of getting the APP ID from my.telegram.org\n",
-    "if you do not trust this bot dev, please host this bot yourself\n",
-    "by opening https://github.com/SpEcHiDe/MyTelegramOrgRoBot and clicking on the Pink Button\n\n",
+    "this code is only used for the purpose of getting the APP ID from my.telegram.org\n\n",
     "/start at any stage to re-enter your details",
   ].join(""),
-  beforeSuccLogin: "recieved code. Scarpping web page ...",
-  erredPage: "something wrongings. failed to get app id. \n\n@SpEcHlDe",
+  beforeSuccLogin: "Code received. Scraping web page ...",
+  erredPage:
+    "Something went wrong. Failed to get the APP ID. Please try again later, or send /start to restart.",
   invalidCode:
     "sorry, but the input does not seem to be a valid Telegram Web-Login code",
   invalidPhone:
@@ -240,7 +233,10 @@ export interface TgApiBotConfig {
   texts?: { zh?: Partial<TgApiBotTexts>; en?: Partial<TgApiBotTexts> };
 }
 
-/** 原 Config 类的默认 APP 创建参数（原样保留，作为申请人跳过时的默认值） */
+/**
+ * 默认 APP 创建参数（v2.1.10 起全部换为中性默认值：不再携带原项目作者
+ * UseTGxBot/SpEcHlDe 的推广链接与署名；footerText 默认空 = 结果消息不附加署名）。
+ */
 export const TGAPI_DEFAULT_APP: {
   appTitle: string;
   appShortName: string;
@@ -249,13 +245,31 @@ export const TGAPI_DEFAULT_APP: {
   appDescription: string;
   footerText: string;
 } = {
-  appTitle: "usetgxbot",
-  appShortName: "usetgxbot",
-  appUrl: "https://telegram.dog/UseTGxBot",
+  appTitle: "usetgapibot",
+  appShortName: "usetgapibot",
+  appUrl: "https://www.telegram.org",
   appPlatforms: [...TGAPI_APP_PLATFORMS],
-  appDescription: "created using https://telegram.dog/UseTGxBot",
-  footerText: "❤️ @SpEcHlDe",
+  appDescription: "My Telegram App",
+  footerText: "",
 };
+
+/**
+ * v2.1.10 垃圾默认值迁移（v2.1.9 及更早版本内置默认值携带原项目作者的
+ * 推广链接/署名，且旧版表单会把默认值固化进 bots.config）——
+ * 仅对逐字等于下列旧默认常量的值做确定性迁移，管理员自定义值一律不动。
+ */
+const LEGACY_GARBAGE_VALUES: Record<string, string> = {
+  "https://telegram.dog/UseTGxBot": TGAPI_DEFAULT_APP.appUrl,
+  "created using https://telegram.dog/UseTGxBot": TGAPI_DEFAULT_APP.appDescription,
+  "❤️ @SpEcHlDe": TGAPI_DEFAULT_APP.footerText,
+};
+
+/** 取配置字符串并迁移旧垃圾默认值（逐字相等才迁移） */
+function pickMigratedString(value: unknown): string | undefined {
+  const trimmed = typeof value === "string" && value.trim() ? value.trim() : undefined;
+  if (trimmed === undefined) return undefined;
+  return LEGACY_GARBAGE_VALUES[trimmed] ?? trimmed;
+}
 
 /** 文案覆盖字段的表单名 → TgApiBotTexts 键（管理后台按语言分组渲染/读取共用） */
 export const TGAPI_TEXT_FIELD_KEYS = [
@@ -326,12 +340,13 @@ export function normalizeTgApiSection(tgapi: unknown): TgApiBotConfig {
         : undefined,
     starsTitle: stringValue(cfg.starsTitle),
     askAppDetails: cfg.askAppDetails !== false,
-    appTitle: stringValue(cfg.appTitle) ?? TGAPI_DEFAULT_APP.appTitle,
-    appShortName: stringValue(cfg.appShortName) ?? TGAPI_DEFAULT_APP.appShortName,
-    appUrl: stringValue(cfg.appUrl) ?? TGAPI_DEFAULT_APP.appUrl,
+    // v2.1.10：读取时迁移旧垃圾默认值（运行实例与管理后台读到同一份干净配置）
+    appTitle: pickMigratedString(cfg.appTitle) ?? TGAPI_DEFAULT_APP.appTitle,
+    appShortName: pickMigratedString(cfg.appShortName) ?? TGAPI_DEFAULT_APP.appShortName,
+    appUrl: pickMigratedString(cfg.appUrl) ?? TGAPI_DEFAULT_APP.appUrl,
     appPlatforms: platforms.length > 0 ? platforms : [...TGAPI_DEFAULT_APP.appPlatforms],
-    appDescription: stringValue(cfg.appDescription) ?? TGAPI_DEFAULT_APP.appDescription,
-    footerText: stringValue(cfg.footerText) ?? TGAPI_DEFAULT_APP.footerText,
+    appDescription: pickMigratedString(cfg.appDescription) ?? TGAPI_DEFAULT_APP.appDescription,
+    footerText: pickMigratedString(cfg.footerText) ?? TGAPI_DEFAULT_APP.footerText,
     texts: {
       zh: pickTexts(zhSource),
       en: pickTexts(enSource),

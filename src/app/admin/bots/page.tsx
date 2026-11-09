@@ -3,10 +3,12 @@ import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { getStorage } from "@/database/bindings";
 import { countMenuStats, parseBotMenuConfig } from "@/services/menu-config";
 import { getTelegramRuntimeSettings, resolveBotRuntime } from "@/services/bot-transport";
+import { probeBotDeployState } from "@/services/bot-deploy";
+import { BotDeployBadge, briefDeployDetail } from "@/components/admin/bot-deploy-badge";
 import { isEdgeRuntime } from "@/lib/telegram/runtime-mode";
 import { parseBotProfile, parseBotPrivacyMode } from "@/bot/multi-runtime";
 import { requirePermission } from "@/lib/auth";
-import { deleteBotAction, syncBotMenuAction, testBotAction } from "./actions";
+import { deleteBotAction, deployBotAction, syncBotMenuAction, testBotAction } from "./actions";
 import { BotFormDialog } from "./bot-form-dialog";
 import { CommandMenuDialog } from "./command-menu-dialog";
 import { MenuDesignerDialog } from "./menu-designer-dialog";
@@ -49,7 +51,7 @@ function maskToken(token: string): string {
 export default async function BotsPage({
   searchParams,
 }: {
-  searchParams: Promise<{ saved?: string; error?: string; test?: string; sync?: string; message?: string }>;
+  searchParams: Promise<{ saved?: string; error?: string; test?: string; sync?: string; message?: string; deploy?: string; deploy_msg?: string }>;
 }) {
   await requirePermission("bots:view");
   const params = await searchParams;
@@ -68,6 +70,9 @@ export default async function BotsPage({
   }));
   const runtimeGlobal = await getTelegramRuntimeSettings();
   const isEdge = isEdgeRuntime();
+  // v2.1.10：真实部署状态逐 bot 并行探测（webhook=Telegram 侧 getWebhookInfo 权威值，
+  // 含投递错误/积压；polling=本进程运行实例权威值）—— 与 TGAPI 页共用同一实现
+  const deployChecks = await Promise.all(bots.map((bot) => probeBotDeployState(bot)));
 
   return (
     <div className="space-y-6">
@@ -114,6 +119,25 @@ export default async function BotsPage({
           同步失败：{params.message}
         </div>
       ) : null}
+      {params.deploy && params.deploy_msg ? (
+        params.deploy === "ok" ? (
+          <div className="rounded-md border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">
+            🚀 {params.deploy_msg}
+          </div>
+        ) : params.deploy === "fail" ? (
+          <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            ❌ {params.deploy_msg}
+          </div>
+        ) : params.deploy === "pending" ? (
+          <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+            ⏳ {params.deploy_msg}
+          </div>
+        ) : (
+          <div className="rounded-md border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-600">
+            {params.deploy_msg}
+          </div>
+        )
+      ) : null}
 
       <div className="rounded-xl border bg-card">
         <div className="overflow-x-auto">
@@ -126,6 +150,7 @@ export default async function BotsPage({
                 <th className="px-4 py-3 font-medium">Token</th>
                 <th className="px-4 py-3 font-medium">消息内嵌按钮</th>
                 <th className="px-4 py-3 font-medium">运行 / 隐私</th>
+                <th className="px-4 py-3 font-medium">部署状态</th>
                 <th className="px-4 py-3 font-medium">状态</th>
                 <th className="px-4 py-3 font-medium">更新时间</th>
                 <th className="px-4 py-3 font-medium">操作</th>
@@ -134,12 +159,12 @@ export default async function BotsPage({
             <tbody>
               {bots.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="px-4 py-8 text-center text-sm text-muted-foreground">
+                  <td colSpan={10} className="px-4 py-8 text-center text-sm text-muted-foreground">
                     还没有机器人，点击右上角「从零创建机器人」按引导创建，或「新增机器人」直接接入 Token
                   </td>
                 </tr>
               ) : (
-                bots.map((bot) => {
+                bots.map((bot, botIndex) => {
                   const stats = countMenuStats(parseBotMenuConfig(bot.menuConfig).root);
                   const profile = parseBotProfile(bot.config);
                   return (
@@ -181,6 +206,17 @@ export default async function BotsPage({
                         })()}
                       </td>
                       <td className="px-4 py-3">
+                        <div className="max-w-56 space-y-1">
+                          <BotDeployBadge check={deployChecks[botIndex] ?? { key: "unknown", detail: "探测结果缺失" }} />
+                          {"detail" in (deployChecks[botIndex] ?? {}) &&
+                          (deployChecks[botIndex] as { detail?: string }).detail ? (
+                            <p className="text-xs leading-snug text-muted-foreground">
+                              {briefDeployDetail((deployChecks[botIndex] as { detail: string }).detail)}
+                            </p>
+                          ) : null}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3">
                         <span
                           className={`inline-flex rounded-full border px-2 py-0.5 text-sm ${
                             bot.enabled
@@ -196,6 +232,16 @@ export default async function BotsPage({
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex flex-wrap items-center gap-2">
+                          <form action={deployBotAction}>
+                            <input type="hidden" name="id" value={String(bot.id)} />
+                            <button
+                              type="submit"
+                              className="inline-flex h-8 items-center rounded-md border border-emerald-200 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 hover:bg-emerald-100"
+                              title="显式部署：重启运行实例并回传真实结果（webhook=setWebhook 注册结果 / polling=长轮询确认）"
+                            >
+                              🚀 部署
+                            </button>
+                          </form>
                           <MenuDesignerDialog
                             bot={{
                               id: String(bot.id),
@@ -204,7 +250,36 @@ export default async function BotsPage({
                               menuText: bot.menuText,
                               username: bot.username,
                               privacyMode: parseBotPrivacyMode(profile),
+                              isTgApi: Boolean(profile.tgapi?.enabled),
                             }}
+                            builtinCommands={
+                              profile.tgapi?.enabled
+                                ? [
+                                    // v2.1.11：TGAPI 机器人同样注册指令库内置指令（排除 /start，
+                                    // 流程自有重入语义）+ 自有 /language —— 选项与运行时真实注册
+                                    // 同源（见 tgapi.ts registerTgApiHandlers）
+                                    ...commandLibrary
+                                      .filter((item) => item.type === "builtin" && item.name !== "start")
+                                      .map((item) => ({
+                                        name: item.name,
+                                        label: `/${item.name} — ${item.description}`,
+                                      })),
+                                    { name: "start", label: "/start — 开始 TGAPI 申请（机器人内置）" },
+                                    { name: "language", label: "/language — 切换中文/English（机器人内置）" },
+                                  ]
+                                : commandLibrary
+                                    .filter((item) => item.type === "builtin")
+                                    .map((item) => ({
+                                      name: item.name,
+                                      label: `/${item.name} — ${item.description}`,
+                                    }))
+                            }
+                            customCommands={commandLibrary
+                              .filter((item) => item.type === "custom")
+                              .map((item) => ({
+                                name: item.name,
+                                label: `/${item.name} — ${item.description}`,
+                              }))}
                             groups={groups.map((group) => ({
                               chatId: String(group.chatId),
                               chatTitle: group.chatTitle,
@@ -213,19 +288,24 @@ export default async function BotsPage({
                             trigger="⚙️ 消息内嵌按钮"
                             triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
                           />
-                          <CommandMenuDialog
-                            bot={{
-                              id: String(bot.id),
-                              name: bot.name,
-                              privacyMode: parseBotPrivacyMode(profile),
-                              selectedCommandIds: Array.isArray(profile.commandIds)
-                                ? profile.commandIds
-                                : [],
-                            }}
-                            library={commandLibrary}
-                            trigger="⌨️ 指令菜单"
-                            triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
-                          />
+                          {/* v2.1.11：TGAPI 机器人的 Telegram 指令菜单由 TGAPI 流程自管
+                              （/start + /language + 内置启用项 + 全部自定义指令，见 tgapi.ts），
+                              逐机器人勾选 commandIds 对其无效 —— 隐藏无效入口，避免误导 */}
+                          {!profile.tgapi?.enabled ? (
+                            <CommandMenuDialog
+                              bot={{
+                                id: String(bot.id),
+                                name: bot.name,
+                                privacyMode: parseBotPrivacyMode(profile),
+                                selectedCommandIds: Array.isArray(profile.commandIds)
+                                  ? profile.commandIds
+                                  : [],
+                              }}
+                              library={commandLibrary}
+                              trigger="⌨️ 指令菜单"
+                              triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
+                            />
+                          ) : null}
                           <BotRuntimeDialog
                             bot={{
                               id: String(bot.id),

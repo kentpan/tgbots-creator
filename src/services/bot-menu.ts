@@ -57,7 +57,29 @@ function childMenuId(parentId: string, rowIndex: number, colIndex: number): stri
   return `${parentId}.${rowIndex}.${colIndex}`;
 }
 
-function appendButton(menu: TGuardMenu, button: MenuButton, parentId: string): void {
+/**
+ * 菜单指令运行器注册表（v2.1.10）：「执行指令」按钮（action.type="command"）
+ * 点击时按指令名查表真实执行 —— 运行实例在注册能力阶段把该机器人可用的
+ * 指令（内置 + 自定义）填入注册表，与指令库启用状态实时一致。
+ * 签名取 Context（菜单插件/CommandGroup 回调的上下文类型）；需要会话的指令
+ * 在各自模块内窄化（运行实例的会话中间件先于菜单/指令安装，运行时必然携带）。
+ */
+export type MenuCommandRunner = (ctx: Context) => Promise<void>;
+
+export interface MenuCommandRegistry {
+  runners: Map<string, MenuCommandRunner>;
+}
+
+export function createMenuCommandRegistry(): MenuCommandRegistry {
+  return { runners: new Map() };
+}
+
+function appendButton(
+  menu: TGuardMenu,
+  button: MenuButton,
+  parentId: string,
+  registry?: MenuCommandRegistry,
+): void {
   const action = button.action;
   switch (action.type) {
     case "url": {
@@ -97,6 +119,22 @@ function appendButton(menu: TGuardMenu, button: MenuButton, parentId: string): v
       }
       return;
     }
+    case "command": {
+      // v2.1.10：点击等同用户发送 /指令 —— 按指令名查注册表真实执行；
+      // 注册表由运行实例在能力注册阶段填充（内置 + 已启用自定义指令）
+      const commandName = (action.target ?? "").trim().replace(/^\//, "");
+      menu.text(button.text, async (ctx) => {
+        const runner = registry?.runners.get(commandName);
+        if (runner) {
+          await runner(ctx);
+          return;
+        }
+        await ctx.reply(
+          `⚠️ 指令 /${commandName || "（未指定）"} 不存在或未启用：请在「指令管理」确认该指令已启用，并在菜单设计器中重新选择。`,
+        );
+      });
+      return;
+    }
     case "back": {
       // 子菜单内：官方 back 导航到父菜单；根菜单没有父级，给出确定提示
       if (parentId !== MENU_ROOT_ID) {
@@ -128,7 +166,7 @@ function appendButton(menu: TGuardMenu, button: MenuButton, parentId: string): v
   }
 }
 
-function buildNodeMenu(node: MenuNode, nodeId: string): TGuardMenu {
+function buildNodeMenu(node: MenuNode, nodeId: string, registry?: MenuCommandRegistry): TGuardMenu {
   const menu = new TGuardMenu(nodeId);
   const children: TGuardMenu[] = [];
   let firstRow = true;
@@ -141,11 +179,11 @@ function buildNodeMenu(node: MenuNode, nodeId: string): TGuardMenu {
         // 因此必须先把本节点全部按钮（含 submenu 导航按钮）加完，最后统一 register 子菜单；
         // 子菜单内部同理递归构建完毕后才被 register
         const childId = childMenuId(nodeId, rowIndex, colIndex);
-        children.push(buildNodeMenu(button.submenu, childId));
+        children.push(buildNodeMenu(button.submenu, childId, registry));
         menu.submenu(button.text, childId);
         return;
       }
-      appendButton(menu, button, nodeId);
+      appendButton(menu, button, nodeId, registry);
     });
   });
   if (children.length > 0) menu.register(children);
@@ -153,16 +191,21 @@ function buildNodeMenu(node: MenuNode, nodeId: string): TGuardMenu {
 }
 
 /** 由菜单配置构建官方 @grammyjs/menu 实例树（根 id 固定为 tg:root） */
-export function buildBotMenu(config: BotMenuConfig): TGuardMenu {
-  return buildNodeMenu(config.root, MENU_ROOT_ID);
+export function buildBotMenu(config: BotMenuConfig, registry?: MenuCommandRegistry): TGuardMenu {
+  return buildNodeMenu(config.root, MENU_ROOT_ID, registry);
 }
 
 /**
  * 在机器人实例上安装官方菜单插件（回调路由全部由插件处理）。
  * 每个机器人实例独立构建自己的 Menu 树，无共享状态。
+ * registry（v2.1.10）：「执行指令」按钮的指令运行器注册表（可选）。
  */
-export function installBotMenu(bot: Bot<BotContext>, config: BotMenuConfig): TGuardMenu {
-  const menu = buildBotMenu(config);
+export function installBotMenu(
+  bot: Bot<BotContext>,
+  config: BotMenuConfig,
+  registry?: MenuCommandRegistry,
+): TGuardMenu {
+  const menu = buildBotMenu(config, registry);
   bot.use(menu);
   return menu;
 }
@@ -180,8 +223,9 @@ export function installBotMenu(bot: Bot<BotContext>, config: BotMenuConfig): TGu
 export async function renderMenuMarkup(
   config: BotMenuConfig,
   bot: Bot<BotContext>,
+  registry?: MenuCommandRegistry,
 ): Promise<InlineKeyboardMarkup> {
-  const menu = buildBotMenu(config);
+  const menu = buildBotMenu(config, registry);
   const me = bot.isInited() ? bot.botInfo : await bot.api.getMe();
   const ctx = new Context({ update_id: 0 }, bot.api, me);
   return { inline_keyboard: await menu.renderMarkup(ctx) };

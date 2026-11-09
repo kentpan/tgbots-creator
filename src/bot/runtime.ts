@@ -81,7 +81,10 @@ export async function startBotRuntime(): Promise<void> {
   {
     const { probeRemoteWebhook } = await import("@/services/bot-transport");
     const remote = await probeRemoteWebhook(config.bot.token);
-    if (remote && process.env.TG_FORCE_LOCAL_POLLING !== "1") {
+    // v2.1.10 类型收窄修复：probeRemoteWebhook 恒返回对象（none/active/unknown），
+    // 旧 truthy 判断会把 status="none"（无远程消费者）误判为存在远程消费者，
+    // 导致主 bot 轮询永远拒绝启动（v2.1.9 遗留回归）。按 status 精确分支：
+    if (remote.status === "active" && process.env.TG_FORCE_LOCAL_POLLING !== "1") {
       console.warn(
         `[runtime] Main bot 检测到远程 Webhook 消费者（${remote.url}，待处理更新 ${remote.pendingUpdateCount} 条），` +
           "本地长轮询已停用：getUpdates 与 Webhook 互斥，删除远程 Webhook 会掐断另一环境（如线上部署）的事件推送。" +
@@ -89,11 +92,20 @@ export async function startBotRuntime(): Promise<void> {
       );
       return;
     }
-    if (!remote) {
+    if (remote.status === "unknown" && process.env.TG_FORCE_LOCAL_POLLING !== "1") {
+      // v2.1.9 语义：探测连续失败（无法判定）时严禁删除/接管任何 Webhook —— 宁可让位
+      console.warn(
+        "[runtime] Main bot 远程 Webhook 探测连续失败（无法判定是否存在线上消费者），本地长轮询已停用：" +
+          "按让位处理避免掐断线上事件推送；确需本环境接管，请设置 TG_FORCE_LOCAL_POLLING=1。",
+      );
+      return;
+    }
+    if (remote.status === "none") {
       console.log(
-        "[runtime] Main bot 未探测到远程 Webhook 消费者（无 webhook 或探测连续失败），按本地轮询启动。",
+        "[runtime] Main bot 未探测到远程 Webhook 消费者（无 webhook），按本地轮询启动。",
       );
     }
+    // active/unknown + TG_FORCE_LOCAL_POLLING=1：按强制接管继续执行
   }
 
   const bot = await createBot(config.bot.token);
