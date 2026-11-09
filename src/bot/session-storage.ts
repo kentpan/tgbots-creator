@@ -721,6 +721,23 @@ export async function resolveSessionStorage(single?: string): Promise<SessionSto
 export interface BotSessionData {
   /** AI 客服多轮历史（最近 8 条，轮转覆盖） */
   aiHistory?: { role: "user" | "assistant"; content: string }[];
+  /**
+   * TGAPI申请 对话流状态（v2.1.7）：title=等待 APP 名称 / desc=等待 APP 描述
+   * （askAppDetails 开启时前置两步）→ phone=等待手机号 → code=等待 Telegram 登录码。
+   * 对应原 MyTelegramOrgRoBot 的 ConversationHandler 状态机与 GLOBAL_USERS_DICTIONARY；
+   * appTitle/appDescription 为申请人自定义值（/skip 时缺省，创建时回落配置默认）。
+   */
+  tgapi?: {
+    state: "title" | "desc" | "phone" | "code";
+    phone?: string;
+    randomHash?: string;
+    appTitle?: string;
+    appDescription?: string;
+  };
+  /** TGAPI 对话语言偏好（v2.1.7 中英文双语；未设置时按用户 language_code 自动识别） */
+  tgapiLang?: "zh" | "en";
+  /** TGAPI 星星解锁发票已发送（防任意文本重复弹发票） */
+  tgapiStarsInvoiceSent?: boolean;
 }
 
 export type BotSessionContext = BotContext;

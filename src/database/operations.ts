@@ -2659,3 +2659,83 @@ export async function listChatMessages(
         );
   return rows.map(mapChatMessage).reverse();
 }
+
+// ---------------------------------------------------------------------------
+// TGAPI申请（v2.1.6）— 解锁用户台账
+// ---------------------------------------------------------------------------
+
+export interface TgApiUnlockRow {
+  id: bigint;
+  botId: bigint;
+  userId: bigint;
+  username: string | null;
+  /** 解锁方式：captcha=外部 API 验证码核验 / stars=Telegram 星星支付 */
+  mode: string;
+  createdTime: Date;
+  updatedTime: Date;
+}
+
+function mapTgApiUnlock(row: Record<string, unknown>): TgApiUnlockRow {
+  return {
+    id: toBigInt(row.id),
+    botId: toBigInt(row.bot_id),
+    userId: toBigInt(row.user_id),
+    username: (row.username as string | null) ?? null,
+    mode: (row.mode as string) ?? "captcha",
+    createdTime: toDate(row.created_time),
+    updatedTime: toDate(row.updated_time),
+  };
+}
+
+/** 查询用户对某个 TGAPI 机器人的解锁状态（未解锁返回 null） */
+export async function getTgApiUnlock(
+  botId: bigint,
+  userId: bigint,
+): Promise<TgApiUnlockRow | null> {
+  const row = await queryOne<Record<string, unknown>>(
+    `SELECT * FROM tgapi_unlocks WHERE bot_id = ? AND user_id = ?`,
+    [Number(botId), Number(userId)],
+  );
+  return row ? mapTgApiUnlock(row) : null;
+}
+
+/** 列出某个 TGAPI 机器人的全部解锁用户（按解锁时间倒序） */
+export async function listTgApiUnlocks(botId: bigint): Promise<TgApiUnlockRow[]> {
+  const rows = await queryAll<Record<string, unknown>>(
+    `SELECT * FROM tgapi_unlocks WHERE bot_id = ? ORDER BY id DESC`,
+    [Number(botId)],
+  );
+  return rows.map(mapTgApiUnlock);
+}
+
+/** 记录/更新解锁状态（upsert：同一机器人同一用户仅一行） */
+export async function saveTgApiUnlock(input: {
+  botId: bigint;
+  userId: bigint;
+  username?: string | null;
+  mode: string;
+}): Promise<TgApiUnlockRow | null> {
+  await executeRun(
+    `INSERT INTO tgapi_unlocks (bot_id, user_id, username, mode, created_time, updated_time)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(bot_id, user_id) DO UPDATE SET
+       username = excluded.username,
+       mode = excluded.mode,
+       updated_time = excluded.updated_time`,
+    [
+      Number(input.botId),
+      Number(input.userId),
+      input.username ?? null,
+      input.mode,
+      dateText(new Date()),
+      dateText(new Date()),
+    ],
+  );
+  return getTgApiUnlock(input.botId, input.userId);
+}
+
+/** 撤销解锁（管理员操作） */
+export async function deleteTgApiUnlock(id: bigint): Promise<boolean> {
+  const result = await executeRun(`DELETE FROM tgapi_unlocks WHERE id = ?`, [Number(id)]);
+  return result.changes > 0;
+}

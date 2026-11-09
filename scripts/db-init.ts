@@ -36,6 +36,8 @@ const PERMISSIONS: { code: string; name: string; description: string; sort: numb
   { code: "devaccounts:manage", name: "管理开发者账号", description: "维护手机号与 api_id/api_hash", sort: 20 },
   { code: "ai:view", name: "查看AI配置", description: "浏览 AI 模型配置与调用统计", sort: 21 },
   { code: "ai:manage", name: "管理AI配置", description: "创建编辑删除 AI 模型并设置默认模型", sort: 22 },
+  { code: "tgapi:view", name: "查看TGAPI申请", description: "浏览 TGAPI 申请机器人与解锁用户", sort: 23 },
+  { code: "tgapi:manage", name: "管理TGAPI申请", description: "创建编辑 TGAPI 申请机器人与解锁配置", sort: 24 },
 ];
 
 const OPERATOR_PERMISSION_CODES = [
@@ -48,6 +50,7 @@ const OPERATOR_PERMISSION_CODES = [
   "methods:manage",
   "bots:view",
   "devaccounts:view",
+  "tgapi:view",
   "logs:view",
 ];
 
@@ -73,6 +76,7 @@ const MENUS: {
       { title: "机器人测试", path: "/admin/bots/testing", icon: "🧪", sort: 2, permission: "bots:view" },
       { title: "指令管理", path: "/admin/bots/commands", icon: "⌨️", sort: 3, permission: "bots:view" },
       { title: "开发者账号", path: "/admin/developer-accounts", icon: "☎️", sort: 4, permission: "devaccounts:view" },
+      { title: "TGAPI申请", path: "/admin/tgapi", icon: "🔑", sort: 5, permission: "tgapi:view" },
     ],
   },
   { title: "验证方式", path: "/admin/verification-methods", icon: "🔐", sort: 5, permission: "methods:view" },
@@ -341,8 +345,27 @@ async function ensureMigrations(): Promise<void> {
   await executeRun(
     `CREATE INDEX IF NOT EXISTS "idx_chat_messages_chat_id" ON "chat_messages"("chat_id", "id")`,
   );
+  // v2.1.6 TGAPI申请：解锁用户台账（首次对话验证码解锁 / 星星解锁的持久化凭证，
+  // 与机器人运行时会话无关 —— 会话后端可能为 memory，解锁状态必须落库持久保存）
+  await executeRun(
+    `CREATE TABLE IF NOT EXISTS "tgapi_unlocks" (
+      "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      "bot_id" INTEGER NOT NULL,
+      "user_id" BIGINT NOT NULL,
+      "username" TEXT,
+      "mode" TEXT NOT NULL DEFAULT 'captcha',
+      "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`,
+  );
+  await executeRun(
+    `CREATE UNIQUE INDEX IF NOT EXISTS "tgapi_unlocks_bot_user_key" ON "tgapi_unlocks"("bot_id", "user_id")`,
+  );
+  await executeRun(
+    `CREATE INDEX IF NOT EXISTS "idx_tgapi_unlocks_bot" ON "tgapi_unlocks"("bot_id")`,
+  );
   console.log(
-    "Migrations ensured: bots, developer_accounts, group_bot_admins, bot_commands, privacy_mode, require_approval, xianyu_products, xianyu_delivery_logs, verify_codes, ai_providers, ai_usage_logs, bot_sessions, invite_links, chat_messages",
+    "Migrations ensured: bots, developer_accounts, group_bot_admins, bot_commands, privacy_mode, require_approval, xianyu_products, xianyu_delivery_logs, verify_codes, ai_providers, ai_usage_logs, bot_sessions, invite_links, chat_messages, tgapi_unlocks",
   );
 }
 

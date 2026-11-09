@@ -107,7 +107,7 @@ CREATE TABLE "group_settings" (
     "enabled" BOOLEAN NOT NULL DEFAULT true,
     "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-, "privacy_mode" BOOLEAN NOT NULL DEFAULT true, require_approval BOOLEAN NOT NULL DEFAULT false, "verification_channel" TEXT NOT NULL DEFAULT 'group', kick_direct_joins BOOLEAN NOT NULL DEFAULT false, reply_code_in_group BOOLEAN NOT NULL DEFAULT false);
+, "privacy_mode" BOOLEAN NOT NULL DEFAULT true, require_approval BOOLEAN NOT NULL DEFAULT false, "verification_channel" TEXT NOT NULL DEFAULT 'group', kick_direct_joins BOOLEAN NOT NULL DEFAULT false, "reply_code_in_group" BOOLEAN NOT NULL DEFAULT false);
 CREATE TABLE "verification_methods" (
     "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "name" TEXT NOT NULL,
@@ -276,6 +276,15 @@ CREATE TABLE "chat_messages" (
   "message_time" DATETIME,
   "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE "tgapi_unlocks" (
+      "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      "bot_id" INTEGER NOT NULL,
+      "user_id" BIGINT NOT NULL,
+      "username" TEXT,
+      "mode" TEXT NOT NULL DEFAULT 'captcha',
+      "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
 CREATE UNIQUE INDEX "admin_users_username_key" ON "admin_users"("username");
 CREATE UNIQUE INDEX "bot_commands_type_name_key" ON "bot_commands"("type", "name");
 CREATE UNIQUE INDEX "bot_sessions_scope_key" ON "bot_sessions"("scope", "session_key");
@@ -297,6 +306,7 @@ CREATE INDEX "idx_join_requests_status" ON "join_requests"("status");
 CREATE INDEX 'idx_join_requests_status_chat' ON 'join_requests'('status', 'chat_id');
 CREATE INDEX "idx_join_requests_user_id" ON "join_requests"("user_id");
 CREATE INDEX "idx_operation_logs_created_time" ON "operation_logs"("created_time");
+CREATE INDEX "idx_tgapi_unlocks_bot" ON "tgapi_unlocks"("bot_id");
 CREATE INDEX 'idx_verification_sessions_created' ON 'verification_sessions'('created_time');
 CREATE INDEX 'idx_verification_sessions_expires' ON 'verification_sessions'('expires_at');
 CREATE INDEX 'idx_verification_sessions_user_chat' ON 'verification_sessions'('user_id', 'chat_id', 'captcha_completed');
@@ -309,6 +319,7 @@ CREATE UNIQUE INDEX "invite_links_link_key" ON "invite_links"("link");
 CREATE UNIQUE INDEX "join_requests_verification_token_key" ON "join_requests"("verification_token");
 CREATE UNIQUE INDEX "permissions_code_key" ON "permissions"("code");
 CREATE UNIQUE INDEX "roles_code_key" ON "roles"("code");
+CREATE UNIQUE INDEX "tgapi_unlocks_bot_user_key" ON "tgapi_unlocks"("bot_id", "user_id");
 CREATE UNIQUE INDEX "user_stats_user_id_key" ON "user_stats"("user_id");
 CREATE UNIQUE INDEX "verification_methods_name_key" ON "verification_methods"("name");
 CREATE UNIQUE INDEX "verification_sessions_token_key" ON "verification_sessions"("token");

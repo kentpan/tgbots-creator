@@ -22,6 +22,8 @@ import { CommandGroup } from "@grammyjs/commands";
 import { codeQuestion } from "./verification-question";
 import { registerAiSupport, type AiSupportConfig } from "./handlers/ai-support";
 import { registerBuiltinCommandHandlers } from "./handlers/builtin-commands";
+import { registerTgApiHandlers } from "./handlers/tgapi";
+import { normalizeTgApiSection, type TgApiBotConfig } from "@/services/tgapi-config";
 import { buildSessionMiddleware } from "./session-storage";
 import { registerChatTracking } from "./chat-tracking";
 import { registerInviteLinkTracking } from "./invite-link-tracking";
@@ -61,6 +63,8 @@ interface BotProfileConfig {
   plugins?: BotPluginsConfig;
   /** AI 客服配置 */
   aiSupport?: AiSupportConfig;
+  /** TGAPI申请 机器人配置（v2.1.6）：启用后实例为纯私聊对话工具机器人（MyTelegramOrgRoBot 复刻） */
+  tgapi?: TgApiBotConfig;
 }
 
 export interface BotPluginsConfig {
@@ -255,8 +259,20 @@ async function registerBotCapabilities(
   bot: Bot<BotContext>,
   profile: BotProfileConfig,
   effectivePrivacy: boolean,
+  botId?: bigint,
 ): Promise<() => Promise<void>> {
   const privacyMode = effectivePrivacy;
+
+  // v2.1.6 TGAPI申请 机器人：启用 tgapi 配置后，实例切换为纯私聊对话工具机器人
+  //（MyTelegramOrgRoBot 复刻：解锁门禁 + 手机号 → Telegram 登录码 → my.telegram.org
+  // 抓取/创建 APP）。不注册群验证/指令库/AI 客服能力（私聊文本全部被对话流消费，
+  // 群验证 handler 对该类型机器人无意义且可能干扰）。
+  // v2.1.7：传入前先 normalize（parseBotProfile 是裸 JSON.parse，这里补齐缺省字段
+  // 默认值，保证运行实例与管理后台读到同一份配置语义）。
+  if (profile.tgapi?.enabled) {
+    const resolvedBotId = botId ?? BigInt(0);
+    return registerTgApiHandlers(bot, normalizeTgApiSection(profile.tgapi), resolvedBotId);
+  }
 
   // 加群验证入口：收到真实加群申请 → 群内验证（默认）/私聊验证创建验证会话
   //（v1.1.1 修复：multi-runtime 此前完全缺失该 handler，机器人管理创建的验证机器人无法验证）
@@ -339,8 +355,9 @@ async function ensureMenuBotCapabilities(
   effectivePrivacy: boolean,
 ): Promise<() => Promise<void>> {
   if (instance.capabilitiesReady) return async () => undefined;
-  const syncCommands = await registerBotCapabilities(instance.bot, profile, effectivePrivacy);
-  if (profile.aiSupport?.enabled) {
+  const syncCommands = await registerBotCapabilities(instance.bot, profile, effectivePrivacy, row.id);
+  // TGAPI申请 机器人是纯私聊对话工具机器人：AI 客服等附加能力不叠加
+  if (profile.aiSupport?.enabled && !profile.tgapi?.enabled) {
     registerAiSupport(instance.bot, profile.aiSupport, row.id);
   }
   instance.capabilitiesReady = true;
