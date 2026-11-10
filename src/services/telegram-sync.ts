@@ -7,10 +7,9 @@ import {
 } from "@/lib/telegram/transport";
 import { registerInviteLinkTracking } from "@/bot/invite-link-tracking";
 import {
-  deleteGroupBotAdminsByChat,
+  deleteGroupBotAdminsByChatAndBots,
   listBots,
   listGroupBotAdmins,
-  listGroupSettings,
 } from "@/database/operations";
 
 /**
@@ -289,11 +288,15 @@ interface TgUpdate {
  * （常驻轮询会实时确认消费，导致管理端永远拉到空列表）。因此改为三源合并：
  *
  * 1. getUpdates：最近未确认更新（webhook/轮询冲突时自动自愈，读取不确认）
- * 2. 数据库已关联群组：group_bot_admins（同 Token 全部机器人条目）+ group_settings
- * 3. getChat + getChatMember 逐一验证：确认机器人仍在群内并取回最新群名（不依赖更新队列，
+ * 2. 数据库已关联群组：group_bot_admins（仅限当前 Token 对应的机器人条目）
+ * 3. getChat + getChatMember 逐一验证：确认机器人仍在群内并取回最新群名（不依赖更新队列,
  *    被轮询消费过的历史群组也能找回）；确认失效（Telegram 400 群不存在，或机器人
- *    成员身份为 left/kicked）的群组移除 group_bot_admins 关联行并归入 stale 提示；
- *    网络错误/超时/429 等不确定结果一律不删（防误删）
+ *    成员身份为 left/kicked）的群组仅移除当前 Token 机器人的 group_bot_admins 关联行
+ *    并归入 stale 提示；网络错误/超时/429 等不确定结果一律不删（防误删）
+ *
+ * v2.2.2 跨机器人误删修复：候选群组绝不含 group_settings 全表（那是全部机器人的群，
+ * 用当前 Token 验证其他机器人的群必然 left），删除也只按 chat_id + 当前 Token 机器人
+ * 集合精确删除——其他机器人对同一群组的关联不受本次同步影响。
  *
  * 机器人日常运行中收到群事件时仍会自动登记（chat-tracking → chat-registry）。
  */
@@ -444,18 +447,20 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
       collect(update.chat_member?.chat);
     }
 
-    // 数据库已关联群组（group_bot_admins + group_settings）→ getChat + getChatMember 逐一验证：
+    // 数据库已关联群组（仅限当前 Token 对应的机器人条目）→ getChat + getChatMember 逐一验证：
     // 机器人仍在群内则用 Telegram 返回的最新群名（真实数据优先）；
-    // 确认失效（群不存在 / 成员身份 left/kicked）则移除关联行并标记 stale
+    // 确认失效（群不存在 / 成员身份 left/kicked）则移除关联行并标记 stale。
+    // v2.2.2 修复：候选只收「当前 Token 机器人」的关联——群组校验身份是当前 Token，
+    // 把其他机器人的群拉进来验证必然误判 left，再按 chat_id 全删就是跨机器人误删事故。
     const candidateIds = new Set<string>([...chats.keys()].map((id) => String(id)));
+    const tokenBotIds = new Set<string>();
     try {
       const tokenBots = (await listBots()).filter((item) => item.token === token);
-      const tokenBotIds = new Set(tokenBots.map((item) => String(item.id)));
-      const [links, settings] = await Promise.all([listGroupBotAdmins(), listGroupSettings()]);
+      for (const item of tokenBots) tokenBotIds.add(String(item.id));
+      const links = await listGroupBotAdmins();
       for (const link of links) {
         if (tokenBotIds.has(String(link.botId))) candidateIds.add(String(link.chatId));
       }
-      for (const setting of settings) candidateIds.add(String(setting.chatId));
     } catch (error) {
       console.warn("Failed to load DB group links for sync:", error);
     }
@@ -525,9 +530,14 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
       }
     }
     const staleChatIds: string[] = [];
+    // v2.2.2 修复：只移除当前 Token 机器人的关联行（同一群可被多个机器人同时关联，
+    // 其他机器人对同一群组的关联不受本次同步影响）；Token 机器人清单加载失败时
+    // staleBotIds 为空 → 删除函数直接返回 0，绝不误删（防误删方向保持一致）
+    const staleBotIds = [...tokenBotIds].map((id) => BigInt(id));
     for (const stale of staleList) {
+      const removed = await deleteGroupBotAdminsByChatAndBots(BigInt(stale.candidate), staleBotIds);
+      if (removed === 0) continue;
       staleChatIds.push(stale.candidate);
-      const removed = await deleteGroupBotAdminsByChat(BigInt(stale.candidate));
       const reasonText =
         stale.reason === "not_found"
           ? "群组已不存在（Telegram 400 chat not found）"

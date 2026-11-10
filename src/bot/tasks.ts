@@ -1,5 +1,6 @@
 import { config } from "@/config/settings";
 import { getRuntimeSettings } from "@/config/runtime-settings";
+import { getDatabase } from "@/database/client";
 import {
   cleanupExpiredSessions,
   getGroupSettings,
@@ -12,6 +13,8 @@ import {
   notifyVerificationExpired,
   sendGroupTimeoutNotice,
 } from "@/services/approval";
+import { isBackupDue, loadBackupSettings, markBackupRan, parseBackupConfig, runBackup } from "@/lib/backup/backup-runner";
+import { getBackupStore } from "@/lib/backup/backup-store";
 
 export const CLEANUP_INTERVAL_SECONDS = 60;
 export const PURGE_INTERVAL_SECONDS = 24 * 60 * 60;
@@ -97,6 +100,30 @@ export async function purgeOldRecords(): Promise<void> {
   }
 }
 
+/**
+ * 定时备份到点检查（v2.2.3 备份管理，xianyu-admin 复刻）：
+ * Cloudflare 部署用 cron 回调端点（/api/admin/backup/cron，令牌鉴权）；
+ * 本地 Node 常驻部署由清理循环每轮（60s）顺带判定 isBackupDue ——
+ * 每 X 天 X时X分X秒 到点才真正执行，绝不重复备份；存储未就绪/库不可用
+ * 如实记日志，不影响清理主循环。
+ */
+async function runBackupScheduleTick(): Promise<void> {
+  try {
+    const db = await getDatabase();
+    const cfg = parseBackupConfig(await loadBackupSettings(db));
+    const due = isBackupDue(cfg);
+    if (!due.due) return;
+    const store = await getBackupStore();
+    const result = await runBackup(db, store, cfg.tables);
+    await markBackupRan(db);
+    console.log(
+      `[backup-schedule] 定时备份完成: ${result.key} (${result.tables.length} 表 / ${result.rows} 行 → ${result.storage})`,
+    );
+  } catch (error) {
+    console.error("Backup schedule tick failed:", error);
+  }
+}
+
 export async function runCleanupLoop(
   intervalSeconds = CLEANUP_INTERVAL_SECONDS,
   signal?: AbortSignal,
@@ -111,6 +138,7 @@ export async function runCleanupLoop(
         await purgeOldRecords();
         elapsedSincePurge = 0;
       }
+      await runBackupScheduleTick();
     } catch (error) {
       console.error("Cleanup loop iteration failed:", error);
     }

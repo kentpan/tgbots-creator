@@ -2177,6 +2177,23 @@ export async function deleteGroupBotAdminsByChat(chatId: bigint): Promise<number
   return result.changes;
 }
 
+/** 按 chat_id + bot_id 集合精确移除群组关联行，返回删除行数。
+ *  同一群组可被多个机器人同时关联（group_bot_admins 一行一个 bot×chat），
+ *  「同步真实群组」的失效清理只允许删除本次校验 Token 对应机器人的关联行，
+ *  绝不能按 chat_id 全删波及其他机器人的关联（v2.2.2 跨机器人误删事故回归防线）。 */
+export async function deleteGroupBotAdminsByChatAndBots(
+  chatId: bigint,
+  botIds: bigint[],
+): Promise<number> {
+  if (botIds.length === 0) return 0;
+  const placeholders = botIds.map(() => "?").join(",");
+  const result = await executeRun(
+    `DELETE FROM group_bot_admins WHERE chat_id = ? AND bot_id IN (${placeholders})`,
+    [Number(chatId), ...botIds.map((id) => Number(id))],
+  );
+  return result.changes;
+}
+
 export async function getGroupBotAdmin(id: bigint): Promise<GroupBotAdminRow | null> {
   const row = await queryOne<Record<string, unknown>>(
     `SELECT * FROM group_bot_admins WHERE id = ?`,

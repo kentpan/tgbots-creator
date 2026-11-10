@@ -288,10 +288,10 @@ export function CustomKeyboardDesigner({
     >
       <input type="hidden" name="id" value={botId} />
       <input type="hidden" name="custom_keyboard" value={payload} />
-      {extraFields}
       <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-4">
         <div className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[1fr_430px]">
           <div className="min-w-0 space-y-4">
+            {extraFields ? <div className="space-y-4">{extraFields}</div> : null}
             {tgapiModeHint ? (
               <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-700">
                 ⚠️ {tgapiModeHint}
