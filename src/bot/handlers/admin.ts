@@ -125,6 +125,12 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
     // 优先发自己安装的菜单（ctx.botMenu），主 bot 无 botMenu 注入走全局 mainMenu
     { parse_mode: "MarkdownV2", reply_markup: ctx.botMenu ?? mainMenu },
   );
+  // v2.2.0 自定义键盘：实例配置了 customKeyboard 时随 /start 附发（一条消息只能携带
+  // 一种 reply_markup —— 欢迎语保留内嵌菜单，自定义键盘用附加消息承载）；
+  // 点击键盘按钮=发送按钮文本，multi-runtime 按按钮配置真实响应
+  if (ctx.customKeyboard) {
+    await ctx.reply("👇 请使用下方自定义键盘按钮：", { reply_markup: ctx.customKeyboard });
+  }
 }
 
 export async function cmdHelp(ctx: BotContext): Promise<void> {

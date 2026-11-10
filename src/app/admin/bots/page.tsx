@@ -8,15 +8,16 @@ import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { getStorage } from "@/database/bindings";
 import { countMenuStats, parseBotMenuConfig } from "@/services/menu-config";
 import { getTelegramRuntimeSettings, resolveBotRuntime } from "@/services/bot-transport";
-import { probeBotDeployState } from "@/services/bot-deploy";
-import { BotDeployBadge, briefDeployDetail } from "@/components/admin/bot-deploy-badge";
+import { DeployStatusCell } from "@/components/admin/deploy-status-cell";
 import { isEdgeRuntime } from "@/lib/telegram/runtime-mode";
 import { parseBotProfile, parseBotPrivacyMode } from "@/bot/multi-runtime";
+import { parseCustomKeyboardConfig } from "@/services/custom-keyboard";
 import { requirePermission } from "@/lib/auth";
-import { deleteBotAction, deployBotAction, syncBotMenuAction, testBotAction } from "./actions";
+import { deleteBotAction, deployBotAction, saveBotCustomKeyboardAction, syncBotMenuAction, testBotAction } from "./actions";
 import { BotFormDialog } from "./bot-form-dialog";
 import { CommandMenuDialog } from "./command-menu-dialog";
 import { MenuDesignerDialog } from "./menu-designer-dialog";
+import { CustomKeyboardDialog } from "@/components/admin/custom-keyboard-dialog";
 import { BotRuntimeDialog } from "./bot-runtime-dialog";
 import { BotCreateGuide } from "./bot-create-guide";
 import { FormDialog } from "@/components/admin/form-dialog";
@@ -28,6 +29,7 @@ const NOTICES: Record<string, string> = {
   "1": "机器人已保存",
   menu: "消息内嵌按钮配置已保存，运行实例已热更新",
   sync: "消息内嵌按钮已真实同步到群组",
+  keyboard: "自定义键盘已保存，运行实例已热更新",
   deleted: "机器人已删除",
   profile: "官方资料已应用到机器人",
   commands: "指令菜单已保存并同步到 Telegram",
@@ -39,6 +41,7 @@ const ERRORS: Record<string, string> = {
   "duplicate-token": "该 Token 已存在",
   "invalid-id": "机器人不存在",
   "invalid-menu": "消息内嵌按钮配置不合法",
+  "invalid-keyboard": "自定义键盘配置不合法，请重新打开弹窗后保存",
   "invalid-commands": "指令菜单数据不合法，请重试",
   "runtime": "机器人运行配置已保存并热应用",
 };
@@ -79,9 +82,8 @@ export default async function BotsPage({
   }));
   const runtimeGlobal = await getTelegramRuntimeSettings();
   const isEdge = isEdgeRuntime();
-  // v2.1.10：真实部署状态逐 bot 并行探测（webhook=Telegram 侧 getWebhookInfo 权威值，
-  // 含投递错误/积压；polling=本进程运行实例权威值）—— 与 TGAPI 页共用同一实现
-  const deployChecks = await Promise.all(bots.map((bot) => probeBotDeployState(bot)));
+  // v2.2.1 SSR/CSR 分层：部署状态探测（逐 bot 调 Telegram getWebhookInfo 的跨网络往返）
+  // 不再阻塞首屏 —— 由 DeployStatusCell（客户端）挂载后经 /api/admin/bot-deploy-status 异步探测
 
   return (
     <div className="space-y-6">
@@ -173,7 +175,7 @@ export default async function BotsPage({
                   </td>
                 </tr>
               ) : (
-                bots.map((bot, botIndex) => {
+                bots.map((bot) => {
                   const stats = countMenuStats(parseBotMenuConfig(bot.menuConfig).root);
                   const profile = parseBotProfile(bot.config);
                   // 指令归属过滤（v2.1.13）：本机器人可见的自定义指令 = 全局 + 群组私有 + 本机器人私有；
@@ -230,15 +232,7 @@ export default async function BotsPage({
                         })()}
                       </td>
                       <td className="px-4 py-3">
-                        <div className="max-w-56 space-y-1">
-                          <BotDeployBadge check={deployChecks[botIndex] ?? { key: "unknown", detail: "探测结果缺失" }} />
-                          {"detail" in (deployChecks[botIndex] ?? {}) &&
-                          (deployChecks[botIndex] as { detail?: string }).detail ? (
-                            <p className="text-xs leading-snug text-muted-foreground">
-                              {briefDeployDetail((deployChecks[botIndex] as { detail: string }).detail)}
-                            </p>
-                          ) : null}
-                        </div>
+                        <DeployStatusCell botId={String(bot.id)} />
                       </td>
                       <td className="px-4 py-3">
                         <span
@@ -336,6 +330,29 @@ export default async function BotsPage({
                               scopeLabel: scopeLabelOf(item),
                             }))}
                             trigger="⌨️ 指令菜单"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
+                          />
+                          {/* ⌨️ 自定义键盘（v2.2.0）：配置 ReplyKeyboard（复用仿真屏+复刻内嵌按钮配置），
+                              附加到 /start 欢迎消息；按钮点击=发送文本，运行时按按钮配置真实响应 */}
+                          <CustomKeyboardDialog
+                            botId={String(bot.id)}
+                            botName={bot.name}
+                            initialConfig={parseCustomKeyboardConfig(profile.customKeyboard)}
+                            isTgApi={false}
+                            action={saveBotCustomKeyboardAction}
+                            builtinCommands={commandLibrary
+                              .filter((item) => item.type === "builtin")
+                              .map((item) => ({
+                                name: item.name,
+                                label: `/${item.name} — ${item.description}`,
+                              }))}
+                            customCommands={visibleCommands
+                              .filter((item) => item.type === "custom")
+                              .map((item) => ({
+                                name: item.name,
+                                label: `/${item.name} — ${item.description}`,
+                              }))}
+                            trigger="⌨️ 自定义键盘"
                             triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
                           />
                           <BotRuntimeDialog

@@ -78,13 +78,21 @@ export interface MenuCommandRegistry {
   languageRunner?: MenuCommandRunner;
   /**
    * TGAPI 内置功能执行器（v2.1.16）：菜单按钮 action.type="tgapi_func" 点击时调用，
-   * 由 TGAPI 申请机器人在能力注册阶段注入（start/create/my 三个功能统一入口）。
-   * 按钮级配置（unlock 门禁开关 / response 响应文案）随 action 原样透传，
-   * 门禁检测与已创建检测都在执行器内完成。未注入时点击回复明确提示。
+   * 由 TGAPI 申请机器人在能力注册阶段注入（10 个固定指令统一入口）。
+   * 按钮级配置（unlock 门禁开关 / value 平台值 / response 响应文案 /
+   * success/fail 结果消息）随 action 原样透传，门禁检测与已创建检测都在执行器内完成。
+   * 未注入时点击回复明确提示。
    */
   tgapiFuncRunner?: (
     ctx: Context,
-    action: { func: string; unlock: boolean; response?: MenuTgApiResponse },
+    action: {
+      func: string;
+      unlock: boolean;
+      value?: string;
+      response?: MenuTgApiResponse;
+      success?: MenuTgApiResponse;
+      fail?: MenuTgApiResponse;
+    },
   ) => Promise<void>;
 }
 
@@ -192,11 +200,14 @@ function appendButton(
     }
     case "tgapi_func": {
       // v2.1.16：TGAPI 内置功能按钮（启动/创建API/我的API）—— 执行器由 TGAPI 实例
-      // 注入 registry.tgapiFuncRunner；按钮级门禁/响应配置随 action 透传，
+      // 注入 registry.tgapiFuncRunner；按钮级门禁/响应/结果消息配置随 action 透传，
       // 过期拦截/门禁检测/已创建检测全部在执行器内完成。
       const func = (action.tgapi_func ?? "").trim();
       const unlock = action.tgapi_unlock === true;
+      const value = action.tgapi_value ?? "";
       const response = action.tgapi_response;
+      const success = action.tgapi_success;
+      const fail = action.tgapi_fail;
       menu.text(button.text, async (ctx) => {
         if (!func || !registry?.tgapiFuncRunner) {
           await ctx.reply(
@@ -204,7 +215,7 @@ function appendButton(
           );
           return;
         }
-        await registry.tgapiFuncRunner(ctx, { func, unlock, response });
+        await registry.tgapiFuncRunner(ctx, { func, unlock, value, response, success, fail });
       });
       return;
     }

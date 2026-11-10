@@ -34,29 +34,224 @@ export type MenuActionType =
   | "tgapi_func";
 
 /**
- * TGAPI 申请机器人内置功能（v2.1.16）：内嵌按钮「交互」下拉框的可选项，
+ * TGAPI 指令消息槽位定义（v2.1.16）：每个固定指令中可配置的消息（发送消息 /
+ * 成功消息 / 失败消息），管理端「指令配置」模块按 slots 渲染，
+ * 真实端 handlers/tgapi.ts 按同名槽位读取渲染（{{变量}} 由 renderMenuTemplate 解析）。
+ */
+export interface TgApiFuncMessageSlot {
+  key: "response" | "success" | "fail";
+  label: string;
+  /** 该槽位的说明（发送时机/留空语义） */
+  desc: string;
+  /** 可用模板变量提示（空 = 无变量） */
+  vars: string;
+  /** 默认文案（真实端未配置时使用；管理端作为 placeholder 展示） */
+  defaultZh: string;
+  defaultEn: string;
+}
+
+/**
+ * TGAPI 申请机器人内置功能（v2.2.0）：内嵌按钮「交互」下拉框的可选项，
  * 与 TGAPI 机器人真实具备的功能一一对应（运行时由 registerTgApiHandlers 注入执行器）。
- * label 即管理端下拉框展示文案（指令 /xxx : 描述格式）。
+ * label 即管理端下拉框展示文案（指令 /xxx : 描述格式）；slots 是该指令
+ * 可配置的消息槽位（发送消息/成功消息/失败消息，双语，支持 {{变量}}）。
+ *
+ * TGAPI 固定指令（v2.2.2 起 9 个，/skip 已移除）：
+ * 启动机器人 / 创建API / 我的API / 设置平台 / 语言切换 / 帮助 / 客服支持 /
+ * 设置APP名称(title) / 设置APP描述(description)。
+ * 其中 /start 是入口指令不设按钮，其余 8 个指令对应默认菜单的 8 个内嵌按钮
+ *（v2.2.2：/skip 指令已移除 —— 创建 API 直接手机号 → 登录码，APP 参数用
+ * 设置Title/设置Description/设置平台 预配置或管理端默认值）。
  */
 export const TGAPI_MENU_FUNCS = [
   {
     func: "start",
     label: "指令 /start : 启动机器人",
     hint: "重新发送一条新的初始消息+内嵌按钮，之前的消息和内嵌按钮过时失效",
+    slots: [
+      {
+        key: "response",
+        label: "发送消息",
+        desc: "点击按钮后机器人先发送的提示（留空 = 直接重发初始消息）",
+        vars: "",
+        defaultZh: "",
+        defaultEn: "",
+      },
+    ],
   },
   {
     func: "create",
     label: "指令 /createapi : 创建API",
     hint: "先检测是否已创建过 → 未解锁时进入验证码验证流程 → 通过后自动进入创建流程（手机号 → 登录码 → api_id/api_hash）",
+    slots: [
+      {
+        key: "response",
+        label: "发送消息",
+        desc: "点击按钮后机器人先发送的提示（留空 = 点击后直接执行）",
+        vars: "",
+        defaultZh: "🗝 正在为你创建 API，请稍候…",
+        defaultEn: "🗝 Creating your API, please wait…",
+      },
+      {
+        key: "success",
+        label: "成功消息",
+        desc: "API 创建成功后发送（留空 = 只发默认完整 APP 配置消息）",
+        vars: "{{phone}} {{api_id}} {{api_hash}}",
+        defaultZh: "",
+        defaultEn: "",
+      },
+      {
+        key: "fail",
+        label: "失败消息",
+        desc: "创建失败时发送（留空 = 只发默认错误提示）",
+        vars: "{{error}}",
+        defaultZh: "",
+        defaultEn: "",
+      },
+    ],
   },
   {
     func: "my",
     label: "指令 /myapi : 我的API",
     hint: "查看已创建的 api_id 与 api_hash（号码 / api_id / api_hash 三行格式）",
+    slots: [
+      {
+        key: "success",
+        label: "成功消息",
+        desc: "已创建时发送（号码/api_id/api_hash 三行格式）",
+        vars: "{{phone}} {{api_id}} {{api_hash}}",
+        defaultZh: "📱 号码：{{phone}}\n🆔 api_id：{{api_id}}\n🔑 api_hash：{{api_hash}}",
+        defaultEn: "📱 Number: {{phone}}\n🆔 api_id: {{api_id}}\n🔑 api_hash: {{api_hash}}",
+      },
+      {
+        key: "fail",
+        label: "失败消息",
+        desc: "未创建时发送",
+        vars: "",
+        defaultZh: "💎 你还没有创建 API。\n\n点击 🗝 创建API 开始申请。",
+        defaultEn: "💎 You haven't created an API yet.\n\nTap 🗝 Create API to start.",
+      },
+    ],
+  },
+  {
+    func: "platform",
+    label: "指令 /setplatform : 设置平台",
+    hint: "点按钮展开平台子菜单（每行2个共8个平台按钮）；选中平台用于创建 APP 时提交（未选择则从 APP_PLATFORM 配置随机选一）",
+    slots: [
+      {
+        key: "success",
+        label: "选择成功消息",
+        desc: "平台子菜单中点击具体平台后发送",
+        vars: "{{platform}}",
+        defaultZh: "✅ APP 平台已设置为 {{platform}}，创建 API 时将优先使用。",
+        defaultEn: "✅ App platform set to {{platform}}; it will be used when creating your API.",
+      },
+    ],
+  },
+  {
+    func: "language",
+    label: "指令 /language : 语言切换",
+    hint: "点击后在 中文/English 之间切换并回复确认；语言偏好按会话记忆",
+    slots: [],
+  },
+  {
+    func: "help",
+    label: "指令 /help : 帮助",
+    hint: "回复使用帮助（各按钮功能说明）",
+    slots: [
+      {
+        key: "response",
+        label: "发送消息",
+        desc: "点击后发送的帮助文案（留空 = 内置默认帮助）",
+        vars: "{{user_id}} {{username}} {{first_name}}",
+        defaultZh: "",
+        defaultEn: "",
+      },
+    ],
+  },
+  {
+    func: "support",
+    label: "指令 /support : 客服支持",
+    hint: "回复客服支持文案（联系方式等）",
+    slots: [
+      {
+        key: "response",
+        label: "发送消息",
+        desc: "点击后发送的客服文案（留空 = 内置默认）",
+        vars: "{{user_id}} {{username}} {{first_name}}",
+        defaultZh: "",
+        defaultEn: "",
+      },
+    ],
+  },
+  {
+    func: "settitle",
+    label: "指令 /settitle : 设置APP名称",
+    hint: "在输入框发送 APP 名称（title，1-32 字符），创建 API 时优先使用；发送 /start 返回主键盘",
+    slots: [
+      {
+        key: "response",
+        label: "发送消息",
+        desc: "点击后先发送的提示（留空 = 内置名称输入提示）",
+        vars: "{{title}}",
+        defaultZh: "",
+        defaultEn: "",
+      },
+      {
+        key: "success",
+        label: "设置成功消息",
+        desc: "保存成功后发送",
+        vars: "{{title}}",
+        defaultZh: "✅ APP 名称已设置为：{{title}}",
+        defaultEn: "✅ App title set to: {{title}}",
+      },
+    ],
+  },
+  {
+    func: "setdescription",
+    label: "指令 /setdescription : 设置APP描述",
+    hint: "在输入框发送 APP 描述（description，1-200 字符），创建 API 时优先使用；发送 /start 返回主键盘",
+    slots: [
+      {
+        key: "response",
+        label: "发送消息",
+        desc: "点击后先发送的提示（留空 = 内置描述输入提示）",
+        vars: "{{description}}",
+        defaultZh: "",
+        defaultEn: "",
+      },
+      {
+        key: "success",
+        label: "设置成功消息",
+        desc: "保存成功后发送",
+        vars: "{{description}}",
+        defaultZh: "✅ APP 描述已设置为：{{description}}",
+        defaultEn: "✅ App description set to: {{description}}",
+      },
+    ],
   },
 ] as const;
 
 export type TgApiMenuFunc = (typeof TGAPI_MENU_FUNCS)[number]["func"];
+
+/** TGAPI 平台指令的合法平台值（tgapi_value，与 my.telegram.org APP_PLATFORM 提交值一致） */
+export const TGAPI_PLATFORM_VALUES = [
+  "android",
+  "ios",
+  "wp",
+  "bb",
+  "desktop",
+  "web",
+  "ubp",
+  "other",
+] as const;
+
+const TGAPI_PLATFORM_VALUE_SET: Set<string> = new Set(TGAPI_PLATFORM_VALUES);
+
+/** 判断是否合法的 TGAPI 平台值（parseAction 校验用） */
+export function isValidTgApiPlatformValue(value: string | undefined | null): boolean {
+  return typeof value === "string" && TGAPI_PLATFORM_VALUE_SET.has(value);
+}
 
 const TGAPI_MENU_FUNC_SET: Set<string> = new Set(TGAPI_MENU_FUNCS.map((item) => item.func));
 
@@ -100,12 +295,18 @@ export interface MenuButtonAction {
   switch_query?: string;
   /** command 类型专用：点击后真实执行的指令名（不含 /；内置或自定义指令） */
   target?: string;
-  /** tgapi_func 类型专用：TGAPI 内置功能名（start=create/create/my，见 TGAPI_MENU_FUNCS） */
+  /** tgapi_func 类型专用：TGAPI 内置功能名（见 TGAPI_MENU_FUNCS，共 9 个固定指令） */
   tgapi_func?: string;
+  /** tgapi_func=platform 专用：按钮绑定的平台值（android/ios/wp/bb/desktop/web/ubp/other） */
+  tgapi_value?: string;
   /** tgapi_func 类型专用：首次对话解锁门禁（true=未解锁用户点击先进入验证码验证流程） */
   tgapi_unlock?: boolean;
   /** tgapi_func 类型专用：点击后的响应提示消息（中英双语，先于功能执行发送） */
   tgapi_response?: MenuTgApiResponse;
+  /** tgapi_func 类型专用：功能成功消息（中英双语，{{phone}}/{{api_id}}/{{api_hash}} 可用；留空用内置默认） */
+  tgapi_success?: MenuTgApiResponse;
+  /** tgapi_func 类型专用：功能失败消息（中英双语，{{error}} 可用；留空用内置默认） */
+  tgapi_fail?: MenuTgApiResponse;
 }
 
 export interface MenuButton {
@@ -140,9 +341,50 @@ export function emptyMenuConfig(): BotMenuConfig {
 }
 
 /**
- * TGAPI 申请机器人图 1 默认按钮（v2.1.16）：存量机器人首次打开新弹窗时按钮区按此生成
- * （不迁移旧 menu_config 的按钮文案）；消息正文不在此处（正文沿用其已自定义的欢迎语 texts.start）。
- * 🗝 创建API 默认开启首次对话解锁门禁；💎 我的API / 🌐 切换语言 不开启。
+ * TGAPI 平台标签（my.telegram.org APP_PLATFORM 提交值 → 展示文案，图2 清单逐字对齐）
+ */
+export const TGAPI_PLATFORM_LABELS: Record<string, string> = {
+  android: "Android",
+  ios: "iOS",
+  wp: "Windows Phone",
+  bb: "BlackBerry",
+  desktop: "桌面端",
+  web: "Web",
+  ubp: "Ubiquitous",
+  other: "其他",
+};
+
+/** 平台子菜单布局：每行 2 个、共 8 个平台按钮（[值, 标签] 配对） */
+export const TGAPI_PLATFORM_LABEL_ROWS: [string, string][][] = [
+  [
+    ["android", TGAPI_PLATFORM_LABELS.android],
+    ["ios", TGAPI_PLATFORM_LABELS.ios],
+  ],
+  [
+    ["wp", TGAPI_PLATFORM_LABELS.wp],
+    ["bb", TGAPI_PLATFORM_LABELS.bb],
+  ],
+  [
+    ["desktop", TGAPI_PLATFORM_LABELS.desktop],
+    ["web", TGAPI_PLATFORM_LABELS.web],
+  ],
+  [
+    ["ubp", TGAPI_PLATFORM_LABELS.ubp],
+    ["other", TGAPI_PLATFORM_LABELS.other],
+  ],
+];
+
+/**
+ * TGAPI 申请机器人默认按钮组（v2.2.0）：存量机器人首次打开新弹窗时按钮区按此生成；
+ * 固定指令中除 /start（入口指令）外的 8 个指令各对应一个按钮（v2.2.2 移除跳过）。
+ * 图1 布局基础上扩展：
+ * 行1 🗝 创建 API（整行，默认开启首次对话解锁门禁）；
+ * 行2 🗂 我的 API ｜ 📱 设置平台（两列；设置平台展开平台子菜单）；
+ * 行3 ✅ 语言 ｜ 🆘 帮助（两列）；
+ * 行4 🎫 客服支持（整行）；
+ * 行5 ✏️ 设置Title ｜ 📝 设置Description（两列，v2.2.2 移除跳过按钮）。
+ * 平台子菜单：每行 2 个共 8 个平台按钮（TGAPI_PLATFORM_LABELS 全量）。
+ * 消息正文不在此处（正文沿用其已自定义的欢迎语 texts.start）。
  */
 export function defaultTgApiMenuRoot(): MenuNode {
   const row = (buttons: MenuButton[]): MenuRow => ({
@@ -154,7 +396,7 @@ export function defaultTgApiMenuRoot(): MenuNode {
       row([
         {
           id: "btn-create-api",
-          text: "🗝 创建API",
+          text: "🗝 创建 API",
           action: {
             type: "tgapi_func",
             tgapi_func: "create",
@@ -169,7 +411,7 @@ export function defaultTgApiMenuRoot(): MenuNode {
       row([
         {
           id: "btn-my-api",
-          text: "💎 我的API",
+          text: "🗂 我的 API",
           action: {
             type: "tgapi_func",
             tgapi_func: "my",
@@ -179,12 +421,56 @@ export function defaultTgApiMenuRoot(): MenuNode {
             },
           },
         },
+        {
+          id: "btn-platform",
+          text: "📱 设置平台",
+          action: { type: "submenu" },
+          submenu: {
+            rows: TGAPI_PLATFORM_LABEL_ROWS.map((pair) =>
+              row(
+                pair.map(([value, label]) => ({
+                  id: `btn-platform-${value}`,
+                  text: label,
+                  action: {
+                    type: "tgapi_func",
+                    tgapi_func: "platform",
+                    tgapi_value: value,
+                  },
+                } satisfies MenuButton)),
+              ),
+            ),
+          },
+        },
       ]),
       row([
         {
           id: "btn-language",
-          text: "🌐 切换语言",
+          text: "✅ 语言",
           action: { type: "language" },
+        },
+        {
+          id: "btn-help",
+          text: "🆘 帮助",
+          action: { type: "tgapi_func", tgapi_func: "help" },
+        },
+      ]),
+      row([
+        {
+          id: "btn-support",
+          text: "🎫 客服支持",
+          action: { type: "tgapi_func", tgapi_func: "support" },
+        },
+      ]),
+      row([
+        {
+          id: "btn-set-title",
+          text: "✏️ 设置Title",
+          action: { type: "tgapi_func", tgapi_func: "settitle" },
+        },
+        {
+          id: "btn-set-description",
+          text: "📝 设置Description",
+          action: { type: "tgapi_func", tgapi_func: "setdescription" },
         },
       ]),
     ],
@@ -277,6 +563,16 @@ function parseVerify(raw: unknown): MenuVerifyConfig | undefined {
   };
 }
 
+/** 解析 TGAPI 指令消息槽位（双语，全空 = 未配置返回 undefined） */
+function parseTgApiResponse(raw: unknown): MenuTgApiResponse | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const source = raw as Partial<MenuTgApiResponse>;
+  const zh = typeof source.zh === "string" ? source.zh : "";
+  const en = typeof source.en === "string" ? source.en : "";
+  if (!zh.trim() && !en.trim()) return undefined;
+  return { zh, en };
+}
+
 function parseAction(raw: unknown): MenuButtonAction {
   const fallback: MenuButtonAction = { type: "reply", text: "" };
   if (typeof raw !== "object" || raw === null) return fallback;
@@ -296,21 +592,21 @@ function parseAction(raw: unknown): MenuButtonAction {
     TGAPI_MENU_FUNC_SET.has(source.tgapi_func)
   ) {
     action.tgapi_func = source.tgapi_func;
-    if (source.tgapi_unlock === true) action.tgapi_unlock = true;
-    const response = source.tgapi_response;
+    // 平台指令：按钮可绑定具体平台值（子菜单平台按钮）；非法值丢弃
     if (
-      typeof response === "object" &&
-      response !== null &&
-      ((typeof (response as Partial<MenuTgApiResponse>).zh === "string" &&
-        (response as Partial<MenuTgApiResponse>).zh !== "") ||
-        (typeof (response as Partial<MenuTgApiResponse>).en === "string" &&
-          (response as Partial<MenuTgApiResponse>).en !== ""))
+      source.tgapi_func === "platform" &&
+      typeof source.tgapi_value === "string" &&
+      TGAPI_PLATFORM_VALUE_SET.has(source.tgapi_value)
     ) {
-      action.tgapi_response = {
-        zh: typeof response.zh === "string" ? response.zh : "",
-        en: typeof response.en === "string" ? response.en : "",
-      };
+      action.tgapi_value = source.tgapi_value;
     }
+    if (source.tgapi_unlock === true) action.tgapi_unlock = true;
+    const response = parseTgApiResponse(source.tgapi_response);
+    if (response) action.tgapi_response = response;
+    const success = parseTgApiResponse(source.tgapi_success);
+    if (success) action.tgapi_success = success;
+    const fail = parseTgApiResponse(source.tgapi_fail);
+    if (fail) action.tgapi_fail = fail;
   }
   const content = parseContent(source.content);
   if (source.type === "reply" && (content.type !== "text" || content.text)) {

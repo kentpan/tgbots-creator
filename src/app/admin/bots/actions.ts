@@ -17,6 +17,7 @@ import {
 } from "@/database/operations";
 import { logOperation, requirePermission } from "@/lib/auth";
 import { parseBotMenuConfig, sendMenuMessage, validateMenuConfig, renderMenuMarkup } from "@/services/bot-menu";
+import { parseCustomKeyboardConfig } from "@/services/custom-keyboard";
 import { deployBotAndReport } from "@/services/bot-deploy";
 import {
   acquireMenuBot,
@@ -379,6 +380,50 @@ export async function saveBotMenuAction(formData: FormData): Promise<void> {
       ? botPath({ saved: "sync", message: syncMessage })
       : botPath({ saved: "menu" }),
   );
+}
+
+/**
+ * 保存机器人自定义键盘（v2.2.0）：「自定义键盘」弹窗提交 ——
+ * 写入 bots.config JSON 顶层 customKeyboard 段（通用机器人附加到 /start 欢迎消息，
+ * 按钮点击按配置真实响应）；保存后热更新运行实例（配置即时生效）。
+ * 空提交 = 清除自定义键盘（机器人回到纯消息内嵌按钮形态）。
+ */
+export async function saveBotCustomKeyboardAction(formData: FormData): Promise<void> {
+  const admin = await requirePermission("bots:manage");
+  const idRaw = String(formData.get("id") ?? "").trim();
+  const keyboardRaw = String(formData.get("custom_keyboard") ?? "").trim();
+  if (!idRaw || !/^\d+$/.test(idRaw)) redirect(botPath({ error: "invalid-id" }));
+  const bot = await getBot(BigInt(idRaw));
+  if (!bot) redirect(botPath({ error: "invalid-id" }));
+
+  const profile = parseBotProfile(bot.config);
+  if (keyboardRaw) {
+    let source: unknown;
+    try {
+      source = JSON.parse(keyboardRaw);
+    } catch {
+      redirect(botPath({ error: "invalid-keyboard" }));
+    }
+    const parsed = parseCustomKeyboardConfig(source);
+    if (!parsed) redirect(botPath({ error: "invalid-keyboard" }));
+    profile.customKeyboard = parsed;
+  } else {
+    delete profile.customKeyboard;
+  }
+
+  await updateBotRecord(bot.id, { config: JSON.stringify(profile) });
+  if (bot.enabled) {
+    void restartMenuBot(bot.id).catch((error: unknown) => {
+      console.error(`[bots] 自定义键盘保存后重启运行实例失败（#id ${bot.id}）:`, error);
+    });
+  }
+  await logOperation(admin, {
+    action: keyboardRaw ? "保存机器人自定义键盘" : "清除机器人自定义键盘",
+    target: bot.name,
+    headers: await headers(),
+  });
+  revalidatePath("/admin/bots");
+  redirect(botPath({ saved: "keyboard" }));
 }
 
 export async function syncBotMenuAction(formData: FormData): Promise<void> {

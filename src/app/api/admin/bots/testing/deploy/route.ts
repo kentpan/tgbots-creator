@@ -113,9 +113,13 @@ export async function POST(request: Request): Promise<NextResponse> {
     const me = meResult.value;
 
     // 群信息：失败容忍（大概率机器人不在群，后续 getChatMember 给出准确 stage）
+    // v2.1.16：同时取公开群用户名（getChat.username）—— 公开群部署必须用
+    // 公开自定义链接 t.me/<username>，而不是机器人新建的私密形态邀请链接
     let chatTitle = `群组 ${chatId}`;
+    let publicUsername: string | null = null;
     if (chatResult.status === "fulfilled" && chatResult.value && chatResult.value.type !== "private") {
       chatTitle = ("title" in chatResult.value && chatResult.value.title) || chatTitle;
+      publicUsername = ("username" in chatResult.value && chatResult.value.username) || null;
     }
 
     // 机器人群成员身份：失败 = 机器人不在群/群不可见 → 拉进群指引
@@ -213,6 +217,7 @@ export async function POST(request: Request): Promise<NextResponse> {
           api,
           chatId: effectiveChatId,
           superGroup,
+          publicUsername,
           botId: bot.id,
           meta: { bot_username: me.username ?? null, chat_title: chatTitle },
         }),
@@ -252,6 +257,7 @@ export async function POST(request: Request): Promise<NextResponse> {
           api,
           chatId: effectiveChatId,
           superGroup,
+          publicUsername,
           botId: bot.id,
           meta: { bot_username: me.username ?? null, chat_title: chatTitle },
         }),
@@ -279,7 +285,19 @@ export async function POST(request: Request): Promise<NextResponse> {
       /* 设置读取失败时按群型默认值展示 */
     }
 
-    const guide = superGroup
+    // v2.1.16：公开群（getChat.username 非空）→ 公开自定义链接 t.me/<username>；
+    // 群开启「加入审核」时点链接 → 「申请加入」→ chat_join_request → 机器人自动审批。
+    const isPublicLink = /^https:\/\/t\.me\/[^+]/.test(linkAcquired.invite_link) && !linkAcquired.invite_link.includes("/+") && !linkAcquired.invite_link.includes("joinchat");
+    const guide = isPublicLink
+      ? [
+          "部署完成！本群是公开群（有 @用户名），已直接使用公开自定义链接：",
+          linkAcquired.invite_link,
+          "把该链接发给买家（或配置到闲鱼自动发货）：点链接 → 群资料 → 「申请加入」（需群已开启「加入审核」）→ 机器人自动批准进群",
+          "⚠️ 若点链接直接进群（无「申请加入」按钮）：请在 Telegram 群设置 → 管理员审核权限中开启「加入群组需管理员审批」（Approve new members），Bot API 无法代开该开关",
+          "✅ 公开链接永久有效（与机器人无关）；机器人拥有「邀请用户」权限时将自动批准入群申请",
+          "💡 链接复用：重复部署不会改动公开链接；分享群主客户端里的主邀请链接仍被禁止（那种链接绕过审批直接进群）",
+        ]
+      : superGroup
       ? verificationChannel === "group"
         ? [
             "部署完成！把入群申请链接发给买家（或配置到闲鱼自动发货）",
@@ -327,7 +345,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       invite_link: linkAcquired.invite_link,
       reused: linkAcquired.reused,
       deployed_at: linkAcquired.deployed_at,
-      deploy_mode: superGroup ? "join_request" : "direct",
+      deploy_mode: isPublicLink ? "public" : superGroup ? "join_request" : "direct",
       guide,
     });
   } catch (error) {

@@ -72,13 +72,16 @@ export function mergeGroupBotAdminRights(
 }
 
 export interface AcquireInviteLinkResult {
-  /** 可直接发给买家的邀请链接（复用或新建） */
+  /** 可直接发给买家的邀请链接（公开群=公开链接；复用或新建） */
   invite_link: string;
   /** true = 复用了已保存的链接（未新建） */
   reused: boolean;
   /** 部署状态中的 deployed_at（复用时返回原值，新建时返回当前时间） */
   deployed_at: string;
 }
+
+/** 链接形态：public=公开群自定义链接（t.me/<username>）；join_request=申请制邀请链接；direct=普通邀请链接 */
+export type InviteLinkMode = "public" | "join_request" | "direct";
 
 /**
  * 探测失败是否为「确定性死链」信号。
@@ -107,11 +110,64 @@ export function isDefinitiveInviteLinkDeath(error: unknown): boolean {
  *
  * @param input.api         grammY API 实例（botByToken(...).api 或 ctx.api）
  * @param input.chatId      目标群 chat_id（调用方负责先解析 migrate_to_chat_id）
- * @param input.superGroup  超级群/频道 → creates_join_request 申请制链接；基础群 → 普通链接
+ * @param input.superGroup  超级群/频道 → 申请制链接；基础群 → 普通链接
+ * @param input.publicUsername v2.1.16：群组公开用户名（getChat.username，非空 = 公开群）——
+ *   直接使用公开群自定义链接 https://t.me/<username>（群开启「加入审核」时点链接出
+ *   「申请加入」→ chat_join_request 事件；绝不给公开群再生成 t.me/+hash 私密形态
+ *   邀请链接 —— 那正是「部署后生成私密分享链接而不是公开自定义链接」的根因）
  * @param input.botId       提供时读取/合并落库部署状态；null 时仅新建、不落库
  * @param input.meta        新建落库时合并进 rights 的附加字段（bot_username / chat_title）
  */
 export async function acquireStableGroupInviteLink(input: {
+  api: Api;
+  chatId: bigint;
+  superGroup: boolean;
+  publicUsername?: string | null;
+  botId?: bigint | null;
+  meta?: Record<string, unknown>;
+}): Promise<AcquireInviteLinkResult> {
+  const { api, chatId, superGroup } = input;
+  const botId = input.botId ?? null;
+  const publicUsername = input.publicUsername?.trim() ?? "";
+  const deployedAt = new Date().toISOString();
+
+  // 0) 公开群（v2.1.16）：自定义公开链接 t.me/<username>，无需机器人建链，
+  //    不参与复用探测/重建（链接与机器人无关，永不失效）。
+  //    群侧「加入审核」开关由群主在 Telegram 客户端控制（Bot API 无此开关），
+  //    开启时点链接 → 「申请加入」→ chat_join_request → 机器人审批。
+  if (publicUsername) {
+    if (botId !== null) {
+      const rights = mergeGroupBotAdminRights(
+        (await getGroupBotAdminByBotAndChat(botId, chatId))?.rights ?? null,
+        {
+          can_invite_users: true,
+          invite_link: `https://t.me/${publicUsername}`,
+          invite_link_name: `公开群链接 @${publicUsername}`,
+          deployed_at: deployedAt,
+          deploy_mode: "public",
+          ...(input.meta ?? {}),
+        },
+      );
+      await upsertGroupBotAdmin({ botId, chatId, rights, status: "active" });
+    }
+    return {
+      invite_link: `https://t.me/${publicUsername}`,
+      reused: false,
+      deployed_at: deployedAt,
+    };
+  }
+
+  return acquireInviteLinkViaBot({
+    api,
+    chatId,
+    superGroup,
+    ...(botId !== null ? { botId } : {}),
+    ...(input.meta ? { meta: input.meta } : {}),
+  });
+}
+
+/** 非公开群路径：申请制/普通邀请链接（复用探测 + 新建，v2.0.14 原逻辑） */
+async function acquireInviteLinkViaBot(input: {
   api: Api;
   chatId: bigint;
   superGroup: boolean;

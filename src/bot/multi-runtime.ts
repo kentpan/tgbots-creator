@@ -17,7 +17,9 @@ import {
   getTgApiBotUser,
   type BotRow,
 } from "@/database/operations";
-import { installBotMenu, parseBotMenuConfig, createMenuCommandRegistry, scopeCommandRunnerToGroup, type BotMenuConfig, type MenuCommandRegistry, type MenuCommandRunner } from "@/services/bot-menu";
+import { installBotMenu, parseBotMenuConfig, createMenuCommandRegistry, scopeCommandRunnerToGroup, sendMenuMessage, type BotMenuConfig, type MenuCommandRegistry, type MenuCommandRunner } from "@/services/bot-menu";
+import { parseCustomKeyboardConfig, renderCustomKeyboardMarkup, type CustomKeyboardButton } from "@/services/custom-keyboard";
+import { normalizeReplyContent } from "@/services/menu-config";
 import { CommandGroup } from "@grammyjs/commands";
 import { codeQuestion } from "./verification-question";
 import { registerAiSupport, type AiSupportConfig } from "./handlers/ai-support";
@@ -66,6 +68,8 @@ interface BotProfileConfig {
   aiSupport?: AiSupportConfig;
   /** TGAPI申请 机器人配置（v2.1.6）：启用后实例为纯私聊对话工具机器人（MyTelegramOrgRoBot 复刻） */
   tgapi?: TgApiBotConfig;
+  /** v2.2.0 自定义键盘（ReplyKeyboard）：通用机器人附加到 /start 欢迎消息；TGAPI 机器人由 tgapi.customKeyboard 承载（互斥切换见 services/custom-keyboard.ts） */
+  customKeyboard?: unknown;
 }
 
 export interface BotPluginsConfig {
@@ -325,7 +329,7 @@ async function createMenuBot(row: BotRow, menuConfig: BotMenuConfig, mode: Effec
     bot.use(async (ctx, next) => {
       const data = ctx.callbackQuery?.data ?? "";
       if (data.startsWith("tg:") && data.includes("/") && ctx.from) {
-        const messageId = ctx.callbackQuery.message?.message_id;
+        const messageId = ctx.callbackQuery?.message?.message_id;
         const botUser = await getTgApiBotUser(guardedBotId, BigInt(ctx.from.id));
         if (botUser?.menuMessageId && messageId && botUser.menuMessageId !== messageId) {
           await ctx.answerCallbackQuery({
@@ -387,6 +391,50 @@ async function registerBotCapabilities(
   menuConfig?: BotMenuConfig,
 ): Promise<() => Promise<void>> {
   const privacyMode = effectivePrivacy;
+
+  // v2.2.0 自定义键盘（ReplyKeyboard）：配置非空时注入 ctx.customKeyboard
+  //（cmdStart 欢迎后附发键盘）并注册按钮文本响应（点击按钮=发送文本，按配置真实响应）；
+  // TGAPI 申请机器人不在此处理（互斥的对话流程由 tgapi.customKeyboard 驱动）
+  const instanceKeyboard = parseCustomKeyboardConfig(profile.customKeyboard);
+  if (instanceKeyboard) {
+    const keyboardMarkup = renderCustomKeyboardMarkup(instanceKeyboard);
+    const keyboardButtons = new Map<string, CustomKeyboardButton>();
+    for (const row of instanceKeyboard.root.rows) {
+      for (const button of row.buttons) {
+        if (button.kind === "text") keyboardButtons.set(button.text.trim(), button);
+      }
+    }
+    bot.use(async (ctx, next) => {
+      ctx.customKeyboard = keyboardMarkup;
+      await next();
+    });
+    bot.on("message:text", async (ctx, next) => {
+      const button = keyboardButtons.get((ctx.msg?.text ?? "").trim());
+      if (!button) {
+        await next();
+        return;
+      }
+      const action = button.action;
+      if (action?.type === "command") {
+        const target = (action.target ?? "").trim().replace(/^\//, "");
+        const runner = target ? menuCommands?.runners.get(target) : undefined;
+        if (runner) {
+          await runner(ctx);
+          return;
+        }
+        await ctx.reply(
+          `⚠️ 指令 /${target || "（未指定）"} 不存在或未在「⌨️ 指令菜单」中勾选：请在机器人管理页勾选后保存。`,
+        );
+        return;
+      }
+      if (action?.type === "reply" && ctx.chat) {
+        await sendMenuMessage(ctx.api, ctx.chat.id, normalizeReplyContent(action), {});
+        return;
+      }
+      // 无动作配置（kind=text 且未绑定行为）：点击仅作为普通文本放行
+      await next();
+    });
+  }
 
   // v2.1.6 TGAPI申请 机器人：启用 tgapi 配置后，实例切换为纯私聊对话工具机器人
   //（MyTelegramOrgRoBot 复刻：解锁门禁 + 手机号 → Telegram 登录码 → my.telegram.org

@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
+import { extractTgWebLoginCode } from "@/services/tgapi-flow-text";
 import { getCurrentAdmin, hasPermission, logOperation } from "@/lib/auth";
 import { headers } from "next/headers";
 import {
   createNewTgApp,
-  extractTgWebLoginCode,
   loginStepGetStelCookie,
   requestTgCodeGetRandomHash,
   scrapeTgExistingApp,

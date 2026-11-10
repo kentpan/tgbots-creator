@@ -722,22 +722,43 @@ export interface BotSessionData {
   /** AI 客服多轮历史（最近 8 条，轮转覆盖） */
   aiHistory?: { role: "user" | "assistant"; content: string }[];
   /**
-   * TGAPI申请 对话流状态（v2.1.7）：title=等待 APP 名称 / desc=等待 APP 描述
-   * （askAppDetails 开启时前置两步）→ phone=等待手机号 → code=等待 Telegram 登录码。
+   * TGAPI申请 对话流状态（v2.2.2）：phone=等待手机号 → code=等待 Telegram 登录码；
+   * prefTitle/prefDesc=设置Title/设置Description 按钮触发的偏好收集
+   * （只记录偏好不进入创建流程；v2.2.2 起 title/desc 状态与 askAppDetails 已移除）。
    * 对应原 MyTelegramOrgRoBot 的 ConversationHandler 状态机与 GLOBAL_USERS_DICTIONARY；
-   * appTitle/appDescription 为申请人自定义值（/skip 时缺省，创建时回落配置默认）。
+   * APP 名称/描述用键盘预配置（tgapiPrefTitle/tgapiPrefDesc）或管理端默认值。
    */
   tgapi?: {
-    state: "title" | "desc" | "phone" | "code";
+    state: "phone" | "code" | "prefTitle" | "prefDesc";
     phone?: string;
     randomHash?: string;
-    appTitle?: string;
-    appDescription?: string;
+    /**
+     * 按钮级结果消息模板（v2.1.16）：点击「创建API」按钮时从按钮 action 带入，
+     * 登录码流程结束时渲染（success=创建成功消息 {{phone}}/{{api_id}}/{{api_hash}}，
+     * fail=失败消息 {{error}}；留空用内置默认文案）。
+     */
+    pendingSuccess?: { zh: string; en: string };
+    pendingFail?: { zh: string; en: string };
   };
   /** TGAPI 对话语言偏好（v2.1.7 中英文双语；未设置时按用户 language_code 自动识别） */
   tgapiLang?: "zh" | "en";
   /** TGAPI 星星解锁发票已发送（防任意文本重复弹发票） */
   tgapiStarsInvoiceSent?: boolean;
+  /**
+   * v2.2.0 自定义键盘对话流程（@grammyjs/conversations）：
+   * entry=start 表示本次进入由 /start 触发（重发主键盘消息）；auto=其他消息自动进入（不重发）。
+   * platform=设置平台记忆（创建 APP 提交时优先使用，未设置则随机选一）；
+   * prefTitle/prefDesc=设置Title/设置Description 按钮收集的 APP 名称/描述偏好（创建流程中优先于管理端默认）。
+   */
+  tgapiFlowEntry?: "start" | "auto";
+  tgapiPlatform?: string;
+  tgapiPrefTitle?: string;
+  tgapiPrefDesc?: string;
+  /**
+   * v2.2.0 内嵌模式设置Title/设置Description 按钮的槽位模板（按钮 action 透传，
+   * 保存成功后按 success 槽位渲染 {{title}}/{{description}}）。
+   */
+  tgapiPendingSlot?: { success?: { zh: string; en: string }; fail?: { zh: string; en: string } };
   /**
    * 菜单「外部验证 API」按钮验证会话（v2.1.12）：点击按钮时写入（绑定方法+自定义
    * 文案+已试次数），verifyCodeExternally 核验出结果后清除；成功/达到尝试上限清除，

@@ -183,7 +183,15 @@ const includeRootFiles = [
   "tsconfig.json",
 ];
 const includeDirs = [".github", "pages-adapter", "prisma", "public", "scripts", "src"];
-const skipNames = new Set(["dev.log", ".package-stage", "node_modules", ".vercel"]);
+const skipNames = new Set([
+  "dev.log",
+  ".package-stage",
+  "node_modules",
+  ".vercel",
+  // v2.2.1：prisma/snapshots/ 是开发期数据库备份（v2.2.0 误入包导致 zip 膨胀 1.1MB→2.8MB），
+  // 发布包只随 prisma/bot-groups.db 主库 + schema.sql，备份不入包
+  "snapshots",
+]);
 // SQLite 运行时伴生文件不入包：WAL checkpoint(TRUNCATE) 后 -wal 已是 0 字节，
 // -shm 是共享内存索引，两者与主 db 文件无关且解压后可能引起误判
 const skipSuffixes = [".db-wal", ".db-shm"];

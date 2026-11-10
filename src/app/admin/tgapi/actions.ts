@@ -12,7 +12,7 @@ import {
   createBotRecord,
 } from "@/database/operations";
 import { logOperation, requirePermission } from "@/lib/auth";
-import { parseBotProfile, stopMenuBot } from "@/bot/multi-runtime";
+import { parseBotProfile, restartMenuBot, stopMenuBot } from "@/bot/multi-runtime";
 import { deployBotAndReport } from "@/services/bot-deploy";
 import { parseBotMenuConfig } from "@/services/menu-config";
 import {
@@ -24,6 +24,7 @@ import {
   type TgApiBotTexts,
   type TgApiUnlockMode,
 } from "@/services/tgapi-config";
+import { parseCustomKeyboardConfig } from "@/services/custom-keyboard";
 
 function tgapiPath(params: Record<string, string>): string {
   const query = new URLSearchParams(params).toString();
@@ -92,7 +93,6 @@ function buildTgApiConfig(formData: FormData): TgApiBotConfig {
     starsAmount:
       unlockMode === "stars" && Number.isFinite(starsAmount) ? Math.floor(starsAmount) : undefined,
     starsTitle: String(formData.get("stars_title") ?? "").trim() || undefined,
-    askAppDetails: formData.get("ask_app_details") === "1",
     // v2.1.10：默认值全部中性化，不再携带原项目作者推广链接/署名
     appTitle: String(formData.get("app_title") ?? "").trim() || "usetgapibot",
     appShortName: String(formData.get("app_short_name") ?? "").trim() || "usetgapibot",
@@ -189,6 +189,82 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
     revalidatePath("/admin/tgapi");
     redirect(tgapiPath({ saved: "1" }));
   }
+}
+
+/**
+ * 保存 TGAPI 自定义键盘（v2.2.0；v2.2.2 起兼收门禁配置字段）：
+ * 「自定义键盘」/「菜单和键盘」键盘页签提交 —— 写入 bots.config JSON tgapi 段：
+ * - customKeyboard：非空 = 自定义键盘对话流程生效（互斥：消息内嵌按钮不再渲染）；
+ *   空提交 = 清除配置，回到消息内嵌按钮模式；
+ * - 解锁门禁配置（unlock_mode / verification_method_id / stars_amount / stars_title）：
+ *   键盘页签内嵌的门禁配置模块随表单提交（验证码模式必须绑定验证方式，
+ *   星星模式必须金额≥1，校验规则与机器人保存动作一致）；字段缺失 = 不修改。
+ * 保存后热更新运行实例。
+ */
+export async function saveTgApiCustomKeyboardAction(formData: FormData): Promise<void> {
+  const admin = await requirePermission("tgapi:manage");
+  const idRaw = String(formData.get("id") ?? "").trim();
+  const keyboardRaw = String(formData.get("custom_keyboard") ?? "").trim();
+  if (!idRaw || !/^\d+$/.test(idRaw)) redirect(tgapiPath({ error: "invalid-id" }));
+  const bot = await getBot(BigInt(idRaw));
+  if (!bot) redirect(tgapiPath({ error: "invalid-id" }));
+
+  const profile = parseBotProfile(bot.config);
+  const tgapiSection = (profile.tgapi ?? {}) as Record<string, unknown>;
+  if (keyboardRaw) {
+    let source: unknown;
+    try {
+      source = JSON.parse(keyboardRaw);
+    } catch {
+      redirect(tgapiPath({ error: "invalid-keyboard" }));
+    }
+    const parsed = parseCustomKeyboardConfig(source);
+    if (!parsed) redirect(tgapiPath({ error: "invalid-keyboard" }));
+    tgapiSection.customKeyboard = parsed;
+  } else {
+    delete tgapiSection.customKeyboard;
+  }
+
+  // v2.2.2 门禁配置模块（键盘页签内嵌）：字段存在时才覆写（保留弹窗外维护的其他字段）
+  const unlockModeRaw = formData.get("unlock_mode");
+  if (typeof unlockModeRaw === "string" && unlockModeRaw.trim()) {
+    const unlockMode: TgApiUnlockMode = unlockModeRaw.trim() === "stars" ? "stars" : "captcha";
+    const methodRaw = String(formData.get("verification_method_id") ?? "").trim();
+    const starsRaw = String(formData.get("stars_amount") ?? "").trim();
+    const starsAmount = starsRaw === "" ? NaN : Number(starsRaw);
+    if (unlockMode === "captcha" && (!methodRaw || !/^\d+$/.test(methodRaw))) {
+      redirect(tgapiPath({ error: "method-required" }));
+    }
+    if (unlockMode === "stars" && (!Number.isFinite(starsAmount) || starsAmount < 1)) {
+      redirect(tgapiPath({ error: "invalid-stars" }));
+    }
+    tgapiSection.unlockMode = unlockMode;
+    if (unlockMode === "captcha") {
+      tgapiSection.verificationMethodId = Number(methodRaw);
+      delete tgapiSection.starsAmount;
+    } else {
+      tgapiSection.starsAmount = Math.floor(starsAmount);
+      delete tgapiSection.verificationMethodId;
+    }
+    const starsTitle = String(formData.get("stars_title") ?? "").trim();
+    if (starsTitle) tgapiSection.starsTitle = starsTitle;
+    else delete tgapiSection.starsTitle;
+  }
+
+  profile.tgapi = tgapiSection as unknown as TgApiBotConfig;
+  await updateBotRecord(bot.id, { config: JSON.stringify(profile) });
+  if (bot.enabled) {
+    void restartMenuBot(bot.id).catch((error: unknown) => {
+      console.error(`[tgapi] 自定义键盘保存后重启运行实例失败（#id ${bot.id}）:`, error);
+    });
+  }
+  await logOperation(admin, {
+    action: keyboardRaw ? "保存TGAPI自定义键盘" : "清除TGAPI自定义键盘",
+    target: bot.name,
+    headers: await headers(),
+  });
+  revalidatePath("/admin/tgapi");
+  redirect(tgapiPath({ saved: keyboardRaw ? "keyboard" : "1" }));
 }
 
 export async function toggleTgApiBotAction(formData: FormData): Promise<void> {

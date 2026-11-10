@@ -13,67 +13,9 @@
  */
 
 /**
- * extract_code_imn_ges 增强版（v2.1.8）：从用户消息提取 Telegram Web 登录码。
- * 机器人与管理端申请向导共用（机器人收「转发的服务通知消息」，向导收「粘贴的消息文本」，
- * 两者都是纯文本，解析逻辑完全一致）。
- *
- * 已知消息形态（Telegram 777000 服务通知）：
- *  1. "Web login code: 12345"（原版 trial-and-error 依据的 "web login code" 关键字）
- *  2. "Login code: 12345\n\nDo not give this code to anyone, ... "（新版措辞）
- *  3. 用户手输/复制的独立验证码行
- * 解析优先级：
- *  a) 关键字行（web login code / login code）冒号后的数字段；
- *  b) 原版第二行试错结论：关键字行的后续非空行中的数字段；
- *  c) 整行即验证码（纯数字独立行）；
- *  d) 首个行内独立数字段（3-8 位，不吞长数字的片段）；
- *  e) 单行原文兜底（原版行为：单行原样提交）。
+ * extract_code_imn_ges 增强版（extractTgWebLoginCode）已迁至 services/tgapi-flow-text.ts
+ * （v2.2.1：运行端与客户端仿真屏共用同一实现）—— 本文件只保留 my.telegram.org 网络管道。
  */
-export function extractTgWebLoginCode(messageText: string): string | null {
-  const text = messageText.trim();
-  if (!text) return null;
-  const lines = text
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  /** 行内独立数字段（3-8 位；前后不能还是数字，避免吞掉手机号片段） */
-  const codeInLine = (line: string): string | null =>
-    line.match(/(?<!\d)\d{3,8}(?!\d)/)?.[0] ?? null;
-
-  const keywordIndex = lines.findIndex((line) => {
-    const lower = line.toLowerCase();
-    return lower.includes("web login code") || lower.includes("login code");
-  });
-
-  if (keywordIndex >= 0) {
-    // a) 关键字行冒号后直接跟验证码（"Web login code: 12345" / "Login code: 12345"）
-    const keywordLine = lines[keywordIndex] ?? "";
-    const afterColon = keywordLine.split(/[:：]/).slice(1).join(":").trim();
-    if (afterColon) {
-      const code = codeInLine(afterColon);
-      if (code) return code;
-    }
-    // b) 原版第二行试错结论：验证码在关键字行的后续非空行
-    for (let i = keywordIndex + 1; i < lines.length; i += 1) {
-      const code = codeInLine(lines[i] ?? "");
-      if (code) return code;
-    }
-  }
-
-  // c) 整行即验证码（手输/复制的纯数字行）
-  for (const line of lines) {
-    if (/^\d{3,8}$/.test(line)) return line;
-  }
-  // d) 首个行内独立数字段（多行且无关键字，如转发的旧版通知）
-  for (const line of lines) {
-    const code = codeInLine(line);
-    if (code) return code;
-  }
-  // e) 单行原文兜底（原版行为：单行原样作为验证码提交）
-  if (lines.length === 1) {
-    return lines[0] ?? null;
-  }
-  return null;
-}
 
 const MY_TELEGRAM_ORG_ORIGIN = "https://my.telegram.org";
 const REQUEST_TIMEOUT_MS = 30000;

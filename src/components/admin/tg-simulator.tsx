@@ -1,6 +1,14 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { Mic, Paperclip, Pin, Search, SendHorizontal, Smile, MoreVertical } from "lucide-react";
 import {
   renderMenuTemplate,
@@ -11,6 +19,10 @@ import {
   type MenuNode,
   type MenuTemplateVars,
 } from "@/services/menu-config";
+import type {
+  CustomKeyboardButton,
+  CustomKeyboardConfig,
+} from "@/services/custom-keyboard";
 
 interface SimMessage {
   id: number;
@@ -191,25 +203,12 @@ function MenuKeyboard({
   );
 }
 
-export function TgSimulator({
-  config,
-  botName,
-  groupTitle = "测试群组",
-  nodeId,
-  onNodeNavigate,
-  systemNote,
-  templateVars,
-  promptMessage,
-  onUserSend,
-  memberCount = "12 位成员",
-  joinPhase,
-  onRequestJoin,
-  view = "group",
-  /** 可选：点击顶部「‹」返回按钮（iOS push 导航返回上一级，由外壳组件传入） */
-  onBack,
-  /** 可选：点击左上角头像 / 右侧三个点 → 打开群组设置（iOS push 导航，由外壳组件传入） */
-  onOpenSettings,
-}: {
+/**
+ * TgSimulator 属性（v2.1.16）：机器人管理页「消息内嵌按钮」弹窗与
+ * TGAPI申请 弹窗共用同一仿真屏；TGAPI 扩展 props（showMenuInPrivate /
+ * onTgApiFunc / onLanguageToggle）全部可选，不传时行为与既有版本完全一致。
+ */
+export interface TgSimulatorProps {
   config: BotMenuConfig;
   botName: string;
   groupTitle?: string;
@@ -223,6 +222,7 @@ export function TgSimulator({
   promptMessage?: { id: number; text: string; hint?: string } | null;
   /** 用户发送文本消息的处理器（如提交验证码）；未提供时保持本地回显行为。joined=true 时追加「已加入群组」系统提示 */
   onUserSend?: (text: string) => Promise<{ ok: boolean; text: string; joined?: boolean }>;
+  /** 副标题（群组成员数等）；空字符串 = 不渲染该行（TGAPI 弹窗无真实成员数时避免假数据） */
   memberCount?: string;
   /** 加群仿真阶段（与真实 Telegram 加群一致）：idle=尚未加入（底部显示「申请加入群组」按钮），awaiting_code/joined=显示输入框。不传则始终显示输入框（菜单预览模式） */
   joinPhase?: "idle" | "awaiting_code" | "joined";
@@ -230,9 +230,67 @@ export function TgSimulator({
   onRequestJoin?: () => Promise<{ ok: boolean; message: string }>;
   /** 当前聊天视图：group=群组聊天（真实加群界面），private=与机器人的私聊（验证码在此输入，隐私模式，群里看不到）。由父组件控制切换 */
   view?: "group" | "private";
+  /** 可选：点击顶部「‹」返回按钮（iOS push 导航返回上一级，由外壳组件传入） */
   onBack?: () => void;
+  /** 可选：点击左上角头像 / 右侧三个点 → 打开群组设置（iOS push 导航，由外壳组件传入） */
   onOpenSettings?: () => void;
-}) {
+  /** v2.1.16 TGAPI 弹窗：私聊视图也渲染菜单消息+内嵌按钮键盘（机器人初始消息在私聊中） */
+  showMenuInPrivate?: boolean;
+  /** v2.1.16 TGAPI 弹窗：语言切换按钮点击交给宿主（返回 true=已处理，不再显示内置提示） */
+  onTgApiFunc?: (button: MenuButton) => void | Promise<void>;
+  /** v2.1.16 TGAPI 弹窗：语言切换按钮点击交给宿主（返回 true=已处理，不再显示内置提示） */
+  onLanguageToggle?: () => boolean;
+  /** v2.2.0 自定义键盘（ReplyKeyboard）：传入后在输入框下方渲染底部键盘（样式=KeyboardButton.style） */
+  replyKeyboard?: CustomKeyboardConfig;
+  /** v2.2.0 自定义键盘按钮点击交给宿主（未传时回显按钮文本） */
+  onReplyButtonClick?: (button: CustomKeyboardButton) => void | Promise<void>;
+  /** v2.2.1 静默发送：宿主自行追加全部机器人消息（对话流程仿真），不再插入 loading 气泡 */
+  silentUserSend?: boolean;
+}
+
+/**
+ * TgSimulator 命令式句柄：TGAPI 弹窗等宿主驱动仿真流程时向消息流追加
+ * 机器人/系统消息或清空流；机器人管理页不传 ref，行为零变化。
+ */
+export interface TgSimulatorHandle {
+  /** 向指定消息流追加一条消息（group=群组聊天，dm=与机器人的私聊）；返回消息 id（供 patchMessage 编辑，对应真实端 editMessageText） */
+  appendMessage: (
+    target: "group" | "dm",
+    message: { from: "bot" | "user" | "system"; text: string; tone?: "info" | "error" },
+  ) => number;
+  /** 编辑指定消息（对应真实端 editMessageText：登录进度消息 → 结果消息） */
+  patchMessage: (
+    target: "group" | "dm",
+    id: number,
+    patch: { text?: string; tone?: "info" | "error" },
+  ) => void;
+  /** 清空指定消息流（/start 重发等"重新开始"仿真语义） */
+  clearStream: (target: "group" | "dm") => void;
+}
+
+export const TgSimulator = forwardRef<TgSimulatorHandle, TgSimulatorProps>(function TgSimulator({
+  config,
+  botName,
+  groupTitle = "测试群组",
+  nodeId,
+  onNodeNavigate,
+  systemNote,
+  templateVars,
+  promptMessage,
+  onUserSend,
+  memberCount = "12 位成员",
+  joinPhase,
+  onRequestJoin,
+  view = "group",
+  onBack,
+  onOpenSettings,
+  showMenuInPrivate = false,
+  onTgApiFunc,
+  onLanguageToggle,
+  replyKeyboard,
+  onReplyButtonClick,
+  silentUserSend = false,
+}, ref) {
   const history = useRef<string[]>([]);
   const [messages, setMessages] = useState<SimMessage[]>([]);
   // 与机器人的私聊消息流（验证码在此输入，与群组消息完全隔离）
@@ -244,6 +302,47 @@ export function TgSimulator({
   const scrollRef = useRef<HTMLDivElement>(null);
   const menuMessageRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // 命令式句柄（v2.1.16）：宿主（TGAPI 弹窗仿真流程）驱动消息流追加/清空
+  useImperativeHandle(
+    ref,
+    (): TgSimulatorHandle => ({
+      appendMessage: (target, message) => {
+        const entry: SimMessage = {
+          id: nextId.current++,
+          from: message.from,
+          sender: message.from === "user" ? "我" : message.from === "system" ? "system" : botName,
+          content: { type: "text", text: message.text, mediaUrl: "", items: [] },
+          ...(message.tone ? { tone: message.tone } : {}),
+          time: nowTime(),
+        };
+        if (target === "dm") setDmMessages((prev) => [...prev, entry]);
+        else setMessages((prev) => [...prev, entry]);
+        return entry.id;
+      },
+      patchMessage: (target, id, patch) => {
+        const setter = target === "dm" ? setDmMessages : setMessages;
+        setter((prev) =>
+          prev.map((item) =>
+            item.id === id
+              ? {
+                  ...item,
+                  ...(patch.text !== undefined
+                    ? { content: { type: "text" as const, text: patch.text, mediaUrl: "", items: [] } }
+                    : {}),
+                  ...(patch.tone !== undefined ? { tone: patch.tone } : {}),
+                }
+              : item,
+          ),
+        );
+      },
+      clearStream: (target) => {
+        if (target === "dm") setDmMessages([]);
+        else setMessages([]);
+      },
+    }),
+    [botName],
+  );
   // SSR 期间为空字符串，水合完成后显示本地时间 → 消除服务端/客户端时区不一致的水合错误
   const clock = useSyncExternalStore(subscribeClock, getClockSnapshot, getServerClockSnapshot);
 
@@ -317,6 +416,27 @@ export function TgSimulator({
     setDmMessages((prev) => [...prev, entry]);
   }, [view]);
 
+  /** 自定义键盘按钮点击（v2.2.0）：宿主驱动真实流程仿真；未传宿主时回显按钮文本 */
+  const handleReplyButtonClick = async (button: CustomKeyboardButton): Promise<void> => {
+    if (pressed) return;
+    setPressed(button.id);
+    setTimeout(() => setPressed(null), 250);
+    if (onReplyButtonClick) {
+      await onReplyButtonClick(button);
+      return;
+    }
+    appendMessage({
+      from: "user",
+      sender: "我",
+      content: { type: "text", text: button.text, mediaUrl: "", items: [] },
+    });
+    appendMessage({
+      from: "bot",
+      sender: botName,
+      content: { type: "text", text: `（未接入真实流程：点击「${button.text}」）`, mediaUrl: "", items: [] },
+    });
+  };
+
   const handleButtonClick = async (button: MenuButton): Promise<void> => {
     if (pressed) return;
     setPressed(button.id);
@@ -389,6 +509,9 @@ export function TgSimulator({
       return;
     }
     if (action.type === "language") {
+      // v2.1.16：TGAPI 弹窗可接管语言切换（仿真屏实时切换双语文案）；
+      // 未接管时显示内置提示（机器人管理页行为不变）
+      if (onLanguageToggle && onLanguageToggle()) return;
       // v2.1.14 仿真预览：语言切换按钮（TGAPI 申请机器人）—— 真实机器人点击后
       // 在 中文/English 之间切换并回复切换结果（语言偏好按会话记忆）
       appendMessage({
@@ -397,6 +520,25 @@ export function TgSimulator({
         content: {
           type: "text",
           text: "✅ 语言已切换 / Language switched：中文 ⇄ English\n（真实机器人点击后在 中文/English 之间切换并回复切换结果）",
+          mediaUrl: "",
+          items: [],
+        },
+      });
+      return;
+    }
+    if (action.type === "tgapi_func") {
+      // v2.1.16：TGAPI 功能按钮 —— 宿主（TGAPI 弹窗）执行真实流程仿真；
+      // 未传 onTgApiFunc 时保持占位提示（不出现死路）
+      if (onTgApiFunc) {
+        void onTgApiFunc(button);
+        return;
+      }
+      appendMessage({
+        from: "bot",
+        sender: botName,
+        content: {
+          type: "text",
+          text: "（TGAPI 功能按钮：真实机器人将执行对应指令流程）",
           mediaUrl: "",
           items: [],
         },
@@ -419,14 +561,17 @@ export function TgSimulator({
     // appendStream 立即分配 id：loading 消息将拿到当前 nextId
     const loadingId = nextId.current;
     setSending(true);
-    appendStream(stream, {
-      from: "bot",
-      sender: botName,
-      content: { type: "text", text: "", mediaUrl: "", items: [] },
-      loading: true,
-    });
+    if (!silentUserSend) {
+      appendStream(stream, {
+        from: "bot",
+        sender: botName,
+        content: { type: "text", text: "", mediaUrl: "", items: [] },
+        loading: true,
+      });
+    }
     try {
       const result = await onUserSend(text);
+      if (silentUserSend) return;
       patchStream(stream, loadingId, {
         loading: false,
         content: {
@@ -535,7 +680,9 @@ export function TgSimulator({
               <p className="truncate text-sm font-semibold text-white [text-shadow:0_1px_2px_rgba(0,0,0,0.35)]">
                 {groupTitle}
               </p>
-              <p className="text-sm text-white/85 [text-shadow:0_1px_2px_rgba(0,0,0,0.3)]">{memberCount}</p>
+              {memberCount ? (
+                <p className="text-sm text-white/85 [text-shadow:0_1px_2px_rgba(0,0,0,0.3)]">{memberCount}</p>
+              ) : null}
             </div>
           </>
         )}
@@ -603,7 +750,9 @@ export function TgSimulator({
           </div>
         ) : null}
 
-        {!isPrivate ? (
+        {/* v2.1.16：showMenuInPrivate 时私聊视图也渲染菜单消息+键盘
+           （TGAPI 仿真：机器人初始消息+内嵌按钮在私聊中，随左侧配置实时同步） */}
+        {!isPrivate || showMenuInPrivate ? (
           <div className="flex max-w-[86%] flex-col items-start">
             <div
               ref={menuMessageRef}
@@ -701,7 +850,9 @@ export function TgSimulator({
           </button>
         </div>
       ) : (
-        <div className="flex items-center gap-2 px-3 py-2.5" style={WALLPAPER_STYLE}>
+        <div style={WALLPAPER_STYLE}>
+          {/* v2.2.1 输入框：自定义键盘与真实 Telegram 一致 —— 键盘面板位于输入框下方 */}
+          <div className="flex items-center gap-2 px-3 py-2.5">
           <div className="flex min-w-0 flex-1 items-center gap-2 rounded-full bg-white px-3 py-2 shadow-sm">
             <Smile className="h-5 w-5 shrink-0 text-[#a0adb8]" />
             <input
@@ -709,18 +860,24 @@ export function TgSimulator({
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter") void sendText(input);
+                // v2.2.1：仿真屏嵌入设计器 <form> 内，Enter 必须阻止隐式表单提交
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void sendText(input);
+                }
               }}
               placeholder={
-                joinPhase === "awaiting_code"
-                  ? sending
-                    ? "验证中..."
-                    : "输入验证码，点击右侧发送按钮..."
-                  : onUserSend
+                replyKeyboard && replyKeyboard.root.rows.length > 0 && replyKeyboard.options.inputPlaceholder.trim()
+                  ? replyKeyboard.options.inputPlaceholder.trim()
+                  : joinPhase === "awaiting_code"
                     ? sending
-                      ? "发送中..."
-                      : "输入消息，Enter 发送..."
-                    : "写消息..."
+                      ? "验证中..."
+                      : "输入验证码，点击右侧发送按钮..."
+                    : onUserSend
+                      ? sending
+                        ? "发送中..."
+                        : "输入消息，Enter 发送..."
+                      : "写消息..."
               }
               className="min-w-0 flex-1 bg-transparent text-sm text-[#0f0f0f] outline-none placeholder:text-[#a0adb8]"
             />
@@ -740,8 +897,42 @@ export function TgSimulator({
               <Mic className="h-4 w-4" />
             )}
           </button>
+          </div>
+          {/* v2.2.1 自定义键盘（ReplyKeyboard）：底部键盘面板，样式对应 KeyboardButton.style */}
+          {replyKeyboard && replyKeyboard.root.rows.length > 0 ? (
+            <div className="border-t border-black/10 px-2 pb-1 pt-2">
+              {replyKeyboard.root.rows.map((row, rowIndex) => (
+                <div key={row.id || rowIndex} className="mb-[3px] flex gap-[3px]">
+                  {row.buttons.map((button) => {
+                    const isPrimary = button.style === "primary";
+                    const isDanger = button.style === "danger";
+                    const isSuccess = button.style === "success";
+                    return (
+                      <button
+                        key={button.id || button.text}
+                        type="button"
+                        onClick={() => void handleReplyButtonClick(button)}
+                        className={`min-w-0 flex-1 truncate rounded-lg px-2 py-2.5 text-center text-sm font-medium transition-colors ${
+                          isPrimary
+                            ? "bg-[#54a9eb] text-white hover:bg-[#4a9bdd]"
+                            : isDanger
+                              ? "bg-[#ec5e5e] text-white hover:bg-[#dd4f4f]"
+                              : isSuccess
+                                ? "bg-[#63cf64] text-white hover:bg-[#55c057]"
+                                : "bg-white/90 text-[#1c1e21] hover:bg-white"
+                        } ${pressed === button.id ? "brightness-90" : ""}`}
+                        title={button.text}
+                      >
+                        {button.text}
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          ) : null}
         </div>
       )}
     </div>
   );
-}
+});

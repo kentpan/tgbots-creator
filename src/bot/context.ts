@@ -1,4 +1,4 @@
-import type { Context, SessionFlavor } from "grammy";
+import type { Context, Keyboard as KeyboardMarkup, SessionFlavor } from "grammy";
 import type { Menu } from "@grammyjs/menu";
 import type { BotSessionData } from "./session-storage";
 
@@ -10,4 +10,9 @@ import type { BotSessionData } from "./session-storage";
  * 菜单 bot（bots 表实例）发送它会抛 "Cannot send menu"。multi-runtime 的
  * createMenuBot 通过中间件把实例菜单写入 ctx.botMenu，cmdStart/cmdMenu 优先使用）。
  */
-export type BotContext = Context & SessionFlavor<BotSessionData> & { botMenu?: Menu<Context> };
+export type BotContext = Context &
+  SessionFlavor<BotSessionData> & {
+    botMenu?: Menu<Context>;
+    /** v2.2.0 自定义键盘（ReplyKeyboard）：multi-runtime 按实例配置注入，cmdStart 欢迎消息附带 */
+    customKeyboard?: KeyboardMarkup;
+  };

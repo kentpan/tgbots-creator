@@ -10,9 +10,18 @@
  *   v2.1.14 起语言切换为消息内嵌按钮「语言切换」（action.type=language），
  *   不再提供 /language 指令）；文案覆盖从单语言改为按语言（zh/en）覆盖，
  *   旧版扁平 texts 覆盖自动迁移为 zh 覆盖（兼容既有机器人配置）。
- * - 新增 askAppDetails：申请人可自定义 APP 名称（title）与描述（description），
- *   跳过（/skip）时回落下方 APP 创建默认参数。
+ * v2.2.2 变更：
+ * - askAppDetails（申请人对话中自定义 APP 名称/描述）移除：创建 API 直接
+ *   手机号 → 登录码，APP 参数用键盘「设置Title/设置Description/设置平台」
+ *   预配置（会话偏好）或管理端默认值（平台随机选一）。
+ * - /skip 指令移除；unlockSuccess 单独成功消息移除（解锁后直接进入下一步，
+ *   消灭双消息）；全部常规对话文案纳入 TgApiBotTexts（配置框预填默认值）。
  */
+
+import {
+  parseCustomKeyboardConfig,
+  type CustomKeyboardConfig,
+} from "@/services/custom-keyboard";
 
 /** 机器人对话语言（v2.1.7 起仅支持中英文两套） */
 export type TgApiLang = "zh" | "en";
@@ -32,90 +41,165 @@ export const TGAPI_APP_PLATFORMS = [
   "other",
 ] as const;
 
-/** 单语言对话文案（原 bot/translation.py + 增值门禁/申请人自定义 APP 提示） */
+/**
+ * 单语言对话文案（v2.2.2 起全量可配置：机器人发出的每一条常规对话消息都在这里，
+ * 管理端配置框全部预填内置默认值；{{var}} 槽位在发送时按真实上下文渲染）。
+ */
 export interface TgApiBotTexts {
-  /** 原 START_TEXT（/start 欢迎语；askAppDetails 关闭时兼作手机号提示） */
+  /** 主键盘菜单消息（/start 与各操作后附键盘重新显示的消息正文） */
   start: string;
-  /** 申请人自定义 APP：APP 名称（title）提示，{default} 占位符替换为默认值 */
-  askAppTitle: string;
-  /** 申请人自定义 APP：APP 描述（description）提示，{default} 占位符替换为默认值 */
-  askAppDescription: string;
-  /** 申请人自定义 APP：描述录入完成后的手机号提示 */
+  /** 门禁提示（唯一门禁消息：force-reply 提问 / 对话流程等待输码，不再叠加输入提示） */
+  unlockPrompt: string;
+  /** 手机号提示（request_contact 键盘随消息发送） */
   askPhone: string;
-  /** 原 AFTER_RECVD_CODE_TEXT */
+  /** 原 AFTER_RECVD_CODE_TEXT（登录码提示，随消息移除底部键盘） */
   afterRecvdCode: string;
-  /** 原 BEFORE_SUCC_LOGIN */
+  /** 原 BEFORE_SUCC_LOGIN（登录码受理后的提交进度提示） */
   beforeSuccLogin: string;
-  /** 原 ERRED_PAGE */
+  /** 原 ERRED_PAGE（提交失败时编辑到进度消息） */
   erredPage: string;
   /** 原 IN_VALID_CODE_PVDED */
   invalidCode: string;
   /** 原 IN_VALID_PHNO_PVDED */
   invalidPhone: string;
-  /** 增值功能：首次对话解锁提示（验证码模式） */
-  unlockPrompt: string;
-  /** 增值功能：解锁成功提示 */
-  unlockSuccess: string;
+  /** 设置Title 提示，{default} 占位符替换为管理端默认 APP 名称 */
+  askAppTitle: string;
+  /** 设置Description 提示，{default} 占位符替换为管理端默认 APP 描述 */
+  askAppDescription: string;
+  /** 帮助按钮/指令回复（未配置按钮槽位消息时使用） */
+  helpText: string;
+  /** 客服支持按钮/指令回复（未配置按钮槽位消息时使用） */
+  supportText: string;
+  /** 未匹配任何键盘按钮/指令时的提示 */
+  unknownInputHint: string;
+  /** 设置平台：平台键盘消息提示 */
+  askPlatform: string;
+  /** 设置平台完成确认，{{platform}} = 平台名（随主键盘一并重新显示） */
+  platformSet: string;
+  /** 设置Title 完成确认，{{title}} = 所设名称 */
+  titleSet: string;
+  /** 设置Description 完成确认，{{description}} = 所设描述 */
+  descriptionSet: string;
+  /** 创建API：已创建过时的提示 */
+  alreadyCreated: string;
+  /** 我的API：尚未创建时的提示 */
+  myApiEmpty: string;
+  /** 我的API：结果消息，{{phone}}/{{api_id}}/{{api_hash}} */
+  myApiResult: string;
+  /** 主菜单层收到联系人卡片时的提示 */
+  contactAtMenu: string;
+  /** my.telegram.org 登录被拒后的最终提示（附主键盘），{{error}} = 原因摘要 */
+  loginRejected: string;
+  /** request_contact 授权按钮文案 */
+  shareContactLabel: string;
+  /** request_contact 流程的取消按钮文案 */
+  cancelLabel: string;
 }
 
-/** 内置中文文案（v2.1.10 起全部重写：不再携带原项目作者 SpEcHlDe 的推广链接/署名） */
+/** 内置中文文案（v2.2.2 起全量默认值：/skip 指令已移除，APP 参数用预配置或默认值） */
 export const TGAPI_TEXTS_ZH: TgApiBotTexts = {
   start: [
     "💀 欢迎使用 API 生成机器人！\n\n",
     "本机器人可为您自己的 Telegram 账号自动生成 api_id 和 api_hash。\n\n",
     "👇 请选择下面的方式之一：",
   ].join(""),
-  askAppTitle: "📝 请发送你要申请的 APP 名称（App title，1-32 个字符）\n发送 /skip 使用默认：{default}",
-  askAppDescription: "📄 请发送 APP 描述（App description）\n发送 /skip 使用默认：{default}",
-  askPhone: "📱 请发送你的 Telegram 手机号（国际格式，如 +8613800138000）\n\n任意阶段发送 /start 可重新输入资料",
+  unlockPrompt:
+    "🔒 本机器人仅对已解锁用户开放。\n\n首次使用请先解锁：请回复本消息并输入解锁验证码。",
+  askPhone:
+    "📱 请发送你的 Telegram 手机号（国际格式，如 +8613800138000），或点击下方按钮授权共享\n\n任意阶段发送 /start 可重新开始",
   afterRecvdCode: [
     "收到！\n",
     "现在请发送你从 Telegram 收到的登录码！\n\n",
     "该验证码仅用于从 my.telegram.org 获取 APP ID\n\n",
-    "任意阶段发送 /start 可重新输入资料",
+    "任意阶段发送 /start 可重新开始",
   ].join(""),
-  beforeSuccLogin: "已收到验证码，正在抓取页面 ...",
+  beforeSuccLogin: "已收到验证码，正在提交 my.telegram.org ...",
   erredPage: "出错了，获取 APP ID 失败。请稍后重试，或发送 /start 重新开始。",
   invalidCode: "抱歉，输入内容似乎不是有效的 Telegram 网页登录码",
   invalidPhone: "抱歉，输入内容似乎不是有效的手机号",
-  unlockPrompt:
-    "🔒 本机器人仅对已解锁用户开放。\n\n首次使用请先解锁：请回复本消息并输入解锁验证码。",
-  unlockSuccess: "✅ 解锁成功，欢迎使用！",
+  askAppTitle: "✏️ 请发送 APP 名称（App title，1-32 个字符）。\n当前默认：{default}\n\n任意阶段发送 /start 可重新开始",
+  askAppDescription: "📝 请发送 APP 描述（App description，1-200 个字符）。\n当前默认：{default}\n\n任意阶段发送 /start 可重新开始",
+  helpText:
+    "🆘 使用帮助：\n\n" +
+    "🗝 创建 API — 为你的 Telegram 账号自动生成 api_id 和 api_hash\n" +
+    "🗂 我的 API — 查看已创建的 api_id 与 api_hash\n" +
+    "📱 设置平台 — 选择创建 APP 时的平台（Android/iOS/桌面端等）\n" +
+    "✅ 语言 — 中文/English 切换\n" +
+    "✏️ 设置Title / 📝 设置Description — 自定义 APP 名称与描述\n" +
+    "🎫 客服支持 — 联系管理员获取人工支持",
+  supportText: "🎫 如需人工支持，请联系管理员。",
+  unknownInputHint: "🤔 请使用下方键盘按钮或发送指令；发送 /start 重新显示主菜单。",
+  askPlatform: "📱 请选择创建 APP 时使用的平台：",
+  platformSet: "✅ APP 平台已设置为 {{platform}}，创建 API 时将使用。",
+  titleSet: "✅ APP 名称已设置为：{{title}}",
+  descriptionSet: "✅ APP 描述已设置为：{{description}}",
+  alreadyCreated: "✅ 你的 api_id 和 api_hash 已创建，点击键盘「🗂 我的 API」查看。",
+  myApiEmpty: "💎 你还没有创建 API。\n\n点击 🗝 创建API 开始申请。",
+  myApiResult: "📱 号码：{{phone}}\n🆔 api_id：{{api_id}}\n🔑 api_hash：{{api_hash}}",
+  contactAtMenu: "📱 请先点击键盘「🗝 创建 API」，机器人会向你请求手机号授权。",
+  loginRejected:
+    "❌ 登录被拒绝：{{error}}\n\n请重新点击「🗝 创建 API」再试，或发送 /start 返回主键盘。",
+  shareContactLabel: "📱 共享我的手机号",
+  cancelLabel: "❌ 取消",
 };
 
-/** 内置英文文案（v2.1.10 起同步重写：不再携带原项目作者推广链接/署名） */
+/** 内置英文文案（与中文同结构全量默认值） */
 export const TGAPI_TEXTS_EN: TgApiBotTexts = {
   start: [
     "💀 Welcome to the API Generator Bot!\n\n",
     "This bot automatically generates api_id and api_hash for your own Telegram account.\n\n",
     "👇 Please choose one of the options below:",
   ].join(""),
-  askAppTitle:
-    "📝 Please send the App title for your application (1-32 characters).\n" +
-    "Send /skip to use the default: {default}",
-  askAppDescription:
-    "📄 Please send the App description for your application.\n" +
-    "Send /skip to use the default: {default}",
+  unlockPrompt:
+    "🔒 This bot is only available to unlocked users.\n\n" +
+    "First time here? Please unlock: reply to this message and send your unlock code.",
   askPhone:
-    "📱 Please send your Telegram phone number in international format, e.g. +14155552671\n\n" +
-    "/start at any stage to re-enter your details",
+    "📱 Please send your Telegram phone number in international format, e.g. +14155552671, or tap the button below to share it\n\n" +
+    "/start at any stage to restart",
   afterRecvdCode: [
     "I see!\n",
     "now please send the Telegram code that you received from Telegram!\n\n",
     "this code is only used for the purpose of getting the APP ID from my.telegram.org\n\n",
-    "/start at any stage to re-enter your details",
+    "/start at any stage to restart",
   ].join(""),
-  beforeSuccLogin: "Code received. Scraping web page ...",
+  beforeSuccLogin: "Code received. Submitting to my.telegram.org ...",
   erredPage:
     "Something went wrong. Failed to get the APP ID. Please try again later, or send /start to restart.",
   invalidCode:
     "sorry, but the input does not seem to be a valid Telegram Web-Login code",
   invalidPhone:
     "sorry, but the input does not seem to be a valid phone number",
-  unlockPrompt:
-    "🔒 This bot is only available to unlocked users.\n\n" +
-    "First time here? Please unlock: reply to this message and send your unlock code.",
-  unlockSuccess: "✅ Unlocked successfully, welcome!",
+  askAppTitle:
+    "✏️ Please send the App title (1-32 characters).\n" +
+    "Current default: {default}\n\n/start at any stage to restart",
+  askAppDescription:
+    "📝 Please send the App description (1-200 characters).\n" +
+    "Current default: {default}\n\n/start at any stage to restart",
+  helpText:
+    "🆘 How to use:\n\n" +
+    "🗝 Create API — automatically generate api_id and api_hash for your Telegram account\n" +
+    "🗂 My API — view your created api_id and api_hash\n" +
+    "📱 Set Platform — choose the platform for your APP (Android/iOS/Desktop/…)\n" +
+    "✅ Language — switch between 中文/English\n" +
+    "✏️ Set Title / 📝 Set Description — customize your APP title and description\n" +
+    "🎫 Support — contact the admin for human support",
+  supportText: "🎫 For human support, please contact the admin.",
+  unknownInputHint:
+    "🤔 Please use the keyboard buttons below or send a command; send /start to show the main menu again.",
+  askPlatform: "📱 Choose the platform for your APP:",
+  platformSet: "✅ App platform set to {{platform}}; it will be used when creating your API.",
+  titleSet: "✅ App title set to: {{title}}",
+  descriptionSet: "✅ App description set to: {{description}}",
+  alreadyCreated:
+    "✅ Your api_id and api_hash have already been created. Tap 🗂 My API on the keyboard to view them.",
+  myApiEmpty: "💎 You haven't created an API yet.\n\nTap 🗝 Create API to start.",
+  myApiResult: "📱 Number: {{phone}}\n🆔 api_id: {{api_id}}\n🔑 api_hash: {{api_hash}}",
+  contactAtMenu:
+    "📱 Please tap 🗝 Create API first; the bot will request your phone number there.",
+  loginRejected:
+    "❌ Login rejected: {{error}}\n\nTap 🗝 Create API to retry, or send /start for the main menu.",
+  shareContactLabel: "📱 Share my phone number",
+  cancelLabel: "❌ Cancel",
 };
 
 /**
@@ -124,10 +208,10 @@ export const TGAPI_TEXTS_EN: TgApiBotTexts = {
  */
 export interface TgApiSystemTexts {
   networkRetry: string;
-  /** 输入提示（v2.1.14：需要用户在输入框输入的交互，force-reply 提问前先发送） */
-  inputHint: string;
   /** 网络故障后追加的说明（外部 API 核验网络错误不计入任何代价） */
   unlockNetworkRetry: string;
+  /** 解锁状态落库回读失败（绝不发送成功提示，直接要求重试） */
+  unlockPersistFail: string;
   switchedToStars: string;
   methodMissing: string;
   methodUnavailable: string;
@@ -147,8 +231,8 @@ export interface TgApiSystemTexts {
 export const TGAPI_SYSTEM_TEXTS: Record<TgApiLang, TgApiSystemTexts> = {
   zh: {
     networkRetry: "🌐 网络波动，正在重试...",
-    inputHint: "✍🏻 请在下方的输入框进行输入:",
     unlockNetworkRetry: "本次未消耗任何额度，请重新发送解锁验证码。",
+    unlockPersistFail: "解锁状态保存失败，请稍后重试。",
     switchedToStars: "当前解锁方式已切换为星星支付，请发送 /start 获取支付发票。",
     methodMissing: "机器人尚未配置解锁验证方式，请联系管理员。",
     methodUnavailable: "解锁验证方式不可用，请联系管理员。",
@@ -164,14 +248,14 @@ export const TGAPI_SYSTEM_TEXTS: Record<TgApiLang, TgApiSystemTexts> = {
     pipelineFail: (error) => `处理失败：${error}`,
     languageHelp: (current) =>
       `✅ 语言已切换 / Language switched：${current === "zh" ? "中文" : "English"}`,
-    titleInvalid: "APP 名称不合法：请输入 1-32 个字符，或发送 /skip 使用默认值。",
-    descriptionInvalid: "APP 描述不合法：请输入 1-200 个字符，或发送 /skip 使用默认值。",
+    titleInvalid: "APP 名称不合法：请输入 1-32 个字符。",
+    descriptionInvalid: "APP 描述不合法：请输入 1-200 个字符。",
   },
   en: {
     networkRetry: "🌐 Network fluctuation, retrying...",
-    inputHint: "✍🏻 Please type in the input field below:",
     unlockNetworkRetry:
       "Nothing was consumed this time. Please send your unlock code again.",
+    unlockPersistFail: "Failed to save the unlock state. Please try again later.",
     switchedToStars:
       "Unlocking has been switched to Telegram Stars. Please send /start to get the payment invoice.",
     methodMissing:
@@ -193,9 +277,9 @@ export const TGAPI_SYSTEM_TEXTS: Record<TgApiLang, TgApiSystemTexts> = {
     languageHelp: (current) =>
       `✅ 语言已切换 / Language switched：${current === "zh" ? "中文" : "English"}`,
     titleInvalid:
-      "Invalid App title: please send 1-32 characters, or send /skip to use the default.",
+      "Invalid App title: please send 1-32 characters.",
     descriptionInvalid:
-      "Invalid App description: please send 1-200 characters, or send /skip to use the default.",
+      "Invalid App description: please send 1-200 characters.",
   },
 };
 
@@ -216,22 +300,26 @@ export interface TgApiBotConfig {
   starsAmount?: number;
   /** stars 模式：发票标题 */
   starsTitle?: string;
-  /** v2.1.7 申请人自定义 APP 名称/描述（默认开启；关闭则始终使用下方默认参数创建） */
-  askAppDetails: boolean;
-  /** 原 Config.APP_TITLE（申请人跳过/自定义关闭时的默认值） */
+  /** 原 Config.APP_TITLE（APP 创建参数；用户经设置Title 预配置时优先使用） */
   appTitle: string;
   /** 原 Config.APP_SHORT_NAME */
   appShortName: string;
   /** 原 Config.APP_URL */
   appUrl: string;
-  /** 原 Config.APP_PLATFORM（管理后台勾选；随机选一提交） */
+  /** 原 Config.APP_PLATFORM（管理端勾选；用户未预配置平台时随机选一提交） */
   appPlatforms: string[];
-  /** 原 Config.APP_DESCRIPTION（申请人跳过/自定义关闭时的默认值） */
+  /** 原 Config.APP_DESCRIPTION（APP 创建参数；用户经设置Description 预配置时优先使用） */
   appDescription: string;
   /** 原 Config.FOOTER_TEXT */
   footerText: string;
   /** 按语言文案覆盖（v2.1.7：texts.zh / texts.en；旧版扁平字符串键自动按 zh 迁移） */
   texts?: { zh?: Partial<TgApiBotTexts>; en?: Partial<TgApiBotTexts> };
+  /**
+   * v2.2.0 自定义键盘（ReplyKeyboard 对话流程）：配置非空 = 启用 @grammyjs/conversations
+   * 驱动的自定义键盘工作流（主键盘 → 创建API（门禁 → 手机号 → 登录码 → 结果）等）；
+   * 此时消息内嵌按钮不再渲染（互斥条件）。
+   */
+  customKeyboard?: CustomKeyboardConfig;
 }
 
 /**
@@ -272,14 +360,32 @@ function pickMigratedString(value: unknown): string | undefined {
   return LEGACY_GARBAGE_VALUES[trimmed] ?? trimmed;
 }
 
-/** 文案覆盖字段的表单名 → TgApiBotTexts 键（管理后台按语言分组渲染/读取共用） */
+/** 文案覆盖字段的表单名 → TgApiBotTexts 键（管理后台按语言分组渲染/读取共用，全量可配置） */
 export const TGAPI_TEXT_FIELD_KEYS = [
-  { name: "start", label: "START_TEXT（/start 欢迎）" },
-  { name: "askAppTitle", label: "APP 名称提示（申请人自定义）" },
-  { name: "askAppDescription", label: "APP 描述提示（申请人自定义）" },
-  { name: "askPhone", label: "手机号提示（申请人自定义流程）" },
-  { name: "unlockPrompt", label: "解锁提示（验证码门禁）" },
-  { name: "unlockSuccess", label: "解锁成功提示" },
+  { name: "start", label: "主键盘菜单消息（/start 与各操作后重新显示）" },
+  { name: "unlockPrompt", label: "门禁提示（唯一门禁消息）" },
+  { name: "askPhone", label: "手机号提示" },
+  { name: "afterRecvdCode", label: "登录码提示" },
+  { name: "beforeSuccLogin", label: "提交进度提示" },
+  { name: "erredPage", label: "提交失败提示" },
+  { name: "invalidCode", label: "登录码无效提示" },
+  { name: "invalidPhone", label: "手机号无效提示" },
+  { name: "askAppTitle", label: "设置Title 提示（{default} = 默认名称）" },
+  { name: "askAppDescription", label: "设置Description 提示（{default} = 默认描述）" },
+  { name: "helpText", label: "帮助回复" },
+  { name: "supportText", label: "客服支持回复" },
+  { name: "unknownInputHint", label: "未知输入提示" },
+  { name: "askPlatform", label: "平台选择提示" },
+  { name: "platformSet", label: "平台设置确认（{{platform}}）" },
+  { name: "titleSet", label: "Title 设置确认（{{title}}）" },
+  { name: "descriptionSet", label: "Description 设置确认（{{description}}）" },
+  { name: "alreadyCreated", label: "已创建过提示（创建API）" },
+  { name: "myApiEmpty", label: "尚未创建提示（我的API）" },
+  { name: "myApiResult", label: "我的API 结果（{{phone}}/{{api_id}}/{{api_hash}}）" },
+  { name: "contactAtMenu", label: "主菜单层收到联系人提示" },
+  { name: "loginRejected", label: "登录被拒提示（{{error}}）" },
+  { name: "shareContactLabel", label: "授权共享手机号按钮文案" },
+  { name: "cancelLabel", label: "取消按钮文案" },
 ] as const;
 
 const TEXT_KEY_SET = new Set<string>(TGAPI_TEXT_FIELD_KEYS.map((item) => item.name));
@@ -291,7 +397,7 @@ const TEXT_KEY_SET = new Set<string>(TGAPI_TEXT_FIELD_KEYS.map((item) => item.na
  */
 export function normalizeTgApiSection(tgapi: unknown): TgApiBotConfig {
   if (typeof tgapi !== "object" || tgapi === null) {
-    return { enabled: false, unlockMode: "captcha", askAppDetails: true, ...TGAPI_DEFAULT_APP };
+    return { enabled: false, unlockMode: "captcha", ...TGAPI_DEFAULT_APP };
   }
   const cfg = tgapi as Record<string, unknown>;
   const unlockMode = cfg.unlockMode === "stars" ? "stars" : "captcha";
@@ -340,7 +446,6 @@ export function normalizeTgApiSection(tgapi: unknown): TgApiBotConfig {
         ? Math.floor(cfg.starsAmount)
         : undefined,
     starsTitle: stringValue(cfg.starsTitle),
-    askAppDetails: cfg.askAppDetails !== false,
     // v2.1.10：读取时迁移旧垃圾默认值（运行实例与管理后台读到同一份干净配置）
     appTitle: pickMigratedString(cfg.appTitle) ?? TGAPI_DEFAULT_APP.appTitle,
     appShortName: pickMigratedString(cfg.appShortName) ?? TGAPI_DEFAULT_APP.appShortName,
@@ -352,6 +457,8 @@ export function normalizeTgApiSection(tgapi: unknown): TgApiBotConfig {
       zh: pickTexts(zhSource),
       en: pickTexts(enSource),
     },
+    // v2.2.0 自定义键盘（配置非空 = 自定义键盘对话流程，与内嵌按钮互斥）
+    customKeyboard: parseCustomKeyboardConfig(cfg.customKeyboard) ?? undefined,
   };
 }
 
@@ -365,31 +472,27 @@ export function parseTgApiBotConfig(raw: string): TgApiBotConfig {
     profile = JSON.parse(raw);
   } catch (error) {
     console.error(`parseTgApiBotConfig: bots.config JSON 解析失败:`, error);
-    return { enabled: false, unlockMode: "captcha", askAppDetails: true, ...TGAPI_DEFAULT_APP };
+    return { enabled: false, unlockMode: "captcha", ...TGAPI_DEFAULT_APP };
   }
   if (typeof profile !== "object" || profile === null) {
-    return { enabled: false, unlockMode: "captcha", askAppDetails: true, ...TGAPI_DEFAULT_APP };
+    return { enabled: false, unlockMode: "captcha", ...TGAPI_DEFAULT_APP };
   }
   return normalizeTgApiSection((profile as { tgapi?: unknown }).tgapi);
 }
 
-/** 组装某语言的对话文案：配置覆盖值（该语言）> 内置该语言默认文案 */
+/**
+ * 组装某语言的对话文案：配置覆盖值（该语言）> 内置该语言默认文案
+ *（v2.2.2 起全量字段，预填默认值；{{var}} 槽位在发送时按真实上下文渲染）。
+ */
 export function resolveTgApiTexts(cfg: TgApiBotConfig, lang: TgApiLang): TgApiBotTexts {
   const overrides = lang === "zh" ? cfg.texts?.zh : cfg.texts?.en;
   const builtin = lang === "zh" ? TGAPI_TEXTS_ZH : TGAPI_TEXTS_EN;
-  return {
-    start: overrides?.start?.trim() || builtin.start,
-    askAppTitle: overrides?.askAppTitle?.trim() || builtin.askAppTitle,
-    askAppDescription: overrides?.askAppDescription?.trim() || builtin.askAppDescription,
-    askPhone: overrides?.askPhone?.trim() || builtin.askPhone,
-    afterRecvdCode: overrides?.afterRecvdCode?.trim() || builtin.afterRecvdCode,
-    beforeSuccLogin: overrides?.beforeSuccLogin?.trim() || builtin.beforeSuccLogin,
-    erredPage: overrides?.erredPage?.trim() || builtin.erredPage,
-    invalidCode: overrides?.invalidCode?.trim() || builtin.invalidCode,
-    invalidPhone: overrides?.invalidPhone?.trim() || builtin.invalidPhone,
-    unlockPrompt: overrides?.unlockPrompt?.trim() || builtin.unlockPrompt,
-    unlockSuccess: overrides?.unlockSuccess?.trim() || builtin.unlockSuccess,
-  };
+  const resolved = {} as TgApiBotTexts;
+  for (const field of TGAPI_TEXT_FIELD_KEYS) {
+    const key = field.name as keyof TgApiBotTexts;
+    resolved[key] = overrides?.[key]?.trim() || builtin[key];
+  }
+  return resolved;
 }
 
 /** 渲染 {default} 占位符（APP 名称/描述提示共用） */

@@ -7,21 +7,17 @@ import { htmlEscape } from "@/utils/html";
 import {
   getTgApiBotUser,
   getTgApiUnlock,
-  getVerificationMethod,
   listBotCommandsByIds,
   saveTgApiBotUser,
-  saveTgApiUnlock,
 } from "@/database/operations";
-import {
-  parseCodeApiConfig,
-  verifyCodeExternally,
-} from "@/services/external-verify";
 import { approveTelegramJoinRequest } from "@/services/approval";
 import {
   countMenuStats,
+  isValidTgApiPlatformValue,
   renderMenuMarkup,
   renderMenuTemplate,
   scopeCommandRunnerToGroup,
+  TGAPI_PLATFORM_LABELS,
   varsFromContext,
   type MenuCommandRegistry,
   type MenuCommandRunner,
@@ -39,14 +35,26 @@ import {
 } from "@/services/tgapi-config";
 import {
   createNewTgApp,
-  extractTgWebLoginCode,
   loginStepGetStelCookie,
   requestTgCodeGetRandomHash,
   scrapeTgExistingApp,
-  type TgAppInfo,
   type TgOrgScrapeResult,
 } from "@/services/my-telegram-org";
+import {
+  briefError,
+  buildAppResultHTML,
+  extractPhoneNumber,
+  extractTgWebLoginCode,
+} from "@/services/tgapi-flow-text";
 import { registerBuiltinCommandHandlers } from "./builtin-commands";
+import { registerTgApiConversation } from "./tgapi-conversation";
+import {
+  checkTgApiGateMethod,
+  createTgApiGateRouter,
+  persistTgApiUnlock,
+  sendTgApiStarsInvoice,
+  verifyTgApiUnlockCode,
+} from "../tgapi-gate";
 
 /**
  * TGAPI申请 机器人（v2.1.10）—— my.telegram.org APP 申请对话流程 +
@@ -99,63 +107,6 @@ const APP_TITLE_MAX_LENGTH = 32;
 const APP_DESCRIPTION_MAX_LENGTH = 200;
 
 /**
- * get_phno_imn_ges 原样移植：提取国际格式手机号。
- * 优先级：phone_number 实体片段（Telegram 已校验）＞ 联系人号码 ＞ 原文。
- */
-function extractPhoneNumber(
-  messageText: string,
-  entities: MessageEntity[] | undefined,
-  contactPhone: string | null,
-): string | null {
-  if (entities && entities.length > 0) {
-    for (const entity of entities) {
-      if (entity.type === "phone_number") {
-        return messageText.slice(entity.offset, entity.offset + entity.length).trim();
-      }
-    }
-  }
-  if (contactPhone && contactPhone.trim()) {
-    return contactPhone.trim();
-  }
-  return null;
-}
-
-/**
- * parse_to_meaning_ful_text 原样移植：把抓取结果组装为 Telegram HTML 消息。
- * 结构与原实现逐字一致（Phone Number / App Configuration / Available MTProto
- * Servers / Disclaimer），占位值做 HTML 转义（原实现未转义，这里只加固不改变结构）。
- */
-function buildAppResultHTML(phone: string, info: TgAppInfo): string {
-  return (
-    "<i>Phone Number</i>: " +
-    `<u>${htmlEscape(phone)}</u>` +
-    "\n\n" +
-    "<i>App Configuration</i>\n" +
-    "<b>APP ID</b>: " +
-    `<code>${htmlEscape(info.appId)}</code>` +
-    "\n" +
-    "<b>API HASH</b>: " +
-    `<code>${htmlEscape(info.apiHash)}</code>` +
-    "\n\n" +
-    "<i>Available MTProto Servers</i>\n" +
-    "<b>Production Configuration</b>: " +
-    `<code>${htmlEscape(info.productionConfiguration.ip)}</code> <u>${htmlEscape(info.productionConfiguration.dc)}</u>` +
-    "\n" +
-    "<b>Test Configuration</b>: " +
-    `<code>${htmlEscape(info.testConfiguration.ip)}</code> <u>${htmlEscape(info.testConfiguration.dc)}</u>` +
-    "\n\n" +
-    "<i>Disclaimer</i>: " +
-    "<u>It is forbidden to pass this value to third parties.</u>"
-  );
-}
-
-/** TGAPI 机器人错误详情的终端截断长度（详细日志进 dev.log，用户侧截断展示） */
-function briefError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.length > 300 ? `${message.slice(0, 300)}…` : message;
-}
-
-/**
  * 注册 TGAPI申请 机器人全部能力（multi-runtime 专用入口）。
  *
  * v2.1.10 按钮驱动新流程（参照 My-Telegram-Api-Bot 交互形态）：
@@ -204,8 +155,63 @@ export async function registerTgApiHandlers(
   }
 
   // ---------------------------------------------------------------------------
-  // 解锁门禁：外部 API 验证码（stateless-question force_reply，与加群验证同款交互）
+  // 指令注册来源（唯一：机器人管理页「⌨️ 指令菜单」弹窗勾选，bots.config.commandIds）
+  // —— 内嵌按钮模式与自定义键盘对话模式共用同一份勾选与同步任务
   // ---------------------------------------------------------------------------
+  const selectedIds = options.commandIds
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id) && id > 0)
+    .map((id) => BigInt(id));
+  // 指令归属过滤（v2.1.13）：机器人私有指令仅本 TGAPI 机器人可注册；
+  // 群组私有指令注册是机器人级，群组限制由 runner 校验（scopeCommandRunnerToGroup）
+  const selectedItems =
+    selectedIds.length > 0
+      ? await listBotCommandsByIds(selectedIds, { botId })
+      : [];
+  // 指令同步（v2.1.14）：仅勾选的指令写入 Telegram 指令菜单
+  //（Telegram 上限 100 条，超出部分按顺序截断）；描述与 syncBotCommandsToTelegram
+  // 同一规则（指令库条目 description > intro > 名称）。
+  const myCommands = selectedItems.slice(0, 100).map((item) => ({
+    command: item.name,
+    description: (item.description || item.intro || item.name).slice(0, 256),
+  }));
+  const syncCommands = async (): Promise<void> => {
+    await bot.api.setMyCommands(myCommands).catch((error: unknown) => {
+      console.warn(`TGAPI bot #${botId} setMyCommands failed:`, error);
+    });
+  };
+
+  // ---------------------------------------------------------------------------
+  // v2.2.0 自定义键盘对话流程（与消息内嵌按钮互斥）：tgapi.customKeyboard 配置非空
+  // 时启用 —— @grammyjs/conversations 驱动完整工作流（参数 → 门禁 → 图1 主键盘 →
+  // 创建API → requestContact 手机号 → 验证码 → my.telegram.org → API ID/HASH），
+  // 内嵌按钮/旧会话状态机/授权认证按钮全部不再注册。清空键盘配置即回到下方内嵌模式。
+  // ---------------------------------------------------------------------------
+  if (cfg.customKeyboard) {
+    registerTgApiConversation(bot, { cfg, botId, keyboard: cfg.customKeyboard });
+    // 加群申请自动通过（与内嵌模式同一能力，对话模式下仍需生效）
+    bot.on("chat_join_request", async (ctx) => {
+      const joinRequest = ctx.chatJoinRequest;
+      if (!joinRequest) return;
+      const { from: requestUser, chat } = joinRequest;
+      const approval = await approveTelegramJoinRequest(BigInt(chat.id), BigInt(requestUser.id), ctx.api);
+      console.log(
+        `TGAPI bot #${botId} join request: user ${requestUser.id} ` +
+          `to chat ${chat.id} -> ${approval.success ? "auto-approved" : `failed: ${approval.error ?? "unknown"}`}`,
+      );
+    });
+    console.log(
+      `TGAPI bot #${botId} custom keyboard mode active (inline menu suppressed by mutual exclusion)`,
+    );
+    return syncCommands;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 解锁门禁：外部 API 验证码（stateless-question force_reply，与加群验证同款交互）
+  // 核验/落库统一走 tgapi-gate.ts 通用门禁组件（真实外部 API 核验 + 落库回读）
+  // ---------------------------------------------------------------------------
+  const gateDeps = { cfg, botId };
+
   const unlockQuestion = new StatelessQuestion<BotContext>(
     TGAPI_UNLOCK_QUESTION_ID,
     async (ctx) => {
@@ -225,7 +231,7 @@ export async function registerTgApiHandlers(
     },
   );
 
-  /** 外部 API 核验解锁码（复用加群验证机器人 code_api 外部 API 验证的同一实现） */
+  /** 外部 API 核验解锁码（通用门禁组件共享实现：真实外部 API 核验 + 落库回读） */
   async function handleUnlockAttempt(ctx: BotContext, lang: TgApiLang, code: string): Promise<void> {
     const from = ctx.from;
     if (!from) return;
@@ -234,25 +240,22 @@ export async function registerTgApiHandlers(
       await ctx.reply(sys.switchedToStars);
       return;
     }
-    if (!cfg.verificationMethodId) {
+    const check = await checkTgApiGateMethod(gateDeps);
+    if (check.kind === "method-missing") {
       await ctx.reply(sys.methodMissing);
       return;
     }
-    const method = await getVerificationMethod(BigInt(cfg.verificationMethodId));
-    if (!method || !method.enabled) {
+    if (check.kind === "method-unavailable") {
       await ctx.reply(sys.methodUnavailable);
       return;
     }
-    const apiConfig = parseCodeApiConfig(method.config);
-    if (!apiConfig) {
-      console.error(
-        `TGAPI bot #${botId} unlock method ${method.id} has invalid code API config`,
-      );
+    if (check.kind === "method-config-invalid") {
       await ctx.reply(sys.methodConfigInvalid);
       return;
     }
-    const result = await verifyCodeExternally(
-      apiConfig,
+    const result = await verifyTgApiUnlockCode(
+      gateDeps,
+      check.apiConfig,
       { userId: BigInt(from.id), username: from.username ?? null, code },
       {
         onNetworkRetry: async () => {
@@ -261,55 +264,43 @@ export async function registerTgApiHandlers(
       },
     );
     if (!result.ok) {
-      // 与验证码输入通道同口径：网络故障不计入用户侧任何代价，明确说明；
-      // v2.1.8：网络故障附带具体原因（如「连接被拒绝（验证接口服务未启动）」），便于管理员排查
+      // 网络故障不计入用户侧任何代价，明确说明并附带具体原因便于管理员排查
       await ctx.reply(
         result.networkError
           ? `${result.message}${result.detail ? `\n原因：${result.detail}` : ""}\n${sys.unlockNetworkRetry}`
           : result.message,
       );
-      console.log(
-        `TGAPI bot #${botId} unlock rejected: user ${from.id} networkError=${result.networkError} reason=${result.message}${result.detail ? ` detail=${result.detail}` : ""}`,
-      );
       return;
     }
-    await saveTgApiUnlock({
-      botId,
-      userId: BigInt(from.id),
-      username: from.username ?? null,
-      mode: "captcha",
-    });
+    const persisted = await persistTgApiUnlock(
+      gateDeps,
+      BigInt(from.id),
+      from.username ?? null,
+      "captcha",
+    );
+    if (!persisted) {
+      await ctx.reply(sys.unlockPersistFail);
+      return;
+    }
     ctx.session.tgapiStarsInvoiceSent = false;
-    // v2.1.10：验证成功消息 + 图4 菜单内嵌按钮（管理端配置真实渲染）
-    await sendUnlockSuccessWithMenu(ctx, lang);
+    // 解锁通过 → 直接进入下一步（单条手机号提示；不再发送单独成功消息）
+    await beginApplication(ctx, lang);
     console.log(
       `TGAPI bot #${botId} unlocked via captcha: user ${from.id} (${from.username ?? "no username"})`,
     );
   }
 
-  /** 发送星星解锁发票（Telegram Stars / XTR） */
+  /** 发送星星解锁发票（通用门禁组件共享实现；金额未配置绝不放行） */
   async function sendStarsInvoice(ctx: BotContext, lang: TgApiLang): Promise<void> {
     if (!ctx.chat) return;
     const sys = TGAPI_SYSTEM_TEXTS[lang];
-    const amount = cfg.starsAmount ?? 0;
-    if (amount < 1) {
+    const sent = await sendTgApiStarsInvoice(gateDeps, ctx.api, ctx.chat.id);
+    if (sent === "not-configured") {
       await ctx.reply(sys.starsNotConfigured);
       return;
     }
-    await ctx.api.sendInvoice(
-      ctx.chat.id,
-      (cfg.starsTitle?.trim() || "TGAPI 解锁").slice(0, 32),
-      "首次使用 TGAPI 申请机器人前的一次性解锁".slice(0, 255),
-      `${UNLOCK_PAYLOAD_PREFIX}${botId}`,
-      // Telegram Stars：currency 固定 XTR，provider_token 必须为空字符串
-      "XTR",
-      [{ label: "TGAPI 解锁", amount }],
-      { provider_token: "" },
-    );
     ctx.session.tgapiStarsInvoiceSent = true;
-    console.log(
-      `TGAPI bot #${botId} stars invoice sent: user ${ctx.from?.id ?? "?"} amount=${amount} XTR`,
-    );
+    await ctx.reply(sys.starsInvoiceHint(String(cfg.starsAmount ?? "-")));
   }
 
   /**
@@ -425,38 +416,36 @@ export async function registerTgApiHandlers(
    *    / 星星发票（stars），通过后自动调创建API（handleUnlockAttempt / 支付回调内）；
    * 3. 已解锁 → 直接进入创建流程。解锁一次永久有效：任意按钮通过验证后所有按钮不再需要验证。
    */
-  async function runCreateApi(ctx: BotContext, lang: TgApiLang, unlockRequired: boolean): Promise<void> {
+  async function runCreateApi(
+    ctx: BotContext,
+    lang: TgApiLang,
+    unlockRequired: boolean,
+    templates?: { success?: MenuTgApiResponse; fail?: MenuTgApiResponse },
+  ): Promise<void> {
     const from = ctx.from;
     if (!from || from.is_bot) return;
+    const texts = resolveTgApiTexts(cfg, lang);
     // 1. 已创建检测（解锁门禁前）
     const botUser = await getTgApiBotUser(botId, BigInt(from.id));
     if (botUser?.appId) {
-      await ctx.reply(
-        lang === "zh"
-          ? "✅ 你的 api_id 和 api_hash 已创建，点击下方按钮查看。"
-          : "✅ Your api_id and api_hash have already been created. Tap the button below to view them.",
-        {
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: lang === "zh" ? "💎 我的API" : "💎 My API",
-                  callback_data: `${TGAPI_FUNC_CALLBACK_PREFIX}my`,
-                },
-              ],
+      await ctx.reply(renderMenuTemplate(texts.alreadyCreated, varsFromContext(ctx)), {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: lang === "zh" ? "💎 我的API" : "💎 My API",
+                callback_data: `${TGAPI_FUNC_CALLBACK_PREFIX}my`,
+              },
             ],
-          } satisfies InlineKeyboardMarkup,
-        },
-      );
+          ],
+        } satisfies InlineKeyboardMarkup,
+      });
       return;
     }
-    // 2. 解锁门禁（每按钮可选；解锁一次永久有效）
+    // 2. 解锁门禁（每按钮可选；解锁一次永久有效）—— 唯一门禁提示，不再叠加输入提示
     if (unlockRequired && !(await getTgApiUnlock(botId, BigInt(from.id)))) {
-      const texts = resolveTgApiTexts(cfg, lang);
       const sys = TGAPI_SYSTEM_TEXTS[lang];
       if (cfg.unlockMode === "captcha") {
-        // 与加群验证同款交互：先发输入提示，再 force-reply 要求在输入框输入验证码
-        await ctx.reply(sys.inputHint);
         await unlockQuestion.replyWithHTML(ctx, htmlEscape(texts.unlockPrompt));
       } else {
         await sendStarsInvoice(ctx, lang);
@@ -464,40 +453,51 @@ export async function registerTgApiHandlers(
       }
       return;
     }
-    // 3. 已解锁 → 创建API流程
+    // 3. 已解锁 → 创建API流程（按钮级结果消息模板随会话带入，登录码流程结束时渲染）
+    if (templates?.success) {
+      ctx.session.tgapi = { state: "phone", ...ctx.session.tgapi, pendingSuccess: templates.success };
+    }
+    if (templates?.fail) {
+      ctx.session.tgapi = { state: "phone", ...ctx.session.tgapi, pendingFail: templates.fail };
+    }
     await beginApplication(ctx, lang);
   }
 
   /**
    * 我的API功能（v2.1.16 需求5，图2格式）：展示已创建的 api_id / api_hash。
    * 格式逐字对齐图2：📱 号码 / 🆔 api_id / 🔑 api_hash 三行；未创建时给出明确引导。
+   * v2.1.16 指令消息槽位：按钮配置 tgapi_success/tgapi_fail 时按模板渲染
+   *（{{phone}}/{{api_id}}/{{api_hash}} 变量；留空用内置默认三行格式）。
    */
-  async function runMyApi(ctx: BotContext, lang: TgApiLang): Promise<void> {
+  async function runMyApi(
+    ctx: BotContext,
+    lang: TgApiLang,
+    templates?: { success?: MenuTgApiResponse; fail?: MenuTgApiResponse },
+  ): Promise<void> {
     const from = ctx.from;
     if (!from || from.is_bot) return;
     const botUser = await getTgApiBotUser(botId, BigInt(from.id));
+    const templateText = (template: MenuTgApiResponse | undefined): string => {
+      const primary = (lang === "zh" ? template?.zh : template?.en)?.trim() ?? "";
+      return primary || (lang === "zh" ? template?.en : template?.zh)?.trim() || "";
+    };
     if (!botUser?.appId) {
+      const failRaw = templates ? templateText(templates.fail) : "";
       await ctx.reply(
-        lang === "zh"
-          ? "💎 你还没有创建 API。\n\n点击 🗝 创建API 开始申请。"
-          : "💎 You haven't created an API yet.\n\nTap 🗝 Create API to start.",
+        renderMenuTemplate(failRaw || resolveTgApiTexts(cfg, lang).myApiEmpty, varsFromContext(ctx)),
       );
       return;
     }
-    const lines = (
-      lang === "zh"
-        ? [
-            `📱 号码：${botUser.appPhone ?? "-"}`,
-            `🆔 api_id：${botUser.appId}`,
-            `🔑 api_hash：${botUser.appHash ?? "-"}`,
-          ]
-        : [
-            `📱 Number: ${botUser.appPhone ?? "-"}`,
-            `🆔 api_id: ${botUser.appId}`,
-            `🔑 api_hash: ${botUser.appHash ?? "-"}`,
-          ]
-    ).join("\n");
-    await ctx.reply(lines);
+    const vars = {
+      ...varsFromContext(ctx),
+      phone: botUser.appPhone ?? "-",
+      api_id: botUser.appId,
+      api_hash: botUser.appHash ?? "-",
+    };
+    const successRaw = templates ? templateText(templates.success) : "";
+    await ctx.reply(
+      renderMenuTemplate(successRaw || resolveTgApiTexts(cfg, lang).myApiResult, vars),
+    );
     console.log(
       `TGAPI bot #${botId} my api delivered: user ${from.id} app_id=${botUser.appId}`,
     );
@@ -506,7 +506,7 @@ export async function registerTgApiHandlers(
   // v2.1.16：TGAPI 内置功能执行器（菜单按钮 tgapi_func 点击统一入口，bot-menu 渲染层调用）。
   // 按钮级门禁开关与响应文案随 action 透传；响应消息先发（{{变量}} 按真实上下文渲染），
   // 群内点击一律引导私聊完成（创建/查看 API 都是私聊流程）。
-  registry.tgapiFuncRunner = async (ctx, { func, unlock, response }) => {
+  registry.tgapiFuncRunner = async (ctx, { func, unlock, value, response, success, fail }) => {
     const from = ctx.from;
     if (!from || from.is_bot) return;
     const lang = langOf(ctx as BotContext);
@@ -520,12 +520,80 @@ export async function registerTgApiHandlers(
       return;
     }
     if (func === "create") {
-      await runCreateApi(ctx as BotContext, lang, unlock);
+      await runCreateApi(ctx as BotContext, lang, unlock, { success, fail });
       return;
     }
     if (func === "my") {
-      await runMyApi(ctx as BotContext, lang);
+      await runMyApi(ctx as BotContext, lang, { success, fail });
       return;
+    }
+    // v2.2.0 固定指令全量（设置平台/语言/帮助/客服支持/跳过/设置Title/设置Description）
+    if (func === "platform") {
+      if (value && isValidTgApiPlatformValue(value)) {
+        (ctx as BotContext).session.tgapiPlatform = value;
+        const label = TGAPI_PLATFORM_LABELS[value] ?? value;
+        const successRaw = responseText(success, lang);
+        await ctx.reply(
+          renderMenuTemplate(
+            successRaw || resolveTgApiTexts(cfg, lang).platformSet,
+            {
+              ...varsFromContext(ctx),
+              platform: label,
+            },
+          ),
+        );
+        return;
+      }
+      await ctx.reply(
+        lang === "zh"
+          ? "📱 请展开「设置平台」子菜单选择平台（每行 2 个共 8 个平台按钮）；选中平台用于创建 APP 时提交。"
+          : "📱 Please open the 📱 Set Platform submenu to pick a platform (8 options, 2 per row).",
+      );
+      return;
+    }
+    if (func === "help") {
+      await ctx.reply(
+        renderMenuTemplate(
+          responseRaw || resolveTgApiTexts(cfg, lang).helpText,
+          varsFromContext(ctx),
+        ),
+      );
+      return;
+    }
+    if (func === "support") {
+      await ctx.reply(
+        renderMenuTemplate(
+          responseRaw || resolveTgApiTexts(cfg, lang).supportText,
+          varsFromContext(ctx),
+        ),
+      );
+      return;
+    }
+    if (func === "settitle") {
+      if (!responseRaw) {
+        const texts = resolveTgApiTexts(cfg, lang);
+        await ctx.reply(renderTgApiTextTemplate(texts.askAppTitle, cfg.appTitle), { parse_mode: "HTML" });
+      }
+      (ctx as BotContext).session.tgapi = { state: "prefTitle" };
+      (ctx as BotContext).session.tgapiPendingSlot = { success, fail };
+      return;
+    }
+    if (func === "setdescription") {
+      if (!responseRaw) {
+        const texts = resolveTgApiTexts(cfg, lang);
+        await ctx.reply(renderTgApiTextTemplate(texts.askAppDescription, cfg.appDescription), {
+          parse_mode: "HTML",
+        });
+      }
+      (ctx as BotContext).session.tgapi = { state: "prefDesc" };
+      (ctx as BotContext).session.tgapiPendingSlot = { success, fail };
+      return;
+    }
+    if (func === "language") {
+      if (registry.languageRunner) {
+        await registry.languageRunner(ctx);
+        return;
+      }
     }
     await ctx.reply(`⚠️ 未知的 TGAPI 功能：${func}`);
     console.warn(`TGAPI bot #${botId} unknown tgapi_func from user ${from.id}: ${func}`);
@@ -563,41 +631,22 @@ export async function registerTgApiHandlers(
   bot.on("chat_join_request", async (ctx) => {
     const joinRequest = ctx.chatJoinRequest;
     if (!joinRequest) return;
-    const { user, chat } = joinRequest;
-    const approval = await approveTelegramJoinRequest(BigInt(chat.id), BigInt(user.id), ctx.api);
+    const { from: requestUser, chat } = joinRequest;
+    const approval = await approveTelegramJoinRequest(BigInt(chat.id), BigInt(requestUser.id), ctx.api);
     console.log(
-      `TGAPI bot #${botId} join request: user ${user.id} (${user.username ?? "no username"}) ` +
+      `TGAPI bot #${botId} join request: user ${requestUser.id} (${requestUser.username ?? "no username"}) ` +
         `to chat ${chat.id} -> ${approval.success ? "auto-approved" : `failed: ${approval.error ?? "unknown"}`}`,
     );
   });
 
   /**
-   * 解锁成功消息（v2.1.16 需求8/9）：验证成功文案 + 自动调创建API ——
-   * 内嵌按钮菜单已在初始消息上渲染，解锁通过后直接进入创建流程（不再重发菜单）。
-   * 解锁一次永久有效：任意按钮通过验证后所有按钮不再需要验证。
-   */
-  async function sendUnlockSuccessWithMenu(ctx: BotContext, lang: TgApiLang): Promise<void> {
-    const texts = resolveTgApiTexts(cfg, lang);
-    await ctx.reply(texts.unlockSuccess);
-    await beginApplication(ctx, lang);
-  }
-
-  /**
-   * 开始申请流程（已解锁用户）：askAppDetails 开启时先收集 APP 名称/描述
-   * （申请人自定义，/skip 用管理端默认），否则直接进入手机号状态（原版行为）。
+   * 开始申请流程（已解锁用户，v2.2.2）：直接进入手机号状态 —— 创建流程不再
+   * 收集可选 APP 参数（askAppDetails 已移除，APP 参数用键盘预配置或管理端默认）。
    */
   async function beginApplication(ctx: BotContext, lang: TgApiLang): Promise<void> {
     const texts = resolveTgApiTexts(cfg, lang);
-    ctx.session.tgapi = cfg.askAppDetails ? { state: "title" } : { state: "phone" };
-    if (cfg.askAppDetails) {
-      await ctx.reply(
-        renderTgApiTextTemplate(texts.askAppTitle, cfg.appTitle),
-        { parse_mode: "HTML" },
-      );
-    } else {
-      // askAppDetails 关闭：直接进入手机号输入（需要输入的在输入框输入）
-      await ctx.reply(texts.askPhone, { parse_mode: "HTML" });
-    }
+    ctx.session.tgapi = { state: "phone" };
+    await ctx.reply(texts.askPhone, { parse_mode: "HTML" });
   }
 
   /** /start 入口（对应原 ConversationHandler entry_point + fallback；仅私聊） */
@@ -611,27 +660,22 @@ export async function registerTgApiHandlers(
     await sendTgApiStartMessage(ctx, lang);
   }
 
-  /** 推进到 APP 描述步骤（title 收集完成后共用） */
-  async function advanceToDescription(ctx: BotContext, lang: TgApiLang): Promise<void> {
-    const texts = resolveTgApiTexts(cfg, lang);
-    ctx.session.tgapi = {
-      ...ctx.session.tgapi,
-      state: "desc",
-    };
+  /**
+   * 指令失败消息槽位（v2.1.16）：创建流程失败时追加发送按钮配置的 tgapi_fail 模板
+   *（{{error}} 变量 = 具体错误摘要；模板随点击按钮存入会话 pendingFail；未配置则不追加）。
+   */
+  async function sendFailTemplateMessage(ctx: BotContext, lang: TgApiLang, error: string): Promise<void> {
+    const failTemplate = ctx.session.tgapi?.pendingFail;
+    if (!failTemplate) return;
+    const primary = (lang === "zh" ? failTemplate.zh : failTemplate.en).trim();
+    const failRaw = primary || (lang === "zh" ? failTemplate.en : failTemplate.zh).trim();
+    if (!failRaw) return;
     await ctx.reply(
-      renderTgApiTextTemplate(texts.askAppDescription, cfg.appDescription),
-      { parse_mode: "HTML" },
+      renderMenuTemplate(failRaw, {
+        ...varsFromContext(ctx),
+        error,
+      }),
     );
-  }
-
-  /** 推进到手机号步骤（APP 名称/描述收集完成或跳过后共用） */
-  async function advanceToPhone(ctx: BotContext, lang: TgApiLang): Promise<void> {
-    const texts = resolveTgApiTexts(cfg, lang);
-    ctx.session.tgapi = {
-      ...ctx.session.tgapi,
-      state: "phone",
-    };
-    await ctx.reply(texts.askPhone, { parse_mode: "HTML" });
   }
 
   /** INPUT_PHONE_NUMBER 状态：受理手机号/联系人，请求发送登录码 */
@@ -711,6 +755,7 @@ export async function registerTgApiHandlers(
       if (!login.ok) {
         // 原实现：把 my.telegram.org 的错误原文原样 edit 给用户，会话结束
         await editProgress(login.error || texts.erredPage, false);
+        await sendFailTemplateMessage(ctx, lang, login.error || "my.telegram.org 登录被拒绝");
         ctx.session.tgapi = undefined;
         console.log(
           `TGAPI bot #${botId} my.telegram.org login rejected: user ${from.id} reason=${login.error.slice(0, 120)}`,
@@ -718,10 +763,12 @@ export async function registerTgApiHandlers(
         return;
       }
 
-      // 申请人自定义 APP 参数（/skip 或未开启自定义时回落管理端默认值）；
+      // APP 参数：键盘「设置Title/设置Description」预配置 > 管理端默认；
       // shortname 由 title 派生（my.telegram.org 要求字母开头 5-32 位）
-      const effectiveTitle = flow.appTitle?.trim() || cfg.appTitle;
-      const effectiveDescription = flow.appDescription?.trim() || cfg.appDescription;
+      const prefTitle = ctx.session.tgapiPrefTitle?.trim() ?? "";
+      const prefDesc = ctx.session.tgapiPrefDesc?.trim() ?? "";
+      const effectiveTitle = prefTitle || cfg.appTitle;
+      const effectiveDescription = prefDesc || cfg.appDescription;
       const effectiveShortName = deriveTgApiShortName(effectiveTitle, cfg.appShortName);
 
       // 原实现：抓取现有 APP → 无则按参数创建 → 再抓取（stars have failed us 兜底）
@@ -771,18 +818,37 @@ export async function registerTgApiHandlers(
           buildAppResultHTML(flow.phone, scraped.info) +
           (cfg.footerText ? `\n\n${cfg.footerText}` : "");
         await editProgress(resultHtml, true);
+        // v2.1.16 指令消息槽位：按钮配置了成功消息模板时追加发送（{{phone}}/{{api_id}}/{{api_hash}}）
+        const successTemplate = flow.pendingSuccess;
+        if (successTemplate) {
+          const primary = (lang === "zh" ? successTemplate.zh : successTemplate.en).trim();
+          const successRaw = primary || (lang === "zh" ? successTemplate.en : successTemplate.zh).trim();
+          if (successRaw) {
+            await ctx.reply(
+              renderMenuTemplate(successRaw, {
+                ...varsFromContext(ctx),
+                phone: flow.phone,
+                api_id: scraped.info.appId,
+                api_hash: scraped.info.apiHash,
+              }),
+            );
+          }
+        }
         console.log(
           `TGAPI bot #${botId} app credentials delivered: user ${from.id} app_id=${scraped.info.appId}`,
         );
       } else {
         await editProgress(texts.erredPage, false);
+        await sendFailTemplateMessage(ctx, lang, "APP 抓取/创建失败（my.telegram.org 页面不可用）");
       }
     } catch (error) {
       console.error(`TGAPI bot #${botId} login/scrape pipeline failed: user ${from.id}:`, error);
+      const brief = briefError(error);
       await editProgress(
-        `${sys.pipelineFail(briefError(error))}\n\n${texts.erredPage}`,
+        `${sys.pipelineFail(brief)}\n\n${texts.erredPage}`,
         false,
       );
+      await sendFailTemplateMessage(ctx, lang, brief);
     }
     // 原实现：ConversationHandler.END（无论成败，登录码状态一律终结；
     // 解锁状态不受影响 —— 同一用户后续再次申请无需再次解锁）
@@ -790,10 +856,12 @@ export async function registerTgApiHandlers(
   }
 
   // ---------------------------------------------------------------------------
-  // 私聊统一入口（TGAPI 机器人是纯私聊工具机器人；群聊消息一律透传/忽略）
+  // 私聊消息处理（v2.2.2 门禁 Router 双路由：locked = 门禁组件 / open = 本函数）
+  // TGAPI 机器人是纯私聊工具机器人；群聊消息一律透传/忽略
   // ---------------------------------------------------------------------------
 
-  async function handlePrivateMessage(
+  /** open 路由：已解锁用户的私聊消息（偏好收集/手机号/登录码/无状态重入） */
+  async function handleUnlockedPrivateMessage(
     ctx: BotContext,
     messageText: string | null,
     contactPhone: string | null,
@@ -803,43 +871,30 @@ export async function registerTgApiHandlers(
     const lang = langOf(ctx);
     const flow = ctx.session.tgapi;
 
-    // APP 名称/描述状态：任意文本即输入（/start 已在「指令菜单」勾选注册时由指令
-    // 中间件先行消费并重入；/skip 用管理端默认值推进到下一步）
-    if (flow?.state === "title" || flow?.state === "desc") {
-      const texts = resolveTgApiTexts(cfg, lang);
+    // 设置Title/设置Description 偏好收集（只记录偏好，创建 API 时优先使用）
+    if (flow?.state === "prefTitle" || flow?.state === "prefDesc") {
       const sys = TGAPI_SYSTEM_TEXTS[lang];
       const input = (messageText ?? "").trim();
-      if (flow.state === "title") {
-        if (input === "/skip") {
-          await advanceToDescription(ctx, lang);
-          return;
-        }
+      const slot = ctx.session.tgapiPendingSlot;
+      ctx.session.tgapi = undefined;
+      ctx.session.tgapiPendingSlot = undefined;
+      if (flow.state === "prefTitle") {
         if (!input || input.length > APP_TITLE_MAX_LENGTH) {
           await ctx.reply(sys.titleInvalid);
-          await ctx.reply(
-            renderTgApiTextTemplate(texts.askAppTitle, cfg.appTitle),
-            { parse_mode: "HTML" },
-          );
           return;
         }
-        ctx.session.tgapi = { ...flow, appTitle: input };
-        await advanceToDescription(ctx, lang);
-        return;
-      }
-      if (input === "/skip") {
-        await advanceToPhone(ctx, lang);
+        ctx.session.tgapiPrefTitle = input;
+        const raw = responseText(slot?.success, lang) || resolveTgApiTexts(cfg, lang).titleSet;
+        await ctx.reply(renderMenuTemplate(raw, { ...varsFromContext(ctx), title: input }));
         return;
       }
       if (!input || input.length > APP_DESCRIPTION_MAX_LENGTH) {
         await ctx.reply(sys.descriptionInvalid);
-        await ctx.reply(
-          renderTgApiTextTemplate(texts.askAppDescription, cfg.appDescription),
-          { parse_mode: "HTML" },
-        );
         return;
       }
-      ctx.session.tgapi = { ...flow, appDescription: input };
-      await advanceToPhone(ctx, lang);
+      ctx.session.tgapiPrefDesc = input;
+      const raw = responseText(slot?.success, lang) || resolveTgApiTexts(cfg, lang).descriptionSet;
+      await ctx.reply(renderMenuTemplate(raw, { ...varsFromContext(ctx), description: input }));
       return;
     }
 
@@ -849,31 +904,6 @@ export async function registerTgApiHandlers(
       return;
     }
 
-    const unlocked = await getTgApiUnlock(botId, BigInt(from.id));
-    if (!unlocked) {
-      // 门禁：未解锁时消费全部私聊消息（首次对话必须解锁）
-      const texts = resolveTgApiTexts(cfg, lang);
-      const sys = TGAPI_SYSTEM_TEXTS[lang];
-      if (cfg.unlockMode === "captcha") {
-        if (messageText) {
-          // 回复解锁提示的消息已由 stateless-question 中间件先行消费；
-          // 此处兜底任意文本直接进入核验（与加群验证私聊输码同款宽松通道）
-          await handleUnlockAttempt(ctx, lang, messageText.trim());
-        } else {
-          // v2.1.14：需要用户在输入框输入的交互，先发输入提示再发 force-reply 提问
-          await ctx.reply(sys.inputHint);
-          await unlockQuestion.replyWithHTML(ctx, htmlEscape(texts.unlockPrompt));
-        }
-        return;
-      }
-      if (!ctx.session.tgapiStarsInvoiceSent) {
-        await sendStarsInvoice(ctx, lang);
-        await ctx.reply(sys.starsInvoiceHint(String(cfg.starsAmount ?? "-")));
-      } else {
-        await ctx.reply(sys.starsInvoicePending);
-      }
-      return;
-    }
     if (!flow?.state) {
       // 原 ConversationHandler：无状态时的输入被忽略；
       // 这里给出明确重入（等价 /start 的 fallback 语义，避免机器人看起来"没反应"）
@@ -890,10 +920,28 @@ export async function registerTgApiHandlers(
   }
 
   // ---------------------------------------------------------------------------
-  // 中间件装配（顺序：问题插件 → 授权认证 callback → 指令 → 自定义指令 → 文本 → 支付）
+  // 中间件装配（顺序：问题插件 → 门禁 Router → 授权认证 callback → 指令 → 支付）
   // ---------------------------------------------------------------------------
 
   bot.use(unlockQuestion.middleware());
+
+  // 通用门禁 Router（tgapi-gate.ts 组件）：locked 路由 = 门禁全部行为（captcha 输码
+  // 真实外部核验 / stars 发票与支付等待），open 路由 = 已解锁业务处理；指令与支付
+  // 类更新透传下游（路由函数返回 undefined）。force-reply 回复由上方问题插件先行消费。
+  bot.use(
+    createTgApiGateRouter({
+      deps: gateDeps,
+      langOf,
+      sendCaptchaPrompt: async (ctx, lang) => {
+        // 唯一门禁提示（v2.2.2：不再叠加「请在下方的输入框进行输入」输入提示）
+        const texts = resolveTgApiTexts(cfg, lang);
+        await unlockQuestion.replyWithHTML(ctx, htmlEscape(texts.unlockPrompt));
+      },
+      onCaptchaAttempt: (ctx, lang, code) => handleUnlockAttempt(ctx, lang, code),
+      onOpen: (ctx, messageText, contactPhone) =>
+        handleUnlockedPrivateMessage(ctx, messageText, contactPhone),
+    }),
+  );
 
   // ---------------------------------------------------------------------------
   // 语言切换（v2.1.14）：不再是 /language 指令 —— 按钮化
@@ -932,9 +980,7 @@ export async function registerTgApiHandlers(
     await ctx.answerCallbackQuery();
     if (chatType === "private") {
       if (cfg.unlockMode === "captcha") {
-        // 点击后发送消息要求在输入框输入验证码（StatelessQuestion force-reply）；
-        // v2.1.14：先发输入提示再发提问，引导用户去输入框输入
-        await ctx.reply(sys.inputHint);
+        // 点击后发送唯一门禁提示（StatelessQuestion force-reply，要求在输入框输入验证码）
         await unlockQuestion.replyWithHTML(ctx, htmlEscape(texts.unlockPrompt));
       } else {
         await sendStarsInvoice(ctx, lang);
@@ -967,21 +1013,9 @@ export async function registerTgApiHandlers(
   });
 
   // ---------------------------------------------------------------------------
-  // 指令注册（唯一来源：机器人管理页「⌨️ 指令菜单」弹窗勾选，bots.config.commandIds）
+  // 指令注册（唯一来源：机器人管理页「⌨️ 指令菜单」弹窗勾选，bots.config.commandIds；
+  // 勾选清单与同步任务已在函数开头与自定义键盘模式共用，见 selectedItems / myCommands）
   // ---------------------------------------------------------------------------
-  // 管理员在「指令菜单」弹窗勾选并保存后，实例经 restartMenuBot 热更新按勾选注册；
-  // 运行时绝不按指令库启用状态自行补注册 —— 未勾选的指令一律不响应。
-  // v2.1.14：不再有任何硬编码注册的「TGAPI 自有指令」。
-  const selectedIds = options.commandIds
-    .map((id) => Number(id))
-    .filter((id) => Number.isInteger(id) && id > 0)
-    .map((id) => BigInt(id));
-  // 指令归属过滤（v2.1.13）：机器人私有指令仅本 TGAPI 机器人可注册；
-  // 群组私有指令注册是机器人级，群组限制由 runner 校验（scopeCommandRunnerToGroup）
-  const selectedItems =
-    selectedIds.length > 0
-      ? await listBotCommandsByIds(selectedIds, { botId })
-      : [];
 
   // 内置指令：注册勾选项（/start 除外 —— TGAPI 的 /start 在下方按勾选单独注册，
   // 执行 TGAPI 启动语义而非通用欢迎指令，避免同一 /start 双响应）。
@@ -1056,19 +1090,8 @@ export async function registerTgApiHandlers(
     `TGAPI bot #${botId} commands registered (menu selection only): builtin=[${selectedBuiltin.map((item) => item.name).join(", ") || "none"}]${startSelected ? " +start" : ""} custom=[${customItems.map((item) => item.name).join(", ") || "none"}]`,
   );
 
-  bot.on("message:text", async (ctx) => {
-    if (ctx.chat?.type !== "private") return;
-    await handlePrivateMessage(ctx, ctx.message.text, null);
-  });
-
-  bot.on("message:contact", async (ctx) => {
-    if (ctx.chat?.type !== "private") return;
-    await handlePrivateMessage(
-      ctx,
-      ctx.message.text ?? null,
-      ctx.message.contact.phone_number || null,
-    );
-  });
+  // 私聊文本/联系人消息已由上方门禁 Router 双路由统一受理（locked = 门禁 / open =
+  // handleUnlockedPrivateMessage），此处不再重复注册消息处理器（避免双响应）。
 
   // Telegram Stars 支付链路：预结单放行 + 支付成功落库解锁
   bot.on("pre_checkout_query", async (ctx) => {
@@ -1087,31 +1110,25 @@ export async function registerTgApiHandlers(
     if (!from || from.is_bot || !payment) return;
     if (!payment.invoice_payload.startsWith(UNLOCK_PAYLOAD_PREFIX)) return;
     const lang = langOf(ctx);
-    await saveTgApiUnlock({
-      botId,
-      userId: BigInt(from.id),
-      username: from.username ?? null,
-      mode: "stars",
-    });
+    // 解锁落库 + 回读校验（通用门禁组件共享实现；回读失败绝不发送成功语义）
+    const persisted = await persistTgApiUnlock(
+      gateDeps,
+      BigInt(from.id),
+      from.username ?? null,
+      "stars",
+    );
+    if (!persisted) {
+      await ctx.reply(TGAPI_SYSTEM_TEXTS[lang].unlockPersistFail);
+      return;
+    }
     ctx.session.tgapiStarsInvoiceSent = false;
-    // v2.1.10：支付成功同款 —— 验证成功消息 + 图4 菜单内嵌按钮
-    await sendUnlockSuccessWithMenu(ctx, lang);
+    // 支付成功 → 直接进入下一步（单条手机号提示；不再发送单独成功消息）
+    await beginApplication(ctx, lang);
     console.log(
       `TGAPI bot #${botId} unlocked via stars: user ${from.id} paid ${payment.total_amount} XTR (${payment.telegram_payment_charge_id})`,
     );
   });
 
-  // 指令同步（v2.1.14）：仅「⌨️ 指令菜单」弹窗勾选的指令（含按勾选注册的 /start）
-  //（真实写入 Telegram 指令菜单；Telegram 上限 100 条，超出部分按顺序截断）——
-  // 与注册同源，未勾选的指令不进 Telegram 指令菜单；描述与 syncBotCommandsToTelegram
-  // 同一规则（指令库条目 description > intro > 名称）。
-  const myCommands = selectedItems.slice(0, 100).map((item) => ({
-    command: item.name,
-    description: (item.description || item.intro || item.name).slice(0, 256),
-  }));
-  return async () => {
-    await bot.api.setMyCommands(myCommands).catch((error: unknown) => {
-      console.warn(`TGAPI bot #${botId} setMyCommands failed:`, error);
-    });
-  };
+  // 指令同步任务：仅勾选指令写入 Telegram 指令菜单（syncCommands 见函数开头）
+  return syncCommands;
 }
