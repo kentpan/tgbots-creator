@@ -18,11 +18,13 @@ import {
   Paintbrush,
   Phone,
   PlayCircle,
+  RefreshCw,
   Rocket,
   Search,
   Settings2,
   ShieldBan,
   ShieldCheck,
+  HeartPulse,
   SquarePen,
   Trash2,
   UserRoundPlus,
@@ -290,7 +292,7 @@ function DoodleWallpaper() {
   );
 }
 
-type Screen = "chat" | "settings" | "admins" | "proxy" | "newgroup" | "apiconfig";
+type Screen = "chat" | "settings" | "admins" | "proxy" | "newgroup" | "apiconfig" | "botcheck";
 
 /** v2.1.2 真实群消息（chat_messages 台账，/api/admin/telegram/chat-messages 返回项） */
 export interface RealChatMessage {
@@ -734,6 +736,187 @@ export function TgAppSimulator({
   useEffect(() => {
     if (screen === "settings" && activeChatId) void loadGroupSettings(activeChatId);
   }, [screen, activeChatId, loadGroupSettings]);
+
+  // —— v2.2.7 群组真实状态快照（展示时实时调用 getChat，绝不硬编码假数据） ——
+  interface ChatStateSnapshot {
+    id: string;
+    type: string;
+    title: string | null;
+    username: string | null;
+    active_usernames: string[];
+    is_forum: boolean;
+    has_visible_history: boolean;
+    has_available_reactions: boolean;
+    available_reactions_count: number | null;
+    max_reaction_count: number | null;
+    has_custom_appearance: boolean;
+    has_protected_content: boolean;
+  }
+  const [chatState, setChatState] = useState<ChatStateSnapshot | null>(null);
+  const [chatStateError, setChatStateError] = useState<string | null>(null);
+  const [chatStateLoading, setChatStateLoading] = useState(false);
+
+  const loadChatState = useCallback(
+    async (chatId: string): Promise<void> => {
+      setChatStateLoading(true);
+      setChatStateError(null);
+      try {
+        const response = await opsFetch(
+          `/api/admin/bots/testing/chat-state?bot_id=${encodeURIComponent(selectedBotId)}&chat_id=${encodeURIComponent(chatId)}`,
+          { cache: "no-store" },
+        );
+        const payload = await readJson<{ ok: boolean; error?: string; chat?: ChatStateSnapshot }>(response);
+        if (!payload) {
+          setChatStateError(`服务返回异常（HTTP ${response.status}）`);
+          return;
+        }
+        if (!payload.ok || !payload.chat) {
+          setChatStateError(payload.error ?? "读取失败");
+          return;
+        }
+        setChatState(payload.chat);
+      } catch (error) {
+        setChatStateError(error instanceof Error ? error.message : "网络失败");
+      } finally {
+        setChatStateLoading(false);
+      }
+    },
+    [selectedBotId],
+  );
+
+  // 打开设置浮层时实时拉取该群真实状态（展示时获取，与 Telegram 侧同步）
+  useEffect(() => {
+    if (screen === "settings" && activeChatId) void loadChatState(activeChatId);
+  }, [screen, activeChatId, loadChatState]);
+
+  /** 群组信息行右侧真实值（chatState 展示时实时获取；加载/失败如实展示，绝无假数据） */
+  const chatStateValue = (row: "type" | "history" | "reactions" | "appearance" | "topics"): string => {
+    if (chatStateLoading) return "…";
+    if (!chatState) return "—";
+    switch (row) {
+      case "type": {
+        const visibility =
+          chatState.active_usernames.length > 0 ? "公开" : "私密";
+        if (chatState.type === "supergroup") return `超级群组 · ${visibility}`;
+        if (chatState.type === "group") return `群组 · ${visibility}`;
+        if (chatState.type === "channel") return "频道";
+        return chatState.type;
+      }
+      case "history":
+        return chatState.has_visible_history ? "新成员可见" : "新成员不可见";
+      case "reactions": {
+        if (!chatState.has_available_reactions) return "全部表情";
+        const count = chatState.available_reactions_count ?? 0;
+        return count === 0 ? "已停用" : `限 ${count} 种表情`;
+      }
+      case "appearance":
+        return chatState.has_custom_appearance ? "自定义外观" : "默认外观";
+      case "topics":
+        return chatState.is_forum ? "已启用" : "已禁用";
+    }
+  };
+
+  // —— v2.2.7 机器人关键节点真实检测（顺序逐节点真实执行，❌ 即停） ——
+  interface BotCheckPlanNode {
+    key: string;
+    label: string;
+    hint: string;
+  }
+  interface BotCheckResult {
+    key: string;
+    label: string;
+    ok: boolean;
+    ms: number;
+    detail: string;
+    error?: string;
+    suggestion?: string;
+  }
+  const [checkPlan, setCheckPlan] = useState<BotCheckPlanNode[] | null>(null);
+  const [checkResults, setCheckResults] = useState<BotCheckResult[]>([]);
+  /** 当前正在真实检测的节点下标（-1 = 空闲） */
+  const [checkRunningIndex, setCheckRunningIndex] = useState(-1);
+  const [checkError, setCheckError] = useState<string | null>(null);
+  /** 检测已启动过（用于区分「未检测」与「空闲展示」） */
+  const [checkStarted, setCheckStarted] = useState(false);
+  const checkRunIdRef = useRef(0);
+
+  /** 加载检测计划（打开浮层时；只读不发网络请求 Telegram） */
+  const loadCheckPlan = useCallback(async (): Promise<void> => {
+    setCheckPlan(null);
+    setCheckResults([]);
+    setCheckRunningIndex(-1);
+    setCheckError(null);
+    setCheckStarted(false);
+    try {
+      const response = await opsFetch("/api/admin/bots/testing/bot-check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bot_id: selectedBotId }),
+      });
+      const payload = await readJson<{ ok: boolean; error?: string; plan?: BotCheckPlanNode[] }>(response);
+      if (!payload) {
+        setCheckError(`服务返回异常（HTTP ${response.status}）`);
+        return;
+      }
+      if (!payload.ok || !payload.plan) {
+        setCheckError(payload.error ?? "读取检测计划失败");
+        return;
+      }
+      setCheckPlan(payload.plan);
+    } catch (error) {
+      setCheckError(error instanceof Error ? error.message : "网络失败");
+    }
+  }, [selectedBotId]);
+
+  /** 按顺序逐节点真实检测：通过打 ✅ 继续，❌ 停止（后续节点保持未检测） */
+  const runBotCheck = useCallback(async (): Promise<void> => {
+    if (!checkPlan || checkRunningIndex >= 0) return;
+    const runId = ++checkRunIdRef.current;
+    setCheckStarted(true);
+    setCheckResults([]);
+    setCheckError(null);
+    for (let index = 0; index < checkPlan.length; index++) {
+      if (checkRunIdRef.current !== runId) return; // 已被新的检测轮次取代
+      setCheckRunningIndex(index);
+      try {
+        const response = await opsFetch("/api/admin/bots/testing/bot-check", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ bot_id: selectedBotId, index }),
+        });
+        const payload = await readJson<{ ok: boolean; error?: string; result?: BotCheckResult }>(response);
+        if (checkRunIdRef.current !== runId) return;
+        if (!payload) {
+          setCheckError(`服务返回异常（HTTP ${response.status}）`);
+          setCheckRunningIndex(-1);
+          return;
+        }
+        if (!payload.ok || !payload.result) {
+          setCheckError(payload.error ?? `节点 ${checkPlan[index].label} 检测失败`);
+          setCheckRunningIndex(-1);
+          return;
+        }
+        setCheckResults((prev) => [...prev, payload.result!]);
+        if (!payload.result.ok) {
+          // ❌：停止后续节点（真实检测语义）
+          setCheckRunningIndex(-1);
+          return;
+        }
+      } catch (error) {
+        if (checkRunIdRef.current !== runId) return;
+        setCheckError(error instanceof Error ? error.message : "网络失败");
+        setCheckRunningIndex(-1);
+        return;
+      }
+    }
+    if (checkRunIdRef.current !== runId) return;
+    setCheckRunningIndex(-1);
+  }, [checkPlan, checkRunningIndex, selectedBotId]);
+
+  // 打开检测浮层时加载计划
+  useEffect(() => {
+    if (screen === "botcheck") void loadCheckPlan();
+  }, [screen, loadCheckPlan]);
 
   // —— v2.1.2 外部验证 API 配置浮层（验证渠道 code_api 分支入口，iOS 风格页） ——
   const [apiConfigLoading, setApiConfigLoading] = useState(false);
@@ -1449,7 +1632,7 @@ export function TgAppSimulator({
               ))}
             </div>
 
-            {/* 群组信息行（展示系统真实状态） */}
+            {/* 群组信息行（v2.2.7：右侧全部为展示时实时获取的真实状态，无硬编码假数据） */}
             <div className="overflow-hidden rounded-xl bg-white">
               <div className="flex items-center gap-3 border-b border-black/[0.06] px-4 py-2.5">
                 <IosRowIcon bg="#3390ec">
@@ -1457,7 +1640,7 @@ export function TgAppSimulator({
                 </IosRowIcon>
                 <span className="flex-1 text-[17px] text-black">群组类型</span>
                 <span className="text-[17px]" style={{ color: IOS_TEXT_SECONDARY }}>
-                  {activeGroup?.chatId.startsWith("-100") ? "超级群组 · 私密" : "群组"}
+                  {chatStateValue("type")}
                 </span>
                 <ChevronRight className="h-4 w-4 text-[#c7c7cc]" />
               </div>
@@ -1467,7 +1650,7 @@ export function TgAppSimulator({
                 </IosRowIcon>
                 <span className="flex-1 text-[17px] text-black">聊天记录</span>
                 <span className="text-[17px]" style={{ color: IOS_TEXT_SECONDARY }}>
-                  {form.enabled ? "新成员不可见" : "已停用验证"}
+                  {chatStateValue("history")}
                 </span>
                 <ChevronRight className="h-4 w-4 text-[#c7c7cc]" />
               </div>
@@ -1491,7 +1674,7 @@ export function TgAppSimulator({
                 </IosRowIcon>
                 <span className="flex-1 text-[17px] text-black">表情回应</span>
                 <span className="text-[17px]" style={{ color: IOS_TEXT_SECONDARY }}>
-                  已停用
+                  {chatStateValue("reactions")}
                 </span>
                 <ChevronRight className="h-4 w-4 text-[#c7c7cc]" />
               </div>
@@ -1510,6 +1693,9 @@ export function TgAppSimulator({
                   <Paintbrush className="h-4 w-4" />
                 </IosRowIcon>
                 <span className="flex-1 text-[17px] text-black">外观</span>
+                <span className="text-[17px]" style={{ color: IOS_TEXT_SECONDARY }}>
+                  {chatStateValue("appearance")}
+                </span>
                 <ChevronRight className="h-4 w-4 text-[#c7c7cc]" />
               </div>
               <div className="flex items-center gap-3 px-4 py-2.5">
@@ -1518,11 +1704,16 @@ export function TgAppSimulator({
                 </IosRowIcon>
                 <span className="flex-1 text-[17px] text-black">话题</span>
                 <span className="text-[17px]" style={{ color: IOS_TEXT_SECONDARY }}>
-                  已禁用
+                  {chatStateValue("topics")}
                 </span>
                 <ChevronRight className="h-4 w-4 text-[#c7c7cc]" />
               </div>
             </div>
+            {!chatStateLoading && chatStateError ? (
+              <p className="rounded-lg bg-amber-50 px-3 py-2 text-[13px] leading-relaxed text-amber-700">
+                实时状态获取失败（右侧显示「—」）：{chatStateError}
+              </p>
+            ) : null}
             <p className="px-1 text-[13px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
               群聊将被划分为由管理员或用户创建的话题。
             </p>
@@ -1915,6 +2106,158 @@ export function TgAppSimulator({
     </div>
   );
 
+  // —— v2.2.7 机器人关键节点真实检测浮层（iOS 风格页：顺序✅/❌ + 耗时 + 错误 + 修复建议） ——
+  const checkResultFor = (index: number): BotCheckResult | undefined => checkResults[index];
+  const botcheckOverlay = (
+    <div className="relative flex h-full flex-col" style={{ backgroundColor: IOS_GRAY_BG }}>
+      <div className="flex items-center justify-between border-b border-black/[0.06] bg-white/85 px-3 py-2 backdrop-blur">
+        <button
+          type="button"
+          onClick={() => setScreen("chat")}
+          aria-label="关闭机器人检测"
+          className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] text-black transition-transform active:scale-95"
+        >
+          <X className="h-5 w-5" />
+        </button>
+        <span className="text-[17px] font-semibold text-black">机器人检测</span>
+        <button
+          type="button"
+          onClick={() => void loadCheckPlan()}
+          disabled={checkRunningIndex >= 0}
+          aria-label="重新加载检测计划"
+          className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] text-black transition-transform active:scale-95 disabled:opacity-60"
+        >
+          <RefreshCw className="h-4 w-4" />
+        </button>
+      </div>
+
+      <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4" style={{ paddingBottom: 116 }}>
+        {/* 机器人信息卡 */}
+        <div className="flex items-center gap-3 rounded-xl bg-white p-4">
+          <GroupAvatar title={botName} size={48} />
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-[16px] font-semibold text-black">{botName}</p>
+            <p className="truncate text-[13px]" style={{ color: IOS_TEXT_SECONDARY }}>
+              {botUsername ? `@${botUsername}` : "未获取用户名"} · 关键节点按消息链路顺序真实检测
+            </p>
+          </div>
+        </div>
+        <p className="px-1 text-[13px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+          每个节点均为真实检测（真实 Telegram API 调用 / 真实数据库读取 / 真实运行实例状态），
+          耗时为本次真实耗时；通过打 ✅ 继续下一节点，失败打 ❌ 后停止并给出修复建议。
+        </p>
+
+        {/* 节点列表 */}
+        {checkError ? (
+          <p className="rounded-lg bg-amber-50 px-3 py-2 text-[13px] leading-relaxed text-amber-700">{checkError}</p>
+        ) : null}
+        <div className="overflow-hidden rounded-xl bg-white">
+          {!checkPlan ? (
+            <div className="flex justify-center py-8">
+              <Loader2 className="h-6 w-6 animate-spin text-[#8e8e93]" />
+            </div>
+          ) : (
+            checkPlan.map((node, index) => {
+              const result = checkResultFor(index);
+              const running = checkRunningIndex === index;
+              const pending = !result && !running;
+              return (
+                <div
+                  key={`${node.key}-${index}`}
+                  className={`px-4 py-3 ${index > 0 ? "border-t border-black/[0.06]" : ""}`}
+                >
+                  <div className="flex items-center gap-2.5">
+                    <span className="flex h-6 w-6 shrink-0 items-center justify-center">
+                      {result ? (
+                        result.ok ? (
+                          <Check className="h-5 w-5 text-[#34c759]" aria-label="通过" />
+                        ) : (
+                          <X className="h-5 w-5 text-[#eb5545]" aria-label="失败" />
+                        )
+                      ) : running ? (
+                        <Loader2 className="h-4.5 w-4.5 animate-spin text-[#3390ec]" />
+                      ) : (
+                        <span
+                          className="h-2 w-2 rounded-full"
+                          style={{ backgroundColor: pending ? "#c7c7cc" : "transparent" }}
+                          aria-hidden
+                        />
+                      )}
+                    </span>
+                    <span className="min-w-0 flex-1 text-[16px] font-medium text-black">{node.label}</span>
+                    {result ? (
+                      <span
+                        className="shrink-0 rounded-full px-2 py-0.5 text-[12px] font-medium"
+                        style={{
+                          backgroundColor: result.ok ? "rgba(52,199,89,0.12)" : "rgba(235,85,69,0.12)",
+                          color: result.ok ? "#1e8e3e" : "#eb5545",
+                        }}
+                      >
+                        ⏱ {result.ms}ms
+                      </span>
+                    ) : null}
+                  </div>
+                  {!result && !running ? (
+                    <p className="mt-1 pl-8.5 text-[13px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+                      {node.hint}
+                    </p>
+                  ) : null}
+                  {running ? (
+                    <p className="mt-1 pl-8.5 text-[13px] text-[#3390ec]">正在真实检测…</p>
+                  ) : null}
+                  {result?.ok ? (
+                    <p className="mt-1 break-words pl-8.5 text-[13px] leading-relaxed text-[#1e8e3e]">{result.detail}</p>
+                  ) : null}
+                  {result && !result.ok ? (
+                    <div className="mt-2 space-y-1.5 pl-8.5">
+                      <p className="rounded-lg bg-[#eb5545]/10 px-3 py-2 text-[13px] leading-relaxed break-words text-[#b3261e]">
+                        {result.error}
+                      </p>
+                      {result.suggestion ? (
+                        <p className="rounded-lg bg-[#3390ec]/10 px-3 py-2 text-[13px] leading-relaxed break-words text-[#1a5c9e]">
+                          💡 修复建议：{result.suggestion}
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })
+          )}
+        </div>
+        {checkStarted && checkRunningIndex < 0 && checkPlan ? (
+          <p className="px-1 text-[13px]" style={{ color: IOS_TEXT_SECONDARY }}>
+            {checkResults.length === checkPlan.length
+              ? `全部 ${checkPlan.length} 个节点检测通过 ✅`
+              : `检测已停止：第 ${checkResults.length + 1} 个节点未通过（后续节点未检测）`}
+          </p>
+        ) : null}
+      </div>
+
+      {/* 底部固定动作按钮 */}
+      <div className="absolute inset-x-0 bottom-0 border-t border-black/[0.06] bg-white/95 px-4 py-3 backdrop-blur">
+        <button
+          type="button"
+          onClick={() => void runBotCheck()}
+          disabled={!checkPlan || checkRunningIndex >= 0}
+          className="pointer-events-auto w-full cursor-pointer rounded-full py-3.5 text-[17px] font-semibold text-white shadow-sm transition-transform active:scale-[0.99] disabled:opacity-60"
+          style={{ backgroundColor: checkStarted ? IOS_GREEN : IOS_BLUE }}
+        >
+          {checkRunningIndex >= 0 ? (
+            <span className="inline-flex items-center gap-2">
+              <Loader2 className="h-5 w-5 animate-spin" />
+              正在按顺序真实检测…
+            </span>
+          ) : checkStarted ? (
+            "重新检测"
+          ) : (
+            "开始检测"
+          )}
+        </button>
+      </div>
+    </div>
+  );
+
   const joinPanelOverlay = joinPanel ? (
     <div className="flex h-full flex-col" style={{ backgroundColor: IOS_GRAY_BG }}>
       <div className="flex items-center justify-between border-b border-black/[0.06] bg-white/85 px-3 py-2 backdrop-blur">
@@ -2254,6 +2597,15 @@ export function TgAppSimulator({
             <div className="absolute right-4 flex items-center gap-3.5 text-[#3390ec]">
               <button
                 type="button"
+                onClick={() => setScreen("botcheck")}
+                aria-label="机器人检测"
+                title="机器人检测：按顺序真实检测该机器人全部关键节点（Token/Webhook/投递/运行实例/指令/群组/门禁/界面配置），失败即停并给出修复建议"
+                className="cursor-pointer transition-transform active:scale-95"
+              >
+                <HeartPulse className="h-5 w-5" />
+              </button>
+              <button
+                type="button"
                 onClick={() => setScreen("proxy")}
                 aria-label="代理偏好设置"
                 title="代理偏好设置：管理 Telegram API 代理（原系统设置代理配置）"
@@ -2453,6 +2805,19 @@ export function TgAppSimulator({
       {/* v2.0.15 代理偏好设置 / 新建群组浮层：桌面端只覆盖右侧区域（左滑滑入，复刻图3/图4），
           移动端覆盖全屏；不依赖当前会话 —— 与群组设置浮层（需先打开会话）不同 */}
       <AnimatePresence initial={false}>
+        {screen === "botcheck" ? (
+          <motion.div
+            key="botcheck"
+            variants={OVERLAY_VARIANTS}
+            initial="enter"
+            animate="center"
+            exit="exit"
+            transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+            className="absolute inset-0 z-40 lg:left-[360px]"
+          >
+            {botcheckOverlay}
+          </motion.div>
+        ) : null}
         {screen === "proxy" ? (
           <motion.div
             key="proxy"

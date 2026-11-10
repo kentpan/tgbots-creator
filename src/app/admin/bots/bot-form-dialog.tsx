@@ -463,11 +463,7 @@ export function BotFormDialog({
                 <span className="flex shrink-0 items-center gap-1.5 text-muted-foreground">
                   <span className="font-mono">{group.chatId}</span>
                   <span className="rounded-full border bg-muted/40 px-1.5 py-0.5 text-[10px]">
-                    {group.source === "updates"
-                      ? "getUpdates 新发现"
-                      : group.source === "getchat"
-                        ? "getChat 验证"
-                        : "已登记"}
+                    {group.source === "getchat" ? "getChat 验证" : "已登记"}
                   </span>
                 </span>
               </div>

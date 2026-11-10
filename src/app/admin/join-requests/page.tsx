@@ -6,6 +6,7 @@ import {
   approveJoinRequestAction,
   rejectJoinRequestAction,
 } from "./actions";
+import { SubmitButton } from "@/components/admin/submit-button";
 
 export const dynamic = "force-dynamic";
 
@@ -183,21 +184,21 @@ export default async function JoinRequestsPage({
                         <div className="flex items-center gap-2">
                           <form action={approveJoinRequestAction}>
                             <input type="hidden" name="token" value={row.verificationToken} />
-                            <button
-                              type="submit"
+                            <SubmitButton
                               className="inline-flex h-8 items-center rounded-md bg-green-600 px-3 text-sm font-medium text-white hover:bg-green-700"
+                              pendingLabel="批准中…"
                             >
                               批准
-                            </button>
+                            </SubmitButton>
                           </form>
                           <form action={rejectJoinRequestAction}>
                             <input type="hidden" name="token" value={row.verificationToken} />
-                            <button
-                              type="submit"
+                            <SubmitButton
                               className="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
+                              pendingLabel="拒绝中…"
                             >
                               拒绝
-                            </button>
+                            </SubmitButton>
                           </form>
                         </div>
                       ) : (

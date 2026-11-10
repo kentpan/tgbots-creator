@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { loginAction } from "./actions";
+import { SubmitButton } from "@/components/admin/submit-button";
 
 export const metadata: Metadata = {
   title: "管理后台登录 - TGuard",
@@ -67,12 +68,12 @@ export default async function LoginPage({
                   className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 />
               </div>
-              <button
-                type="submit"
+              <SubmitButton
                 className="inline-flex h-10 w-full items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+                pendingLabel="登录中…"
               >
                 登 录
-              </button>
+              </SubmitButton>
             </form>
           </div>
         </div>

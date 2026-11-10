@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useCallback, useMemo, useRef, useState } from "react";
 import { ListTree } from "lucide-react";
 import {
   Dialog,
@@ -20,7 +20,6 @@ import {
   type DesignerState,
 } from "@/components/admin/menu-designer-editor";
 import { TgApiBotGroupsPanel } from "@/components/admin/tgapi-bot-groups-panel";
-import { TgApiUnlockMethodBinding } from "@/components/admin/tgapi-unlock-api-config";
 import { useRealGroups } from "@/components/admin/use-real-groups";
 import {
   countMenuStats,
@@ -43,10 +42,16 @@ import {
   TGAPI_TEXT_FIELD_KEYS,
   TGAPI_TEXTS_EN,
   TGAPI_TEXTS_ZH,
+  tgApiInterfaceMode,
   type TgApiBotConfig,
 } from "@/services/tgapi-config";
-import { parseCustomKeyboardConfig } from "@/services/custom-keyboard";
+import {
+  parseCustomKeyboardConfig,
+  type CustomKeyboardConfig,
+} from "@/services/custom-keyboard";
 import { CustomKeyboardDesigner } from "@/components/admin/custom-keyboard-dialog";
+import { TgApiGatePanel } from "@/components/admin/tgapi-gate-panel";
+import { SubmitButton } from "@/components/admin/submit-button";
 import { TgApiKeyboardFlowSim } from "@/components/admin/tgapi-keyboard-flow";
 import { saveTgApiBotAction, saveTgApiCustomKeyboardAction } from "./actions";
 
@@ -126,12 +131,11 @@ export function TgApiMenuKeyboardDialog({
   triggerClassName?: string;
 }) {
   const [open, setOpen] = useState(false);
-  const [tab, setTab] = useState<"inline" | "keyboard">(defaultTab);
-  // 每次打开重置到宿主指定页签（新增机器人固定 inline）
+  // 每次打开重置到宿主指定模式（新增机器人固定 inline）
   useEffect(() => {
     if (defaultOpen) {
       setOpen(true);
-      setTab(defaultTab);
+      setMode(defaultTab);
     }
   }, [defaultOpen, defaultTab]);
   const cfg: TgApiBotConfig = useMemo(
@@ -168,6 +172,10 @@ export function TgApiMenuKeyboardDialog({
                     ? (tgapi.texts as TgApiBotConfig["texts"])
                     : undefined,
                 customKeyboard: parseCustomKeyboardConfig(tgapi.customKeyboard) ?? undefined,
+                interfaceMode:
+                  tgapi.interfaceMode === "inline" || tgapi.interfaceMode === "keyboard"
+                    ? tgapi.interfaceMode
+                    : undefined,
               } satisfies TgApiBotConfig;
             } catch {
               return { enabled: false, unlockMode: "captcha" as const, ...TGAPI_DEFAULT_APP };
@@ -178,6 +186,21 @@ export function TgApiMenuKeyboardDialog({
   );
   const suffix = bot ? String(bot.id) : "new";
   const selectedPlatforms = useMemo(() => new Set(cfg.appPlatforms), [cfg.appPlatforms]);
+
+  // ---------------------------------------------------------------------------
+  // v2.2.6 解耦：mode 仅切换「内嵌按钮配置 ⇄ 自定义键盘配置」两个编辑区（checkbox
+  // 单选，勾选即切换编辑区草稿）；真正生效模式是 tgapi.interfaceMode（保存并部署后
+  // 生效）——「生效中」标签按已保存数据（activeMode）打标，绝不随草稿切换。
+  // ---------------------------------------------------------------------------
+  const [mode, setMode] = useState<"inline" | "keyboard">(defaultTab);
+  const activeMode = tgApiInterfaceMode(cfg);
+  // 键盘编辑器当前载荷（onConfigChange 同步；初始值 = 已保存配置，未编辑过时原样回存）
+  const [kbPayload, setKbPayload] = useState<string>(() =>
+    cfg.customKeyboard ? JSON.stringify(cfg.customKeyboard) : "",
+  );
+  const handleKbConfigChange = useCallback((config: CustomKeyboardConfig): void => {
+    setKbPayload(config.root.rows.length === 0 ? "" : JSON.stringify(config));
+  }, []);
 
   // 消息配置（中英双语；当前仿真语言文案实时同步仿真屏）
   const [zhStart, setZhStart] = useState(
@@ -697,65 +720,21 @@ export function TgApiMenuKeyboardDialog({
   const stats = countMenuStats(menuRoot);
 
   /**
-   * 解锁门禁配置模块（v2.2.2 通用组件）：内嵌页签与自定义键盘页签共用同一渲染
-   * （两表单互斥渲染，id 无冲突）；unlock_mode/verification_method_id/stars_amount/
-   * stars_title 随宿主表单提交 —— 键盘页签由 saveTgApiCustomKeyboardAction 兼收，
-   * 内嵌页签由 saveTgApiBotAction 收取。所有配置框预填默认值。
+   * 解锁门禁配置模块（v2.2.5 抽为全站通用组件 src/components/admin/tgapi-gate-panel.tsx）：
+   * 内嵌页签与自定义键盘页签共用同一渲染（两表单互斥渲染，id 无冲突）；
+   * unlock_mode/verification_method_id/stars_amount/stars_title 随宿主表单提交 ——
+   * 键盘页签由 saveTgApiCustomKeyboardAction 兼收，内嵌页签由 saveTgApiBotAction 收取。
+   * 机器人管理页「自定义键盘」弹窗（TGAPI 机器人）同用本组件。
    */
   const gateConfigPanel = (idScope: string) => (
-    <div className="rounded-lg border bg-muted/20 p-4 space-y-4">
-      <p className="text-sm font-semibold">🔐 解锁门禁配置（解锁方式与验证方式绑定）</p>
-      <p className="text-xs text-muted-foreground">
-        「首次对话解锁门禁」开关在按钮配置里（每按钮可选：开启后未解锁用户点击该按钮时
-        先进入门禁验证流程，通过后自动执行该按钮功能；任意按钮通过验证后所有按钮不再需要验证）。
-        门禁真实调用外部验证 API 核验，验证不通过绝不放行。
-      </p>
-      <div className="grid gap-4 md:grid-cols-2">
-        <div className="space-y-1">
-          <label className="text-sm font-medium" htmlFor={`unlock-mode-${idScope}`}>
-            解锁方式
-          </label>
-          <select
-            id={`unlock-mode-${idScope}`}
-            name="unlock_mode"
-            defaultValue={cfg.unlockMode}
-            className={inputClassOf()}
-          >
-            <option value="captcha">验证码解锁（外部 API 核验，同加群验证）</option>
-            <option value="stars">星星解锁（Telegram Stars 支付）</option>
-          </select>
-        </div>
-        <div className="space-y-1">
-          <label className="text-sm font-medium" htmlFor={`stars-${idScope}`}>
-            星星解锁金额（⭐，星星解锁模式使用）
-          </label>
-          <input
-            id={`stars-${idScope}`}
-            name="stars_amount"
-            type="number"
-            min="1"
-            step="1"
-            defaultValue={cfg.starsAmount ?? 100}
-            className={inputClassOf()}
-          />
-        </div>
-      </div>
-      <TgApiUnlockMethodBinding
-        initialMethods={methods}
-        initialMethodId={cfg.verificationMethodId ?? null}
-      />
-      <div className="space-y-1">
-        <label className="text-sm font-medium" htmlFor={`stars-title-${idScope}`}>
-          发票标题（星星解锁模式使用）
-        </label>
-        <input
-          id={`stars-title-${idScope}`}
-          name="stars_title"
-          defaultValue={cfg.starsTitle ?? "TGAPI 解锁"}
-          className={inputClassOf()}
-        />
-      </div>
-    </div>
+    <TgApiGatePanel
+      idScope={idScope}
+      methods={methods}
+      unlockMode={cfg.unlockMode}
+      verificationMethodId={cfg.verificationMethodId}
+      starsAmount={cfg.starsAmount}
+      starsTitle={cfg.starsTitle}
+    />
   );
 
   return (
@@ -772,89 +751,17 @@ export function TgApiMenuKeyboardDialog({
             菜单和键盘 · {bot ? bot.name : "新增 TGAPI 申请机器人"}
           </DialogTitle>
           <DialogDescription>
-            自包含切换按钮组：消息内嵌按钮（初始消息底部按钮）与自定义键盘（ReplyKeyboard 对话流程）互斥，
-            保存非空自定义键盘后自动切换到对话流程；右侧仿真屏与部署后真实展现/交互完全一致。
+            通用配置（基本信息 / 机器人所在真实群组 / my.telegram.org APP 创建参数 / 门禁 / 消息）为内嵌按钮与自定义键盘共用；
+            「界面模式」checkbox 单选仅切换下方两个配置编辑区，勾选并保存（部署）后才对运行实例生效，此处仅按已保存数据打「生效中」标签。
             保存仅落库配置；上线/更新运行实例请到「仿真APP」页面部署。
           </DialogDescription>
         </DialogHeader>
-        {/* 自包含切换按钮组：内嵌按钮 ⇄ 自定义键盘（互斥，带「生效中」标记） */}
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b px-6 py-3">
-          <div className="inline-flex rounded-lg border bg-muted/40 p-1">
-            <button
-              type="button"
-              onClick={() => setTab("inline")}
-              className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors ${
-                tab === "inline" ? "bg-background shadow-sm" : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              🔘 消息内嵌按钮
-              {!cfg.customKeyboard ? (
-                <span className="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">生效中</span>
-              ) : null}
-            </button>
-            <button
-              type="button"
-              onClick={() => setTab("keyboard")}
-              disabled={!bot}
-              title={!bot ? "先保存机器人，再配置自定义键盘" : undefined}
-              className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-                tab === "keyboard" ? "bg-background shadow-sm" : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              ⌨️ 自定义键盘
-              {cfg.customKeyboard ? (
-                <span className="rounded-full bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700">生效中</span>
-              ) : null}
-            </button>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            {cfg.customKeyboard
-              ? "⌨️ 自定义键盘对话流程当前生效（互斥）：消息内嵌按钮不再发送；保存空键盘回到内嵌按钮模式。"
-              : "🔘 消息内嵌按钮模式生效中；在「⌨️ 自定义键盘」页签保存非空键盘后自动切换为对话流程。"}
-          </p>
-        </div>
-        {tab === "keyboard" && bot ? (
-          <CustomKeyboardDesigner
-            key={`kb-${bot.id}-${kbSimKey}`}
-            botId={String(bot.id)}
-            botName={botDisplayName}
-            initialConfig={cfg.customKeyboard ?? null}
-            isTgApi
-            action={saveTgApiCustomKeyboardAction}
-            extraFields={gateConfigPanel(`kb-${suffix}`)}
-            tgapiModeHint={
-              cfg.customKeyboard
-                ? "自定义键盘对话流程当前生效：消息内嵌按钮不再渲染（互斥）。保存空键盘可回到内嵌按钮模式。"
-                : "保存非空键盘后，机器人切换为自定义键盘对话流程（互斥：消息内嵌按钮不再渲染）。"
-            }
-            renderSimulator={(kbConfig) => (
-              <div className="space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-xs font-medium text-muted-foreground">
-                    TGAPI 对话流程仿真（与部署后真实行为一致）：/start → 门禁 → 主键盘 → 按钮交互
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => setKbSimKey((prev) => prev + 1)}
-                    className="inline-flex h-7 shrink-0 items-center rounded-md border px-2 text-xs hover:bg-accent"
-                    title="重新从 /start 开始仿真"
-                  >
-                    🔄 重新仿真
-                  </button>
-                </div>
-                <TgApiKeyboardFlowSim
-                  key={`kbflow-${kbSimKey}`}
-                  cfg={cfg}
-                  keyboard={kbConfig}
-                  botName={botDisplayName}
-                />
-              </div>
-            )}
-          />
-        ) : (
         <form action={saveTgApiBotAction} className="flex min-h-0 flex-1 flex-col">
           <input type="hidden" name="id" value={bot ? String(bot.id) : ""} />
           <input type="hidden" name="menu_config" value={menuConfigPayload} />
+          {/* v2.2.6：生效模式（checkbox 单选，保存并部署后生效）+ 自定义键盘附加属性载荷 */}
+          <input type="hidden" name="kb_mode" value={mode} />
+          <input type="hidden" name="custom_keyboard" value={kbPayload} />
           <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-4">
             <div className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[1fr_430px]">
               {/* 左侧配置区 */}
@@ -1088,12 +995,65 @@ export function TgApiMenuKeyboardDialog({
                   ))}
                 </div>
 
-                {/* 5. 内嵌按钮配置（与机器人管理「消息内嵌按钮」弹窗完全同一编辑器实现） */}
-                <div className="space-y-3">
+                {/* 5. 界面模式选择（v2.2.6 checkbox 单选）：仅切换下方两个编辑区；生效标签按已保存数据打标 */}
+                <div className="space-y-3 rounded-xl border bg-card p-4">
+                  <p className="text-sm font-semibold">5️⃣ 界面模式（checkbox 单选：勾选即切换下方编辑区）</p>
+                  <p className="text-xs text-muted-foreground">
+                    两种界面互斥生效：勾选并「保存机器人」（再到「仿真APP」页部署）后才对运行实例正式生效 —— 此处「生效中」标签按已保存数据打标，不随草稿切换。
+                  </p>
+                  <div className="flex flex-col gap-2">
+                    <label
+                      className={`inline-flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
+                        mode === "inline" ? "border-primary/50 bg-primary/5" : ""
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        name="kb_mode"
+                        value="inline"
+                        checked={mode === "inline"}
+                        onChange={() => setMode("inline")}
+                        className="h-4 w-4"
+                      />
+                      🔘 消息内嵌按钮（初始消息底部 InlineKeyboard）
+                      {activeMode === "inline" ? (
+                        <span className="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">生效中</span>
+                      ) : null}
+                    </label>
+                    <label
+                      className={`inline-flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
+                        mode === "keyboard" ? "border-primary/50 bg-primary/5" : ""
+                      } ${!bot ? "opacity-60" : ""}`}
+                    >
+                      <input
+                        type="checkbox"
+                        name="kb_mode"
+                        value="keyboard"
+                        checked={mode === "keyboard"}
+                        onChange={() => setMode("keyboard")}
+                        disabled={!bot}
+                        className="h-4 w-4"
+                      />
+                      ⌨️ 自定义键盘（ReplyKeyboard 对话流程）
+                      {activeMode === "keyboard" ? (
+                        <span className="rounded-full bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700">生效中</span>
+                      ) : null}
+                      {!bot ? <span className="text-xs text-muted-foreground">（先保存机器人，再配置自定义键盘）</span> : null}
+                    </label>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {kbPayload
+                      ? "自定义键盘配置已保留（附加属性）：切换到内嵌按钮模式不会清除键盘配置。"
+                      : "尚未配置自定义键盘；勾选键盘模式后可在下方编辑区设计。"}
+                  </p>
+                </div>
+
+                {/* 6. 内嵌按钮配置（与机器人管理「消息内嵌按钮」弹窗完全同一编辑器实现；仅内嵌模式显示，切换保留草稿） */}
+                <div className={mode === "inline" ? "space-y-3" : "hidden"}>
                   <div className="rounded-lg border bg-muted/20 p-4">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <p className="text-sm font-semibold">
-                        5️⃣ 🔘 内嵌按钮配置（初始消息底部的按钮，仿真屏实时预览；交互下拉 = TGAPI 固定指令列表（10 条）+ 通用项）
+                        🔘 内嵌按钮配置（初始消息底部的按钮，仿真屏实时预览；交互下拉 = TGAPI 固定指令列表（10 条）+ 通用项）
                       </p>
                       <button
                         type="button"
@@ -1108,10 +1068,10 @@ export function TgApiMenuKeyboardDialog({
                         ↺ 恢复默认按钮组
                       </button>
                     </div>
-                    {cfg.customKeyboard ? (
+                    {cfg.customKeyboard && activeMode === "keyboard" ? (
                       <p className="mt-2 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-relaxed text-sky-700">
                         ⌨️ 自定义键盘对话流程当前生效（互斥）：本弹窗配置的内嵌按钮不会被发送；
-                        保存空自定义键盘即可回到内嵌按钮模式。
+                        勾选「消息内嵌按钮」并保存即可切回内嵌模式（键盘配置保留不清除）。
                       </p>
                     ) : null}
                   </div>
@@ -1138,8 +1098,11 @@ export function TgApiMenuKeyboardDialog({
                 </div>
               </div>
 
-              {/* 右侧仿真屏（与机器人管理页完全同一 TgSimulator） */}
-              <div className="min-w-0 lg:sticky lg:top-0 lg:self-start" key={resetKey}>
+              {/* 右侧仿真屏（与机器人管理页完全同一 TgSimulator；仅内嵌模式显示 —— 键盘模式见下方整宽键盘编辑区） */}
+              <div
+                className={`min-w-0 lg:sticky lg:top-0 lg:self-start ${mode === "inline" ? "" : "hidden"}`}
+                key={resetKey}
+              >
                 <TgSimulator
                   ref={simRef}
                   config={simulatorConfig}
@@ -1168,6 +1131,55 @@ export function TgApiMenuKeyboardDialog({
                 </p>
               </div>
             </div>
+
+            {/* ⌨️ 自定义键盘配置区（v2.2.6：仅键盘模式显示；embedded 无独立表单/保存按钮，
+                键盘载荷经 onConfigChange 同步到统一表单 hidden custom_keyboard 字段提交；
+                切换保留草稿 —— 编辑器始终保持挂载，仅 CSS 隐藏） */}
+            <div className={mode === "keyboard" ? "" : "hidden"}>
+              {bot ? (
+                <CustomKeyboardDesigner
+                  botId={String(bot.id)}
+                  botName={botDisplayName}
+                  initialConfig={cfg.customKeyboard ?? null}
+                  isTgApi
+                  embedded
+                  action={saveTgApiCustomKeyboardAction}
+                  onConfigChange={handleKbConfigChange}
+                  tgapiModeHint={
+                    activeMode === "keyboard"
+                      ? "自定义键盘对话流程当前生效：消息内嵌按钮不再渲染（互斥）。勾选「消息内嵌按钮」并保存可切回内嵌模式（本键盘配置保留不清除）。"
+                      : "当前生效的是消息内嵌按钮模式：设计好键盘并保存后，勾选「自定义键盘」为生效模式（保存并部署后生效）。"
+                  }
+                  renderSimulator={(kbConfig) => (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs font-medium text-muted-foreground">
+                          TGAPI 对话流程仿真（与部署后真实行为一致）：/start → 门禁 → 主键盘 → 按钮交互
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => setKbSimKey((prev) => prev + 1)}
+                          className="inline-flex h-7 shrink-0 items-center rounded-md border px-2 text-xs hover:bg-accent"
+                          title="重新从 /start 开始仿真"
+                        >
+                          🔄 重新仿真
+                        </button>
+                      </div>
+                      <TgApiKeyboardFlowSim
+                        key={`kbflow-${kbSimKey}`}
+                        cfg={cfg}
+                        keyboard={kbConfig}
+                        botName={botDisplayName}
+                      />
+                    </div>
+                  )}
+                />
+              ) : (
+                <p className="rounded-md border border-dashed bg-muted/20 px-3 py-6 text-center text-sm text-muted-foreground">
+                  ⌨️ 自定义键盘：先保存机器人（填写名称与 Token 后点「保存机器人」），再次打开本弹窗即可配置。
+                </p>
+              )}
+            </div>
           </div>
           <div className="flex shrink-0 items-center justify-end gap-2 border-t bg-muted/30 px-6 py-3">
             <button
@@ -1177,15 +1189,14 @@ export function TgApiMenuKeyboardDialog({
             >
               取消
             </button>
-            <button
-              type="submit"
+            <SubmitButton
               className="inline-flex h-10 items-center rounded-md bg-primary px-6 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+              pendingLabel="保存中…"
             >
               保存机器人
-            </button>
+            </SubmitButton>
           </div>
         </form>
-        )}
       </DialogContent>
     </Dialog>
   );

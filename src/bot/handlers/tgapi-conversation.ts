@@ -1,4 +1,5 @@
 import { type Bot, type MiddlewareFn } from "grammy";
+import type { InlineKeyboardMarkup } from "grammy/types";
 import {
   conversations,
   createConversation,
@@ -48,17 +49,20 @@ import {
 } from "@/services/tgapi-flow-text";
 import {
   checkTgApiGateMethod,
+  isTgApiGateConfigured,
   persistTgApiUnlock,
   sendTgApiStarsInvoice,
   verifyTgApiUnlockCode,
 } from "../tgapi-gate";
 
 /**
- * TGAPI 申请机器人 · 自定义键盘对话流程（v2.2.2）：
+ * TGAPI 申请机器人 · 自定义键盘对话流程（v2.2.2；v2.2.7 入口门禁）：
  *
  * 工作流（@grammyjs/conversations 驱动，门禁 = tgapi-gate.ts 通用组件）：
  *
- *   /start 启动机器人 → 主键盘消息（键盘常驻输入框下方；无全局门禁拦截）
+ *   /start 启动机器人 → 【入口门禁】门禁已配置且未验证：固定的可配置信息内容
+ *   （unlockPrompt）+ 内嵌按钮（gateButton）→ 点击按钮输入解锁验证码（或直接文本
+ *   宽松通道）→ 外部 API 真实核验 → 通过后调起主键盘（键盘常驻输入框下方）
  *   → 点击键盘按钮（= 发送按钮文本）→ 动作分发
  *      【通用门禁中间件步】按钮声明 tgapi_unlock 且未解锁 → 门禁组件
  *      （captcha = 输码真实外部 API 核验 / stars = 发票 + 支付；配置缺失绝不放行）
@@ -66,21 +70,25 @@ import {
  *      → my.telegram.org 登录抓取/自动创建 APP（APP 参数 = 设置Title/设置Description/
  *        设置平台 的会话预配置 > 管理端默认值，平台未预配置时随机选一）→ 返回 api_id/api_hash
  *   → 🗂 我的API / 📱 设置平台 / ✅ 语言 / 🆘 帮助 / 🎫 客服支持 / ✏️ 设置Title / 📝 设置Description
- *   → 任意阶段 /start 重入（整段流程从头开始）
+ *   → 任意阶段 /start 重入（整段流程从头开始，门禁已解锁则直达主键盘）
  *
- * v2.2.2 变更：
- * - 创建API 精简：点击后直接手机号 → 验证码 → 提交，不再收集已有默认值的可选
- *   配置（askAppDetails 移除）；/skip 指令彻底移除。
- * - 双消息清理：门禁只发一条 unlockPrompt（输入提示移除）；解锁后直接进入下一步
- *  （单独成功消息移除）；设置类确认/创建结果收尾随主键盘一并重新显示（一条消息）。
- * - 门禁真实化：验证码必须真实调用外部验证 API；解锁落库回读校验；星星金额
- *   未配置绝不自动放行（核验核心与内嵌按钮模式共用 tgapi-gate.ts 同一实现）。
+ * v2.2.7 变更：
+ * - 门禁升级为入口门禁（核心）：门禁已配置（captcha 绑定验证方式 / stars 金额≥1）
+ *   即在 /start 与任意私聊消息入口生效 —— 未验证用户统一先看到门禁消息+内嵌按钮，
+ *   验证通过后才调起自定义键盘；门禁未配置 = 不启用，行为与旧版一致。
+ * - 门禁消息新增内嵌按钮（文案 gateButton 可配置），点击后进入输码验证
+ *  （unlockCodePrompt 可配置）；直接文本仍走宽松通道核验（与内嵌按钮模式一致）。
+ * - 历史门禁消息的按钮永不失联：无活跃对话时由专用 callback 处理器接住
+ *  （已解锁 → 重发主键盘；未解锁 → 重新进入对话重走门禁）。
  *
  * 互斥条件：本流程仅在 tgapi.customKeyboard 配置非空时启用（registerTgApiHandlers
  * 分支），此时消息内嵌按钮完全不渲染；清空键盘配置即回到内嵌按钮模式。
  */
 
 export const TGAPI_CONVERSATION_ID = "tgapi-main";
+
+/** 键盘模式门禁消息内嵌按钮 callback（v2.2.7）：点击进入验证；历史按钮由兜底处理器接住 */
+const TGAPI_GATE_CALLBACK = "tgapi:gate";
 
 /** 对话上下文（conversations 插件 flavor） */
 type ConvCtx = ConversationFlavor<BotContext>;
@@ -186,6 +194,35 @@ export function registerTgApiConversation(bot: Bot<BotContext>, deps: TgApiConve
     await (ctx as ConvCtx).conversation.enter(TGAPI_CONVERSATION_ID);
   });
 
+  // v2.2.7 历史门禁按钮兜底：无活跃对话时（上一轮对话已结束）点击旧门禁消息的
+  // 「授权认证」按钮 —— 已解锁 → 重发主键盘；未解锁 → 重新进入对话重走门禁。
+  // 对话激活时 callback 由对话内 wait() 消费，本处理器不触发（不双响应）。
+  bot.callbackQuery(TGAPI_GATE_CALLBACK, async (ctx) => {
+    if (!ctx.from || ctx.from.is_bot) return;
+    const lang = detectTgApiLang(ctx.from.language_code);
+    if (ctx.chat?.type !== "private") {
+      await ctx.answerCallbackQuery().catch(() => undefined);
+      return;
+    }
+    const unlocked = await getTgApiUnlock(deps.botId, BigInt(ctx.from.id));
+    await ctx.answerCallbackQuery({
+      text: unlocked
+        ? lang === "zh"
+          ? "已完成授权认证"
+          : "Already authorized"
+        : undefined,
+    }).catch(() => undefined);
+    if (unlocked) {
+      await ctx.reply(resolveTgApiTexts(deps.cfg, lang).start, {
+        parse_mode: "HTML",
+        reply_markup: renderCustomKeyboardMarkup(deps.keyboard),
+      });
+      return;
+    }
+    ctx.session.tgapiFlowEntry = "auto";
+    await (ctx as ConvCtx).conversation.enter(TGAPI_CONVERSATION_ID);
+  });
+
   console.log(
     `TGAPI bot #${deps.botId} custom keyboard conversation registered ` +
       `(${countCustomKeyboardStats(deps.keyboard).buttons} buttons)`,
@@ -266,99 +303,135 @@ async function tgapiMainFlow(
 
   // ---------------------------------------------------------------------------
   // 门禁步（tgapi-gate.ts 通用组件的对话宿主形态 = Router locked 路由等价实现）：
-  // captcha = 唯一门禁提示 + 输码真实外部 API 核验；stars = 发票 + 支付等待。
+  // v2.2.7 消息形态 = 固定的可配置信息内容（unlockPrompt）+ 内嵌按钮（gateButton）：
+  // captcha = 点击按钮 → 输码提示（unlockCodePrompt）→ 真实外部 API 核验；
+  //           直接文本仍走宽松通道核验（与内嵌按钮模式 locked 路由一致）；
+  // stars = 点击按钮 → 发票 + 支付等待；未点击前其它输入重发门禁消息。
   // 配置缺失绝不放行；解锁落库回读校验通过才算解锁。
   // ---------------------------------------------------------------------------
+  const gateMarkup: InlineKeyboardMarkup = {
+    inline_keyboard: [[{ text: texts().gateButton, callback_data: TGAPI_GATE_CALLBACK }]],
+  };
+
+  /** captcha 单次尝试：完整前置检查 + 真实外部核验 + 落库回读（返回 true = 解锁成功） */
+  const attemptCaptchaUnlock = async (
+    evt: FlowCtx,
+    code: string,
+  ): Promise<boolean> => {
+    const check = await conversation.external(() => checkTgApiGateMethod(gateDeps));
+    if (check.kind === "method-missing") {
+      await evt.reply(sys().methodMissing);
+      return false;
+    }
+    if (check.kind === "method-unavailable") {
+      await evt.reply(sys().methodUnavailable);
+      return false;
+    }
+    if (check.kind === "method-config-invalid") {
+      await evt.reply(sys().methodConfigInvalid);
+      return false;
+    }
+    const result = await conversation.external(() =>
+      verifyTgApiUnlockCode(
+        gateDeps,
+        check.apiConfig,
+        { userId, username: from.username ?? null, code },
+        {
+          onNetworkRetry: async () => {
+            await evt.reply(sys().networkRetry);
+          },
+        },
+      ),
+    );
+    if (!result.ok) {
+      await evt.reply(
+        result.networkError
+          ? `${result.message}${result.detail ? `\n原因：${result.detail}` : ""}\n${sys().unlockNetworkRetry}`
+          : result.message,
+      );
+      return false;
+    }
+    const persisted = await conversation.external(() =>
+      persistTgApiUnlock(gateDeps, userId, from.username ?? null, "captcha"),
+    );
+    if (!persisted) {
+      await evt.reply(sys().unlockPersistFail);
+      return false;
+    }
+    return true;
+  };
+
   const runGateStep = async (entry: FlowCtx): Promise<StepResult> => {
+    await entry.reply(texts().unlockPrompt, { reply_markup: gateMarkup });
     if (cfg.unlockMode === "captcha") {
-      // 唯一门禁消息（v2.2.2：不再叠加「请在下方的输入框进行输入」输入提示）
-      await entry.reply(texts().unlockPrompt);
       while (true) {
         const evt = await conversation.wait();
         lang = langOf(evt);
         if (isRestart(evt)) return "restart";
+        if (evt.callbackQuery?.data === TGAPI_GATE_CALLBACK) {
+          await evt.answerCallbackQuery().catch(() => undefined);
+          // 点击验证按钮 → 输码提示（下一条文本即验证码）
+          await evt.reply(texts().unlockCodePrompt);
+          continue;
+        }
         const code = evt.msg?.text?.trim() ?? "";
-        if (!code) continue;
-        const check = await conversation.external(() => checkTgApiGateMethod(gateDeps));
-        if (check.kind === "method-missing") {
-          await evt.reply(sys().methodMissing);
+        if (!code) {
+          // 非文本更新（联系人/图片等）：重发输码提示
+          await evt.reply(texts().unlockCodePrompt);
           continue;
         }
-        if (check.kind === "method-unavailable") {
-          await evt.reply(sys().methodUnavailable);
-          continue;
-        }
-        if (check.kind === "method-config-invalid") {
-          await evt.reply(sys().methodConfigInvalid);
-          continue;
-        }
-        const result = await conversation.external(() =>
-          verifyTgApiUnlockCode(
-            gateDeps,
-            check.apiConfig,
-            { userId, username: from.username ?? null, code },
-            {
-              onNetworkRetry: async () => {
-                await evt.reply(sys().networkRetry);
-              },
-            },
-          ),
-        );
-        if (!result.ok) {
-          await evt.reply(
-            result.networkError
-              ? `${result.message}${result.detail ? `\n原因：${result.detail}` : ""}\n${sys().unlockNetworkRetry}`
-              : result.message,
-          );
-          continue;
-        }
-        const persisted = await conversation.external(() =>
-          persistTgApiUnlock(gateDeps, userId, from.username ?? null, "captcha"),
-        );
-        if (!persisted) {
-          await evt.reply(sys().unlockPersistFail);
-          continue;
-        }
-        return "done";
+        // 宽松通道：任意文本直接作为解锁验证码核验（与内嵌按钮模式一致）
+        if (await attemptCaptchaUnlock(evt, code)) return "done";
       }
     }
-    // stars 模式：发票在对话内发送，支付回调由对话受理（pre_checkout 必须应答）
+    // stars 模式：点击按钮 → 发票在对话内发送，支付回调由对话受理（pre_checkout 必须应答）
     while (true) {
-      const sent = await conversation.external(() => sendTgApiStarsInvoice(gateDeps, ctx.api, chatId));
-      if (sent === "not-configured") {
-        // 金额未配置：绝不放行也绝不解锁（等待 /start 重入或管理员补配置）
-        await ctx.reply(sys().starsNotConfigured);
-        while (true) {
-          const evt = await conversation.wait();
-          lang = langOf(evt);
-          if (isRestart(evt)) return "restart";
-          await evt.reply(sys().starsNotConfigured);
-        }
+      const evt = await conversation.wait();
+      lang = langOf(evt);
+      if (isRestart(evt)) return "restart";
+      if (evt.callbackQuery?.data !== TGAPI_GATE_CALLBACK) {
+        // 未点击验证按钮：重发门禁消息（stars 解锁以按钮进入发票支付为唯一入口）
+        await evt.reply(texts().unlockPrompt, { reply_markup: gateMarkup });
+        continue;
       }
-      await ctx.reply(sys().starsInvoiceHint(String(cfg.starsAmount ?? 0)));
+      await evt.answerCallbackQuery().catch(() => undefined);
       while (true) {
-        const evt = await conversation.wait();
-        lang = langOf(evt);
-        if (evt.preCheckoutQuery) {
-          if (evt.preCheckoutQuery.invoice_payload === `tgapi_unlock:${botId}`) {
-            await evt.answerPreCheckoutQuery(true);
-          } else {
-            await evt.answerPreCheckoutQuery(false, { error_message: "无效的支付请求" });
+        const sent = await conversation.external(() => sendTgApiStarsInvoice(gateDeps, ctx.api, chatId));
+        if (sent === "not-configured") {
+          // 金额未配置：绝不放行也绝不解锁（等待 /start 重入或管理员补配置）
+          await ctx.reply(sys().starsNotConfigured);
+          while (true) {
+            const idle = await conversation.wait();
+            lang = langOf(idle);
+            if (isRestart(idle)) return "restart";
+            await idle.reply(sys().starsNotConfigured);
           }
-          continue;
         }
-        if (evt.message?.successful_payment) {
-          const persisted = await conversation.external(() =>
-            persistTgApiUnlock(gateDeps, userId, from.username ?? null, "stars"),
-          );
-          if (!persisted) {
-            await evt.reply(sys().unlockPersistFail);
+        await ctx.reply(sys().starsInvoiceHint(String(cfg.starsAmount ?? 0)));
+        while (true) {
+          const pay = await conversation.wait();
+          lang = langOf(pay);
+          if (pay.preCheckoutQuery) {
+            if (pay.preCheckoutQuery.invoice_payload === `tgapi_unlock:${botId}`) {
+              await pay.answerPreCheckoutQuery(true);
+            } else {
+              await pay.answerPreCheckoutQuery(false, { error_message: "无效的支付请求" });
+            }
             continue;
           }
-          return "done";
+          if (pay.message?.successful_payment) {
+            const persisted = await conversation.external(() =>
+              persistTgApiUnlock(gateDeps, userId, from.username ?? null, "stars"),
+            );
+            if (!persisted) {
+              await pay.reply(sys().unlockPersistFail);
+              continue;
+            }
+            return "done";
+          }
+          if (isRestart(pay)) return "restart";
+          await pay.reply(sys().starsInvoicePending);
         }
-        if (isRestart(evt)) return "restart";
-        await evt.reply(sys().starsInvoicePending);
       }
     }
   };
@@ -381,9 +454,11 @@ async function tgapiMainFlow(
     }
 
     // 2. APP 参数：键盘预配置 > 管理端默认；平台未预配置 → 随机选一（对应原 random.choice）
-    const prefTitle = (await conversation.external(() => ctx.session.tgapiPrefTitle))?.trim() ?? "";
-    const prefDesc = (await conversation.external(() => ctx.session.tgapiPrefDesc))?.trim() ?? "";
-    const prefPlatform = await conversation.external(() => ctx.session.tgapiPlatform);
+    const prefTitle =
+      ((await conversation.external((outside) => outside.session.tgapiPrefTitle)) ?? "").trim();
+    const prefDesc =
+      ((await conversation.external((outside) => outside.session.tgapiPrefDesc)) ?? "").trim();
+    const prefPlatform = await conversation.external((outside) => outside.session.tgapiPlatform);
     const appTitle = prefTitle || cfg.appTitle;
     const appDescription = prefDesc || cfg.appDescription;
     const platformPool = cfg.appPlatforms.length > 0 ? cfg.appPlatforms : [...TGAPI_APP_PLATFORMS];
@@ -429,12 +504,15 @@ async function tgapiMainFlow(
 
     // 4. 登录码（单独验证码或从固定信息中提取）→ 登录 → 抓取/创建 APP → 结果
     while (true) {
-      const randomHash = await conversation.external(() => requestTgCodeGetRandomHashSafe(phone));
-      if (randomHash === null) {
-        await ctx.reply(sys().requestLoginCodeFail("请求失败，请稍后重试"));
+      const sentCode = await conversation.external(() => requestTgCodeGetRandomHashSafe(phone));
+      if (!sentCode.ok) {
+        // 详细失败状态（v2.2.5）：被风控限制 24h / 手机号无效 / 网络失败等原因随提示下发，
+        // 并随主键盘重新显示（用户可直接重试其它功能）
+        await ctx.reply(sys().requestLoginCodeFail(sentCode.error));
         await sendMenu(ctx);
         return "done";
       }
+      const randomHash = sentCode.hash;
       await ctx.reply(texts().afterRecvdCode, {
         parse_mode: "HTML",
         reply_markup: { keyboard: [[]], remove_keyboard: true },
@@ -545,11 +623,28 @@ async function tgapiMainFlow(
   // ---------------------------------------------------------------------------
   // 主循环：主键盘 → 动作分发（门禁中间件步 → 功能执行）
   // ---------------------------------------------------------------------------
-  const fromStart = ctx.session.tgapiFlowEntry === "start";
-  ctx.session.tgapiFlowEntry = undefined;
+  // v2.2.6 修复：对话体内 ctx 是 conversations 插件重建的裸 Context（无 session），
+  // 直接读 ctx.session 首次进入即崩（实测「部署后机器人全场景静默」第二根因）。
+  // 官方规则：对话体内必须经 conversation.external((outside) => ...) 访问外层会话。
+  const fromStart =
+    (await conversation.external((outside) => outside.session.tgapiFlowEntry)) === "start";
+  await conversation.external((outside) => {
+    outside.session.tgapiFlowEntry = undefined;
+  });
   let showMenu = fromStart;
 
   outer: while (true) {
+    // —— 入口门禁（v2.2.7 核心）：门禁已配置且未验证 → 消息+内嵌按钮 → 验证 → 调起键盘 ——
+    if (
+      isTgApiGateConfigured(cfg) &&
+      !(await conversation.external(() => getTgApiUnlock(botId, userId)))
+    ) {
+      const gate = await runGateStep(ctx);
+      if (gate === "restart") continue outer; // /start 重入：未解锁仍先过门禁
+      // 验证通过：调起自定义键盘（“通过后调起自定义键盘”）
+      showMenu = true;
+    }
+
     // —— 主键盘消息 ——
     if (showMenu) {
       await sendMenu(ctx);
@@ -628,7 +723,9 @@ async function tgapiMainFlow(
         case "platform": {
           const value = action?.tgapi_value ?? "";
           if (value && isValidTgApiPlatformValue(value)) {
-            ctx.session.tgapiPlatform = value;
+            await conversation.external((outside) => {
+              outside.session.tgapiPlatform = value;
+            });
             const label = TGAPI_PLATFORM_LABELS[value] ?? value;
             await replyTemplate(evt, action?.tgapi_success, texts().platformSet, {
               platform: label,
@@ -637,7 +734,7 @@ async function tgapiMainFlow(
           }
           // 入口按钮：切换到平台键盘（每行 2 个共 8 个平台按钮 + 返回）
           const backLabel = lang === "zh" ? "← 返回主键盘" : "← Back";
-          const current = await conversation.external(() => ctx.session.tgapiPlatform);
+          const current = await conversation.external((outside) => outside.session.tgapiPlatform);
           await evt.reply(texts().askPlatform, {
             reply_markup: platformKeyboard(TGAPI_PLATFORM_LABELS, backLabel, current ?? undefined),
           });
@@ -661,7 +758,9 @@ async function tgapiMainFlow(
               await pick.reply(texts().unknownInputHint);
               continue;
             }
-            ctx.session.tgapiPlatform = matched[0];
+            await conversation.external((outside) => {
+              outside.session.tgapiPlatform = matched[0];
+            });
             // 单条消息：设置确认随主键盘一并重新显示（平台键盘为 one_time，选中后关闭）
             await pick.reply(
               renderMenuTemplate(texts().platformSet, {
@@ -676,7 +775,9 @@ async function tgapiMainFlow(
         }
         case "language": {
           const next: TgApiLang = lang === "zh" ? "en" : "zh";
-          ctx.session.tgapiLang = next;
+          await conversation.external((outside) => {
+            outside.session.tgapiLang = next;
+          });
           lang = next;
           await evt.reply(TGAPI_SYSTEM_TEXTS[next].languageHelp(next));
           break;
@@ -711,7 +812,9 @@ async function tgapiMainFlow(
               await input.reply(sys().titleInvalid);
               continue;
             }
-            ctx.session.tgapiPrefTitle = value;
+            await conversation.external((outside) => {
+              outside.session.tgapiPrefTitle = value;
+            });
             await replyTemplate(input, action?.tgapi_success, texts().titleSet, { title: value });
             settled = true;
           }
@@ -739,7 +842,9 @@ async function tgapiMainFlow(
               await input.reply(sys().descriptionInvalid);
               continue;
             }
-            ctx.session.tgapiPrefDesc = value;
+            await conversation.external((outside) => {
+              outside.session.tgapiPrefDesc = value;
+            });
             await replyTemplate(input, action?.tgapi_success, texts().descriptionSet, {
               description: value,
             });
@@ -759,12 +864,15 @@ async function tgapiMainFlow(
 // 外部调用安全包装（conversation.external 内执行；错误统一转 brief 摘要）
 // ---------------------------------------------------------------------------
 
-async function requestTgCodeGetRandomHashSafe(phone: string): Promise<string | null> {
+async function requestTgCodeGetRandomHashSafe(
+  phone: string,
+): Promise<{ ok: true; hash: string } | { ok: false; error: string }> {
   try {
-    return await requestTgCodeGetRandomHash(phone);
+    return { ok: true, hash: await requestTgCodeGetRandomHash(phone) };
   } catch (error) {
+    // v2.2.5：详细状态透传（风控 24h / 手机号无效 / 网络错误等用户可读原因），不再泛化为「请求失败」
     console.error(`TGAPI conversation send_password failed:`, error);
-    return null;
+    return { ok: false, error: briefError(error) };
   }
 }
 

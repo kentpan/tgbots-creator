@@ -2,6 +2,7 @@ import { getCachedAppSettings } from "@/database/operations";
 import {
   DEFAULT_GLOBAL_PRIVACY,
   DEFAULT_GLOBAL_TRANSPORT,
+  DEFAULT_WEBHOOK_ROUTE,
   PRIVACY_SETTING_KEY,
   TRANSPORT_SETTING_KEYS,
   WEBHOOK_ALLOWED_UPDATES,
@@ -11,16 +12,20 @@ import {
   normalizeGlobalTransport,
   resolveEffectivePrivacy,
   resolveEffectiveTransportWithFallback,
+  sanitizeWebhookRoute,
   type EffectiveTransport,
   type GlobalTransportMode,
   type PrivacySetting,
 } from "@/lib/telegram/runtime-mode";
+import { logApi } from "@/lib/api-log";
 import { parseBotProfile, parseBotPrivacyMode } from "@/bot/multi-runtime";
 
 /** 运行时全局配置（app_settings 读取） */
 export interface TelegramRuntimeSettings {
   transportMode: GlobalTransportMode;
   webhookBaseUrl: string;
+  /** v2.2.5：Webhook 回调路由（默认 /api/telegram/webhook，系统设置可配置） */
+  webhookRoute: string;
   privacyEnabled: boolean;
 }
 
@@ -31,6 +36,7 @@ export async function getTelegramRuntimeSettings(): Promise<TelegramRuntimeSetti
   return {
     transportMode: normalizeGlobalTransport(stored[TRANSPORT_SETTING_KEYS.mode] || undefined),
     webhookBaseUrl: (stored[TRANSPORT_SETTING_KEYS.webhookBaseUrl] ?? "").trim(),
+    webhookRoute: sanitizeWebhookRoute(stored[TRANSPORT_SETTING_KEYS.webhookRoute]) || DEFAULT_WEBHOOK_ROUTE,
     privacyEnabled:
       stored[PRIVACY_SETTING_KEY] === undefined
         ? DEFAULT_GLOBAL_PRIVACY
@@ -67,7 +73,10 @@ export function resolveBotRuntime(
   return {
     mode,
     privacy,
-    webhookUrl: mode === "webhook" && global.webhookBaseUrl ? botWebhookUrl(global.webhookBaseUrl, botId) : null,
+    webhookUrl:
+      mode === "webhook" && global.webhookBaseUrl
+        ? botWebhookUrl(global.webhookBaseUrl, botId, global.webhookRoute)
+        : null,
   };
 }
 
@@ -123,7 +132,7 @@ export async function probeRemoteWebhook(token: string): Promise<RemoteWebhookPr
  * 是否存在线上消费者）时调用方必须跳过删除，绝不允许盲删掐断线上事件流。
  */
 export async function applyBotTransport(
-  params: { token: string; botId: string },
+  params: { token: string; botId: string; webhookRoute?: string },
   mode: EffectiveTransport,
   webhookBaseUrl: string,
   options: { deleteWebhook?: boolean } = {},
@@ -131,11 +140,13 @@ export async function applyBotTransport(
   const { botByToken, withTelegramTimeout } = await import("@/services/telegram-sync");
   try {
     const bot = botByToken(params.token);
+    // botInfo 仅在 init 后可读（grammY 未初始化时 getter 会抛错），日志标签安全取值
+    const botLabel = bot.isInited() ? bot.botInfo.username ?? null : null;
     if (mode === "webhook") {
       if (!webhookBaseUrl) {
         return { ok: false, error: "未配置 Webhook Base URL（系统设置 → 传输模式）" };
       }
-      const url = botWebhookUrl(webhookBaseUrl, params.botId);
+      const url = botWebhookUrl(webhookBaseUrl, params.botId, params.webhookRoute);
       const secret = botWebhookSecret(params.botId, params.token);
       await withTelegramTimeout(
         bot.api.setWebhook(url, {
@@ -144,17 +155,57 @@ export async function applyBotTransport(
           drop_pending_updates: false,
         }),
       );
+      // v2.2.5 部署日志：setWebhook 传参与结果（密钥值不落库）
+      logApi({
+        category: "deploy",
+        botId: params.botId,
+        botLabel,
+        method: "setWebhook",
+        ok: true,
+        requestPayload: JSON.stringify({ url, allowed_updates: WEBHOOK_ALLOWED_UPDATES, drop_pending_updates: false }),
+        responseBody: JSON.stringify(true),
+        durationMs: 0,
+      });
       return { ok: true, url };
     }
     if (options.deleteWebhook === false) {
       // 探测失败（无法判定远程消费者）的保护路径：不碰任何 Webhook；
       // 若线上确有 Webhook，本地轮询会被 Telegram 409 拒绝并自动让位
+      logApi({
+        category: "deploy",
+        botId: params.botId,
+        botLabel,
+        method: "deleteWebhook",
+        ok: true,
+        requestPayload: JSON.stringify({ skipped: "远程消费者探测失败，保护性跳过删除" }),
+        durationMs: 0,
+      });
       return { ok: true };
     }
     await withTelegramTimeout(bot.api.deleteWebhook({ drop_pending_updates: false }));
+    logApi({
+      category: "deploy",
+      botId: params.botId,
+      botLabel: bot.botInfo.username ?? null,
+      method: "deleteWebhook",
+      ok: true,
+      requestPayload: JSON.stringify({ drop_pending_updates: false }),
+      responseBody: JSON.stringify(true),
+      durationMs: 0,
+    });
     return { ok: true };
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    const message = error instanceof Error ? error.message : String(error);
+    logApi({
+      category: "deploy",
+      botId: params.botId,
+      method: mode === "webhook" ? "setWebhook" : "deleteWebhook",
+      ok: false,
+      error: message,
+      requestPayload: JSON.stringify({ mode, webhookBaseUrl: webhookBaseUrl || null }),
+      durationMs: 0,
+    });
+    return { ok: false, error: message };
   }
 }
 

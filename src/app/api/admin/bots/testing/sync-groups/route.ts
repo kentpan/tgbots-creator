@@ -6,7 +6,8 @@ import { fetchRealGroups } from "@/services/telegram-sync";
 import { registerTelegramChat } from "@/services/chat-registry";
 
 /**
- * 同步真实群组：通过 bot token 调用 Telegram getMe + getUpdates，
+ * 同步真实群组：通过 bot token 调用 Telegram getMe + getChat/getChatMember
+ * （数据库关联群组逐一实时校验；v2.2.6 起不再调用 getUpdates —— 与 Webhook 互斥），
  * 拉取机器人真实所在的群组（真实 chat_id / 群名）并登记到群组配置。
  * 已存在的群组只刷新群名，绝不覆盖已有验证配置（见 chat-registry）。
  */
@@ -63,7 +64,7 @@ export async function POST(request: Request): Promise<NextResponse> {
   await logOperation(admin, {
     action: "同步真实群组",
     target: bot.name,
-    detail: `getUpdates 发现 ${synced.length} 个真实群组（新增 ${synced.filter((item) => item.is_new).length} 个）`,
+    detail: `发现 ${synced.length} 个真实群组（新增 ${synced.filter((item) => item.is_new).length} 个）`,
     headers: requestHeaders,
   });
 

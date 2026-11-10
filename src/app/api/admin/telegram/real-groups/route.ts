@@ -13,8 +13,9 @@ import { registerTelegramChat } from "@/services/chat-registry";
  *
  * GET  ?bot_id=X → 只读数据库已登记群组（group_bot_admins 关联 + group_settings 群名），
  *                   不发起任何 Telegram 请求；页面/弹窗打开时用本接口即时展示现有数据。
- * POST { bot_id } → 手动同步：fetchRealGroups 三源合并
- *                   （getUpdates + 数据库关联 + getChat/getChatMember 验证），
+ * POST { bot_id } → 手动同步：fetchRealGroups 两源合并
+ *                   （数据库关联 + getChat/getChatMember 实时验证；v2.2.6 起
+ *                   不再调用 getUpdates —— 与 Webhook 严格互斥会破坏线上推送），
  *                   并把验证通过的群组登记到 chat-registry（不覆盖已有验证配置）；
  *                   经 Telegram 确认失效的群组（群不存在 / 机器人已 left/kicked）
  *                   会移除 group_bot_admins 关联行（网络错误/超时不删，防误删）。

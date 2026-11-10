@@ -35,6 +35,7 @@ import {
   type MenuNode,
 } from "@/services/menu-config";
 import { saveBotMenuAction } from "./actions";
+import { SubmitButton } from "@/components/admin/submit-button";
 
 /**
  * 机器人管理页「消息内嵌按钮」弹窗（v2.1.16）：
@@ -349,22 +350,22 @@ export function MenuDesignerDialog({
                 </option>
               ))}
             </datalist>
-            <button
-              type="submit"
-              onClick={() => setSyncChatId("")}
+            <SubmitButton
               className="inline-flex h-10 items-center rounded-md border px-4 text-sm font-medium hover:bg-accent"
+              pendingLabel="保存中…"
+              onClick={() => setSyncChatId("")}
             >
               保存配置
-            </button>
-            <button
-              type="submit"
+            </SubmitButton>
+            <SubmitButton
+              className="inline-flex h-10 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+              pendingLabel="同步中…"
               onClick={() => {
                 if (!syncChatId.trim()) setSyncChatId(groups[0]?.chatId ?? "");
               }}
-              className="inline-flex h-10 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
             >
               保存并同步到群组
-            </button>
+            </SubmitButton>
           </div>
         </form>
       </DialogContent>

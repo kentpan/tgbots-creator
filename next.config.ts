@@ -22,10 +22,11 @@ const isPagesBuild =
 
 const nextConfig: NextConfig = {
   ...(isPagesBuild ? {} : { output: "standalone" }),
+  // 彻底关闭 dev 模式左下角的 Next.js 指示器 logo（用户要求：页面左下角不出现任何 logo）
+  devIndicators: false,
   // 放行任意 Host/Origin（Next 16 无 allowedHosts 字段；等价实现：
   // "**.*" 通配任意 ≥2 段的域名 —— allowedDevOrigins（dev 资源/跨站校验）
   // 与 serverActions.allowedOrigins（server action POST 校验）共用同一匹配器）
-  allowedHosts: true,
   allowedDevOrigins: ["**.*", "localhost", "127.0.0.1"],
   // 构建时把 package.json 的 version 注入前后端通用的环境变量
   env: {

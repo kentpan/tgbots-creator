@@ -86,8 +86,10 @@ const MENUS: {
   { title: "系统设置", path: "/admin/settings", icon: "⚙️", sort: 9, permission: "settings:view" },
   { title: "AI 配置", path: "/admin/ai", icon: "🧠", sort: 10, permission: "ai:view" },
   { title: "操作日志", path: "/admin/logs", icon: "📜", sort: 11, permission: "logs:view" },
+  // v2.2.5：API 日志（Webhook / TGAPI 申请 / 一键部署 / Bot API 调用全流程日志 + 图表看板）
+  { title: "API 日志", path: "/admin/api-logs", icon: "📡", sort: 12, permission: "logs:view" },
   // v2.2.3：备份管理（表数据导出 / 定时备份 / 备份列表 下载·导入·删除）
-  { title: "备份管理", path: "/admin/backup", icon: "💾", sort: 12, permission: "settings:view" },
+  { title: "备份管理", path: "/admin/backup", icon: "💾", sort: 13, permission: "settings:view" },
 ];
 
 async function ensureMigrations(): Promise<void> {

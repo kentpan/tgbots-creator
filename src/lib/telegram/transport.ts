@@ -46,6 +46,17 @@
  * - 失败告警按条目 60s 限流，杜绝轮询场景的日志刷屏；诊断 attempts 增加 via
  *   （命中的代理条目名）。
  *
+ * v2.2.5 代理开关门禁 + 统一日志：
+ * - .env 的 PROXY_ENABLED=true/false 是全站唯一外层总开关（Node 环境）：
+ *   必须 PROXY_ENABLED==="true" 且系统设置中的代理开关同时开启才全局走代理；
+ *   edge（Cloudflare Pages/Workers）无 .env 文件，仅认系统设置中的开关。
+ * - 代理鉴权头可配置：系统设置 telegram.proxy_header_name（默认 Authorization）
+ *   + telegram.proxy_apikey（如 "Bearer abc123"）；未配置 apikey 时沿用代理地址
+ *   内嵌 userinfo 的 Basic 鉴权（历史行为不变）。
+ * - 所有 api.telegram.org 出站请求（grammY client.fetch / tgRawCall / globalThis
+ *   补丁，唯一入口都是 telegramProxyFetch）统一记录 bot-api 日志（api_logs 表，
+ *   传参 + 返回原始数据；getUpdates 长轮询噪音不入库），见 lib/api-log.ts。
+ *
  * 接入方式：
  * - grammY：telegramBotClientOptions() 已注入 client.fetch（grammY 在 Node 下默认用
  *   node-fetch，不经过 globalThis.fetch，必须显式注入）
@@ -54,6 +65,8 @@
  *   覆盖遗漏的裸 fetch 调用；instrumentation 启动时装载）
  */
 import type { ApiClientOptions } from "grammy";
+
+import { logApi, serializeLogRequestBody } from "@/lib/api-log";
 
 const DEFAULT_API_ROOT = "https://api.telegram.org";
 
@@ -65,6 +78,10 @@ export const TELEGRAM_PROXY_SETTING_KEYS = {
   enabled: "telegram.proxy_enabled",
   url: "telegram.proxy_url",
   entries: "telegram.proxy_entries",
+  /** v2.2.5：代理鉴权头名称（默认 Authorization） */
+  headerName: "telegram.proxy_header_name",
+  /** v2.2.5：代理鉴权头值（如 "Bearer abc123"；空 = 用代理地址内嵌 userinfo 的 Basic 鉴权） */
+  apikey: "telegram.proxy_apikey",
 } as const;
 
 export function telegramUpstreamRoot(): string {
@@ -103,6 +120,9 @@ interface ProxyCandidate {
 interface TelegramProxyState {
   enabled: boolean;
   url: string;
+  /** v2.2.5: 代理鉴权头名称（默认 Authorization）与头值（空 = URL 内嵌凭据 Basic） */
+  headerName: string;
+  apikey: string;
   /** v2.1.0: telegram.proxy_entries 全量条目（回退链数据源） */
   entries: ProxyCandidate[];
   loadedAt: number;
@@ -124,8 +144,10 @@ function proxyState(): TelegramProxyState {
   if (!globalForTransport.tguardTelegramProxy) {
     // 默认：Node 环境开启代理并使用内置代理地址
     globalForTransport.tguardTelegramProxy = {
-      enabled: true,
+      enabled: false, // v2.2.5：真实开关由 ensureTelegramProxyConfig 按 .env + 系统设置双重门禁判定
       url: DEFAULT_TELEGRAM_PROXY_URL,
+      headerName: "Authorization",
+      apikey: "",
       entries: [],
       loadedAt: 0,
       proxyCursor: 0,
@@ -150,6 +172,15 @@ function isNodeRuntime(): boolean {
 const PROXY_CONFIG_TTL_MS = 15000;
 let proxyRefreshInFlight: Promise<void> | null = null;
 
+/**
+ * v2.2.5 全局唯一外层总开关（Node）：.env 的 PROXY_ENABLED。
+ * 必须 === "true" 才允许代理生效（还需系统设置代理开关同时开启）；
+ * edge 环境无 .env 文件，不适用本门禁（仅认系统设置开关）。
+ */
+export function proxyEnvGateEnabled(): boolean {
+  return process.env.PROXY_ENABLED === "true";
+}
+
 /** 从系统设置刷新代理配置（15s 节流 + 并发去重；DB 不可用时保持默认/上次值）。
  *  v2.0.4：edge 也允许读取 —— edge 直连失败后的代理回退通道需要同一份配置；
  *  DB 读取失败时保持默认值（内置代理），不影响直连主路径 */
@@ -160,12 +191,19 @@ export async function ensureTelegramProxyConfig(): Promise<void> {
   proxyRefreshInFlight = (async () => {
     try {
       const { getAppSetting } = await import("@/database/operations");
-      const [enabledRaw, urlRaw, entriesRaw] = await Promise.all([
+      const [enabledRaw, urlRaw, entriesRaw, headerNameRaw, apikeyRaw] = await Promise.all([
         getAppSetting(TELEGRAM_PROXY_SETTING_KEYS.enabled),
         getAppSetting(TELEGRAM_PROXY_SETTING_KEYS.url),
         getAppSetting(TELEGRAM_PROXY_SETTING_KEYS.entries),
+        getAppSetting(TELEGRAM_PROXY_SETTING_KEYS.headerName),
+        getAppSetting(TELEGRAM_PROXY_SETTING_KEYS.apikey),
       ]);
-      current.enabled = enabledRaw !== "false"; // 未设置时默认开启
+      const settingEnabled = enabledRaw !== "false"; // 系统设置开关（缺省开启）
+      // v2.2.5 双重门禁：Node = .env PROXY_ENABLED 且系统设置开关同时开启；
+      // edge（无 .env）= 仅认系统设置开关
+      current.enabled = isNodeRuntime() ? settingEnabled && proxyEnvGateEnabled() : settingEnabled;
+      current.headerName = headerNameRaw?.trim() || "Authorization";
+      current.apikey = apikeyRaw ?? "";
       const selectedUrl = urlRaw?.trim() ?? "";
       current.entries = parseProxyEntries(entriesRaw);
       // 用户改选条目时重置粘性游标，从新选中条目重新开始
@@ -252,6 +290,21 @@ function orderedProxyCandidates(config: TelegramProxyState): ProxyCandidate[] {
   return list;
 }
 
+/**
+ * v2.2.5 代理鉴权头集合：apikey 已配置 → 注入「headerName: apikey」（默认
+ * Authorization: Bearer xxx，同名校验覆盖 Basic）；未配置 apikey → 沿用代理地址
+ * 内嵌 userinfo 的 Basic 鉴权（历史行为不变）。
+ */
+function proxyAuthHeaders(parts: { authHeader: string | null }): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (parts.authHeader) headers.Authorization = parts.authHeader;
+  const config = proxyState();
+  if (config.apikey.trim() !== "") {
+    headers[config.headerName || "Authorization"] = config.apikey;
+  }
+  return headers;
+}
+
 /** 同一原因的告警 60s 内只输出一次（轮询场景防刷屏） */
 const WARN_RATE_LIMIT_MS = 60_000;
 function warnRateLimited(key: string, message: string): void {
@@ -308,6 +361,75 @@ export function splitProxyAuth(prefix: string): { cleanPrefix: string; authHeade
 /** 是否发往上游 Bot API 的请求（/bot<token>/<method> 或 /file/bot<token>/...） */
 function isBotApiPath(pathname: string): boolean {
   return /^\/(file\/)?bot[^/]+\/[A-Za-z0-9_]+/.test(pathname);
+}
+
+/** 解析请求目标 href（string / URL / Request 三形态；解析失败返回 null） */
+function requestHrefOf(input: RequestInfo | URL): string | null {
+  try {
+    return typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  } catch {
+    return null;
+  }
+}
+
+/** 是否发往上游 Bot API 的请求（日志/代理改写共用判定） */
+function isUpstreamBotApiRequest(input: RequestInfo | URL): boolean {
+  const href = requestHrefOf(input);
+  if (!href) return false;
+  try {
+    const target = new URL(href);
+    const upstream = new URL(telegramUpstreamRoot());
+    return target.origin === upstream.origin && isBotApiPath(target.pathname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * v2.2.5 bot-api 统一日志：出站 api.telegram.org 调用的传参 + 返回原始数据
+ * （api_logs 表 bot-api 类别）。getUpdates 长轮询每秒一次绝不入库。
+ * fire-and-forget：内部所有异常吞掉（日志绝不影响主流程）。
+ */
+async function logBotApiOutcome(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  outcome: { response?: Response; error?: unknown },
+  elapsedMs: number,
+): Promise<void> {
+  try {
+    const href = requestHrefOf(input);
+    if (!href || !isUpstreamBotApiRequest(input)) return;
+    const method = /\/bot[^/]+\/([A-Za-z0-9_]+)/.exec(new URL(href).pathname)?.[1] ?? "";
+    if (!method || method === "getUpdates") return;
+    let requestPayload = serializeLogRequestBody(init?.body);
+    if (!requestPayload && typeof input === "object" && !(input instanceof URL)) {
+      try {
+        requestPayload = await (input as Request).clone().text();
+      } catch {
+        /* 已消费/流失败：请求体缺失不影响日志 */
+      }
+    }
+    let statusCode: number | null = null;
+    let responseBody: string | null = null;
+    let ok = false;
+    let error: string | null = null;
+    if (outcome.response) {
+      statusCode = outcome.response.status;
+      ok = outcome.response.ok;
+      try {
+        const text = await outcome.response.clone().text();
+        responseBody = text;
+        if (text.startsWith('{"ok":false')) ok = false; // Telegram API 层失败（HTTP 200 包裹）
+      } catch {
+        /* 二进制/流读取失败：响应原文缺失不影响日志 */
+      }
+    } else {
+      error = outboundErrorMessage(outcome.error);
+    }
+    logApi({ category: "bot-api", method, ok, statusCode, requestPayload, responseBody, error, durationMs: elapsedMs });
+  } catch {
+    /* 日志绝不影响主流程 */
+  }
 }
 
 /**
@@ -482,7 +604,9 @@ async function edgeTelegramFetch(
     const rewrite = await resolveEdgeProxyRewrite(input);
     if (rewrite) {
       const headers = new Headers(sanitized.headers ?? undefined);
-      if (rewrite.authHeader) headers.set("Authorization", rewrite.authHeader);
+      for (const [headerName, headerValue] of Object.entries(rewrite.headers)) {
+        headers.set(headerName, headerValue);
+      }
       return await attempt("proxy", rewrite.url, { ...sanitized, headers });
     }
   } catch (proxyError) {
@@ -519,7 +643,7 @@ function buildEdgeSanitizedInit(input: RequestInfo | URL, init: RequestInit | un
 /** edge 代理回退地址解析：仅上游 Bot API 请求且系统设置开启代理时返回改写地址 */
 async function resolveEdgeProxyRewrite(
   input: RequestInfo | URL,
-): Promise<{ url: string; authHeader: string | null } | null> {
+): Promise<{ url: string; headers: Record<string, string> } | null> {
   let href: string;
   try {
     href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -544,7 +668,7 @@ async function resolveEdgeProxyRewrite(
   if (!parts) return null;
   return {
     url: applyProxyPrefix(parts.cleanPrefix, telegramUpstreamRoot()) + target.pathname + target.search,
-    authHeader: parts.authHeader,
+    headers: proxyAuthHeaders(parts),
   };
 }
 
@@ -556,7 +680,19 @@ export function telegramProxyFetch(): typeof fetch {
   const proxyFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     // v2.0.4：edge/workerd 出站 —— init 白名单重建 + 直连→代理→直连重试回退链
     // （直连恒为默认与首选；代理仅作直连网络层失败后的救命通道）
-    if (!isNodeRuntime()) return edgeTelegramFetch(input, init);
+    if (!isNodeRuntime()) {
+      // v2.2.5：上游 Bot API 请求统一记录 bot-api 日志（传参 + 返回原始数据），其余透传不记
+      if (!isUpstreamBotApiRequest(input)) return edgeTelegramFetch(input, init);
+      const edgeStartedAt = Date.now();
+      try {
+        const response = await edgeTelegramFetch(input, init);
+        void logBotApiOutcome(input, init, { response }, Date.now() - edgeStartedAt);
+        return response;
+      } catch (error) {
+        void logBotApiOutcome(input, init, { error }, Date.now() - edgeStartedAt);
+        throw error;
+      }
+    }
     // 解析请求 URL（支持 string / URL / Request 三种形态）
     let href: string;
     try {
@@ -582,18 +718,73 @@ export function telegramProxyFetch(): typeof fetch {
       return underlying()(input as Request, init);
     }
 
+    // v2.2.5：代理候选链/直连回退主体抽出为 nodeUpstreamTelegramFetch，
+    // 出站结果统一记录 bot-api 日志（传参 + 返回原始数据）
+    const upstreamStartedAt = Date.now();
+    try {
+      const response = await nodeUpstreamTelegramFetch(input, init, target);
+      void logBotApiOutcome(input, init, { response }, Date.now() - upstreamStartedAt);
+      return response;
+    } catch (error) {
+      void logBotApiOutcome(input, init, { error }, Date.now() - upstreamStartedAt);
+      throw error;
+    }
+  };
+  return proxyFetch as typeof fetch;
+}
+
+/**
+ * Node 出站上游 Bot API 请求主体（v2.2.5 自 telegramProxyFetch 原样抽出，
+ * 代理候选链 → 直连回退语义不变）。
+ */
+async function nodeUpstreamTelegramFetch(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  target: URL,
+): Promise<Response> {
+  {
     await ensureTelegramProxyConfig();
     const config = proxyState();
 
-    // v2.1.0 多代理回退链：选中条目优先，其余代理条目依次兜底，全部失败才直连回退
-    const candidates = orderedProxyCandidates(config);
-    if (candidates.length === 0) {
-      return underlying()(input as Request, init);
-    }
+    // 出站方法名提取：getUpdates 长轮询给更宽超时（下方两处共用）
+    const method = /\/bot[^/]+\/([A-Za-z0-9_]+)/.exec(target.pathname)?.[1] ?? "";
+    const isLongPoll = method === "getUpdates";
 
     const aborted =
       init?.signal?.aborted === true ||
       (typeof input === "object" && !(input instanceof URL) && input.signal?.aborted === true);
+
+    // v2.2.5 修复：无代理候选（代理显式关闭）≠ 免超时 —— 此前该分支裸 fetch 直连，
+    // 被墙/网络不可达环境会挂到 undici 分钟级超时：bot.stop() 保存 offset 的
+    // getUpdates、webhook 实例停止的 deleteWebhook 全部挂起 → 管理端删除/停用
+    // 动作被拖到 3 分钟后网关 502（2026-11-10 删除 TGAPI 机器人 #5 事故根因）。
+    // 直连出站与「直连回退」同款分级超时（长轮询 20s / 其余 8s），调用方 signal 照常联动。
+    const candidates = orderedProxyCandidates(config);
+    if (candidates.length === 0) {
+      if (aborted) return underlying()(input as Request, init);
+      const directTimeoutMs = isLongPoll ? 20000 : 8000;
+      const directController = new AbortController();
+      const directTimer = setTimeout(
+        () => directController.abort(new Error(`直连出站超时（${directTimeoutMs / 1000}s）`)),
+        directTimeoutMs,
+      );
+      if (typeof directTimer === "object" && directTimer && "unref" in directTimer) {
+        (directTimer as { unref: () => void }).unref();
+      }
+      const sourceSignal = toNativeSignal(init?.signal);
+      if (sourceSignal) {
+        if (sourceSignal.aborted) directController.abort(sourceSignal.reason);
+        else
+          sourceSignal.addEventListener("abort", () => directController.abort(sourceSignal.reason), {
+            once: true,
+          });
+      }
+      try {
+        return await underlying()(input as Request, { ...(init ?? {}), signal: directController.signal });
+      } finally {
+        clearTimeout(directTimer);
+      }
+    }
 
     // v2.0.4 出站诊断：整条失败链（各代理条目→直连）逐次记录，附到最终抛出的错误
     const diagStartedAt = Date.now();
@@ -612,14 +803,12 @@ export function telegramProxyFetch(): typeof fetch {
     // v1.2.0：实测前缀代理网关延迟波动极大（5~13.5s），原 12s 上限会误杀
     // 「慢但成功」的网关调用 → 重试+直连回退整条失败链，管理端保存拖到 15s+；
     // 放宽到 20s 后单次尝试可覆盖绝大多数网关请求
-    const method = /\/bot[^/]+\/([A-Za-z0-9_]+)/.exec(target.pathname)?.[1] ?? "";
-    const isLongPoll = method === "getUpdates";
     const attemptTimeoutMs = isLongPoll ? 35000 : 20000;
 
     /** 单候选调用：一次尝试；allowRetry 时网络层失败用全新连接重试一次 */
     const callViaProxy = async (
       finalUrl: string,
-      authHeader: string | null,
+      authHeaders: Record<string, string>,
       allowRetry: boolean,
     ): Promise<Response> => {
       const attemptOnce = async (): Promise<Response> => {
@@ -645,7 +834,9 @@ export function telegramProxyFetch(): typeof fetch {
             // Request 形态：拆出字段重建（undici 同样校验 Request 内的 signal）
             const req = input as Request;
             const initHeaders = new Headers(init?.headers ?? req.headers);
-            if (authHeader) initHeaders.set("Authorization", authHeader);
+            for (const [headerName, headerValue] of Object.entries(authHeaders)) {
+              initHeaders.set(headerName, headerValue);
+            }
             const reqMethod = init?.method ?? req.method;
             const body = init?.body ?? (reqMethod !== "GET" && reqMethod !== "HEAD" ? req.body : undefined);
             return await underlying()(finalUrl, {
@@ -660,7 +851,9 @@ export function telegramProxyFetch(): typeof fetch {
             });
           }
           const headers = new Headers(init?.headers ?? undefined);
-          if (authHeader) headers.set("Authorization", authHeader);
+          for (const [headerName, headerValue] of Object.entries(authHeaders)) {
+            headers.set(headerName, headerValue);
+          }
           return await underlying()(finalUrl, {
             ...(init ?? {}),
             headers,
@@ -699,7 +892,7 @@ export function telegramProxyFetch(): typeof fetch {
       const finalUrl =
         applyProxyPrefix(parts.cleanPrefix, telegramUpstreamRoot()) + target.pathname + target.search;
       try {
-        const response = await callViaProxy(finalUrl, parts.authHeader, offset === 0);
+        const response = await callViaProxy(finalUrl, proxyAuthHeaders(parts), offset === 0);
         // v2.1.0 响应可用性校验：3xx 重定向页 / HTML 错误页视为该条目失败
         // （上游 Bot API /bot 调用恒返回 JSON；部署站旧版无 tg-proxy 路由时会
         // 308→404 HTML —— 不能把这种「成功」响应丢给 grammY 解析）
@@ -775,8 +968,7 @@ export function telegramProxyFetch(): typeof fetch {
     } finally {
       clearTimeout(fallbackTimer);
     }
-  };
-  return proxyFetch as typeof fetch;
+  }
 }
 
 /**
@@ -788,7 +980,7 @@ export function installTelegramProxyFetch(): void {
   globalForPatch.tguardProxyFetchInstalled = true;
   const proxyFetch = telegramProxyFetch();
   globalThis.fetch = proxyFetch;
-  console.log("[telegram-proxy] globalThis.fetch 补丁已装载（Node 出站代理，默认开启）");
+  console.log("[telegram-proxy] globalThis.fetch 补丁已装载（Node 出站代理，按 .env PROXY_ENABLED + 系统设置开关双重门禁）");
 }
 
 export const TELEGRAM_REQUEST_TIMEOUT_MS = 20000;

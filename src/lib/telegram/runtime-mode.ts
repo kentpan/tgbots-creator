@@ -30,6 +30,8 @@ export type PrivacySetting = "inherit" | "on" | "off";
 export const TRANSPORT_SETTING_KEYS = {
   mode: "telegram.transport_mode",
   webhookBaseUrl: "telegram.webhook_base_url",
+  /** v2.2.5：Webhook 回调路由（默认 /api/telegram/webhook；注册到 Telegram 的 URL = baseUrl + route + /<botId>） */
+  webhookRoute: "telegram.webhook_route",
 } as const;
 
 export const PRIVACY_SETTING_KEY = "bot.privacy_mode";
@@ -106,14 +108,31 @@ export function resolveEffectivePrivacy(
   return globalEnabled;
 }
 
-/** per-bot Webhook 回调地址：<base>/api/telegram/webhook/<botId>（botId 为数字 id 或 "main"） */
-export function botWebhookPath(botId: string): string {
-  return `/api/telegram/webhook/${botId}`;
+/** per-bot Webhook 回调地址：<base><route>/<botId>（botId 为数字 id 或 "main"） */
+export const DEFAULT_WEBHOOK_ROUTE = "/api/telegram/webhook";
+
+/**
+ * v2.2.5 Webhook 路由规整：空 → 默认 /api/telegram/webhook；无前导斜杠自动补齐；
+ * 去尾部斜杠与内部空白。仅用于拼注册 URL（反向代理场景可自定义外部路径）。
+ */
+export function sanitizeWebhookRoute(raw: string | undefined | null): string {
+  const trimmed = (raw ?? "").trim().replace(/\/+$/, "");
+  if (!trimmed) return DEFAULT_WEBHOOK_ROUTE;
+  return withSlashGuard(trimmed);
 }
 
-export function botWebhookUrl(baseUrl: string, botId: string): string {
+function withSlashGuard(route: string): string {
+  const withSlash = (route.startsWith("/") ? route : `/${route}`).replace(/\s+/g, "");
+  return withSlash || DEFAULT_WEBHOOK_ROUTE;
+}
+
+export function botWebhookPath(botId: string, route: string = DEFAULT_WEBHOOK_ROUTE): string {
+  return `${sanitizeWebhookRoute(route)}/${botId}`;
+}
+
+export function botWebhookUrl(baseUrl: string, botId: string, route: string = DEFAULT_WEBHOOK_ROUTE): string {
   const trimmed = baseUrl.trim().replace(/\/+$/, "");
-  return `${trimmed}${botWebhookPath(botId)}`;
+  return `${trimmed}${botWebhookPath(botId, route)}`;
 }
 
 /** per-bot Webhook 密钥（确定性派生，A-Za-z0-9，1-256 字符，Telegram 校验头 x-telegram-bot-api-secret-token） */

@@ -25,6 +25,7 @@ import {
   type TgApiUnlockMode,
 } from "@/services/tgapi-config";
 import { parseCustomKeyboardConfig } from "@/services/custom-keyboard";
+import { tgApiInterfaceMode } from "@/services/tgapi-config";
 
 function tgapiPath(params: Record<string, string>): string {
   const query = new URLSearchParams(params).toString();
@@ -50,8 +51,10 @@ function parsePlatforms(formData: FormData): string[] {
  * 组装 tgapi 配置段（表单 → bots.config JSON 的 tgapi 字段）。
  * v2.1.7：文案覆盖按语言（text_zh_* / text_en_*）提交，留空 = 清除该条覆盖、
  * 使用内置双语文案；ask_app_details 开启时申请人可自定义 APP 名称/描述。
+ * v2.2.6 解耦：interfaceMode（表单 kb_mode checkbox 单选）承载生效模式，
+ * customKeyboard 仅是可附加属性（保存/切换/清空语义见 saveTgApiBotAction）。
  */
-function buildTgApiConfig(formData: FormData): TgApiBotConfig {
+function buildTgApiConfig(formData: FormData, previousTgapi?: Record<string, unknown>): TgApiBotConfig {
   const unlockModeRaw = String(formData.get("unlock_mode") ?? "captcha").trim();
   const unlockMode: TgApiUnlockMode = unlockModeRaw === "stars" ? "stars" : "captcha";
 
@@ -85,8 +88,20 @@ function buildTgApiConfig(formData: FormData): TgApiBotConfig {
   const zhTexts = buildLangTexts("zh");
   const enTexts = buildLangTexts("en");
 
+  // v2.2.6 生效模式（checkbox 单选）：inline=消息内嵌按钮 / keyboard=自定义键盘。
+  // 保存并部署后才对运行实例生效；缺省（未提交）时按旧数据推断（旧语义兼容）。
+  const kbModeRaw = String(formData.get("kb_mode") ?? "").trim();
+  const interfaceMode =
+    kbModeRaw === "keyboard" || kbModeRaw === "inline"
+      ? kbModeRaw
+      : tgApiInterfaceMode({
+          interfaceMode: undefined,
+          customKeyboard: parseCustomKeyboardConfig(previousTgapi?.customKeyboard) ?? undefined,
+        });
+
   return {
     enabled: true,
+    interfaceMode,
     unlockMode,
     verificationMethodId:
       unlockMode === "captcha" && methodRaw ? Number(methodRaw) : undefined,
@@ -115,7 +130,6 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
   const name = String(formData.get("name") ?? "").trim();
   const token = String(formData.get("token") ?? "").trim();
   const enabled = formData.get("enabled") === "1";
-
   if (!name) redirect(tgapiPath({ error: "name-required" }));
   const isEdit = Boolean(idRaw && /^\d+$/.test(idRaw));
   if (token && !/^\d{6,}:[\w-]{30,}$/.test(token)) {
@@ -130,7 +144,31 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
 
   // 编辑时保留档案弹窗维护的其他字段（菜单/插件/AI 等），仅覆写 tgapi 段
   const profile = parseBotProfile(existing?.config ?? "{}");
-  profile.tgapi = buildTgApiConfig(formData);
+  const previousTgapi = (profile.tgapi ?? {}) as Record<string, unknown>;
+  profile.tgapi = buildTgApiConfig(formData, previousTgapi);
+
+  // v2.2.6 自定义键盘可附加属性（统一表单 hidden 字段 custom_keyboard 随 kb_mode 提交）：
+  // - 非空 = 解析并保存（或更新）tgapi.customKeyboard —— 勾选内嵌按钮模式时配置同样保留，
+  //   仅生效模式切回 inline（不再像旧版那样整体覆盖 tgapi 段丢失键盘配置）；
+  // - 空串 = 管理员显式清空键盘配置（原「保存空键盘回到内嵌按钮模式」语义）；
+  // - 字段缺失 = 旧调用方/非统一表单，不触碰已有配置（与门禁字段同语义）。
+  const nextTgapi = profile.tgapi as unknown as Record<string, unknown>;
+  const keyboardRaw = String(formData.get("custom_keyboard") ?? "").trim();
+  if (formData.has("custom_keyboard")) {
+    if (keyboardRaw) {
+      let source: unknown;
+      try {
+        source = JSON.parse(keyboardRaw);
+      } catch {
+        redirect(tgapiPath({ error: "invalid-keyboard" }));
+      }
+      const parsedKeyboard = parseCustomKeyboardConfig(source);
+      if (!parsedKeyboard) redirect(tgapiPath({ error: "invalid-keyboard" }));
+      nextTgapi.customKeyboard = parsedKeyboard;
+    } else {
+      delete nextTgapi.customKeyboard;
+    }
+  }
   const configJson = JSON.stringify(profile);
 
   // v2.1.16：内嵌按钮配置随弹窗一并保存（bots.menu_config，含 tgapiDesigner 标记）——

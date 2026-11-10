@@ -9,6 +9,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { SubmitButton } from "@/components/admin/submit-button";
 
 export function FormDialog({
   trigger,
@@ -80,13 +81,12 @@ export function FormDialog({
             >
               取消
             </button>
-            <button
-              type="submit"
-              disabled={pending}
-              className="inline-flex h-10 items-center rounded-md bg-primary px-6 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-60"
+            <SubmitButton
+              className="inline-flex h-10 items-center rounded-md bg-primary px-6 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+              pendingLabel="提交中…"
             >
-              {pending ? "提交中…" : submitLabel}
-            </button>
+              {submitLabel}
+            </SubmitButton>
           </div>
         </form>
       </DialogContent>

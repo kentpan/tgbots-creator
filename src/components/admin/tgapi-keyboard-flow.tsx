@@ -27,12 +27,14 @@ import {
 } from "@/services/tgapi-flow-text";
 
 /**
- * TGAPI 自定义键盘对话流程仿真（v2.2.2）：
+ * TGAPI 自定义键盘对话流程仿真（v2.2.2；v2.2.7 入口门禁同步）：
  *
  * 与运行端 bot/handlers/tgapi-conversation.ts（@grammyjs/conversations）逐段对应的
  * 客户端状态机 —— 保证「部署后在 APP 中的展现界面和交互逻辑跟仿真屏完全一致」：
  *
- *   /start → 主键盘消息（键盘在输入框下方；无全局门禁拦截）
+ *   /start → 【入口门禁】门禁已配置且未验证：固定的可配置信息内容（unlockPrompt）
+ *            + 内嵌按钮（gateButton）→ 点击按钮 → 输码提示（unlockCodePrompt）
+ *            → 外部 API 真实核验 → 通过后调起主键盘
  *          → 点击键盘按钮（= 发送文本）→ 动作分发
  *            【通用门禁中间件步】按钮声明 tgapi_unlock 且未解锁 → 门禁
  *           （captcha=输码真实外部核验 / stars=发票+支付；配置缺失绝不放行）
@@ -40,10 +42,10 @@ import {
  *            → my.telegram.org 抓取/创建（APP 参数 = 预配置 > 默认，平台随机）→ 结果
  *          → 🗂 我的API / 📱 设置平台 / ✅ 语言 / 🆘 帮助 / 🎫 客服支持 /
  *            ✏️ 设置Title / 📝 设置Description
- *          → 任意阶段 /start 重入（重发主键盘消息）
+ *          → 任意阶段 /start 重入（未解锁仍先过门禁）
  *
- * v2.2.2 与运行端同步变更：/skip 移除；门禁唯一提示（无输入提示）；解锁后直接
- * 进入下一步（无单独成功消息）；设置类确认/结果收尾随主键盘一并重新显示。
+ * v2.2.7 与运行端同步变更：门禁升级为入口门禁（门禁已配置即启用）；门禁消息
+ * 新增内嵌按钮（仿真以系统提示模拟点击）；/start 重入未解锁仍先过门禁。
  *
  * 文案与流程分派全部复用运行端同一来源：resolveTgApiTexts / TGAPI_SYSTEM_TEXTS /
  * 按钮槽位（tgapi_response/success/fail）/ buildAppResultHTML / extractTgWebLoginCode /
@@ -53,6 +55,12 @@ import {
  * 渲染态（语言/平台/键盘模式）用 state；流程态（stage/unlocked/收集值）用 ref —— 仅在
  * 事件回调与定时器中读写（react-hooks/refs 合规），不参与渲染。
  */
+
+/** 门禁是否启用（与运行端 isTgApiGateConfigured 同一规则；该模块含服务端依赖不可导入客户端） */
+function gateConfigured(cfg: TgApiBotConfig): boolean {
+  if (cfg.unlockMode === "captcha") return Boolean(cfg.verificationMethodId);
+  return (cfg.starsAmount ?? 0) >= 1;
+}
 
 /** TGAPI 固定指令 → 功能名映射（与运行端 COMMAND_FUNC_MAP 一致；/skip 已移除） */
 const COMMAND_FUNC_MAP: Record<string, string> = {
@@ -186,10 +194,12 @@ export function TgApiKeyboardFlowSim({
 
   // ---------------------------------------------------------------------------
   // 门禁（tgapi-gate 通用组件仿真形态：captcha 输码 / stars 支付；配置缺失绝不放行）
+  // v2.2.7：门禁消息 = 固定的可配置信息内容（unlockPrompt）+ 内嵌按钮（gateButton）；
+  // 仿真无法点击真实内嵌按钮，以系统提示模拟点击 → 点击后进入输码提示/发票支付。
   // ---------------------------------------------------------------------------
 
-  /** 门禁入口：locked → 发唯一门禁提示（v2.2.2：无输入提示双发） */
-  const startGate = (func: string, action: MenuButtonAction | undefined): void => {
+  /** 门禁入口（per-button tgapi_unlock 续接或 /start 入口门禁）：发门禁消息+按钮 → 输码/发票 */
+  const startGate = (func: string | undefined, action: MenuButtonAction | undefined): void => {
     const flow = flowRef.current;
     flow.pendingFunc = func;
     flow.pendingAction = action;
@@ -197,6 +207,8 @@ export function TgApiKeyboardFlowSim({
       flow.stage = "gateCaptcha";
       setKbMode("none");
       append("bot", texts().unlockPrompt);
+      append("system", `（点击消息下方「${texts().gateButton}」按钮开始验证）`);
+      append("bot", texts().unlockCodePrompt);
       return;
     }
     const amount = cfg.starsAmount ?? 0;
@@ -208,6 +220,8 @@ export function TgApiKeyboardFlowSim({
     }
     flow.stage = "gateStars";
     setKbMode("none");
+    append("bot", texts().unlockPrompt);
+    append("system", `（点击消息下方「${texts().gateButton}」按钮开始验证）`);
     const title = (cfg.starsTitle?.trim() || "TGAPI 解锁").slice(0, 32);
     append(
       "bot",
@@ -222,18 +236,23 @@ export function TgApiKeyboardFlowSim({
     }, 1200);
   };
 
-  /** 门禁通过后续接按钮功能（通用门禁中间件步的续接；解锁一次永久有效） */
+  /** 门禁通过后续接（per-button = 执行按钮功能；入口门禁 = 调起自定义键盘） */
   const runAfterGate = (): void => {
     const flow = flowRef.current;
-    const func = flow.pendingFunc ?? "";
+    const func = flow.pendingFunc;
     const action = flow.pendingAction;
     flow.pendingFunc = undefined;
     flow.pendingAction = undefined;
     flow.stage = "menu";
-    dispatchFunc(func, action);
+    if (func) {
+      dispatchFunc(func, action);
+      return;
+    }
+    // 入口门禁通过 → 调起自定义键盘（与运行端 showMenu = true → sendMenu 一致）
+    sendMenu();
   };
 
-  /** /start 重入（对应运行端 restart：清创建中间态 → 主键盘） */
+  /** /start 重入（对应运行端 restart：清创建中间态 → 未解锁仍先过入口门禁 → 主键盘） */
   const restart = (): void => {
     const flow = flowRef.current;
     flow.phone = "";
@@ -242,13 +261,22 @@ export function TgApiKeyboardFlowSim({
     flow.pendingFunc = undefined;
     flow.pendingAction = undefined;
     flow.pendingPrefSuccess = undefined;
+    if (gateConfigured(cfg) && !flow.unlocked) {
+      startGate(undefined, undefined);
+      return;
+    }
     flow.stage = "menu";
     sendMenu();
   };
 
-  /** 对话入口（/start：主键盘；门禁在按钮分发层按需触发） */
+  /** 对话入口（/start：门禁已配置且未验证 → 先入口门禁；通过后调起主键盘） */
   const startConversation = (): void => {
-    flowRef.current.stage = "menu";
+    const flow = flowRef.current;
+    if (gateConfigured(cfg) && !flow.unlocked) {
+      startGate(undefined, undefined);
+      return;
+    }
+    flow.stage = "menu";
     sendMenu();
   };
 
@@ -427,7 +455,16 @@ export function TgApiKeyboardFlowSim({
       // 运行端走外部 API 真实核验；仿真：任意非空验证码通过（界面文案一致）
       flow.unlocked = true;
       flow.stage = "menu";
-      runAfterGate();
+      const func = flow.pendingFunc;
+      const action = flow.pendingAction;
+      flow.pendingFunc = undefined;
+      flow.pendingAction = undefined;
+      if (func) {
+        dispatchFunc(func, action);
+        return;
+      }
+      // 入口门禁通过 → 调起自定义键盘
+      sendMenu();
       return;
     }
     if (flow.stage === "gateStars") {
@@ -612,7 +649,7 @@ export function TgApiKeyboardFlowSim({
   useEffect(() => {
     simRef.current?.appendMessage("dm", {
       from: "system",
-      text: "私聊对话仿真（与部署后真实行为一致）：输入 /start 启动机器人 → 主键盘 → 按钮交互（门禁按按钮开关触发）",
+      text: "私聊对话仿真（与部署后真实行为一致）：输入 /start 启动机器人 → 门禁验证（已配置时）→ 主键盘 → 按钮交互",
     });
   }, []);
 

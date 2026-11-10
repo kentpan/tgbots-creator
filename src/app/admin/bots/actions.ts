@@ -284,23 +284,6 @@ export async function deleteBotAction(formData: FormData): Promise<void> {
   redirect(botPath({ saved: "deleted" }));
 }
 
-export async function testBotAction(formData: FormData): Promise<void> {
-  await requirePermission("bots:manage");
-  const idRaw = String(formData.get("id") ?? "").trim();
-  if (!idRaw || !/^\d+$/.test(idRaw)) redirect(botPath({ error: "invalid-id" }));
-  const bot = await getBot(BigInt(idRaw));
-  if (!bot) redirect(botPath({ error: "invalid-id" }));
-  try {
-    const me = await new Bot(bot.token, telegramBotClientOptions()).api.getMe();
-    await updateBotRecord(bot.id, { username: me.username });
-    revalidatePath("/admin/bots");
-    redirect(botPath({ test: "ok", message: `@${me.username}` }));
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    redirect(botPath({ test: "fail", message: detail.slice(0, 200) }));
-  }
-}
-
 export async function saveBotMenuAction(formData: FormData): Promise<void> {
   const admin = await requirePermission("bots:manage");
   const idRaw = String(formData.get("id") ?? "").trim();
@@ -424,55 +407,6 @@ export async function saveBotCustomKeyboardAction(formData: FormData): Promise<v
   });
   revalidatePath("/admin/bots");
   redirect(botPath({ saved: "keyboard" }));
-}
-
-export async function syncBotMenuAction(formData: FormData): Promise<void> {
-  const admin = await requirePermission("bots:manage");
-  const idRaw = String(formData.get("id") ?? "").trim();
-  const chatIdRaw = String(formData.get("chat_id") ?? "").trim();
-  if (!idRaw || !/^\d+$/.test(idRaw) || !chatIdRaw || !/^-?\d+$/.test(chatIdRaw)) {
-    redirect(botPath({ error: "invalid-id" }));
-  }
-  const bot = await getBot(BigInt(idRaw));
-  if (!bot) redirect(botPath({ error: "invalid-id" }));
-  const parsed = parseBotMenuConfig(bot.menuConfig);
-  const validation = validateMenuConfig(parsed);
-  if (!validation.ok) redirect(botPath({ error: "invalid-menu", message: validation.reason }));
-  const handle = await acquireMenuBot(bot.id);
-  if (!handle) redirect(botPath({ error: "invalid-id" }));
-  try {
-    // v1.1.1：官方 menu.render(ctx) 渲染普通 InlineKeyboardMarkup 直发 + 同步后登记群组链接
-    const result = await sendMenuMessage(handle.bot.api, Number(chatIdRaw), parsed.content, {
-      replyMarkup: await renderMenuMarkup(parsed, handle.bot),
-      keyboardText: bot.menuText,
-    });
-    try {
-      await registerTelegramChat({
-        chatId: BigInt(chatIdRaw),
-        chatTitle: null,
-        botToken: bot.token,
-      });
-    } catch (error) {
-      console.error(`[bots] 菜单同步后登记群组 ${chatIdRaw} 失败:`, error);
-    }
-    if (bot.enabled) {
-      void restartMenuBot(bot.id).catch((error: unknown) => {
-        console.error(`[bots] 菜单同步后重启运行实例失败（#id ${bot.id}）:`, error);
-      });
-    }
-    const requestHeaders = await headers();
-    await logOperation(admin, {
-      action: "同步机器人消息内嵌按钮",
-      target: bot.name,
-      detail: `已发送到群组 ${chatIdRaw}（消息 #${result.messageId}）`,
-      headers: requestHeaders,
-    });
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    redirect(botPath({ sync: "fail", message: detail.slice(0, 200) }));
-  }
-  revalidatePath("/admin/bots");
-  redirect(botPath({ saved: "sync" }));
 }
 
 export async function setBotGroupAdminAction(formData: FormData): Promise<void> {

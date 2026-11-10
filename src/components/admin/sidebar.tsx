@@ -14,14 +14,22 @@ export interface SidebarMenuLink {
 }
 
 function NavLink({ item, active }: { item: SidebarMenuLink; active: boolean }) {
+  // v2.2.5：当前态菜单不可点击（render 为 span 而非 Link，aria-current 标注页面语义）
+  if (active) {
+    return (
+      <span
+        aria-current="page"
+        className="flex cursor-default items-center gap-3 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground"
+      >
+        <span className="w-5 text-center">{item.icon ?? "📄"}</span>
+        <span>{item.title}</span>
+      </span>
+    );
+  }
   return (
     <Link
       href={item.path || "/admin"}
-      className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
-        active
-          ? "bg-primary text-primary-foreground"
-          : "text-muted-foreground hover:bg-accent hover:text-foreground"
-      }`}
+      className="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
     >
       <span className="w-5 text-center">{item.icon ?? "📄"}</span>
       <span>{item.title}</span>

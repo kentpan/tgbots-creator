@@ -22,6 +22,7 @@ import {
   type BotRow,
 } from "@/database/operations";
 import { tgRawCall } from "@/lib/telegram/transport";
+import { logApi } from "@/lib/api-log";
 import { withTelegramTimeout } from "@/services/telegram-sync";
 import { getTelegramRuntimeSettings, resolveBotRuntime } from "@/services/bot-transport";
 import {
@@ -50,45 +51,65 @@ export function truncateDeployMessage(message: string): string {
  * 唯一实现（v2.1.10 整合）：机器人管理页「🚀 部署」与 TGAPI 页「🚀 部署」共用。
  */
 export async function deployBotAndReport(botId: bigint, enabled: boolean): Promise<BotDeployOutcome> {
+  // v2.2.5 部署日志：动作起点（传参：botId/目标状态）
+  logApi({
+    category: "deploy",
+    botId: String(botId),
+    method: "deploy",
+    ok: true,
+    requestPayload: JSON.stringify({ botId: String(botId), enabled }),
+  });
+  const finish = (state: BotDeployOutcome["state"], message: string): BotDeployOutcome => {
+    logApi({
+      category: "deploy",
+      botId: String(botId),
+      method: "deploy",
+      ok: state === "ok" || state === "pending" || state === "stopped",
+      requestPayload: JSON.stringify({ botId: String(botId), enabled }),
+      responseBody: JSON.stringify({ state, message }),
+      error: state === "fail" ? message : null,
+    });
+    return { state, message };
+  };
   if (!enabled) {
-    return { state: "stopped", message: "机器人已停用，运行实例已停止" };
+    return finish("stopped", "机器人已停用，运行实例已停止");
   }
   try {
     await restartMenuBot(botId);
   } catch (error) {
     console.error(`[bot-deploy] 机器人 #${String(botId)} 部署（重启运行实例）失败:`, error);
-    return {
-      state: "fail",
-      message: truncateDeployMessage(error instanceof Error ? error.message : String(error)),
-    };
+    return finish(
+      "fail",
+      truncateDeployMessage(error instanceof Error ? error.message : String(error)),
+    );
   }
   await waitForMenuBotDeployConfirmation(botId, DEPLOY_CONFIRM_TIMEOUT_MS);
   const row = await getBot(botId);
   if (!row) {
-    return { state: "fail", message: "部署失败：机器人记录不存在" };
+    return finish("fail", "部署失败：机器人记录不存在");
   }
   const global = await getTelegramRuntimeSettings();
   const runtime = resolveBotRuntime(String(botId), row.config, global);
   const state = getMenuBotDeployState(botId);
   if (runtime.mode === "webhook") {
     if (state.transportOk === true) {
-      return { state: "ok", message: `部署成功：Webhook 已注册（${state.transportUrl ?? "回调地址已生效"}）` };
+      return finish("ok", `部署成功：Webhook 已注册（${state.transportUrl ?? "回调地址已生效"}）`);
     }
     if (state.transportOk === false) {
-      return { state: "fail", message: `部署失败：${truncateDeployMessage(state.transportError ?? "Webhook 注册失败")}` };
+      return finish("fail", `部署失败：${truncateDeployMessage(state.transportError ?? "Webhook 注册失败")}`);
     }
-    return { state: "pending", message: "部署确认中：Webhook 注册尚未返回，请稍后刷新本页查看部署状态" };
+    return finish("pending", "部署确认中：Webhook 注册尚未返回，请稍后刷新本页查看部署状态");
   }
   if (state.started) {
-    return { state: "ok", message: `部署成功：长轮询运行中（${state.transportUrl ?? "已连接 Telegram"}）` };
+    return finish("ok", `部署成功：长轮询运行中（${state.transportUrl ?? "已连接 Telegram"}）`);
   }
   if (!state.running) {
-    return {
-      state: "fail",
-      message: `部署失败：${truncateDeployMessage(state.startError ?? state.transportError ?? "轮询未启动，详见服务器日志")}`,
-    };
+    return finish(
+      "fail",
+      `部署失败：${truncateDeployMessage(state.startError ?? state.transportError ?? "轮询未启动，详见服务器日志")}`,
+    );
   }
-  return { state: "pending", message: "部署确认中：长轮询启动尚未确认，请稍后刷新本页查看部署状态" };
+  return finish("pending", "部署确认中：长轮询启动尚未确认，请稍后刷新本页查看部署状态");
 }
 
 /** 真实部署状态（webhook=Telegram 侧 getWebhookInfo 权威值；polling=本进程运行实例权威值） */

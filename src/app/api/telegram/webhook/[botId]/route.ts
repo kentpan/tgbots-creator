@@ -4,6 +4,7 @@ import { getBot, listEnabledBots } from "@/database/operations";
 import { config } from "@/config/settings";
 import { acquireMenuBot } from "@/bot/multi-runtime";
 import { botWebhookSecret } from "@/lib/telegram/runtime-mode";
+import { logWebhookRejected, logWebhookUpdate } from "@/lib/telegram/webhook-log";
 import type { BotRow } from "@/database/operations";
 
 /**
@@ -56,9 +57,11 @@ export async function POST(
 
   if (botId === "main") {
     if (!token) {
+      logWebhookRejected(botId, 404, "主机器人 Token 未配置");
       return NextResponse.json({ detail: "主机器人 Token 未配置" }, { status: 404 });
     }
     if (!secretMatches(botId, token)) {
+      logWebhookRejected(botId, 401, "Webhook 密钥校验失败");
       return NextResponse.json({ detail: "Webhook 密钥校验失败" }, { status: 401 });
     }
   } else if (/^\d+$/.test(botId)) {
@@ -82,13 +85,13 @@ export async function POST(
       }
     }
     if (!matchedRow) {
-      return NextResponse.json(
-        { detail: directRow ? "Webhook 密钥校验失败" : "机器人不存在或 Token 未配置" },
-        { status: directRow ? 401 : 404 },
-      );
+      const detail = directRow ? "Webhook 密钥校验失败" : "机器人不存在或 Token 未配置";
+      logWebhookRejected(botId, directRow ? 401 : 404, detail);
+      return NextResponse.json({ detail }, { status: directRow ? 401 : 404 });
     }
     token = matchedRow.token;
   } else {
+    logWebhookRejected(botId, 404, "机器人不存在或 Token 未配置");
     return NextResponse.json({ detail: "机器人不存在或 Token 未配置" }, { status: 404 });
   }
 
@@ -96,9 +99,12 @@ export async function POST(
   try {
     update = await request.json();
   } catch {
+    logWebhookRejected(botId, 422, "请求格式错误（非 JSON）");
     return NextResponse.json({ detail: "请求格式错误" }, { status: 422 });
   }
 
+  const startedAt = Date.now();
+  const botLabel = botId === "main" ? null : matchedRow?.username ?? matchedRow?.name ?? null;
   try {
     // grammY 官方 webhook 模式要求：handleUpdate 依赖 botInfo（如 @bot 定向指令匹配），
     // webhook 实例不经过 bot.start()，必须先 init()（幂等：已初始化则跳过 getMe）。
@@ -119,6 +125,7 @@ export async function POST(
       // 自愈/常规路径统一按真实行 id 取实例（自愈时真实 id ≠ 路径 id）
       const handle = await acquireMenuBot(matchedRow.id);
       if (!handle) {
+        logWebhookRejected(botId, 503, "机器人不可用（运行实例获取失败）");
         return NextResponse.json({ detail: "机器人不可用" }, { status: 503 });
       }
       if (!handle.bot.isInited()) await handle.bot.init();
@@ -126,7 +133,16 @@ export async function POST(
     }
   } catch (error) {
     console.error(`Error handling Telegram webhook update (bot=${botId}):`, error);
+    logWebhookUpdate({
+      botId,
+      botLabel,
+      update,
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - startedAt,
+    });
+    return NextResponse.json({ ok: true });
   }
-
+  logWebhookUpdate({ botId, botLabel, update, ok: true, durationMs: Date.now() - startedAt });
   return NextResponse.json({ ok: true });
 }

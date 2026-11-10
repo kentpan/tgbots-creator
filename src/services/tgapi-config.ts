@@ -48,8 +48,12 @@ export const TGAPI_APP_PLATFORMS = [
 export interface TgApiBotTexts {
   /** 主键盘菜单消息（/start 与各操作后附键盘重新显示的消息正文） */
   start: string;
-  /** 门禁提示（唯一门禁消息：force-reply 提问 / 对话流程等待输码，不再叠加输入提示） */
+  /** 门禁提示（唯一门禁消息：force-reply 提问 / 键盘模式随「授权认证」内嵌按钮发送，不再叠加输入提示） */
   unlockPrompt: string;
+  /** v2.2.7 键盘模式门禁：点击内嵌按钮后的输码提示（等待用户文本输入验证码） */
+  unlockCodePrompt: string;
+  /** v2.2.7 键盘模式门禁消息的内嵌按钮文案（点击后进入输码验证） */
+  gateButton: string;
   /** 手机号提示（request_contact 键盘随消息发送） */
   askPhone: string;
   /** 原 AFTER_RECVD_CODE_TEXT（登录码提示，随消息移除底部键盘） */
@@ -104,7 +108,9 @@ export const TGAPI_TEXTS_ZH: TgApiBotTexts = {
     "👇 请选择下面的方式之一：",
   ].join(""),
   unlockPrompt:
-    "🔒 本机器人仅对已解锁用户开放。\n\n首次使用请先解锁：请回复本消息并输入解锁验证码。",
+    "🔒 本机器人仅对已解锁用户开放。\n\n首次使用请先完成授权验证：点击下方按钮开始。",
+  unlockCodePrompt: "🔑 请输入解锁验证码完成验证：",
+  gateButton: "🔐 授权认证",
   askPhone:
     "📱 请发送你的 Telegram 手机号（国际格式，如 +8613800138000），或点击下方按钮授权共享\n\n任意阶段发送 /start 可重新开始",
   afterRecvdCode: [
@@ -152,7 +158,9 @@ export const TGAPI_TEXTS_EN: TgApiBotTexts = {
   ].join(""),
   unlockPrompt:
     "🔒 This bot is only available to unlocked users.\n\n" +
-    "First time here? Please unlock: reply to this message and send your unlock code.",
+    "First time here? Tap the button below to start authorization.",
+  unlockCodePrompt: "🔑 Please send your unlock code to complete verification:",
+  gateButton: "🔐 Authorize",
   askPhone:
     "📱 Please send your Telegram phone number in international format, e.g. +14155552671, or tap the button below to share it\n\n" +
     "/start at any stage to restart",
@@ -315,11 +323,26 @@ export interface TgApiBotConfig {
   /** 按语言文案覆盖（v2.1.7：texts.zh / texts.en；旧版扁平字符串键自动按 zh 迁移） */
   texts?: { zh?: Partial<TgApiBotTexts>; en?: Partial<TgApiBotTexts> };
   /**
-   * v2.2.0 自定义键盘（ReplyKeyboard 对话流程）：配置非空 = 启用 @grammyjs/conversations
-   * 驱动的自定义键盘工作流（主键盘 → 创建API（门禁 → 手机号 → 登录码 → 结果）等）；
-   * 此时消息内嵌按钮不再渲染（互斥条件）。
+   * v2.2.0 自定义键盘（ReplyKeyboard 对话流程）配置 —— 可附加属性，与生效模式解耦：
+   * 配置保留不清除，是否生效由 interfaceMode 决定（v2.2.6）。
    */
   customKeyboard?: CustomKeyboardConfig;
+  /**
+   * v2.2.6 生效模式（内嵌按钮 ⇄ 自定义键盘 checkbox 单选）：保存并部署后正式生效。
+   * 缺省（旧数据）时由 tgApiInterfaceMode() 按 customKeyboard 有无推断（旧语义兼容）。
+   */
+  interfaceMode?: "inline" | "keyboard";
+}
+
+/**
+ * TGAPI 界面生效模式全站唯一判断源（v2.2.6 解耦）：
+ * - 显式 interfaceMode 存在时以它为准（customKeyboard 配置仅是附加属性，可保留但不生效）；
+ * - 旧数据无 interfaceMode：按原语义 customKeyboard 非空 = 键盘模式，否则内嵌模式。
+ * 运行端（handlers/tgapi.ts）与管理端（设计弹窗生效标签）共用，不再各自判断。
+ */
+export function tgApiInterfaceMode(cfg: Pick<TgApiBotConfig, "interfaceMode" | "customKeyboard">): "inline" | "keyboard" {
+  if (cfg.interfaceMode === "inline" || cfg.interfaceMode === "keyboard") return cfg.interfaceMode;
+  return cfg.customKeyboard ? "keyboard" : "inline";
 }
 
 /**
@@ -364,6 +387,8 @@ function pickMigratedString(value: unknown): string | undefined {
 export const TGAPI_TEXT_FIELD_KEYS = [
   { name: "start", label: "主键盘菜单消息（/start 与各操作后重新显示）" },
   { name: "unlockPrompt", label: "门禁提示（唯一门禁消息）" },
+  { name: "unlockCodePrompt", label: "门禁输码提示（点击验证按钮后）" },
+  { name: "gateButton", label: "门禁验证按钮文案" },
   { name: "askPhone", label: "手机号提示" },
   { name: "afterRecvdCode", label: "登录码提示" },
   { name: "beforeSuccLogin", label: "提交进度提示" },
@@ -457,8 +482,11 @@ export function normalizeTgApiSection(tgapi: unknown): TgApiBotConfig {
       zh: pickTexts(zhSource),
       en: pickTexts(enSource),
     },
-    // v2.2.0 自定义键盘（配置非空 = 自定义键盘对话流程，与内嵌按钮互斥）
+    // v2.2.0 自定义键盘（可附加属性：配置保留与否由表单语义决定，不再承载生效开关）
     customKeyboard: parseCustomKeyboardConfig(cfg.customKeyboard) ?? undefined,
+    // v2.2.6 生效模式（显式值校验；旧数据 undefined → tgApiInterfaceMode 推断）
+    interfaceMode:
+      cfg.interfaceMode === "inline" || cfg.interfaceMode === "keyboard" ? cfg.interfaceMode : undefined,
   };
 }
 

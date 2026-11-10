@@ -14,7 +14,8 @@ import {
 
 /**
  * 机器人测试页与 Telegram 的真实同步通道：
- * - getUpdates 拉取 bot token 真实所在的群组（chat_id / 群名）
+ * - getMe 拉取机器人身份；群组发现靠数据库已关联群组 + getChat/getChatMember 实时验证
+ *   （v2.2.6 起不再调用 getUpdates —— 与 Webhook 严格互斥，会破坏线上事件推送）
  * - sendMessage 将仿真动作（验证提示 / 成功文案）真实发送到群组（「同步到群组」开关开启时）
  * - approveChatJoinRequest 真实批准加群申请
  *
@@ -246,8 +247,8 @@ export async function withTelegramTimeout<T>(promise: Promise<T>): Promise<T> {
 export interface RealChatInfo {
   chatId: string;
   chatTitle: string;
-  /** 发现来源：updates=getUpdates 新发现；getchat=已关联群组经 getChat+getChatMember 验证机器人仍在群内 */
-  source: "updates" | "getchat";
+  /** 发现来源：getchat=已关联群组经 getChat+getChatMember 验证机器人仍在群内 */
+  source: "getchat";
 }
 
 export interface RealGroupsResult {
@@ -265,84 +266,40 @@ export interface RealGroupsResult {
   unverifiedReasons: string[];
 }
 
-interface TgChat {
-  id: number;
-  type: string;
-  title?: string;
-  username?: string;
-}
-
-interface TgUpdate {
-  update_id: number;
-  message?: { chat: TgChat };
-  channel_post?: { chat: TgChat };
-  my_chat_member?: { chat: TgChat };
-  chat_join_request?: { chat: TgChat };
-  chat_member?: { chat: TgChat };
-}
-
 /**
- * 拉取 bot token 真实所在的群组（三源合并，v1.1.1）。
+ * 拉取 bot token 真实所在的群组（v2.2.6 起两源合并）。
  *
- * Telegram 不提供「列出全部会话」接口，单靠 getUpdates 只能看到最近未确认的更新
- * （常驻轮询会实时确认消费，导致管理端永远拉到空列表）。因此改为三源合并：
+ * v2.2.6 移除 getUpdates 源（2026-11-11「部署成功后机器人全场景静默」事故根因）：
+ * getUpdates 与 Webhook 在 Telegram 侧严格互斥 —— webhook 活跃时同步必先 409，
+ * 自愈需 deleteWebhook → getUpdates → setWebhook 恢复，而恢复调用只知道 Token、
+ * 不知道机器人行 id，无法重算 per-bot 回调密钥（botWebhookSecret(botId, token)），
+ * 注册上去的 Webhook 密钥被清空 → Telegram 推送全被 401 拒收；且该链路与部署动作
+ * 并发时存在删除/注册竞态。群组发现改由两源：
  *
- * 1. getUpdates：最近未确认更新（webhook/轮询冲突时自动自愈，读取不确认）
- * 2. 数据库已关联群组：group_bot_admins（仅限当前 Token 对应的机器人条目）
- * 3. getChat + getChatMember 逐一验证：确认机器人仍在群内并取回最新群名（不依赖更新队列,
- *    被轮询消费过的历史群组也能找回）；确认失效（Telegram 400 群不存在，或机器人
- *    成员身份为 left/kicked）的群组仅移除当前 Token 机器人的 group_bot_admins 关联行
- *    并归入 stale 提示；网络错误/超时/429 等不确定结果一律不删（防误删）
+ * 1. 数据库已关联群组：group_bot_admins（仅限当前 Token 对应的机器人条目；
+ *    运行实例收到群事件时由 chat-tracking → chat-registry 自动登记）
+ * 2. getChat + getChatMember 逐一验证：确认机器人仍在群内并取回最新群名；
+ *    确认失效（Telegram 400 群不存在，或机器人成员身份 left/kicked）的群组仅移除
+ *    当前 Token 机器人的 group_bot_admins 关联行并归入 stale 提示；
+ *    网络错误/超时/429 等不确定结果一律不删（防误删）
  *
  * v2.2.2 跨机器人误删修复：候选群组绝不含 group_settings 全表（那是全部机器人的群，
  * 用当前 Token 验证其他机器人的群必然 left），删除也只按 chat_id + 当前 Token 机器人
  * 集合精确删除——其他机器人对同一群组的关联不受本次同步影响。
- *
- * 机器人日常运行中收到群事件时仍会自动登记（chat-tracking → chat-registry）。
  */
 export async function fetchRealGroups(token: string): Promise<RealGroupsResult> {
   try {
     // v2.0.3：机器人 user id 直接取自 Token 前段（Telegram 官方格式 <bot_user_id>:<secret>），
-    // getMe（只为 username）不再阻塞 getChatMember；getMe 与 getUpdates 首轮并行发起，
-    // 总耗时从「getMe→getUpdates→2N 次逐群串行验证」降到两轮并行（约省 2/3+）
+    // getMe 只为 username/兜底 id
     const tokenBotId = Number(token.split(":")[0]);
     const tokenBotIdValid = Number.isSafeInteger(tokenBotId) && tokenBotId > 0;
 
-    const fetchUpdates = (): Promise<
-      { ok: true; updates: TgUpdate[] } | { ok: false; errorCode?: number; description: string }
-    > =>
-      tgRawCall<{
-        ok: boolean;
-        description?: string;
-        result?: TgUpdate[];
-        error_code?: number;
-      }>(token, "getUpdates", {
-        limit: 100,
-        // 注意：getUpdates 的 allowed_updates 会持久覆盖此前的声明（v1.1.3 修复）：
-        // 必须包含 callback_query，否则同步之后机器人内联按钮回调将收不到
-        allowed_updates: JSON.stringify([
-          "message",
-          "channel_post",
-          "callback_query",
-          "my_chat_member",
-          "chat_join_request",
-          "chat_member",
-        ]),
-      }).then((payload) =>
-        payload.ok
-          ? { ok: true, updates: payload.result ?? [] }
-          : { ok: false, errorCode: payload.error_code, description: payload.description ?? "网络错误" },
-      );
-
-    const [mePayload, firstUpdates] = await Promise.all([
-      tgRawCall<{
-        ok: boolean;
-        description?: string;
-        result?: { id?: number; username?: string };
-        error_code?: number;
-      }>(token, "getMe"),
-      fetchUpdates(),
-    ]);
+    const mePayload = await tgRawCall<{
+      ok: boolean;
+      description?: string;
+      result?: { id?: number; username?: string };
+      error_code?: number;
+    }>(token, "getMe");
     if (!mePayload.ok) {
       const description = mePayload.description ?? "网络错误";
       if (mePayload.error_code === 401) {
@@ -362,96 +319,12 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
     }
     const botUserId: number = tokenBotIdValid ? tokenBotId : Number(mePayload.result!.id);
 
-    let updatesResult = firstUpdates;
-    let webhookToRestore: { url: string; allowedUpdates?: string; maxConnections?: number } | null = null;
-    let runtimePaused = false;
-
-    if (!updatesResult.ok && updatesResult.errorCode === 409) {
-      const description = updatesResult.description;
-      if (/webhook/i.test(description)) {
-        // webhook 冲突：备份 → 删除 → 拉取 → 恢复
-        const info = await tgRawCall<{
-          ok: boolean;
-          result?: { url?: string; allowed_updates?: string[]; max_connections?: number };
-        }>(token, "getWebhookInfo");
-        const existing = info.ok ? info.result : undefined;
-        const webhookUrl = existing?.url ?? "";
-        if (webhookUrl) {
-          await tgRawCall<{ ok: boolean }>(token, "deleteWebhook", { drop_pending_updates: "false" });
-          webhookToRestore = {
-            url: webhookUrl,
-            allowedUpdates: existing?.allowed_updates?.length
-              ? JSON.stringify(existing.allowed_updates)
-              : undefined,
-            maxConnections: existing?.max_connections,
-          };
-        }
-      } else {
-        // 与本应用轮询实例冲突：暂停轮询 → 拉取 → 恢复
-        runtimePaused = true;
-        await pauseBotRuntimeForSync();
-      }
-      updatesResult = await fetchUpdates();
-
-      // 恢复现场（无论拉取成败都要恢复）
-      const restore = webhookToRestore;
-      if (restore) {
-        await tgRawCall<{ ok: boolean }>(token, "setWebhook", {
-          url: restore.url,
-          allowed_updates: restore.allowedUpdates,
-          max_connections: restore.maxConnections,
-        }).catch((error: unknown) => {
-          console.error(
-            `[telegram-sync] 同步后恢复 Webhook 失败（${restore.url}），机器人可能收不到推送:`,
-            error,
-          );
-        });
-      }
-      if (runtimePaused) {
-        await resumeBotRuntimeAfterSync();
-      }
-    }
-
-    if (!updatesResult.ok) {
-      const description = updatesResult.description;
-      if (updatesResult.errorCode === 401) {
-        return { ok: false, error: "Bot Token 无效或已被撤销（Telegram 401 Unauthorized）：请到 @BotFather → /mybots → API Token 查看当前 Token，若已撤销请重新生成并在此机器人配置中更新保存。", botUsername, chats: [], staleChatIds: [], unverifiedCount: 0, unverifiedReasons: [] };
-      }
-      if (updatesResult.errorCode === 409) {
-        return {
-          ok: false,
-          error:
-            "Telegram 返回 409：更新队列被其他消费者占用，稍后重试；机器人运行期间收到群事件时会自动登记真实群组。",
-          botUsername,
-          chats: [],
-          staleChatIds: [],
-          unverifiedCount: 0,
-          unverifiedReasons: [],
-        };
-      }
-      return { ok: false, error: `Telegram API 错误：${description}`, botUsername, chats: [], staleChatIds: [], unverifiedCount: 0, unverifiedReasons: [] };
-    }
-
-    const chats = new Map<number, RealChatInfo>();
-    const collect = (chat: TgChat | undefined): void => {
-      if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) return;
-      const title = chat.title?.trim();
-      if (!title) return;
-      chats.set(chat.id, { chatId: String(chat.id), chatTitle: title, source: "updates" });
-    };
-    for (const update of updatesResult.updates) {
-      collect(update.message?.chat);
-      collect(update.channel_post?.chat);
-      collect(update.my_chat_member?.chat);
-      collect(update.chat_join_request?.chat);
-      collect(update.chat_member?.chat);
-    }
-
     // 数据库已关联群组（仅限当前 Token 对应的机器人条目）→ getChat + getChatMember 逐一验证：
     // 机器人仍在群内则用 Telegram 返回的最新群名（真实数据优先）；
     // 确认失效（群不存在 / 成员身份 left/kicked）则移除关联行并标记 stale。
     // v2.2.2 修复：候选只收「当前 Token 机器人」的关联——群组校验身份是当前 Token，
     // 把其他机器人的群拉进来验证必然误判 left，再按 chat_id 全删就是跨机器人误删事故。
+    const chats = new Map<number, RealChatInfo>();
     const candidateIds = new Set<string>([...chats.keys()].map((id) => String(id)));
     const tokenBotIds = new Set<string>();
     try {
@@ -558,37 +431,5 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
     };
   } catch (error) {
     return { ok: false, error: describeSyncError(error), botUsername: null, chats: [], staleChatIds: [], unverifiedCount: 0, unverifiedReasons: [] };
-  }
-}
-
-/** 同步期间暂停本应用的轮询运行时（避免 getUpdates 双消费者 409） */
-async function pauseBotRuntimeForSync(): Promise<void> {
-  try {
-    const { stopBotRuntime } = await import("@/bot/runtime");
-    const { stopAllMenuBots } = await import("@/bot/multi-runtime");
-    await stopAllMenuBots().catch((error: unknown) => {
-      console.error("[telegram-sync] 同步前暂停 menu bots 失败:", error);
-    });
-    await stopBotRuntime().catch((error: unknown) => {
-      console.error("[telegram-sync] 同步前暂停主 bot 运行时失败:", error);
-    });
-  } catch (error) {
-    console.error("[telegram-sync] 加载运行时模块失败（getUpdates 可能遭遇 409 冲突）:", error);
-  }
-}
-
-/** 同步结束后恢复轮询运行时（失败必须暴露：否则机器人静默离线） */
-async function resumeBotRuntimeAfterSync(): Promise<void> {
-  try {
-    const { startBotRuntime } = await import("@/bot/runtime");
-    const { startMenuBots } = await import("@/bot/multi-runtime");
-    await startBotRuntime().catch((error: unknown) => {
-      console.error("[telegram-sync] 同步后恢复主 bot 运行时失败，机器人已离线:", error);
-    });
-    await startMenuBots().catch((error: unknown) => {
-      console.error("[telegram-sync] 同步后恢复 menu bots 失败，机器人已离线:", error);
-    });
-  } catch (error) {
-    console.error("[telegram-sync] 加载运行时模块失败，机器人未能恢复在线:", error);
   }
 }

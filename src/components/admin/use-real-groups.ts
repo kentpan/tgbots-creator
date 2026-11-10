@@ -13,7 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * - 打开页面/弹窗时只调 GET 读取数据库已登记群组（零 Telegram 请求），
  *   已有数据立即展示；没有数据就展示空态引导手动同步。
  * - 只有用户点击「同步真实群组」按钮才调 POST（sync）实时请求 Telegram
- *   （getUpdates + 数据库关联 + getChat 三源合并），绝不默认自动同步。
+ *   （数据库关联 + getChat 两源合并），绝不默认自动同步。
  * - enabled 选项（v2.0.2）：false 时不自动拉取（挂载即请求会造成列表页
  *   每行弹窗各发一次接口）—— 编辑弹窗等懒加载场景在弹窗真正打开后才置 true。
  */
@@ -21,8 +21,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 export interface RealGroup {
   chatId: string;
   chatTitle: string;
-  /** updates=getUpdates 新发现；getchat=已关联群组经 getChat 验证仍在群内；cache=数据库已登记（未实时校验） */
-  source: "updates" | "getchat" | "cache";
+  /** getchat=已关联群组经 getChat 验证仍在群内；cache=数据库已登记（未实时校验） */
+  source: "getchat" | "cache";
   /** 本次同步新登记（此前数据库中不存在） */
   isNew: boolean;
 }
@@ -49,8 +49,7 @@ function mapGroups(
   return (raw ?? []).map((group) => ({
     chatId: group.chat_id,
     chatTitle: group.chat_title,
-    source:
-      group.source === "updates" ? "updates" : group.source === "getchat" ? "getchat" : "cache",
+    source: group.source === "getchat" ? "getchat" : "cache",
     isNew: group.is_new === true,
   }));
 }

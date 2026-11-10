@@ -6,6 +6,8 @@ import { TgApiApplyWizard } from "@/components/admin/tgapi-apply-wizard";
 import { parseTgApiBotConfig } from "@/services/tgapi-config";
 import type { BotDeployCheck } from "@/services/bot-deploy";
 import { TgApiMenuKeyboardDialog } from "./bot-designer-dialog";
+import { SubmitButton } from "@/components/admin/submit-button";
+import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import {
   deleteTgApiBotAction,
   revokeTgApiUnlockAction,
@@ -305,22 +307,22 @@ export function TgApiPageClient({
                           <form action={toggleTgApiBotAction}>
                             <input type="hidden" name="id" value={bot.id} />
                             <input type="hidden" name="enable" value={bot.enabled ? "0" : "1"} />
-                            <button
-                              type="submit"
+                            <SubmitButton
                               className="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
+                              pendingLabel={bot.enabled ? "停用中…" : "启用中…"}
+                              title="启用即上线 / 停用即下线（真实部署结果回显到页面横幅）"
                             >
                               {bot.enabled ? "停用" : "启用"}
-                            </button>
+                            </SubmitButton>
                           </form>
-                          <form action={deleteTgApiBotAction}>
-                            <input type="hidden" name="id" value={bot.id} />
-                            <button
-                              type="submit"
-                              className="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
-                            >
-                              删除
-                            </button>
-                          </form>
+                          <ConfirmDialog
+                            title={`删除 TGAPI 申请机器人「${bot.name}」`}
+                            description={`确定要删除 TGAPI 申请机器人「${bot.name}」#ID ${bot.id} 吗？运行实例将停止且删除后不可恢复！`}
+                            action={deleteTgApiBotAction}
+                            fields={{ id: bot.id }}
+                            trigger="删除"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
+                          />
                         </div>
                       </td>
                     </tr>
@@ -374,16 +376,14 @@ export function TgApiPageClient({
                       </td>
                       <td className="px-4 py-3 text-sm text-muted-foreground">{unlock.time}</td>
                       <td className="px-4 py-3">
-                        <form action={revokeTgApiUnlockAction}>
-                          <input type="hidden" name="id" value={unlock.id} />
-                          <input type="hidden" name="bot_id" value={unlockPanel.botId} />
-                          <button
-                            type="submit"
-                            className="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
-                          >
-                            撤销解锁
-                          </button>
-                        </form>
+                        <ConfirmDialog
+                          title="撤销解锁状态"
+                          description={`确定撤销用户 ${unlock.username ? `@${unlock.username}` : `#${unlock.userId}`} 的解锁状态吗？撤销后该用户需重新通过门禁验证。`}
+                          action={revokeTgApiUnlockAction}
+                          fields={{ id: unlock.id, bot_id: unlockPanel.botId }}
+                          trigger="撤销解锁"
+                          triggerClassName="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
+                        />
                       </td>
                     </tr>
                   ))

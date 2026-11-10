@@ -10,7 +10,13 @@
  * 3. GET  /apps（带 Cookie）                      → 已有 APP：解析 app_id/api_hash/MTProto 服务器；
  *                                                   无 APP：解析创建表单的 hash（step_three.scarp_tg_existing_app）
  * 4. POST /apps/create {hash,app_title,...}       → 创建 APP（step_four.create_new_tg_app）
+ *
+ * v2.2.5 全流程日志：四个网络步骤全部落 api_logs 表（tgapi 类别）——
+ * 请求传参 + 返回结果原始数据 + HTTP 状态 + 耗时，成功/失败均记录
+ * （管理后台「API 日志」页可查完整链路）。
  */
+
+import { logApi } from "@/lib/api-log";
 
 /**
  * extract_code_imn_ges 增强版（extractTgWebLoginCode）已迁至 services/tgapi-flow-text.ts
@@ -20,49 +26,121 @@
 const MY_TELEGRAM_ORG_ORIGIN = "https://my.telegram.org";
 const REQUEST_TIMEOUT_MS = 30000;
 
+/**
+ * send_password 已知错误码 → 用户可读的详细状态（v2.2.5）：
+ * my.telegram.org 风控/参数错误以 JSON {"error": "PHONE_NUMBER_FLOOD"} 等形式返回，
+ * 此前直接抛「未返回 random_hash（响应：…）」，用户只能看到泛化的「请求失败，请稍后重试」。
+ */
+export function describeTgOrgSendCodeError(apiError: string): string {
+  const code = apiError.trim().toUpperCase();
+  if (code === "PHONE_NUMBER_FLOOD") {
+    return (
+      "该手机号被 Telegram 风控限制（PHONE_NUMBER_FLOOD）：短时间内请求登录码次数过多，" +
+      "约 24 小时后才能再次申请，请明日再试或更换手机号。"
+    );
+  }
+  if (code === "PHONE_NUMBER_INVALID") {
+    return "手机号无效（PHONE_NUMBER_INVALID）：请检查国际格式（如 +8613800138000）后重试。";
+  }
+  return apiError;
+}
+
 /** 请求 UA：原项目为 aiohttp 默认 UA；这里使用固定标识 UA（部分站点会拦截 Python UA） */
 const REQUEST_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 TGuardTGApiBot/2.1.8";
 
 /** step_one.request_tg_code_get_random_hash：请求发送 Telegram 登录码，返回 random_hash */
 export async function requestTgCodeGetRandomHash(inputPhone: string): Promise<string> {
-  const response = await fetch(`${MY_TELEGRAM_ORG_ORIGIN}/auth/send_password`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": REQUEST_UA,
-      Referer: `${MY_TELEGRAM_ORG_ORIGIN}/auth/login`,
-    },
-    body: new URLSearchParams({ phone: inputPhone }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`my.telegram.org send_password HTTP ${response.status}: ${text.slice(0, 200)}`);
-  }
-  let payload: unknown;
+  const startedAt = Date.now();
+  const requestPayload = JSON.stringify({ phone: inputPhone });
+  let statusCode: number | null = null;
+  let responseText = "";
   try {
-    payload = JSON.parse(text);
-  } catch {
-    throw new Error(`my.telegram.org send_password 响应不是 JSON：${text.slice(0, 200)}`);
+    const response = await fetch(`${MY_TELEGRAM_ORG_ORIGIN}/auth/send_password`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": REQUEST_UA,
+        Referer: `${MY_TELEGRAM_ORG_ORIGIN}/auth/login`,
+      },
+      body: new URLSearchParams({ phone: inputPhone }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    statusCode = response.status;
+    const text = await response.text();
+    responseText = text;
+    if (!response.ok) {
+      throw new Error(`my.telegram.org send_password HTTP ${response.status}: ${text.slice(0, 200)}`);
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new Error(`my.telegram.org send_password 响应不是 JSON：${text.slice(0, 200)}`);
+    }
+    const randomHash =
+      typeof payload === "object" && payload !== null
+        ? (payload as { random_hash?: unknown }).random_hash
+        : undefined;
+    if (typeof randomHash !== "string" || !randomHash.trim()) {
+      // 风控/参数错误详细状态：JSON 带 error 字段（如 PHONE_NUMBER_FLOOD 24h 风控）时
+      // 给出用户可读的明确提示，而不是泛化的「未返回 random_hash」
+      const apiError =
+        typeof payload === "object" && payload !== null
+          ? (payload as { error?: unknown }).error
+          : undefined;
+      if (typeof apiError === "string" && apiError.trim()) {
+        throw new Error(describeTgOrgSendCodeError(apiError));
+      }
+      throw new Error(
+        `my.telegram.org send_password 未返回 random_hash（响应：${text.slice(0, 200)}）`,
+      );
+    }
+    logApi({
+      category: "tgapi",
+      method: "my.telegram.org/auth/send_password",
+      ok: true,
+      statusCode,
+      requestPayload,
+      responseBody: text,
+      durationMs: Date.now() - startedAt,
+    });
+    return randomHash;
+  } catch (error) {
+    logApi({
+      category: "tgapi",
+      method: "my.telegram.org/auth/send_password",
+      ok: false,
+      statusCode,
+      requestPayload,
+      responseBody: responseText || null,
+      error: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - startedAt,
+    });
+    throw error;
   }
-  const randomHash =
-    typeof payload === "object" && payload !== null
-      ? (payload as { random_hash?: unknown }).random_hash
-      : undefined;
-  if (typeof randomHash !== "string" || !randomHash.trim()) {
-    throw new Error(
-      `my.telegram.org send_password 未返回 random_hash（响应：${text.slice(0, 200)}）`,
-    );
-  }
-  return randomHash;
 }
 
 export interface TgOrgLoginResult {
-  /** true = 登录成功（cookie 为 stel_token 值）；false = 登录失败（error 为接口原文） */
+  /** true = 登录成功（cookie 为 stel_token 值）；false = 登录失败（error 为接口原文/用户可读映射） */
   ok: boolean;
   cookie: string;
   error: string;
+}
+
+/**
+ * 登录阶段已知错误 → 用户可读映射（v2.2.5）：验证码错误/过期等给出明确状态，
+ * 未知错误保留接口原文（登录失败原因仍随 fail 模板 {error} 变量回显）。
+ */
+export function describeTgOrgLoginError(apiError: string): string {
+  const code = apiError.trim().toUpperCase();
+  if (code === "PASSWORD_HASH_INVALID") {
+    return "登录码错误或已过期（PASSWORD_HASH_INVALID）：请确认 Telegram 发送的最新登录码。";
+  }
+  if (code.includes("FLOOD")) {
+    return `被 Telegram 风控限制（${apiError.trim()}）：请约 24 小时后再试。`;
+  }
+  return apiError;
 }
 
 /** step_two.login_step_get_stel_cookie：用登录码换取 stel_token 会话 Cookie */
@@ -71,30 +149,81 @@ export async function loginStepGetStelCookie(
   tgRandomHash: string,
   tgCloudPassword: string,
 ): Promise<TgOrgLoginResult> {
-  const response = await fetch(`${MY_TELEGRAM_ORG_ORIGIN}/auth/login`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": REQUEST_UA,
-      Referer: `${MY_TELEGRAM_ORG_ORIGIN}/auth/login`,
-    },
-    body: new URLSearchParams({
-      phone: inputPhone,
-      random_hash: tgRandomHash,
-      password: tgCloudPassword,
-    }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  const text = await response.text();
-  // 原实现：响应文本 "true" 即成功，Cookie 取 Set-Cookie 响应头
-  if (text.trim() === "true") {
-    const cookie = collectStelTokenCookie(response);
-    if (!cookie) {
-      return { ok: false, cookie: "", error: "登录成功但响应缺少 stel_token Cookie" };
+  const startedAt = Date.now();
+  const requestPayload = JSON.stringify({ phone: inputPhone, random_hash: tgRandomHash, password: tgCloudPassword });
+  let statusCode: number | null = null;
+  let responseText = "";
+  try {
+    const response = await fetch(`${MY_TELEGRAM_ORG_ORIGIN}/auth/login`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": REQUEST_UA,
+        Referer: `${MY_TELEGRAM_ORG_ORIGIN}/auth/login`,
+      },
+      body: new URLSearchParams({
+        phone: inputPhone,
+        random_hash: tgRandomHash,
+        password: tgCloudPassword,
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    statusCode = response.status;
+    const text = await response.text();
+    responseText = text;
+    // 原实现：响应文本 "true" 即成功，Cookie 取 Set-Cookie 响应头
+    if (text.trim() === "true") {
+      const cookie = collectStelTokenCookie(response);
+      if (!cookie) {
+        const result = { ok: false, cookie: "", error: "登录成功但响应缺少 stel_token Cookie" };
+        logApi({
+          category: "tgapi",
+          method: "my.telegram.org/auth/login",
+          ok: false,
+          statusCode,
+          requestPayload,
+          responseBody: text,
+          error: result.error,
+          durationMs: Date.now() - startedAt,
+        });
+        return result;
+      }
+      logApi({
+        category: "tgapi",
+        method: "my.telegram.org/auth/login",
+        ok: true,
+        statusCode,
+        requestPayload,
+        responseBody: text,
+        durationMs: Date.now() - startedAt,
+      });
+      return { ok: true, cookie, error: "" };
     }
-    return { ok: true, cookie, error: "" };
+    const result = { ok: false, cookie: "", error: describeTgOrgLoginError(text.trim() || `HTTP ${response.status}`) };
+    logApi({
+      category: "tgapi",
+      method: "my.telegram.org/auth/login",
+      ok: false,
+      statusCode,
+      requestPayload,
+      responseBody: text,
+      error: result.error,
+      durationMs: Date.now() - startedAt,
+    });
+    return result;
+  } catch (error) {
+    logApi({
+      category: "tgapi",
+      method: "my.telegram.org/auth/login",
+      ok: false,
+      statusCode,
+      requestPayload,
+      responseBody: responseText || null,
+      error: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - startedAt,
+    });
+    throw error;
   }
-  return { ok: false, cookie: "", error: text.trim() || `HTTP ${response.status}` };
 }
 
 /** 从响应头收集 stel_token（原实现直接透传 Set-Cookie 值；这里只取 Cookie 名值对，兼容多 Set-Cookie） */
@@ -146,59 +275,94 @@ function extractText(fragment: string): string {
 
 /** step_three.scarp_tg_existing_app：抓取 /apps 页面（已有 APP → 解析；否则 → 解析创建表单 hash） */
 export async function scrapeTgExistingApp(stelToken: string): Promise<TgOrgScrapeResult> {
-  const response = await fetch(`${MY_TELEGRAM_ORG_ORIGIN}/apps`, {
-    method: "GET",
-    headers: {
-      Cookie: stelToken,
-      "User-Agent": REQUEST_UA,
-      Referer: `${MY_TELEGRAM_ORG_ORIGIN}/apps`,
-    },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  const html = await response.text();
-  if (!response.ok) {
-    throw new Error(`my.telegram.org /apps HTTP ${response.status}: ${html.slice(0, 200)}`);
-  }
-
-  // 页面标题判定（原实现：title 含 "configuration" 即已有 APP）
-  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
-  const title = titleMatch ? extractText(titleMatch[1]) : "";
-
-  if (title.includes("configuration")) {
-    // span.input-xlarge 列表：[0]=app_id [1]=api_hash [4]=测试配置 IP [5]=生产配置 IP
-    //（索引语义与原实现逐字一致 —— 页面中 App title/shortname/url 等输入框占据中间索引）
-    const spans = extractTaggedFragments(html, "span", "input-xlarge");
-    const helpBlocks = extractTaggedFragments(html, "p", "help-block");
-    if (spans.length < 6) {
-      throw new Error(
-        `my.telegram.org /apps 页面结构变化（span.input-xlarge 仅 ${spans.length} 个，需要 6 个）`,
-      );
-    }
-    if (helpBlocks.length < 2) {
-      throw new Error(
-        `my.telegram.org /apps 页面结构变化（p.help-block 仅 ${helpBlocks.length} 个，需要 2 个）`,
-      );
-    }
-    return {
-      ok: true,
-      info: {
-        appId: spans[0],
-        apiHash: spans[1],
-        testConfiguration: { ip: spans[4], dc: helpBlocks[helpBlocks.length - 2] },
-        productionConfiguration: { ip: spans[5], dc: helpBlocks[helpBlocks.length - 1] },
+  const startedAt = Date.now();
+  let statusCode: number | null = null;
+  let html = "";
+  try {
+    const response = await fetch(`${MY_TELEGRAM_ORG_ORIGIN}/apps`, {
+      method: "GET",
+      headers: {
+        Cookie: stelToken,
+        "User-Agent": REQUEST_UA,
+        Referer: `${MY_TELEGRAM_ORG_ORIGIN}/apps`,
       },
-      appHash: "",
-    };
-  }
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    statusCode = response.status;
+    html = await response.text();
+    if (!response.ok) {
+      throw new Error(`my.telegram.org /apps HTTP ${response.status}: ${html.slice(0, 200)}`);
+    }
 
-  // 未创建 APP：解析创建表单 input[name=hash] 的 value
-  const hashMatch =
-    /<input[^>]*name=["']hash["'][^>]*value=["']([^"']*)["']/i.exec(html) ??
-    /<input[^>]*value=["']([^"']*)["'][^>]*name=["']hash["']/i.exec(html);
-  if (!hashMatch) {
-    throw new Error("my.telegram.org /apps 页面未找到创建表单 hash 输入框");
+    // 页面标题判定（原实现：title 含 "configuration" 即已有 APP）
+    const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+    const title = titleMatch ? extractText(titleMatch[1]) : "";
+
+    if (title.includes("configuration")) {
+      // span.input-xlarge 列表：[0]=app_id [1]=api_hash [4]=测试配置 IP [5]=生产配置 IP
+      //（索引语义与原实现逐字一致 —— 页面中 App title/shortname/url 等输入框占据中间索引）
+      const spans = extractTaggedFragments(html, "span", "input-xlarge");
+      const helpBlocks = extractTaggedFragments(html, "p", "help-block");
+      if (spans.length < 6) {
+        throw new Error(
+          `my.telegram.org /apps 页面结构变化（span.input-xlarge 仅 ${spans.length} 个，需要 6 个）`,
+        );
+      }
+      if (helpBlocks.length < 2) {
+        throw new Error(
+          `my.telegram.org /apps 页面结构变化（p.help-block 仅 ${helpBlocks.length} 个，需要 2 个）`,
+        );
+      }
+      logApi({
+        category: "tgapi",
+        method: "my.telegram.org/apps",
+        ok: true,
+        statusCode,
+        requestPayload: null,
+        responseBody: html,
+        durationMs: Date.now() - startedAt,
+      });
+      return {
+        ok: true,
+        info: {
+          appId: spans[0],
+          apiHash: spans[1],
+          testConfiguration: { ip: spans[4], dc: helpBlocks[helpBlocks.length - 2] },
+          productionConfiguration: { ip: spans[5], dc: helpBlocks[helpBlocks.length - 1] },
+        },
+        appHash: "",
+      };
+    }
+
+    // 未创建 APP：解析创建表单 input[name=hash] 的 value
+    const hashMatch =
+      /<input[^>]*name=["']hash["'][^>]*value=["']([^"']*)["']/i.exec(html) ??
+      /<input[^>]*value=["']([^"']*)["'][^>]*name=["']hash["']/i.exec(html);
+    if (!hashMatch) {
+      throw new Error("my.telegram.org /apps 页面未找到创建表单 hash 输入框");
+    }
+    logApi({
+      category: "tgapi",
+      method: "my.telegram.org/apps",
+      ok: true,
+      statusCode,
+      requestPayload: null,
+      responseBody: html,
+      durationMs: Date.now() - startedAt,
+    });
+    return { ok: false, info: null, appHash: decodeHtmlEntities(hashMatch[1]) };
+  } catch (error) {
+    logApi({
+      category: "tgapi",
+      method: "my.telegram.org/apps",
+      ok: false,
+      statusCode,
+      responseBody: html || null,
+      error: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - startedAt,
+    });
+    throw error;
   }
-  return { ok: false, info: null, appHash: decodeHtmlEntities(hashMatch[1]) };
 }
 
 /**
@@ -235,27 +399,63 @@ export async function createNewTgApp(input: {
 }): Promise<string> {
   const platform =
     input.appPlatforms[Math.floor(Math.random() * input.appPlatforms.length)] ?? "android";
-  const response = await fetch(`${MY_TELEGRAM_ORG_ORIGIN}/apps/create`, {
-    method: "POST",
-    headers: {
-      Cookie: input.stelToken,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": REQUEST_UA,
-      Referer: `${MY_TELEGRAM_ORG_ORIGIN}/apps`,
-    },
-    body: new URLSearchParams({
-      hash: input.tgAppHash,
-      app_title: input.appTitle,
-      app_shortname: input.appShortName,
-      app_url: input.appUrl,
-      app_platform: platform,
-      app_desc: input.appDescription,
-    }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  const startedAt = Date.now();
+  const requestPayload = JSON.stringify({
+    hash: input.tgAppHash,
+    app_title: input.appTitle,
+    app_shortname: input.appShortName,
+    app_url: input.appUrl,
+    app_platform: platform,
+    app_desc: input.appDescription,
   });
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`my.telegram.org /apps/create HTTP ${response.status}: ${text.slice(0, 200)}`);
+  let statusCode: number | null = null;
+  let responseText = "";
+  try {
+    const response = await fetch(`${MY_TELEGRAM_ORG_ORIGIN}/apps/create`, {
+      method: "POST",
+      headers: {
+        Cookie: input.stelToken,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": REQUEST_UA,
+        Referer: `${MY_TELEGRAM_ORG_ORIGIN}/apps`,
+      },
+      body: new URLSearchParams({
+        hash: input.tgAppHash,
+        app_title: input.appTitle,
+        app_shortname: input.appShortName,
+        app_url: input.appUrl,
+        app_platform: platform,
+        app_desc: input.appDescription,
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    statusCode = response.status;
+    const text = await response.text();
+    responseText = text;
+    if (!response.ok) {
+      throw new Error(`my.telegram.org /apps/create HTTP ${response.status}: ${text.slice(0, 200)}`);
+    }
+    logApi({
+      category: "tgapi",
+      method: "my.telegram.org/apps/create",
+      ok: true,
+      statusCode,
+      requestPayload,
+      responseBody: text,
+      durationMs: Date.now() - startedAt,
+    });
+    return text;
+  } catch (error) {
+    logApi({
+      category: "tgapi",
+      method: "my.telegram.org/apps/create",
+      ok: false,
+      statusCode,
+      requestPayload,
+      responseBody: responseText || null,
+      error: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - startedAt,
+    });
+    throw error;
   }
-  return text;
 }

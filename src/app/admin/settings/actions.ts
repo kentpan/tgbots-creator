@@ -6,7 +6,8 @@ import { headers } from "next/headers";
 import { EDITABLE_SETTINGS } from "@/config/runtime-settings";
 import { setAppSetting } from "@/database/operations";
 import { logOperation, requirePermission } from "@/lib/auth";
-import { createDatabaseBackup } from "@/services/database-backup";
+import { TELEGRAM_PROXY_SETTING_KEYS, invalidateTelegramProxyConfig, proxyEnvGateEnabled } from "@/lib/telegram/transport";
+import { isEdgeRuntime } from "@/lib/telegram/runtime-mode";
 
 export async function saveSettingsAction(formData: FormData): Promise<void> {
   const admin = await requirePermission("settings:manage");
@@ -47,16 +48,33 @@ export async function saveSettingsAction(formData: FormData): Promise<void> {
   redirect("/admin/settings?saved=1");
 }
 
-export async function backupDatabaseAction(): Promise<void> {
+/**
+ * v2.2.5 全局代理配置（系统设置 → 全局代理配置模块）：
+ * 开关 + 代理 URL + 鉴权头名称 + APIKey。
+ * 生效语义：Node 环境必须 .env PROXY_ENABLED==="true" 且本开关同时开启；
+ * edge（无 .env）仅认本开关。保存后立即失效传输层缓存（无需重启）。
+ */
+export async function saveProxySettingsAction(formData: FormData): Promise<void> {
   const admin = await requirePermission("settings:manage");
-  const backup = await createDatabaseBackup();
+  const proxyEnabled = formData.get(TELEGRAM_PROXY_SETTING_KEYS.enabled) !== null ? "true" : "false";
+  const proxyUrl = String(formData.get(TELEGRAM_PROXY_SETTING_KEYS.url) ?? "").trim();
+  const headerName = String(formData.get(TELEGRAM_PROXY_SETTING_KEYS.headerName) ?? "").trim();
+  const apikey = String(formData.get(TELEGRAM_PROXY_SETTING_KEYS.apikey) ?? "");
+
+  await setAppSetting(TELEGRAM_PROXY_SETTING_KEYS.enabled, proxyEnabled);
+  await setAppSetting(TELEGRAM_PROXY_SETTING_KEYS.url, proxyUrl);
+  await setAppSetting(TELEGRAM_PROXY_SETTING_KEYS.headerName, headerName);
+  await setAppSetting(TELEGRAM_PROXY_SETTING_KEYS.apikey, apikey);
+  invalidateTelegramProxyConfig();
+
   const requestHeaders = await headers();
+  const effective =
+    isEdgeRuntime() || proxyEnvGateEnabled() ? (proxyEnabled === "true" ? "已生效" : "已关闭") : "未生效（.env PROXY_ENABLED≠true）";
   await logOperation(admin, {
-    action: "创建数据库备份",
-    target: backup.key,
-    detail: `${(backup.size / 1024).toFixed(1)} KB`,
+    action: "更新全局代理配置",
+    detail: `enabled=${proxyEnabled}，url=${proxyUrl || "（空→内置默认代理）"}，header=${headerName || "Authorization"}，组合状态=${effective}`,
     headers: requestHeaders,
   });
   revalidatePath("/admin/settings");
-  redirect(`/admin/settings?backup=${encodeURIComponent(backup.key)}`);
+  redirect("/admin/settings?proxy_saved=1");
 }

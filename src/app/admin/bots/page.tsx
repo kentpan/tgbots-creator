@@ -13,15 +13,16 @@ import { isEdgeRuntime } from "@/lib/telegram/runtime-mode";
 import { parseBotProfile, parseBotPrivacyMode } from "@/bot/multi-runtime";
 import { parseCustomKeyboardConfig } from "@/services/custom-keyboard";
 import { requirePermission } from "@/lib/auth";
-import { deleteBotAction, deployBotAction, saveBotCustomKeyboardAction, syncBotMenuAction, testBotAction } from "./actions";
+import { deleteBotAction, deployBotAction, saveBotCustomKeyboardAction } from "./actions";
+import { saveTgApiCustomKeyboardAction } from "@/app/admin/tgapi/actions";
+import { SubmitButton } from "@/components/admin/submit-button";
+import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import { BotFormDialog } from "./bot-form-dialog";
 import { CommandMenuDialog } from "./command-menu-dialog";
 import { MenuDesignerDialog } from "./menu-designer-dialog";
 import { CustomKeyboardDialog } from "@/components/admin/custom-keyboard-dialog";
 import { BotRuntimeDialog } from "./bot-runtime-dialog";
 import { BotCreateGuide } from "./bot-create-guide";
-import { FormDialog } from "@/components/admin/form-dialog";
-import { inputClass, labelClass } from "@/components/admin/form-styles";
 
 export const dynamic = "force-dynamic";
 
@@ -59,7 +60,7 @@ function maskToken(token: string): string {
 export default async function BotsPage({
   searchParams,
 }: {
-  searchParams: Promise<{ saved?: string; error?: string; test?: string; sync?: string; message?: string; deploy?: string; deploy_msg?: string }>;
+  searchParams: Promise<{ saved?: string; error?: string; message?: string; deploy?: string; deploy_msg?: string }>;
 }) {
   await requirePermission("bots:view");
   const params = await searchParams;
@@ -115,21 +116,6 @@ export default async function BotsPage({
           {params.error === "invalid-menu" && params.message ? `：${params.message}` : ""}
         </div>
       ) : null}
-      {params.test === "ok" ? (
-        <div className="rounded-md border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">
-          连接成功：{params.message}
-        </div>
-      ) : null}
-      {params.test === "fail" ? (
-        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          连接失败：{params.message}
-        </div>
-      ) : null}
-      {params.sync === "fail" ? (
-        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          同步失败：{params.message}
-        </div>
-      ) : null}
       {params.deploy && params.deploy_msg ? (
         params.deploy === "ok" ? (
           <div className="rounded-md border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">
@@ -178,6 +164,11 @@ export default async function BotsPage({
                 bots.map((bot) => {
                   const stats = countMenuStats(parseBotMenuConfig(bot.menuConfig).root);
                   const profile = parseBotProfile(bot.config);
+                  // v2.2.5：TGAPI 申请机器人在机器人管理列表用同一「自定义键盘」通用弹窗的
+                  // TGAPI 形态（isTgApi=true：门禁配置模块 + 对话流程仿真，保存走
+                  // saveTgApiCustomKeyboardAction 写 tgapi.customKeyboard + 门禁字段）——
+                  // 与 TGAPI申请页「菜单和键盘」键盘页签完全同一形态；普通机器人保持原有模式
+                  const isTgApiBot = Boolean(profile.tgapi?.enabled);
                   // 指令归属过滤（v2.1.13）：本机器人可见的自定义指令 = 全局 + 群组私有 + 本机器人私有；
                   // 其他机器人私有指令对本机器人完全不可见（勾选/按钮/指令菜单三处同一规则）
                   const visibleCommands = commandLibrary.filter(
@@ -252,13 +243,13 @@ export default async function BotsPage({
                         <div className="flex flex-wrap items-center gap-2">
                           <form action={deployBotAction}>
                             <input type="hidden" name="id" value={String(bot.id)} />
-                            <button
-                              type="submit"
+                            <SubmitButton
                               className="inline-flex h-8 items-center rounded-md border border-emerald-200 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 hover:bg-emerald-100"
                               title="显式部署：重启运行实例并回传真实结果（webhook=setWebhook 注册结果 / polling=长轮询确认）"
+                              pendingLabel="部署中…"
                             >
                               🚀 部署
-                            </button>
+                            </SubmitButton>
                           </form>
                           {Boolean(profile.tgapi?.enabled) ? (
                             /* v2.1.16：TGAPI 申请机器人的内嵌按钮在「TGAPI申请」页面
@@ -333,13 +324,35 @@ export default async function BotsPage({
                             triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
                           />
                           {/* ⌨️ 自定义键盘（v2.2.0）：配置 ReplyKeyboard（复用仿真屏+复刻内嵌按钮配置），
-                              附加到 /start 欢迎消息；按钮点击=发送文本，运行时按按钮配置真实响应 */}
+                              附加到 /start 欢迎消息；按钮点击=发送文本，运行时按按钮配置真实响应。
+                              v2.2.5：TGAPI 申请机器人用同一弹窗的 TGAPI 形态（门禁配置模块 +
+                              对话流程仿真，保存 tgapi.customKeyboard + 门禁字段）——不再与
+                              TGAPI 申请页割裂（此前普通形态写入顶层 customKeyboard，TGAPI
+                              对话流程根本不读，配置无效） */}
                           <CustomKeyboardDialog
                             botId={String(bot.id)}
                             botName={bot.name}
-                            initialConfig={parseCustomKeyboardConfig(profile.customKeyboard)}
-                            isTgApi={false}
-                            action={saveBotCustomKeyboardAction}
+                            initialConfig={parseCustomKeyboardConfig(
+                              isTgApiBot ? profile.tgapi?.customKeyboard : profile.customKeyboard,
+                            )}
+                            isTgApi={isTgApiBot}
+                            action={isTgApiBot ? saveTgApiCustomKeyboardAction : saveBotCustomKeyboardAction}
+                            methods={
+                              isTgApiBot
+                                ? verificationMethods.map((method) => ({
+                                    id: Number(method.id),
+                                    name: method.name,
+                                    enabled: method.enabled,
+                                    type: method.type,
+                                  }))
+                                : undefined
+                            }
+                            tgapiConfig={isTgApiBot ? bot.config : undefined}
+                            tgapiModeHint={
+                              isTgApiBot && !parseCustomKeyboardConfig(profile.tgapi?.customKeyboard)
+                                ? "保存非空键盘后，机器人切换为自定义键盘对话流程（互斥：消息内嵌按钮不再渲染）。"
+                                : undefined
+                            }
                             builtinCommands={commandLibrary
                               .filter((item) => item.type === "builtin")
                               .map((item) => ({
@@ -385,54 +398,14 @@ export default async function BotsPage({
                             trigger="编辑"
                             triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
                           />
-                          <form action={testBotAction}>
-                            <input type="hidden" name="id" value={String(bot.id)} />
-                            <button
-                              type="submit"
-                              className="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
-                            >
-                              测试
-                            </button>
-                          </form>
-                          <FormDialog
-                            trigger="同步"
-                            triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
-                            title={`同步消息内嵌按钮 · ${bot.name}`}
-                            description="把当前已保存的消息内嵌按钮以真实消息发送到目标群组，群成员可立即点击使用。"
-                            action={syncBotMenuAction}
-                            submitLabel="立即同步"
-                          >
-                            <input type="hidden" name="id" value={String(bot.id)} />
-                            <div className="space-y-1">
-                              <label className={labelClass} htmlFor={`sync-${bot.id}`}>
-                                群组 Chat ID
-                              </label>
-                              <input
-                                id={`sync-${bot.id}`}
-                                name="chat_id"
-                                required
-                                list={`sync-group-list-${bot.id}`}
-                                placeholder="-1001998877661"
-                                className={inputClass}
-                              />
-                              <datalist id={`sync-group-list-${bot.id}`}>
-                                {groups.map((group) => (
-                                  <option key={String(group.chatId)} value={String(group.chatId)}>
-                                    {group.chatTitle ?? "群组"}
-                                  </option>
-                                ))}
-                              </datalist>
-                            </div>
-                          </FormDialog>
-                          <form action={deleteBotAction}>
-                            <input type="hidden" name="id" value={String(bot.id)} />
-                            <button
-                              type="submit"
-                              className="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
-                            >
-                              删除
-                            </button>
-                          </form>
+                          <ConfirmDialog
+                            title={`删除机器人「${bot.name}」`}
+                            description={`确定要删除机器人「${bot.name}」#ID ${String(bot.id)} 吗？运行实例将停止且删除后不可恢复！`}
+                            action={deleteBotAction}
+                            fields={{ id: String(bot.id) }}
+                            trigger="删除"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
+                          />
                         </div>
                       </td>
                     </tr>

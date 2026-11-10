@@ -1,6 +1,7 @@
 import { cachedJson } from "@/database/bindings";
 import { getCachedAppSettings } from "@/database/operations";
 import { SESSION_STORAGE_D1_KEYS } from "@/bot/session-storage";
+import { probeCloudflareAccountId } from "@/lib/cloudflare-api";
 
 /**
  * Dashboard 核心指标 —— D1 每日读写用量（v2.0.7，v2.1.3 重做真实获取链路）。
@@ -68,7 +69,7 @@ export interface D1DailyUsage {
   error?: string;
 }
 
-export type D1ConfigSourceKind = "env-cloudflare" | "env-default" | "stored" | "none";
+export type D1ConfigSourceKind = "env-cloudflare" | "env-default" | "stored" | "auto-probe" | "none";
 
 function currentUtcDate(): string {
   return new Date().toISOString().slice(0, 10);
@@ -163,9 +164,20 @@ async function resolveMetricsD1Config(): Promise<{
   const storedDatabaseId = (stored[SESSION_STORAGE_D1_KEYS.databaseId] ?? "").trim();
   const storedApiToken = (stored[SESSION_STORAGE_D1_KEYS.apiToken] ?? "").trim();
 
-  const accountId = envValue("CLOUDFLARE_ACCOUNT_ID") || envValue("TG_D1_ACCOUNT_ID") || storedAccountId;
   const databaseId = envValue("D1_DATABASE_ID") || envValue("TG_D1_DATABASE_ID") || storedDatabaseId;
   const apiToken = envValue("CLOUDFLARE_API_TOKEN") || envValue("TG_D1_API_TOKEN") || storedApiToken;
+
+  // v2.2.6：账号 ID 运行时自动探测（pages-deploy.yml「Resolve Cloudflare account ID」
+  // 步骤同源方式）。仅当配置了 Token 但三个来源（CLOUDFLARE_ACCOUNT_ID /
+  // TG_D1_ACCOUNT_ID / 后台已存）都拿不到账号 ID 时才发起探测，
+  // 探测结果进程内缓存 5 分钟（见 cloudflare-api.ts）；失败时抛出详细错误，不静默。
+  const explicitAccountId = envValue("CLOUDFLARE_ACCOUNT_ID") || envValue("TG_D1_ACCOUNT_ID") || storedAccountId;
+  let accountId = explicitAccountId;
+  let accountIdProbed = false;
+  if (!accountId && apiToken) {
+    accountId = await probeCloudflareAccountId(apiToken);
+    accountIdProbed = true;
+  }
 
   const pick = (value: string, envCloudflare: string, envDefault: string, storedValue: string): D1ConfigSourceKind => {
     if (envCloudflare && value === envCloudflare.trim()) return "env-cloudflare";
@@ -179,7 +191,7 @@ async function resolveMetricsD1Config(): Promise<{
     databaseId,
     apiToken,
     source: {
-      accountId: pick(accountId, envValue("CLOUDFLARE_ACCOUNT_ID"), envValue("TG_D1_ACCOUNT_ID"), storedAccountId),
+      accountId: accountIdProbed ? "auto-probe" : pick(accountId, envValue("CLOUDFLARE_ACCOUNT_ID"), envValue("TG_D1_ACCOUNT_ID"), storedAccountId),
       databaseId: pick(databaseId, envValue("D1_DATABASE_ID"), envValue("TG_D1_DATABASE_ID"), storedDatabaseId),
       apiToken: pick(apiToken, envValue("CLOUDFLARE_API_TOKEN"), envValue("TG_D1_API_TOKEN"), storedApiToken),
     },
@@ -190,10 +202,31 @@ export async function getD1DailyUsage(): Promise<D1DailyUsage> {
   const dateUTC = currentUtcDate();
   const cacheKey = `d1-metrics:daily:${dateUTC}`;
 
-  const config = await resolveMetricsD1Config();
+  // v2.2.6：凭据解析（含账号 ID 自动探测）失败时错误完整进入 usage.error 返回
+  // 前端展示（卡片红字），绝不静默、也绝不让 Dashboard 接口 500。
+  let config: Awaited<ReturnType<typeof resolveMetricsD1Config>>;
+  const limits = { rowsRead: D1_FREE_TIER_DAILY_LIMITS.rowsRead, rowsWritten: D1_FREE_TIER_DAILY_LIMITS.rowsWritten };
+  try {
+    config = await resolveMetricsD1Config();
+  } catch (error) {
+    return {
+      ok: false,
+      configured: true,
+      source: null,
+      dateUTC,
+      rowsRead: 0,
+      rowsWritten: 0,
+      readQueries: 0,
+      writeQueries: 0,
+      limits,
+      readPercent: 0,
+      writePercent: 0,
+      accountWide: true,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
   // v2.1.3：databaseId 可选 —— 留空 = 账户下所有 D1 数据库合计（与参考脚本同语义）
   const configured = Boolean(config.accountId && config.apiToken);
-  const limits = { rowsRead: D1_FREE_TIER_DAILY_LIMITS.rowsRead, rowsWritten: D1_FREE_TIER_DAILY_LIMITS.rowsWritten };
   const accountWide = !config.databaseId;
 
   if (!configured) {
@@ -210,7 +243,7 @@ export async function getD1DailyUsage(): Promise<D1DailyUsage> {
       readPercent: 0,
       writePercent: 0,
       accountWide,
-      error: "未获取到 D1 指标凭据：运行环境需注入 CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID（或 TG_D1_* 部署默认值 / 后台已存配置）",
+      error: "未获取到 D1 指标凭据：运行环境需注入 CLOUDFLARE_API_TOKEN（账号 ID 缺失时将自动探测），或在系统设置 → BOT 数据存储 / TG_D1_* 部署默认值中配置",
     };
   }
 

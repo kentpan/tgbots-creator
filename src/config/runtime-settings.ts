@@ -19,6 +19,8 @@ export const APP_SETTING_KEYS = {
   cleanupRetentionDays: "cleanup.retention_days",
   telegramProxyEnabled: "telegram.proxy_enabled",
   telegramProxyUrl: "telegram.proxy_url",
+  /** v2.2.5：Webhook 回调路由（默认 /api/telegram/webhook） */
+  telegramWebhookRoute: "telegram.webhook_route",
 } as const;
 
 export const EDITABLE_SETTINGS: {
@@ -59,9 +61,18 @@ export const EDITABLE_SETTINGS: {
     description: "过期验证记录的保留天数",
     kind: "number",
   },
+  {
+    key: APP_SETTING_KEYS.telegramWebhookRoute,
+    label: "Webhook 路由",
+    description:
+      "注册到 Telegram 的回调路径，默认 /api/telegram/webhook（完整 URL = Webhook Base URL + 本路由 + /<botId>）；自定义路径需反向代理映射到应用的同路径",
+    kind: "text",
+  },
   // v2.0.15：Telegram 代理配置（telegram.proxy_enabled / telegram.proxy_url）已从系统设置
   // 迁移到「机器人测试 → 仿真屏盾牌图标 → 代理偏好设置」面板（APP 风格，含连通性测试与
   // 线上 Edge 站代理一键接入），仍存储于同一批 app_settings 键，历史配置无损迁移。
+  // v2.2.5：全局代理配置模块重新回到系统设置页（开关 + URL + 鉴权头名 + APIKey，
+  // 详见设置页内 .env PROXY_ENABLED 说明），与仿真屏面板共用同一批键。
 ];
 
 function toNumber(value: string | undefined, fallback: number): number {

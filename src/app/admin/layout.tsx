@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { logoutAction } from "@/app/login/actions";
+import { SubmitButton } from "@/components/admin/submit-button";
 import { AdminSidebar, type SidebarMenuLink } from "@/components/admin/sidebar";
 import { loadAuthorizedMenus, requireAuth } from "@/lib/auth";
 import { getDatabaseInfo } from "@/database/client";
@@ -50,12 +51,12 @@ export default async function AdminLayout({
               {admin.user.displayName ?? admin.user.username}（{admin.user.roleName}）
             </span>
             <form action={logoutAction}>
-              <button
-                type="submit"
+              <SubmitButton
                 className="inline-flex h-8 items-center rounded-md border px-3 text-sm font-medium hover:bg-accent"
+                pendingLabel="退出中…"
               >
                 退出登录
-              </button>
+              </SubmitButton>
             </form>
           </div>
         </header>

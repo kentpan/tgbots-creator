@@ -63,6 +63,32 @@ interface BackupConfigResponse {
   };
 }
 
+interface ImportFileTableInfo {
+  name: string;
+  rows: number;
+  exists_in_db: boolean;
+}
+
+interface ImportAnalysis {
+  file_name: string;
+  file_type: "sql" | "db" | "json";
+  file_size: number;
+  driver: string;
+  supported: boolean;
+  unsupported_reason: string;
+  tables: ImportFileTableInfo[];
+}
+
+interface ImportTableReport {
+  deleted: number;
+  imported: number;
+  created: boolean;
+  added_columns: string[];
+  error: string;
+}
+
+ type ImportReport = Record<string, ImportTableReport>;
+
 const FORMAT_OPTIONS = [
   { value: "sql", label: ".SQL" },
   { value: "db", label: ".DB" },
@@ -103,6 +129,14 @@ export function BackupClient() {
   const [selectedTables, setSelectedTables] = useState<string[]>([]);
   const [exportFormat, setExportFormat] = useState<ExportFormat>("sql");
   const [exporting, setExporting] = useState(false);
+  const [driver, setDriver] = useState<string>("node");
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const importFileRef = useRef<File | null>(null);
+  const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const [importAnalysis, setImportAnalysis] = useState<ImportAnalysis | null>(null);
+  const [importSelected, setImportSelected] = useState<string[]>([]);
+  const [importApplying, setImportApplying] = useState(false);
 
   const [config, setConfig] = useState<BackupConfigInfo | null>(null);
   const [storage, setStorage] = useState("");
@@ -138,6 +172,7 @@ export function BackupClient() {
     const data = await requestJson<{ tables: BackupTableInfo[]; driver: string }>("/api/admin/backup/tables");
     if (!mountedRef.current) return;
     setTables(data.tables);
+    setDriver(data.driver);
   }, []);
 
   const loadConfig = useCallback(async () => {
@@ -197,6 +232,73 @@ export function BackupClient() {
     setSelectedTables((prev) =>
       prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name],
     );
+  }
+
+  function toggleImportTable(name: string) {
+    setImportSelected((prev) =>
+      prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name],
+    );
+  }
+
+  const importAllSelected =
+    !!importAnalysis && importAnalysis.tables.length > 0 && importSelected.length === importAnalysis.tables.length;
+
+  async function onPickFile(file: File) {
+    importFileRef.current = file;
+    setImportAnalysis(null);
+    setImportSelected([]);
+    setImportDialogOpen(true);
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("mode", "analyze");
+    try {
+      const res = await fetch("/api/admin/backup/import-file", { method: "POST", body: fd });
+      const payload = (await res.json()) as { ok: boolean; error?: string; data?: { analysis: ImportAnalysis } };
+      if (!payload.ok || !payload.data) throw new Error(payload.error || "文件解析失败");
+      if (!mountedRef.current) return;
+      setImportAnalysis(payload.data.analysis);
+    } catch (error) {
+      setImportDialogOpen(false);
+      toast.error(error instanceof Error ? error.message : "文件解析失败");
+    }
+  }
+
+  async function applyImport() {
+    const file = importFileRef.current;
+    if (!file || !importSelected.length) return;
+    setImportApplying(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("mode", "apply");
+      fd.append("tables", importSelected.join(","));
+      const res = await fetch("/api/admin/backup/import-file", { method: "POST", body: fd });
+      const payload = (await res.json()) as { ok: boolean; error?: string; data?: { report: ImportReport } };
+      if (!payload.ok || !payload.data) throw new Error(payload.error || "导入失败");
+      const report = payload.data.report;
+      const okParts: string[] = [];
+      const errParts: string[] = [];
+      for (const [table, r] of Object.entries(report)) {
+        if (r.error) {
+          errParts.push(`${table}: ${r.error}`);
+          continue;
+        }
+        okParts.push(
+          `${table}: 清空 ${r.deleted} 行 / 写入 ${r.imported} 行${r.added_columns.length ? ` / 补列 ${r.added_columns.length}` : ""}${r.created ? " / 新建表" : ""}`,
+        );
+      }
+      if (errParts.length) {
+        toast.error(`导入完成但有失败 — ${errParts.slice(0, 3).join("; ")}${errParts.length > 3 ? " 等" : ""}`);
+      } else {
+        toast.success(`导入完成 — ${okParts.slice(0, 4).join(", ")}${okParts.length > 4 ? " 等" : ""}`);
+      }
+      setImportDialogOpen(false);
+      await Promise.all([loadTables(), loadConfig(), loadBackups()]);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "导入失败");
+    } finally {
+      setImportApplying(false);
+    }
   }
 
   function doExport() {
@@ -328,10 +430,24 @@ export function BackupClient() {
           <Button variant="outline" size="sm" disabled={loading} onClick={() => void reloadAll()}>
             <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /> 刷新
           </Button>
+          <Button variant="outline" size="sm" disabled={importApplying} onClick={() => fileInputRef.current?.click()}>
+            <Upload className="h-4 w-4" /> 导入本地文件
+          </Button>
           <Button size="sm" disabled={running} onClick={() => void runNow()}>
             {running ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
             立即备份到 {storageShort}
           </Button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".sql,.db,.sqlite,.sqlite3,.json"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = "";
+              if (f) void onPickFile(f);
+            }}
+          />
         </div>
       </div>
 
@@ -365,18 +481,27 @@ export function BackupClient() {
               取消
             </Button>
             <div className="flex items-center gap-1 rounded-lg border p-0.5">
-              {FORMAT_OPTIONS.map((f) => (
-                <button
-                  key={f.value}
-                  type="button"
-                  className={`rounded-md px-3 py-1.5 transition-colors ${
-                    exportFormat === f.value ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-accent"
-                  }`}
-                  onClick={() => setExportFormat(f.value)}
-                >
-                  {f.label}
-                </button>
-              ))}
+              {FORMAT_OPTIONS.map((f) => {
+                const dbUnavailable = f.value === "db" && driver === "d1";
+                return (
+                  <button
+                    key={f.value}
+                    type="button"
+                    disabled={dbUnavailable}
+                    title={
+                      dbUnavailable
+                        ? ".db 快照需要本地 SQLite 引擎，D1 运行环境不可用 — 请用 .sql / .json"
+                        : undefined
+                    }
+                    className={`rounded-md px-3 py-1.5 transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                      exportFormat === f.value ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-accent"
+                    }`}
+                    onClick={() => setExportFormat(f.value)}
+                  >
+                    {f.label}
+                  </button>
+                );
+              })}
             </div>
             <Button size="sm" disabled={!selectedTables.length || exporting} onClick={doExport}>
               <Download className="h-4 w-4" /> 导出 ({selectedTables.length} 表)
@@ -619,6 +744,115 @@ export function BackupClient() {
             </Button>
             <Button variant="destructive" className="flex-1" disabled={deleting} onClick={() => void doDelete()}>
               {deleting ? <RefreshCw className="h-4 w-4 animate-spin" /> : null} 确认删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 本地文件导入（.sql / .db / .json）：分析弹窗 → 表多选 → 整表覆盖导入 */}
+      <Dialog open={importDialogOpen} onOpenChange={(open) => !open && setImportDialogOpen(false)}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>导入本地备份文件</DialogTitle>
+            <DialogDescription>
+              {importAnalysis
+                ? `${importAnalysis.file_name}（${importAnalysis.file_type.toUpperCase()} · ${formatSize(importAnalysis.file_size)}） · 当前运行环境：${importAnalysis.driver === "d1" ? "Cloudflare D1" : "Node SQLite"}`
+                : "正在解析文件…"}
+            </DialogDescription>
+          </DialogHeader>
+
+          {importAnalysis && !importAnalysis.supported ? (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-700 dark:bg-amber-900/20">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="mt-0.5 h-4 w-4 text-amber-500" />
+                <div>
+                  <p className="font-medium text-amber-700 dark:text-amber-300">当前运行环境不支持导入此文件</p>
+                  <p className="mt-1 text-amber-600 dark:text-amber-400">{importAnalysis.unsupported_reason}</p>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {importAnalysis && importAnalysis.supported ? (
+            <>
+              <p className="text-sm text-muted-foreground">
+                文件共 {importAnalysis.tables.length} 张表。勾选要导入的表（可全量或多选），
+                导入时选中表<b className="text-destructive">现有数据会被清空</b>并整表替换为文件内容。
+              </p>
+              <div className="max-h-64 overflow-y-auto rounded-lg border">
+                <table className="w-full text-sm">
+                  <thead className="sticky top-0 bg-muted/60">
+                    <tr className="text-left">
+                      <th className="w-10 p-2">
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 accent-[var(--primary)]"
+                          checked={importAllSelected}
+                          onChange={(e) =>
+                            setImportSelected(e.target.checked ? importAnalysis.tables.map((t) => t.name) : [])
+                          }
+                        />
+                      </th>
+                      <th className="p-2 font-medium">表名</th>
+                      <th className="p-2 font-medium">文件行数</th>
+                      <th className="p-2 font-medium">导入动作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {importAnalysis.tables.map((t) => (
+                      <tr
+                        key={t.name}
+                        className="cursor-pointer border-t hover:bg-accent/40"
+                        onClick={() => toggleImportTable(t.name)}
+                      >
+                        <td className="p-2" onClick={(e) => e.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            className="h-4 w-4 accent-[var(--primary)]"
+                            checked={importSelected.includes(t.name)}
+                            onChange={() => toggleImportTable(t.name)}
+                          />
+                        </td>
+                        <td className="p-2 font-mono">{t.name}</td>
+                        <td className="p-2 text-muted-foreground">{t.rows}</td>
+                        <td className="p-2">
+                          <span
+                            className={`rounded-full px-2 py-0.5 text-xs ${
+                              t.exists_in_db
+                                ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300"
+                                : "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
+                            }`}
+                          >
+                            {t.exists_in_db ? "覆盖现有表" : "新建表"}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {!importAnalysis.tables.length ? (
+                  <div className="p-6 text-center text-sm text-muted-foreground">文件中没有可导入的表</div>
+                ) : null}
+              </div>
+            </>
+          ) : null}
+
+          <DialogFooter className="gap-2">
+            <Button variant="outline" className="flex-1" onClick={() => setImportDialogOpen(false)}>
+              取消
+            </Button>
+            <Button
+              className="flex-1"
+              disabled={
+                !importAnalysis ||
+                !importAnalysis.supported ||
+                !importSelected.length ||
+                importApplying
+              }
+              onClick={() => void applyImport()}
+            >
+              {importApplying ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+              导入并覆盖 ({importSelected.length} 表)
             </Button>
           </DialogFooter>
         </DialogContent>

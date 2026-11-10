@@ -15,7 +15,7 @@
  * 用法：node scripts/package.mjs
  */
 import { execSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -182,7 +182,7 @@ const includeRootFiles = [
   "tailwind.config.ts",
   "tsconfig.json",
 ];
-const includeDirs = [".github", "pages-adapter", "prisma", "public", "scripts", "src"];
+const includeDirs = [".github", "pages-adapter", "prisma", "public", "scripts", "src", "db"];
 const skipNames = new Set([
   "dev.log",
   ".package-stage",
@@ -223,6 +223,56 @@ for (const dbFile of ["prisma/bot-groups.db", "db/custom.db"]) {
   sanitizeShippedDb(path.join(stage, dbFile));
   dumpShippedConfig(path.join(stage, dbFile));
 }
+
+// 4.7 最新 .sql 备份（v2.2.4，用户要求：打包随带最新 .sql 备份文件，固定放 prisma/ 目录）。
+//     从 staging 清洗后的主库导出全表备份（CREATE TABLE IF NOT EXISTS + DELETE + INSERT），
+//     与备份管理 .sql 导出同语义；同时落一份到沙盒 prisma/ 目录（作为最新快照留存）。
+function dumpDbToSql(dbFile, outFile) {
+  const db = new DatabaseSync(dbFile, { readOnly: true });
+  try {
+    const tables = db
+      .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+      .all();
+    const lines = [
+      `-- tgbots-creator full database backup`,
+      `-- version: v${pkg.version}`,
+      `-- generated_at: ${new Date().toISOString()}`,
+      `-- 导入提示: 先建表再整表替换 (CREATE TABLE IF NOT EXISTS + DELETE + INSERT)；`,
+      `-- 可在备份管理「导入本地文件」中按表导入覆盖，或用 sqlite3 直接执行。`,
+      ``,
+    ];
+    for (const t of tables) {
+      lines.push(`-- ===== table: ${t.name} =====`);
+      if (t.sql) {
+        lines.push(t.sql.replace(/^CREATE TABLE /i, "CREATE TABLE IF NOT EXISTS ") + ";");
+      }
+      const cols = db.prepare(`PRAGMA table_info(${t.name})`).all().map((c) => c.name);
+      const rows = db.prepare(`SELECT * FROM ${t.name}`).all();
+      lines.push(`DELETE FROM ${t.name};`);
+      for (const row of rows) {
+        const vals = cols.map((c) => {
+          const v = row[c];
+          if (v === null || v === undefined) return "NULL";
+          if (typeof v === "number" && Number.isFinite(v)) return String(v);
+          if (typeof v === "bigint") return String(v);
+          if (v instanceof Uint8Array) return `'${Buffer.from(v).toString("base64")}'`;
+          return `'${String(v).replace(/'/g, "''")}'`;
+        });
+        lines.push(`INSERT INTO ${t.name} (${cols.join(", ")}) VALUES (${vals.join(", ")});`);
+      }
+      lines.push("");
+    }
+    writeFileSync(outFile, lines.join("\n"));
+    console.log(`   ── 最新 .sql 备份已生成: ${path.basename(outFile)} (${tables.length} 表) ──`);
+  } finally {
+    db.close();
+  }
+}
+
+const shippedSqlBackup = path.join(stage, "prisma", `tgbots-creator-v${pkg.version}.sql`);
+dumpDbToSql(path.join(stage, "prisma/bot-groups.db"), shippedSqlBackup);
+// 沙盒 prisma/ 同步留存一份最新备份（与包内内容一致）
+cpSync(shippedSqlBackup, path.join(root, "prisma", `tgbots-creator-v${pkg.version}.sql`));
 
 // 4.6 遗留文件清理清单（upgrade-cleanup.txt）：
 //     发布包解压覆盖升级时，历史版本中「后来被删除」的文件会以幽灵文件残留在
@@ -285,6 +335,25 @@ writeFileSync(
 console.log(`   ── upgrade-cleanup.txt：${legacyGhosts.length} 条历史遗留路径入清单 ──`);
 for (const g of legacyGhosts) console.log(`   · ${g}`);
 
+// 4.8 staging SQLite 侧车文件清理：sanitize/dump 等步骤用 node:sqlite 打开 staging
+//     主库（WAL 模式持久化在库头）会重建 -wal/-shm，压缩前统一移除，
+//     保证包内只有主 db 文件本身（与 skipSuffixes 过滤语义一致）。
+function stripSqliteSidecars(dir) {
+  if (!existsSync(dir)) return;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      stripSqliteSidecars(full);
+    } else if (/\.(db|sqlite3?)-(wal|shm)$/.test(entry.name)) {
+      rmSync(full);
+      console.log(`   🧹 移除 staging 侧车文件: ${path.relative(stage, full)}`);
+    }
+  }
+}
+for (const dbFile of ["prisma/bot-groups.db", "db/custom.db"]) {
+  stripSqliteSidecars(path.dirname(path.join(stage, dbFile)));
+}
+
 // 5. 产品默认 .env。沙盒本地 .env 不入包。
 writeFileSync(
   path.join(stage, ".env"),
@@ -296,6 +365,13 @@ writeFileSync(
     "DATABASE_URI=file:./prisma/bot-groups.db",
     "",
     `NEXT_PUBLIC_APP_VERSION=${pkg.version}`,
+    "",
+    "# ---- Telegram 代理总开关（v2.2.5）----",
+    "# 全站所有对 api.telegram.org 的请求按此唯一外层开关：",
+    "# - true  = 允许代理生效（还需管理后台「系统设置 → 全局代理配置」开关同时开启）",
+    "# - false = 强制直连（即使系统设置开关开启也不走代理）",
+    "# - Cloudflare/Edge 部署无 .env 文件，仅认系统设置中的代理开关",
+    "PROXY_ENABLED=true",
     "",
     "# ---- Telegram Bot API 连接 ----",
     "# 默认（推荐）：管理后台「系统设置」中开启 Telegram API 代理（telegram.proxy_enabled，默认开启），",

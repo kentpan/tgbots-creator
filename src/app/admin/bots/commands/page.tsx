@@ -9,6 +9,7 @@ import {
 } from "@/database/operations";
 import { requirePermission } from "@/lib/auth";
 import { ConfirmDialog } from "@/components/admin/confirm-dialog";
+import { SubmitButton } from "@/components/admin/submit-button";
 import { CommandFormDialog } from "./command-form-dialog";
 import {
   deleteBotCommandAction,
@@ -347,12 +348,12 @@ function CommandRow({
             <input type="hidden" name="id" value={String(row.id)} />
             <input type="hidden" name="tab" value={tab} />
             <input type="hidden" name="page" value={String(page)} />
-            <button
-              type="submit"
+            <SubmitButton
               className="inline-flex h-8 items-center rounded-md border px-3 text-xs font-medium hover:bg-accent"
+              pendingLabel={row.enabled ? "停用中…" : "启用中…"}
             >
               {row.enabled ? "停用" : "启用"}
-            </button>
+            </SubmitButton>
           </form>
           <ConfirmDialog
             title={`删除指令 /${row.name}`}

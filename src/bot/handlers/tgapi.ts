@@ -29,6 +29,7 @@ import {
   detectTgApiLang,
   renderTgApiTextTemplate,
   resolveTgApiTexts,
+  tgApiInterfaceMode,
   TGAPI_SYSTEM_TEXTS,
   type TgApiBotConfig,
   type TgApiLang,
@@ -182,12 +183,13 @@ export async function registerTgApiHandlers(
   };
 
   // ---------------------------------------------------------------------------
-  // v2.2.0 自定义键盘对话流程（与消息内嵌按钮互斥）：tgapi.customKeyboard 配置非空
-  // 时启用 —— @grammyjs/conversations 驱动完整工作流（参数 → 门禁 → 图1 主键盘 →
-  // 创建API → requestContact 手机号 → 验证码 → my.telegram.org → API ID/HASH），
-  // 内嵌按钮/旧会话状态机/授权认证按钮全部不再注册。清空键盘配置即回到下方内嵌模式。
+  // v2.2.0 自定义键盘对话流程（与消息内嵌按钮互斥）；v2.2.6 生效模式解耦：
+  // interfaceMode（checkbox 单选，保存并部署后生效）决定渲染哪种界面，
+  // customKeyboard 仅是可附加属性 —— 配置保留不清除，切回内嵌模式不丢配置。
+  // 旧数据无 interfaceMode 时 tgApiInterfaceMode 按原语义（customKeyboard 非空）推断。
+  // 生效条件 = 键盘模式 && 键盘配置非空（空键盘回落内嵌按钮）。
   // ---------------------------------------------------------------------------
-  if (cfg.customKeyboard) {
+  if (tgApiInterfaceMode(cfg) === "keyboard" && cfg.customKeyboard) {
     registerTgApiConversation(bot, { cfg, botId, keyboard: cfg.customKeyboard });
     // 加群申请自动通过（与内嵌模式同一能力，对话模式下仍需生效）
     bot.on("chat_join_request", async (ctx) => {

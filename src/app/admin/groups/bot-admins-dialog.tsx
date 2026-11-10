@@ -75,6 +75,12 @@ function RemoveAdminButton({ adminId }: { adminId: string }) {
       type="submit"
       formAction={removeAction}
       disabled={pending}
+      onClick={(event) => {
+        // v2.2.5：移除群管理员为破坏性操作，必须先确认（取消 = 阻止提交）
+        if (!window.confirm("确定移除该管理员的机器人群管理员身份吗？")) {
+          event.preventDefault();
+        }
+      }}
       className="inline-flex items-center gap-1 rounded border border-red-200 px-2 py-1 text-sm text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60"
     >
       {pending ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : null}

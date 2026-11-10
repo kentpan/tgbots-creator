@@ -13,6 +13,7 @@ import {
   saveMethodAction,
   testMethodAction,
 } from "./actions";
+import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 
 export const dynamic = "force-dynamic";
 
@@ -362,15 +363,14 @@ export default async function VerificationMethodsPage({
                               </p>
                             </FormDialog>
                           ) : null}
-                          <form action={deleteMethodAction}>
-                            <input type="hidden" name="id" value={String(method.id)} />
-                            <button
-                              type="submit"
-                              className="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
-                            >
-                              删除
-                            </button>
-                          </form>
+                          <ConfirmDialog
+                            title={`删除验证方式「${method.name}」`}
+                            description={`确定要删除验证方式「${method.name}」吗？绑定该方式的机器人将无法通过门禁核验，删除后不可恢复！`}
+                            action={deleteMethodAction}
+                            fields={{ id: String(method.id) }}
+                            trigger="删除"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
+                          />
                         </div>
                       </td>
                     </tr>

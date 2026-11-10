@@ -3,6 +3,7 @@ import { requirePermission } from "@/lib/auth";
 import { FormDialog } from "@/components/admin/form-dialog";
 import { inputClass, labelClass } from "@/components/admin/form-styles";
 import { deleteDeveloperAccountAction, saveDeveloperAccountAction } from "./actions";
+import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 
 export const dynamic = "force-dynamic";
 
@@ -180,15 +181,14 @@ export default async function DeveloperAccountsPage({
                           trigger="编辑"
                           triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
                         />
-                        <form action={deleteDeveloperAccountAction}>
-                          <input type="hidden" name="id" value={String(account.id)} />
-                          <button
-                            type="submit"
-                            className="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
-                          >
-                            删除
-                          </button>
-                        </form>
+                        <ConfirmDialog
+                          title={`删除开发者账号「${account.remark || account.phone}」`}
+                          description={`确定要删除开发者账号「${account.remark || account.phone}」吗？删除后不可恢复！`}
+                          action={deleteDeveloperAccountAction}
+                          fields={{ id: String(account.id) }}
+                          trigger="删除"
+                          triggerClassName="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
+                        />
                       </div>
                     </td>
                   </tr>

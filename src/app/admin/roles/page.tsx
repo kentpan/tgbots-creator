@@ -7,6 +7,7 @@ import {
 } from "@/database/operations";
 import { requirePermission } from "@/lib/auth";
 import { deleteRoleAction } from "./actions";
+import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import { RoleFormDialog, type PermissionTreeMenu } from "./role-form-dialog";
 
 export const dynamic = "force-dynamic";
@@ -145,15 +146,14 @@ export default async function RolesPage({
                         triggerClassName={roleTriggerClass}
                       />
                       {!role.isBuiltin ? (
-                        <form action={deleteRoleAction}>
-                          <input type="hidden" name="id" value={String(role.id)} />
-                          <button
-                            type="submit"
-                            className="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
-                          >
-                            删除
-                          </button>
-                        </form>
+                        <ConfirmDialog
+                          title={`删除角色「${role.name}」`}
+                          description={`确定要删除角色「${role.name}」吗？该角色关联的管理员将失去对应权限，删除后不可恢复！`}
+                          action={deleteRoleAction}
+                          fields={{ id: String(role.id) }}
+                          trigger="删除"
+                          triggerClassName="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
+                        />
                       ) : null}
                     </div>
                   </td>

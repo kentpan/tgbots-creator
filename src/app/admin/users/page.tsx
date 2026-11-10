@@ -2,6 +2,7 @@ import { listAdminUsers, listRoles, type AdminUserRow } from "@/database/operati
 import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { requirePermission } from "@/lib/auth";
 import { FormDialog } from "@/components/admin/form-dialog";
+import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import { inputClass, labelClass, selectClass } from "@/components/admin/form-styles";
 import { deleteUserAction, saveUserAction } from "./actions";
 
@@ -208,15 +209,14 @@ export default async function UsersPage({
                         triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
                       />
                       {user.username !== "admin" ? (
-                        <form action={deleteUserAction}>
-                          <input type="hidden" name="id" value={String(user.id)} />
-                          <button
-                            type="submit"
-                            className="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
-                          >
-                            删除
-                          </button>
-                        </form>
+                        <ConfirmDialog
+                          title={`删除管理员「${user.username}」`}
+                          description={`确定要删除管理员「${user.username}」吗？该账号将立即无法登录管理后台，删除后不可恢复！`}
+                          action={deleteUserAction}
+                          fields={{ id: String(user.id) }}
+                          trigger="删除"
+                          triggerClassName="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm font-medium text-red-600 hover:bg-red-50"
+                        />
                       ) : null}
                     </div>
                   </td>

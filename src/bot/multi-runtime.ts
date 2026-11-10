@@ -154,6 +154,21 @@ export interface MenuBotDeployState {
 }
 
 /**
+ * v2.2.5：本进程运行实例清单（系统设置「Bot 状态」真实检测用 —— registry 即权威）。
+ * 返回 present（registry 存在的实例，含 webhook 模式实例）与 running（轮询中实例）两组 id。
+ * Edge 环境 isolate 不共享内存，结果仅代表当前 isolate（与部署状态探测同口径）。
+ */
+export function listMenuBotInstances(): { presentIds: number[]; runningIds: number[] } {
+  const presentIds: number[] = [];
+  const runningIds: number[] = [];
+  for (const [id, instance] of registry().entries()) {
+    presentIds.push(id);
+    if (instance.running) runningIds.push(id);
+  }
+  return { presentIds, runningIds };
+}
+
+/**
  * 读取机器人的真实部署状态（本进程 registry 权威值）。
  * 注意：Edge 环境 isolate 不共享内存，跨请求渲染的页面请用 Telegram 侧
  * getWebhookInfo（webhook 模式）或本接口（polling 模式，同进程内权威）。
@@ -633,7 +648,7 @@ async function startMenuBot(row: BotRow, options: StartMenuBotOptions = {}): Pro
     const syncCommandsWebhook = await ensureMenuBotCapabilities(instance, row, profile, effectivePrivacy);
     instances.set(Number(row.id), instance);
     const applied = await applyBotTransport(
-      { token: row.token, botId: String(row.id) },
+      { token: row.token, botId: String(row.id), webhookRoute: global.webhookRoute },
       "webhook",
       global.webhookBaseUrl,
     );
@@ -779,7 +794,7 @@ async function startMenuBot(row: BotRow, options: StartMenuBotOptions = {}): Pro
   // 启动路径只做传输应用（deleteWebhook 确保 getUpdates 不与残留 Webhook 互斥）
   void Promise.allSettled([
     applyBotTransport(
-      { token: row.token, botId: String(row.id) },
+      { token: row.token, botId: String(row.id), webhookRoute: global.webhookRoute },
       "polling",
       global.webhookBaseUrl,
     ),
@@ -804,7 +819,46 @@ export async function startMenuBots(): Promise<void> {
   }
 }
 
-export async function stopMenuBot(botId: bigint): Promise<void> {
+/**
+ * 管理端动作防挂保护（v2.2.5）：删除/停用机器人时 Telegram 侧清理
+ * （deleteWebhook / bot.stop 保存 offset 的 getUpdates）是纯网络调用，
+ * 网络不可达（如代理关闭且直连被墙）时可能等待出站超时 —— 绝不阻塞管理端
+ * 动作：超时放弃等待并完整记录日志（registry 已先行移除实例，轮询
+ * abortController 已同步触发，放弃等待不影响停止语义）。
+ */
+async function withStopTimeout<T>(task: Promise<T>, label: string, timeoutMs = 8000): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} 超时（${timeoutMs / 1000}s，放弃等待，实例已移除）`)),
+      timeoutMs,
+    );
+  });
+  if (typeof timer === "object" && timer && "unref" in timer) {
+    (timer as { unref: () => void }).unref();
+  }
+  try {
+    return await Promise.race([task, timeout]);
+  } catch (error) {
+    console.warn(`[multi-runtime] ${label}:`, error instanceof Error ? error.message : error);
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export interface StopMenuBotOptions {
+  /**
+   * 跳过 Webhook 注销（restartMenuBot 专用）：重启紧随其后的 setWebhook 会原子覆盖
+   * 同一回调地址；而 stop 的 deleteWebhook 带 8s 超时放弃等待 —— 放弃后请求仍在途，
+   * 与随后 setWebhook 无序到达 Telegram 时会把刚注册的 Webhook 掐掉
+   * （2026-11-11「部署成功后机器人全场景静默、getWebhookInfo url 为空」事故根因）。
+   * 停用/删除路径（不会紧跟 setWebhook）保持注销语义不变。
+   */
+  skipWebhookDelete?: boolean;
+}
+
+export async function stopMenuBot(botId: bigint, options: StopMenuBotOptions = {}): Promise<void> {
   const instance = registry().get(Number(botId));
   if (!instance) return;
   instance.running = false;
@@ -819,23 +873,24 @@ export async function stopMenuBot(botId: bigint): Promise<void> {
   }
   // Webhook 模式实例：停止时同步注销 Webhook，避免 Telegram 继续推送到已停用机器人
   if (instance.mode === "webhook") {
-    try {
-      await instance.bot.api.deleteWebhook({ drop_pending_updates: false });
-    } catch (error) {
-      console.warn(`Menu bot #${String(botId)} deleteWebhook error:`, error);
-    }
+    if (options.skipWebhookDelete) return;
+    await withStopTimeout(
+      instance.bot.api.deleteWebhook({ drop_pending_updates: false }),
+      `Menu bot #${String(botId)} deleteWebhook`,
+    );
     return;
   }
-  try {
-    await instance.bot.stop();
-  } catch (error) {
-    console.warn(`Menu bot #${String(botId)} stop error:`, error);
-  }
+  await withStopTimeout(instance.bot.stop(), `Menu bot #${String(botId)} stop`);
 }
 
 export async function restartMenuBot(botId: bigint): Promise<void> {
-  await stopMenuBot(botId);
-  const row = await getBot(botId);
+  // 重启 = stop 后紧接 startMenuBot，按生效传输模式重新注册传输（webhook=setWebhook
+  // 原子覆盖 / polling=deleteWebhook 后轮询）。stop 的 deleteWebhook 带 8s 超时放弃
+  // 等待，在途请求与随后 setWebhook 无序到达 Telegram 时会把刚注册的 Webhook 掐掉
+  // （2026-11-11「部署成功后机器人全场景静默」事故根因），重启路径一律跳过注销；
+  // 停用/删除（不会紧跟 setWebhook）保持注销，避免 Telegram 向已停用机器人继续推送。
+  const row = await getBot(botId).catch(() => null);
+  await stopMenuBot(botId, { skipWebhookDelete: Boolean(row?.enabled) });
   if (!row || !row.enabled) return;
   // 管理后台显式重启 = 按需推送档案/指令（syncProfile 默认 true）
   await startMenuBot(row);

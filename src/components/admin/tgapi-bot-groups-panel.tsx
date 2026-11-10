@@ -10,7 +10,7 @@ import { useRealGroups } from "@/components/admin/use-real-groups";
  * - 打开弹窗时只调 GET 读取数据库已登记群组（零 Telegram 请求）；
  *   Radix Dialog 关闭时 Content 不挂载，本面板随弹窗打开才挂载发起请求（天然懒加载）。
  * - 只有用户点「同步真实群组」按钮才调 POST 实时请求 Telegram
- *   （getUpdates + 数据库关联 + getChat 三源合并），结果如实展示，
+ *   （数据库关联 + getChat 两源合并），结果如实展示，
  *   未发现/校验失败的原因原文透出 —— 配置不再是黑盒。
  */
 export function TgApiBotGroupsPanel({ botId }: { botId: string }) {
@@ -22,7 +22,7 @@ export function TgApiBotGroupsPanel({ botId }: { botId: string }) {
           <p className="text-sm font-medium">🧭 机器人所在真实群组</p>
           <p className="mt-0.5 text-xs text-muted-foreground">
             打开弹窗展示已登记的群组（本地数据库，不请求 Telegram）；点「同步真实群组」才实时调用
-            Bot API（getUpdates + getChat）发现并校验，结果如实展示。
+            Bot API（getChat）校验，结果如实展示。
           </p>
         </div>
         <button
@@ -47,11 +47,7 @@ export function TgApiBotGroupsPanel({ botId }: { botId: string }) {
               <span className="flex shrink-0 items-center gap-1.5 text-muted-foreground">
                 <span className="font-mono">{group.chatId}</span>
                 <span className="rounded-full border bg-muted/40 px-1.5 py-0.5 text-[10px]">
-                  {group.source === "updates"
-                    ? "getUpdates 新发现"
-                    : group.source === "getchat"
-                      ? "getChat 验证"
-                      : "已登记"}
+                  {group.source === "getchat" ? "getChat 验证" : "已登记"}
                 </span>
               </span>
             </div>

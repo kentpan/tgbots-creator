@@ -88,13 +88,14 @@ function UsageBar({
   );
 }
 
-/** D1 用量数据来源徽标（运行环境注入 / 部署默认值 / 后台配置） */
+/** D1 用量数据来源徽标（运行环境注入 / 部署默认值 / 后台配置 / Token 自动探测） */
 function sourceBadgeText(usage: D1DailyUsage): string | null {
   if (!usage.source) return null;
   const kinds = [usage.source.accountId, usage.source.apiToken];
   if (kinds.includes("env-cloudflare")) return "运行环境注入";
   if (kinds.includes("env-default")) return "部署默认值";
   if (kinds.every((kind) => kind === "stored")) return "后台配置";
+  if (kinds.includes("auto-probe")) return "Token 自动探测";
   return null;
 }
 

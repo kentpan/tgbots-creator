@@ -15,6 +15,7 @@ import {
 } from "@/services/approval";
 import { isBackupDue, loadBackupSettings, markBackupRan, parseBackupConfig, runBackup } from "@/lib/backup/backup-runner";
 import { getBackupStore } from "@/lib/backup/backup-store";
+import { keepLatestApiLogs, API_LOGS_MAX_ROWS } from "@/lib/api-log";
 
 export const CLEANUP_INTERVAL_SECONDS = 60;
 export const PURGE_INTERVAL_SECONDS = 24 * 60 * 60;
@@ -91,6 +92,21 @@ export async function cleanupAndDismissExpiredRequests(): Promise<void> {
   }
 }
 
+/**
+ * v2.2.5：api_logs 容量封顶（保留最近 API_LOGS_MAX_ROWS 行，随清理循环周期执行）；
+ * 失败仅记日志，绝不影响清理主循环。
+ */
+async function capApiLogs(): Promise<void> {
+  try {
+    const removed = await keepLatestApiLogs();
+    if (removed > 0) {
+      console.log(`[api-log] 容量封顶清理：删除 ${removed} 条旧日志（保留最近 ${API_LOGS_MAX_ROWS} 条）`);
+    }
+  } catch (error) {
+    console.error("[api-log] 容量封顶清理失败:", error);
+  }
+}
+
 export async function purgeOldRecords(): Promise<void> {
   try {
     const runtime = await getRuntimeSettings(config);
@@ -98,6 +114,7 @@ export async function purgeOldRecords(): Promise<void> {
   } catch (error) {
     console.error("Error in purge_old_records:", error);
   }
+  await capApiLogs();
 }
 
 /**
