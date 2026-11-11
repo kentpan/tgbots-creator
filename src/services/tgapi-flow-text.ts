@@ -21,11 +21,14 @@ import { htmlEscape } from "@/utils/html";
  * 已知消息形态（Telegram 777000 服务通知）：
  *  1. "Web login code: 12345"（原版 trial-and-error 依据的 "web login code" 关键字）
  *  2. "Login code: 12345\n\nDo not give this code to anyone, ... "（新版措辞）
- *  3. 用户手输/复制的独立验证码行
+ *  3. "登录码：9VC6TeKMTQY"（中文措辞 —— v2.2.8：关键字补中文「登录码」）
+ *  4. 用户手输/复制的独立验证码行
+ *  5. 新版混合码：Telegram 新版登录码为字母数字混合（如 9VC6TeKMTQY），非纯数字
+ *     —— v2.2.8：关键字行冒号后 / 关键字行后续行 / 整行三种形态均支持混合码提取
  * 解析优先级：
- *  a) 关键字行（web login code / login code）冒号后的数字段；
- *  b) 原版第二行试错结论：关键字行的后续非空行中的数字段；
- *  c) 整行即验证码（纯数字独立行）；
+ *  a) 关键字行（web login code / login code / 登录码）冒号后的数字段或混合码；
+ *  b) 原版第二行试错结论：关键字行的后续非空行中的数字段或混合码；
+ *  c) 整行即验证码（纯数字独立行 / 字母数字混合独立行）；
  *  d) 首个行内独立数字段（3-8 位，不吞长数字的片段）；
  *  e) 单行原文兜底（原版行为：单行原样提交）。
  */
@@ -39,30 +42,53 @@ export function extractTgWebLoginCode(messageText: string): string | null {
   /** 行内独立数字段（3-8 位；前后不能还是数字，避免吞掉手机号片段） */
   const codeInLine = (line: string): string | null =>
     line.match(/(?<!\d)\d{3,8}(?!\d)/)?.[0] ?? null;
+  /**
+   * 行内字母数字混合码（v2.2.8）：Telegram 新版登录码形态（如 9VC6TeKMTQY）。
+   * 词边界内 6-16 位 token，必须同时含字母与数字 —— 纯英文单词（anyone/Telegram）
+   * 与纯数字段均被排除，正文警示行不会被误提取。
+   */
+  const mixedCodeInLine = (line: string): string | null => {
+    for (const m of line.matchAll(/(?<![A-Za-z0-9])[A-Za-z0-9]{6,16}(?![A-Za-z0-9])/g)) {
+      const token = m[0] ?? "";
+      if (/[A-Za-z]/.test(token) && /\d/.test(token)) return token;
+    }
+    return null;
+  };
 
   const keywordIndex = lines.findIndex((line) => {
     const lower = line.toLowerCase();
-    return lower.includes("web login code") || lower.includes("login code");
+    return (
+      lower.includes("web login code") ||
+      lower.includes("login code") ||
+      line.includes("登录码") ||
+      line.includes("登录代码")
+    );
   });
 
   if (keywordIndex >= 0) {
-    // a) 关键字行冒号后直接跟验证码（"Web login code: 12345" / "Login code: 12345"）
+    // a) 关键字行冒号后直接跟验证码（"Web login code: 12345" / "登录码：9VC6TeKMTQY"）
     const keywordLine = lines[keywordIndex] ?? "";
     const afterColon = keywordLine.split(/[:：]/).slice(1).join(":").trim();
     if (afterColon) {
-      const code = codeInLine(afterColon);
+      const code = codeInLine(afterColon) ?? mixedCodeInLine(afterColon);
       if (code) return code;
     }
     // b) 原版第二行试错结论：验证码在关键字行的后续非空行
     for (let i = keywordIndex + 1; i < lines.length; i += 1) {
-      const code = codeInLine(lines[i] ?? "");
+      const line = lines[i] ?? "";
+      const code = codeInLine(line) ?? mixedCodeInLine(line);
       if (code) return code;
     }
   }
 
-  // c) 整行即验证码（手输/复制的纯数字行）
+  // c) 整行即验证码（手输/复制的独立码行：旧版纯数字，或新版字母数字混合）
   for (const line of lines) {
     if (/^\d{3,8}$/.test(line)) return line;
+  }
+  for (const line of lines) {
+    if (/^[A-Za-z0-9]{6,16}$/.test(line) && /[A-Za-z]/.test(line) && /\d/.test(line)) {
+      return line;
+    }
   }
   // d) 首个行内独立数字段（多行且无关键字，如转发的旧版通知）
   for (const line of lines) {

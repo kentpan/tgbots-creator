@@ -701,6 +701,11 @@ export async function registerTgApiHandlers(
       await ctx.reply(texts.invalidPhone, { parse_mode: "HTML" });
       return;
     }
+    if (!phone.startsWith("+")) {
+      // v2.2.8：非 + 开头 = 本地格式校验拦截（不发起真实 requestLoginCode 请求）
+      await ctx.reply(texts.invalidPhoneFormat, { parse_mode: "HTML" });
+      return;
+    }
     try {
       const randomHash = await requestTgCodeGetRandomHash(phone);
       ctx.session.tgapi = { ...ctx.session.tgapi, state: "code", phone, randomHash };

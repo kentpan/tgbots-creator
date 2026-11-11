@@ -18,38 +18,29 @@ export interface CommandLibraryItem {
 }
 
 /**
- * 机器人「指令菜单」配置弹窗：
+ * 「指令菜单」配置模块（v2.2.8 从 CommandMenuDialog 抽出，供两处复用）：
  * - 隐私模式 Switch（写入 bots.config.privacyMode，bot 运行时真实生效）
  * - 指令选择浮层：内置指令 / 自定义指令 两个页签，多选指令库中的指令
- * 保存后服务端调用 setMyCommands 同步 Telegram 指令菜单并热更新运行实例。
+ * 状态受控（privacyMode/selected/onToggle 由宿主持有）：
+ * - 机器人管理页「指令菜单」弹窗：宿主 CommandMenuDialog，随独立表单提交
+ * - TGAPI申请页「菜单和键盘」统一弹窗：宿主 bot-designer-dialog，作为指令菜单
+ *   配置模块渲染在「界面模式」上方，随统一表单 hidden 字段提交
  */
-export function CommandMenuDialog({
-  bot,
+export function CommandMenuConfigFields({
+  privacyMode,
+  onPrivacyModeChange,
+  selected,
+  onToggle,
   library,
-  trigger,
-  triggerClassName,
 }: {
-  bot: {
-    id: string;
-    name: string;
-    privacyMode: boolean;
-    selectedCommandIds: number[];
-  };
+  privacyMode: boolean;
+  onPrivacyModeChange: (value: boolean) => void;
+  selected: number[];
+  onToggle: (id: number) => void;
   library: CommandLibraryItem[];
-  trigger: React.ReactNode;
-  triggerClassName?: string;
 }) {
-  const [privacyMode, setPrivacyMode] = useState(bot.privacyMode);
-  const [selected, setSelected] = useState<number[]>(bot.selectedCommandIds);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [tab, setTab] = useState<"builtin" | "custom">("builtin");
-
-  const toggle = (id: string) => {
-    const numId = Number(id);
-    setSelected((prev) =>
-      prev.includes(numId) ? prev.filter((item) => item !== numId) : [...prev, numId],
-    );
-  };
 
   const selectedItems = library.filter((item) => selected.includes(Number(item.id)));
   const pickerLabel = selectedItems.length
@@ -60,18 +51,7 @@ export function CommandMenuDialog({
     : "点击选择指令（可多选）";
 
   return (
-    <FormDialog
-      trigger={trigger}
-      triggerClassName={triggerClassName}
-      title={`指令菜单 · ${bot.name}`}
-      description="指令注册的唯一来源：勾选要应用到该机器人的指令，保存后立即注册响应（按钮点击与手输 /指令 同源）并同步到 Telegram 指令菜单；未勾选的指令不注册、不响应。"
-      action={saveBotCommandMenuAction}
-      contentClassName="sm:max-w-2xl"
-    >
-      <input type="hidden" name="id" value={bot.id} />
-      <input type="hidden" name="privacyMode" value={privacyMode ? "1" : "0"} />
-      <input type="hidden" name="commandIds" value={JSON.stringify(selected)} />
-
+    <>
       {/* 隐私模式开关（通用功能，真实生效） */}
       <div className="flex items-center justify-between rounded-md border px-4 py-3">
         <div>
@@ -84,7 +64,7 @@ export function CommandMenuDialog({
             定向写法（要求已在 BotFather 关闭隐私模式）。
           </p>
         </div>
-        <Switch checked={privacyMode} onCheckedChange={setPrivacyMode} aria-label="隐私模式" />
+        <Switch checked={privacyMode} onCheckedChange={onPrivacyModeChange} aria-label="隐私模式" />
       </div>
 
       {/* 指令选择浮层（双 Tab 多选） */}
@@ -141,7 +121,7 @@ export function CommandMenuDialog({
                       <button
                         key={item.id}
                         type="button"
-                        onClick={() => toggle(item.id)}
+                        onClick={() => onToggle(Number(item.id))}
                         className={`flex w-full items-start gap-2 border-b px-3 py-2 text-left text-sm last:border-0 ${
                           checked ? "bg-primary/5" : "hover:bg-accent"
                         }`}
@@ -189,7 +169,7 @@ export function CommandMenuDialog({
             <button
               key={item.id}
               type="button"
-              onClick={() => toggle(item.id)}
+              onClick={() => onToggle(Number(item.id))}
               className="inline-flex items-center gap-1 rounded-full border bg-muted/40 px-2.5 py-1 text-xs hover:bg-accent"
               title="点击移除"
             >
@@ -199,6 +179,61 @@ export function CommandMenuDialog({
           ))}
         </div>
       ) : null}
+    </>
+  );
+}
+
+/**
+ * 机器人「指令菜单」配置弹窗：
+ * - 隐私模式 Switch（写入 bots.config.privacyMode，bot 运行时真实生效）
+ * - 指令选择浮层：内置指令 / 自定义指令 两个页签，多选指令库中的指令
+ * 保存后服务端调用 setMyCommands 同步 Telegram 指令菜单并热更新运行实例。
+ */
+export function CommandMenuDialog({
+  bot,
+  library,
+  trigger,
+  triggerClassName,
+}: {
+  bot: {
+    id: string;
+    name: string;
+    privacyMode: boolean;
+    selectedCommandIds: number[];
+  };
+  library: CommandLibraryItem[];
+  trigger: React.ReactNode;
+  triggerClassName?: string;
+}) {
+  const [privacyMode, setPrivacyMode] = useState(bot.privacyMode);
+  const [selected, setSelected] = useState<number[]>(bot.selectedCommandIds);
+
+  const toggle = (id: number) => {
+    setSelected((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
+    );
+  };
+
+  return (
+    <FormDialog
+      trigger={trigger}
+      triggerClassName={triggerClassName}
+      title={`指令菜单 · ${bot.name}`}
+      description="指令注册的唯一来源：勾选要应用到该机器人的指令，保存后立即注册响应（按钮点击与手输 /指令 同源）并同步到 Telegram 指令菜单；未勾选的指令不注册、不响应。"
+      action={saveBotCommandMenuAction}
+      contentClassName="sm:max-w-2xl"
+    >
+      <input type="hidden" name="id" value={bot.id} />
+      <input type="hidden" name="privacyMode" value={privacyMode ? "1" : "0"} />
+      <input type="hidden" name="commandIds" value={JSON.stringify(selected)} />
+
+      <CommandMenuConfigFields
+        privacyMode={privacyMode}
+        onPrivacyModeChange={setPrivacyMode}
+        selected={selected}
+        onToggle={toggle}
+        library={library}
+      />
     </FormDialog>
   );
 }

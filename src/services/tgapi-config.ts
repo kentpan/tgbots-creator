@@ -66,6 +66,8 @@ export interface TgApiBotTexts {
   invalidCode: string;
   /** 原 IN_VALID_PHNO_PVDED */
   invalidPhone: string;
+  /** v2.2.8 手机号非 + 开头的本地格式校验提示（不发起真实请求直接拦截） */
+  invalidPhoneFormat: string;
   /** 设置Title 提示，{default} 占位符替换为管理端默认 APP 名称 */
   askAppTitle: string;
   /** 设置Description 提示，{default} 占位符替换为管理端默认 APP 描述 */
@@ -123,6 +125,7 @@ export const TGAPI_TEXTS_ZH: TgApiBotTexts = {
   erredPage: "出错了，获取 APP ID 失败。请稍后重试，或发送 /start 重新开始。",
   invalidCode: "抱歉，输入内容似乎不是有效的 Telegram 网页登录码",
   invalidPhone: "抱歉，输入内容似乎不是有效的手机号",
+  invalidPhoneFormat: "📱 手机号格式错误：请输入以 + 开头的国际格式号码（如 +8613800138000），或点击下方按钮授权共享",
   askAppTitle: "✏️ 请发送 APP 名称（App title，1-32 个字符）。\n当前默认：{default}\n\n任意阶段发送 /start 可重新开始",
   askAppDescription: "📝 请发送 APP 描述（App description，1-200 个字符）。\n当前默认：{default}\n\n任意阶段发送 /start 可重新开始",
   helpText:
@@ -177,6 +180,8 @@ export const TGAPI_TEXTS_EN: TgApiBotTexts = {
     "sorry, but the input does not seem to be a valid Telegram Web-Login code",
   invalidPhone:
     "sorry, but the input does not seem to be a valid phone number",
+  invalidPhoneFormat:
+    "📱 Invalid phone format: please send a number starting with + in international format (e.g. +14155552671), or tap the button below to share it",
   askAppTitle:
     "✏️ Please send the App title (1-32 characters).\n" +
     "Current default: {default}\n\n/start at any stage to restart",
@@ -395,6 +400,7 @@ export const TGAPI_TEXT_FIELD_KEYS = [
   { name: "erredPage", label: "提交失败提示" },
   { name: "invalidCode", label: "登录码无效提示" },
   { name: "invalidPhone", label: "手机号无效提示" },
+  { name: "invalidPhoneFormat", label: "手机号格式错误提示（非 + 开头）" },
   { name: "askAppTitle", label: "设置Title 提示（{default} = 默认名称）" },
   { name: "askAppDescription", label: "设置Description 提示（{default} = 默认描述）" },
   { name: "helpText", label: "帮助回复" },

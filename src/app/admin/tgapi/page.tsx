@@ -1,11 +1,14 @@
 import {
   listBots,
+  listBotCommands,
+  listGroupSettings,
   listTgApiUnlocks,
   listVerificationMethods,
 } from "@/database/operations";
 import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { requirePermission } from "@/lib/auth";
 import { parseTgApiBotConfig } from "@/services/tgapi-config";
+import type { CommandLibraryItem } from "@/app/admin/bots/command-menu-dialog";
 import { TgApiPageClient } from "./page-client";
 
 /**
@@ -36,8 +39,65 @@ export default async function TgApiPage({
   await requirePermission("tgapi:view");
   const params = await searchParams;
 
-  const [bots, methods] = await Promise.all([listBots(), listVerificationMethods()]);
+  const [bots, methods, builtinCommands, customCommands, groups] = await Promise.all([
+    listBots(),
+    listVerificationMethods(),
+    listBotCommands({ type: "builtin", enabledOnly: true }),
+    listBotCommands({ type: "custom", enabledOnly: true }),
+    listGroupSettings(),
+  ]);
   const tgapiBots = bots.filter((bot) => parseTgApiBotConfig(bot.config).enabled);
+
+  // v2.2.8：指令菜单配置模块的指令库（与机器人管理页同源同过滤规则）——
+  // 本机器人可见的自定义指令 = 全局 + 群组私有 + 本机器人私有；其他机器人私有不可见
+  const commandLibrary = [...builtinCommands.rows, ...customCommands.rows].map((row) => ({
+    id: String(row.id),
+    name: row.name,
+    description: row.description,
+    intro: row.intro,
+    type: row.type,
+    botId: row.botId === null ? null : String(row.botId),
+    groupId: row.groupId === null ? null : String(row.groupId),
+  }));
+  const scopeLabelOf = (
+    item: (typeof commandLibrary)[number],
+    botName: string | null,
+  ): string | undefined => {
+    if (item.type !== "custom") return undefined;
+    if (item.botId !== null) return `🤖 ${botName ?? "机器人"} 私有`;
+    if (item.groupId !== null) {
+      const title = groups.find((group) => String(group.chatId) === item.groupId)?.chatTitle;
+      return `👥 群组私有${title ? `（${title}）` : ""}`;
+    }
+    return undefined;
+  };
+  const commandLibraries: Record<string, CommandLibraryItem[]> = {};
+  for (const bot of tgapiBots) {
+    commandLibraries[String(bot.id)] = commandLibrary
+      .filter(
+        (item) =>
+          item.type === "builtin" || item.botId === null || item.botId === String(bot.id),
+      )
+      .map((item) => ({
+        id: item.id,
+        name: item.name,
+        description: item.description,
+        intro: item.intro,
+        type: item.type,
+        scopeLabel: scopeLabelOf(item, bot.name),
+      }));
+  }
+  // 新增机器人弹窗（尚无 id）：全局可见指令 = 内置 + 全局/群组私有自定义
+  const newBotLibrary: CommandLibraryItem[] = commandLibrary
+    .filter((item) => item.type === "builtin" || item.botId === null)
+    .map((item) => ({
+      id: item.id,
+      name: item.name,
+      description: item.description,
+      intro: item.intro,
+      type: item.type,
+      scopeLabel: scopeLabelOf(item, null),
+    }));
 
   const selectedBotId = params.bot && /^\d+$/.test(params.bot) ? params.bot : null;
   const selectedBot = selectedBotId
@@ -61,6 +121,8 @@ export default async function TgApiPage({
         enabled: method.enabled,
         type: method.type,
       }))}
+      commandLibraries={commandLibraries}
+      newBotLibrary={newBotLibrary}
       notices={{
         saved: params.saved,
         error: params.error,

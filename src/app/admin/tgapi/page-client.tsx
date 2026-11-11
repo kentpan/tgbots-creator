@@ -5,6 +5,7 @@ import { BotDeployBadge, briefDeployDetail } from "@/components/admin/bot-deploy
 import { TgApiApplyWizard } from "@/components/admin/tgapi-apply-wizard";
 import { parseTgApiBotConfig } from "@/services/tgapi-config";
 import type { BotDeployCheck } from "@/services/bot-deploy";
+import type { CommandLibraryItem } from "@/app/admin/bots/command-menu-dialog";
 import { TgApiMenuKeyboardDialog } from "./bot-designer-dialog";
 import { SubmitButton } from "@/components/admin/submit-button";
 import { ConfirmDialog } from "@/components/admin/confirm-dialog";
@@ -39,6 +40,7 @@ const ERRORS: Record<string, string> = {
   "invalid-stars": "星星解锁金额必须是大于等于 1 的整数",
   "invalid-menu": "内嵌按钮配置不合法（请重新打开弹窗后保存）",
   "invalid-keyboard": "自定义键盘配置不合法（请重新打开弹窗后保存）",
+  "invalid-commands": "指令菜单选择数据不合法（请重新打开弹窗后保存）",
 };
 
 function KeyboardModeBadge({ custom }: { custom: boolean }) {
@@ -96,12 +98,18 @@ export interface TgApiUnlockItem {
 export function TgApiPageClient({
   bots,
   methods,
+  commandLibraries,
+  newBotLibrary,
   notices,
   editBotId,
   unlockPanel,
 }: {
   bots: TgApiBotListItem[];
   methods: { id: number; name: string; enabled: boolean; type: string }[];
+  /** 指令菜单模块指令库（v2.2.8）：按机器人过滤后的可见指令（SSR 预构建）*/
+  commandLibraries: Record<string, CommandLibraryItem[]>;
+  /** 新增机器人弹窗（尚无 id）的全局可见指令库 */
+  newBotLibrary: CommandLibraryItem[];
   notices: { saved?: string; error?: string; deploy?: string; deployMsg?: string };
   /** ?edit=1 时自动打开该机器人的「菜单和键盘」弹窗 */
   editBotId: string | null;
@@ -160,6 +168,7 @@ export function TgApiPageClient({
           <TgApiApplyWizard />
           <TgApiMenuKeyboardDialog
             methods={methods}
+            library={newBotLibrary}
             trigger="+ 新增 TGAPI 申请机器人"
             triggerClassName="inline-flex h-10 shrink-0 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
           />
@@ -293,6 +302,7 @@ export function TgApiPageClient({
                           <TgApiMenuKeyboardDialog
                             bot={bot}
                             methods={methods}
+                            library={commandLibraries[bot.id] ?? []}
                             defaultOpen={editBotId === bot.id}
                             defaultTab={cfg.customKeyboard ? "keyboard" : "inline"}
                             trigger="⚙️ 菜单和键盘"

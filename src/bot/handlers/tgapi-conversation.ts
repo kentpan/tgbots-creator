@@ -496,6 +496,11 @@ async function tgapiMainFlow(
           await evt.reply(texts().invalidPhone, { parse_mode: "HTML" });
           continue;
         }
+        if (!candidate.startsWith("+")) {
+          // v2.2.8：非 + 开头 = 本地格式校验拦截（不发起真实 requestLoginCode 请求）
+          await evt.reply(texts().invalidPhoneFormat, { parse_mode: "HTML" });
+          continue;
+        }
         phone = candidate;
         requestingPhone = false;
         break;

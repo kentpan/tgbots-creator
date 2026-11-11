@@ -169,6 +169,33 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
       delete nextTgapi.customKeyboard;
     }
   }
+
+  // v2.2.8 指令菜单配置（统一弹窗「5️⃣ 指令菜单」模块随表单提交）：隐私模式 + 指令勾选，
+  // 写入 bots.config.privacyMode / bots.config.commandIds —— 与机器人管理页
+  // 「⌨️ 指令菜单」弹窗（saveBotCommandMenuAction）同一存储位；运行实例注册与
+  // setMyCommands 在「仿真APP」部署时执行（registerBotCapabilities 读取同一字段）。
+  // 字段缺失 = 不触碰（兼容旧调用方）；commandIds 非法 JSON 直接报错不静默。
+  const privacyRaw = formData.get("privacyMode");
+  if (privacyRaw !== null) {
+    profile.privacyMode = privacyRaw === "1";
+  }
+  const commandIdsRaw = formData.get("commandIds");
+  let savedCommandCount = 0;
+  if (commandIdsRaw !== null) {
+    let commandIds: number[] = [];
+    try {
+      const parsedIds = JSON.parse(String(commandIdsRaw)) as unknown;
+      if (Array.isArray(parsedIds)) {
+        commandIds = parsedIds
+          .map((item) => Number(item))
+          .filter((item) => Number.isInteger(item) && item > 0);
+      }
+    } catch {
+      redirect(tgapiPath({ error: "invalid-commands" }));
+    }
+    profile.commandIds = commandIds;
+    savedCommandCount = commandIds.length;
+  }
   const configJson = JSON.stringify(profile);
 
   // v2.1.16：内嵌按钮配置随弹窗一并保存（bots.menu_config，含 tgapiDesigner 标记）——
@@ -204,7 +231,7 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
     await logOperation(admin, {
       action: "保存TGAPI申请机器人",
       target: name,
-      detail: `状态：${enabled ? "启用" : "停用"}（仅保存配置，未部署）`,
+      detail: `状态：${enabled ? "启用" : "停用"}（仅保存配置，未部署）；隐私模式：${formData.get("privacyMode") === "1" ? "开启" : "关闭"}；指令 ${savedCommandCount} 条`,
       headers: await headers(),
     });
     revalidatePath("/admin/tgapi");
@@ -221,7 +248,7 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
     await logOperation(admin, {
       action: "创建TGAPI申请机器人",
       target: name,
-      detail: `Token 尾号：${token.slice(-6)}（仅保存配置，未部署）`,
+      detail: `Token 尾号：${token.slice(-6)}（仅保存配置，未部署）；指令 ${savedCommandCount} 条`,
       headers: await headers(),
     });
     revalidatePath("/admin/tgapi");

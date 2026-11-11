@@ -108,8 +108,9 @@ export function CustomKeyboardDesigner({
   /** 初始配置（宿主从 bots.config 解析；null = 尚未配置） */
   initialConfig: CustomKeyboardConfig | null;
   isTgApi: boolean;
-  /** 保存 server action：表单字段 id + custom_keyboard（JSON；空串 = 清除配置） */
-  action: (formData: FormData) => Promise<void>;
+  /** 保存 server action：表单字段 id + custom_keyboard（JSON；空串 = 清除配置）。
+   *  v2.2.8：embedded 嵌入模式由宿主统一表单提交，不再需要本属性（改为可选） */
+  action?: (formData: FormData) => Promise<void>;
   /** 保存成功回调（宿主关闭弹窗/刷新） */
   onSaved?: () => void;
   /** 取消回调（独立弹窗 = 关闭；统一弹窗键盘页签不传 = 不渲染取消按钮） */
@@ -301,99 +302,59 @@ export function CustomKeyboardDesigner({
   }, [config]);
 
   // v2.2.6 嵌入模式：纯字段编辑区（无 form 外壳/隐藏字段/保存按钮 —— 宿主统一表单提交）
+  // v2.2.8：不再自带「编辑区+仿真屏」两栏网格与内层滚动容器 —— 旧结构在 TGAPI
+  // 「菜单和键盘」统一弹窗里与主两栏网格嵌套（键盘模式下主网格右列隐藏、430px
+  // 空列占位 → 布局断裂；内层 overflow 容器不滚动但仍是 sticky 的最近滚动祖先 →
+  // 仿真屏 sticky 失效）。嵌入时仅输出键盘编辑区片段，仿真屏由宿主放入主网格右列。
   if (embedded) {
     return (
-      <div className="flex min-h-0 flex-1 flex-col">
-        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-4">
-          <div className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[1fr_430px]">
-            <div className="min-w-0 space-y-4">
-              {tgapiModeHint ? (
-                <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-700">
-                  ⚠️ {tgapiModeHint}
-                </p>
-              ) : null}
-              <div className="space-y-3 rounded-xl border bg-card p-4">
-                <p className="text-sm font-semibold">键盘选项</p>
-                <KeyboardOptionsEditor
-                  options={config.options}
-                  onChange={(options) => setConfig((prev) => ({ ...prev, options }))}
-                />
-                <div>
-                  <p className="mb-1 text-sm font-medium">键盘预览（随消息发送，右屏同步）</p>
-                  <KeyboardButtonPreview config={config} />
-                </div>
-                {isTgApi ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setConfig(() =>
-                        JSON.parse(JSON.stringify(defaultTgApiCustomKeyboard())) as CustomKeyboardConfig,
-                      );
-                      setSelected(null);
-                    }}
-                    className="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
-                    title="恢复图1默认键盘（创建API/我的API/设置平台/语言/帮助/客服支持）"
-                  >
-                    ↺ 恢复图1默认键盘
-                  </button>
-                ) : null}
-              </div>
-              <KeyboardRowList state={state} />
-              {!selected ? (
-                <p className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-                  点击任意按钮可配置名称、类型、样式与交互行为
-                  {isTgApi ? "（TGAPI 固定指令列表 + 解锁门禁 + 指令消息）" : ""}
-                </p>
-              ) : null}
-            </div>
-            <div className="min-w-0 lg:sticky lg:top-0 lg:self-start">
-              {renderSimulator ? (
-                renderSimulator(config)
-              ) : (
-                <TgSimulator
-                  config={{
-                    content: {
-                      type: "text",
-                      text: isTgApi
-                        ? "💀 欢迎使用 API 生成机器人！\n\n本机器人可为您自己的 Telegram 账号自动生成 api_id 和 api_hash。\n\n👇 请使用下方键盘按钮："
-                        : "👋 欢迎使用本机器人！\n\n👇 请使用下方自定义键盘：",
-                      mediaUrl: "",
-                      items: [],
-                    },
-                    root: { rows: [] },
-                  }}
-                  botName={botName}
-                  view="private"
-                  nodeId="root"
-                  onNodeNavigate={() => undefined}
-                  systemNote="自定义键盘模式 · 点击键盘按钮模拟用户发送，机器人真实响应"
-                  replyKeyboard={config}
-                  onReplyButtonClick={handleSimReplyClick}
-                  ref={(node) => {
-                    simAppendRef.current =
-                      node &&
-                      ((from: "bot" | "user", text: string) =>
-                        node.appendMessage("dm", { from, text }));
-                  }}
-                />
-              )}
-              <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-                仿真屏为 Telegram 私聊视图：蓝色=primary 主色、红色=danger 危险色、绿色=success 成功色。
-                {isTgApi
-                  ? "保存非空键盘后，真实机器人 /start 即以此键盘开启对话流程。"
-                  : "保存后键盘附加到 /start 欢迎消息。"}
-              </p>
-            </div>
+      <>
+        {tgapiModeHint ? (
+          <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-700">
+            ⚠️ {tgapiModeHint}
+          </p>
+        ) : null}
+        <div className="space-y-3 rounded-xl border bg-card p-4">
+          <p className="text-sm font-semibold">键盘选项</p>
+          <KeyboardOptionsEditor
+            options={config.options}
+            onChange={(options) => setConfig((prev) => ({ ...prev, options }))}
+          />
+          <div>
+            <p className="mb-1 text-sm font-medium">键盘预览（随消息发送，右屏同步）</p>
+            <KeyboardButtonPreview config={config} />
           </div>
+          {isTgApi ? (
+            <button
+              type="button"
+              onClick={() => {
+                setConfig(() =>
+                  JSON.parse(JSON.stringify(defaultTgApiCustomKeyboard())) as CustomKeyboardConfig,
+                );
+                setSelected(null);
+              }}
+              className="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
+              title="恢复图1默认键盘（创建API/我的API/设置平台/语言/帮助/客服支持）"
+            >
+              ↺ 恢复图1默认键盘
+            </button>
+          ) : null}
         </div>
-      </div>
+        <KeyboardRowList state={state} />
+        {!selected ? (
+          <p className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
+            点击任意按钮可配置名称、类型、样式与交互行为
+            {isTgApi ? "（TGAPI 固定指令列表 + 解锁门禁 + 指令消息）" : ""}
+          </p>
+        ) : null}
+      </>
     );
   }
 
   return (
     <form
       action={async (formData) => {
-        await action(formData);
+        if (action) await action(formData);
         onSaved?.();
       }}
       className="flex min-h-0 flex-1 flex-col"

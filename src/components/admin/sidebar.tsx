@@ -88,12 +88,17 @@ export function AdminSidebar({
     item.children.some((child) => child.id === activeLeafId);
 
   return (
-    <aside className="hidden w-60 shrink-0 flex-col border-r bg-card md:flex">
-      <div className="flex h-14 items-center gap-2 border-b px-4">
+    /* v2.2.8：aside 整体作为滚动容器（此前 nav 内层滚动 + 固定 footer 底栏）。旧结构下
+       菜单内容超过可视高度时，底部菜单项被 nav 底边缘截断，其点击点中心落在下方
+       footer 区（border-t p-3）被遮挡 → 点击无反应（实测 AI配置/角色权限 等菜单项
+       在机器人分组展开时稳定复现）。改为 aside 滚动 + footer 随内容流动后，菜单项
+       永远不会被任何固定条带遮挡；菜单较短时 footer 仍钉在底部（flex-1 撑开）。 */
+    <aside className="hidden w-60 shrink-0 flex-col border-r bg-card md:flex md:overflow-y-auto">
+      <div className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
         <span className="text-xl">🤖</span>
         <span className="text-sm font-bold">{title}</span>
       </div>
-      <nav className="flex-1 space-y-1 overflow-y-auto p-3">
+      <nav className="flex-1 space-y-1 p-3">
         {menus.map((menu) => {
           if (menu.children.length === 0) {
             return <NavLink key={menu.id} item={menu} active={menu.id === activeLeafId} />;
@@ -128,7 +133,7 @@ export function AdminSidebar({
           );
         })}
       </nav>
-      <div className="border-t p-3">
+      <div className="shrink-0 border-t p-3">
         <p className="text-sm text-muted-foreground">
           TGuard 管理后台 (v{version})
         </p>
