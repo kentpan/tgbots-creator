@@ -23,6 +23,7 @@ import {
   type BotRow,
 } from "@/database/operations";
 import { tgRawCall } from "@/lib/telegram/transport";
+import { isEdgeRuntime } from "@/lib/telegram/runtime-mode";
 import { withTelegramTimeout, botByToken } from "@/services/telegram-sync";
 import { getTelegramRuntimeSettings, resolveBotRuntime } from "@/services/bot-transport";
 import { getMenuBotDeployState } from "@/bot/multi-runtime";
@@ -223,6 +224,20 @@ export async function runBotCheckNode(
   if (key === "runtime") {
     const { value: state, ms } = await timed(async () => getMenuBotDeployState(bot.id));
     if (!state.present) {
+      // Workers/Edge 形态（isEdgeRuntime）没有常驻进程：isolate 内存不共享，
+      // webhook 更新由 webhook 路由 acquireMenuBot 按请求懒加载实例处理 ——
+      // 本进程 registry 无实例是形态常态而非故障；健康以「Webhook 注册状态」
+      // 「投递健康」（getWebhookInfo，Telegram 侧权威）节点为准，不构成误报。
+      if (isEdgeRuntime()) {
+        return {
+          key,
+          label,
+          ok: true,
+          ms,
+          detail:
+            "Workers/Edge 形态：无常驻运行进程（按设计），Webhook 更新由边缘 Worker 按请求实例化处理；健康以「Webhook 注册状态」「投递健康」节点为准",
+        };
+      }
       return { key, label, ok: false, ms, detail: "", error: `本进程没有该机器人的运行实例（${runtime.mode === "webhook" ? "Webhook 推送进来将无人处理" : "长轮询未启动"}）`, suggestion: "点击「部署」启动运行实例；若刚重启服务器，部署一次即可恢复。" };
     }
     if (runtime.mode === "webhook") {
