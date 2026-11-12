@@ -199,25 +199,47 @@ export async function cachedJson<T>(
     return memoHit.value as T;
   }
   const kv = getKv();
-  const cached = await kv.get(key);
+  // KV 故障不得拖垮业务读写：读失败降级直读数据源，写失败降级内存 memo
+  //（其他 isolate 最长一个 TTL 后自动追平），失败原因必须留痕。
+  let cached: string | null = null;
+  try {
+    cached = await kv.get(key);
+  } catch (error) {
+    console.error(`KV 缓存读取失败（key=${key}，降级直读数据源）:`, error);
+  }
   if (cached) {
     try {
       const parsed = JSON.parse(cached) as T;
       writeMemo(`cached-json:${key}`, parsed, memoTtlMs);
       return parsed;
     } catch {
-      await kv.delete(key);
+      try {
+        await kv.delete(key);
+      } catch (error) {
+        console.error(`KV 缓存清理失败（key=${key}，损坏缓存条目残留）:`, error);
+      }
     }
   }
+  // loader 失败 = 业务数据读取失败，必须继续抛出，绝不吞掉
   const fresh = await loader();
-  await kv.set(key, JSON.stringify(fresh), ttlSeconds);
+  try {
+    await kv.set(key, JSON.stringify(fresh), ttlSeconds);
+  } catch (error) {
+    console.error(`KV 缓存写入失败（key=${key}，本次仅内存 memo，TTL 内自动追平）:`, error);
+  }
   writeMemo(`cached-json:${key}`, fresh, memoTtlMs);
   return fresh;
 }
 
 export async function invalidateCache(key: string): Promise<void> {
   deleteMemo(`cached-json:${key}`);
-  await getKv().delete(key);
+  // KV 故障不得让业务写路径失败（app_settings 保存等）：失效失败只影响
+  // 其他 isolate 的缓存一致性（最长一个 TTL 后自动追平），失败原因必须留痕。
+  try {
+    await getKv().delete(key);
+  } catch (error) {
+    console.error(`KV 缓存失效失败（key=${key}，其他 isolate 最长一个 TTL 后自动追平）:`, error);
+  }
 }
 
 // ---------------------------------------------------------------------------

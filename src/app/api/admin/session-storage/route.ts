@@ -73,7 +73,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     });
   }
 
-  // 保存配置
+  // 保存配置（逐项 upsert）：失败必须返回具体原因并留痕，绝不裸 500
   const updates: [string, string][] = [
     [SESSION_STORAGE_SETTING_KEY, normalizeSessionBackend(payload.backend)],
     ...(d1?.account_id !== undefined ? ([[SESSION_STORAGE_D1_KEYS.accountId, String(d1.account_id).trim()]] as [string, string][]) : []),
@@ -92,8 +92,22 @@ export async function POST(request: Request): Promise<NextResponse> {
     ...(s3?.path_style !== undefined ? ([[SESSION_STORAGE_S3_KEYS.pathStyle, String(s3.path_style).trim() === "virtual_hosted" ? "virtual_hosted" : "path"]] as [string, string][]) : []),
     ...(s3?.cdn_url !== undefined ? ([[SESSION_STORAGE_S3_KEYS.cdnUrl, String(s3.cdn_url).trim()]] as [string, string][]) : []),
   ];
-  for (const [key, value] of updates) {
-    await setAppSetting(key, value);
+  try {
+    for (const [key, value] of updates) {
+      await setAppSetting(key, value);
+    }
+  } catch (error) {
+    console.error(
+      `保存 BOT 会话存储配置失败（backend=${normalizeSessionBackend(payload.backend)}）:`,
+      error,
+    );
+    return NextResponse.json(
+      {
+        ok: false,
+        error: `保存失败：${error instanceof Error ? error.message : String(error)}`,
+      },
+      { status: 200 },
+    );
   }
 
   const requestHeaders = await headers();

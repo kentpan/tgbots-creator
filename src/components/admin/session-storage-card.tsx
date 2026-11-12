@@ -201,6 +201,7 @@ export function SessionStorageCard({ initialConfig }: { initialConfig?: PublicSe
         data?: {
           d1?: { account_id?: string; database_id?: string; api_token?: string };
           r2?: { account_id?: string; bucket?: string };
+          note?: string;
         };
       };
       if (!payload.ok || !payload.data) {
@@ -209,6 +210,8 @@ export function SessionStorageCard({ initialConfig }: { initialConfig?: PublicSe
       }
       const d1Default = payload.data.d1 ?? {};
       const r2Default = payload.data.r2 ?? {};
+      const defaultNote = payload.data.note ?? "";
+      const noteSuffix = defaultNote ? `｜${defaultNote}` : "";
       const filledNames: string[] = [];
 
       const nextD1 = { ...d1 };
@@ -244,17 +247,17 @@ export function SessionStorageCard({ initialConfig }: { initialConfig?: PublicSe
       if (filledNames.length > 0) {
         setMessage({
           kind: "ok",
-          text: `已填入部署默认值：${filledNames.join("、")}（仅填空字段，已填写的值不动；点「保存存储配置」后生效）｜R2 Access Key / Secret 无默认值，需在 Cloudflare 控制台创建后手动填写`,
+          text: `已填入部署默认值：${filledNames.join("、")}（仅填空字段，已填写的值不动；点「保存存储配置」后生效）｜R2 Access Key / Secret 无默认值，需在 Cloudflare 控制台创建后手动填写${noteSuffix}`,
         });
       } else if (anyDefault) {
         setMessage({
           kind: "ok",
-          text: "部署默认值存在，但对应字段均已有值（已保存配置优先），未做改动。",
+          text: `部署默认值存在，但对应字段均已有值（已保存配置优先），未做改动。${noteSuffix}`,
         });
       } else {
         setMessage({
           kind: "error",
-          text: "当前环境没有部署默认值：TG_D1_* / TG_R2_* 由 pages-deploy.yml 在 Cloudflare Pages 部署时注入，本地/Node 直跑环境不存在属正常。",
+          text: `未能自动填入任何部署默认值：TG_D1_* / TG_R2_* 由 pages-deploy.yml 在 Cloudflare Pages 部署时注入，本地/Node 直跑环境不存在属正常${noteSuffix}`,
         });
       }
     } catch {
