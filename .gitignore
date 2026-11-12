@@ -59,6 +59,7 @@ prisma/snapshots/
 prisma/*.db
 prisma/*.db-shm
 prisma/*.db-wal
+prisma/tgbots-creator-*.sql
 
 # OpenNext 构建产物
 .open-next/

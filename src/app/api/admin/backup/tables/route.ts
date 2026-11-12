@@ -1,11 +1,11 @@
 /**
- * GET /api/admin/backup/tables — 可备份表清单（白名单 + 行数），备份页多选导出消费。
- * 自 xianyu-admin v2.3.10 原样复刻（v2.2.3）。
+ * GET /api/admin/backup/tables — 可备份表清单（运行时枚举数据库全部业务表 + 行数），
+ * 备份页多选导出消费。新增表零维护自动出现在清单中。
  */
 import { NextResponse } from "next/server";
 import { getCurrentAdmin, hasPermission } from "@/lib/auth";
 import { getDatabase } from "@/database/client";
-import { DATA_TABLE_WHITELIST } from "@/lib/backup/whitelist";
+import { loadTableCatalog } from "@/lib/backup/whitelist";
 import { driverOf } from "@/lib/backup/backup-runner";
 
 export async function GET(): Promise<NextResponse> {
@@ -15,16 +15,16 @@ export async function GET(): Promise<NextResponse> {
     return NextResponse.json({ ok: false, error: "无权限" }, { status: 403 });
   }
   const db = await getDatabase();
+  const catalog = await loadTableCatalog(db);
   const tables: { name: string; rows: number }[] = [];
-  for (const name of DATA_TABLE_WHITELIST) {
-    let rows = 0;
-    try {
-      const r = await db.all<{ c: number }>(`SELECT COUNT(*) as c FROM ${name}`);
-      rows = Number(r[0]?.c || 0);
-    } catch {
-      rows = 0;
-    }
-    tables.push({ name, rows });
+  for (const name of catalog.tables) {
+    const counted = await db
+      .all<{ c: number }>(`SELECT COUNT(*) as c FROM ${name}`)
+      .catch((error: unknown) => {
+        console.error(`备份表清单 ${name} 行数统计失败:`, error);
+        return [{ c: 0 }];
+      });
+    tables.push({ name, rows: Number(counted[0]?.c ?? 0) });
   }
   return NextResponse.json({ ok: true, data: { tables, driver: driverOf(db) } });
 }

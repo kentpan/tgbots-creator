@@ -95,10 +95,3 @@ export function updateTgApiApplySession(
 export function removeTgApiApplySession(sessionId: string): void {
   sessions.delete(sessionId);
 }
-
-/** 校验请求体中的手机号：国际格式（+ 可选，7-15 位数字） */
-export function normalizeApplyPhone(raw: unknown): string | null {
-  const phone = String(raw ?? "").trim().replace(/[\s()-]/g, "");
-  if (!/^\+?\d{7,15}$/.test(phone)) return null;
-  return phone.startsWith("+") ? phone : `+${phone}`;
-}

@@ -103,7 +103,7 @@ async function main(): Promise<void> {
       appTitle: "t",
       appShortName: "t",
       appUrl: "https://example.com",
-      appPlatforms: ["android"],
+      appPlatform: "android",
       appDescription: "t",
     });
   } catch (error) {

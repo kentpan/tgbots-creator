@@ -385,7 +385,9 @@ function extractTaggedFragments(html: string, tag: string, className: string): s
 }
 
 /**
- * step_four.create_new_tg_app：创建 APP（平台随机选一，与原实现 random.choice 一致）。
+ * step_four.create_new_tg_app：创建 APP。
+ * app_platform 由调用方按「用户设置 > 管理端默认」确定后单值传入，本层不再随机选平台
+ * （随机会让键盘「设置平台」的预配置、管理端默认值在提交时失效）。
  * 返回响应原文（原实现调用方忽略响应内容，靠重新抓取 /apps 验证结果）。
  */
 export async function createNewTgApp(input: {
@@ -394,18 +396,16 @@ export async function createNewTgApp(input: {
   appTitle: string;
   appShortName: string;
   appUrl: string;
-  appPlatforms: string[];
+  appPlatform: string;
   appDescription: string;
 }): Promise<string> {
-  const platform =
-    input.appPlatforms[Math.floor(Math.random() * input.appPlatforms.length)] ?? "android";
   const startedAt = Date.now();
   const requestPayload = JSON.stringify({
     hash: input.tgAppHash,
     app_title: input.appTitle,
     app_shortname: input.appShortName,
     app_url: input.appUrl,
-    app_platform: platform,
+    app_platform: input.appPlatform,
     app_desc: input.appDescription,
   });
   let statusCode: number | null = null;
@@ -424,7 +424,7 @@ export async function createNewTgApp(input: {
         app_title: input.appTitle,
         app_shortname: input.appShortName,
         app_url: input.appUrl,
-        app_platform: platform,
+        app_platform: input.appPlatform,
         app_desc: input.appDescription,
       }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),

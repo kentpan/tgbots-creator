@@ -8,7 +8,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentAdmin, hasPermission } from "@/lib/auth";
 import { getDatabase, type SqlDatabase } from "@/database/client";
-import { isWhitelistedTable } from "@/lib/backup/whitelist";
+import { isCatalogTable, loadTableCatalog } from "@/lib/backup/whitelist";
 import { parseBackupConfig, loadBackupSettings } from "@/lib/backup/backup-runner";
 import { getBackupStore, getStorageSettings } from "@/lib/backup/backup-store";
 
@@ -119,8 +119,11 @@ export async function PUT(request: Request): Promise<NextResponse> {
     const t = String(body.tables).trim() || "all";
     if (t !== "all") {
       const names = t.split(",").map((s) => s.trim()).filter(Boolean);
+      const catalog = await loadTableCatalog(db);
       for (const n of names) {
-        if (!isWhitelistedTable(n)) return NextResponse.json({ ok: false, error: `表不在白名单内: ${n}` }, { status: 200 });
+        if (!isCatalogTable(catalog, n)) {
+          return NextResponse.json({ ok: false, error: `表不存在于数据库: ${n}` }, { status: 200 });
+        }
       }
       if (!names.length) return NextResponse.json({ ok: false, error: "表范围不能为空" }, { status: 200 });
     }

@@ -453,7 +453,8 @@ async function tgapiMainFlow(
       return "done";
     }
 
-    // 2. APP 参数：键盘预配置 > 管理端默认；平台未预配置 → 随机选一（对应原 random.choice）
+    // 2. APP 参数：键盘预配置 > 管理端默认；平台按确定值提交（对话体内不做随机，
+    //    否则 conversations 重放时平台会变，用户「设置平台」的预配置也会失效）
     const prefTitle =
       ((await conversation.external((outside) => outside.session.tgapiPrefTitle)) ?? "").trim();
     const prefDesc =
@@ -465,11 +466,12 @@ async function tgapiMainFlow(
     const chosenPlatform =
       prefPlatform && isValidTgApiPlatformValue(prefPlatform)
         ? prefPlatform
-        : platformPool[Math.floor(Math.random() * platformPool.length)];
+        : platformPool[0];
     const effectiveShortName = deriveTgApiShortName(appTitle, cfg.appShortName);
     console.log(
       `TGAPI bot #${botId} create flow start: user ${from.id} title="${appTitle}" ` +
-        `platform=${chosenPlatform}${prefPlatform ? " (preset)" : " (random)"}`,
+        `shortname=${effectiveShortName} url=${cfg.appUrl} platform=${chosenPlatform}` +
+        `${prefPlatform ? " (preset)" : " (default)"}`,
     );
 
     // 3. 手机号：request_contact 授权共享（Keyboard#requestContact）或手输国际格式
@@ -507,122 +509,149 @@ async function tgapiMainFlow(
       }
     }
 
-    // 4. 登录码（单独验证码或从固定信息中提取）→ 登录 → 抓取/创建 APP → 结果
-    while (true) {
-      const sentCode = await conversation.external(() => requestTgCodeGetRandomHashSafe(phone));
-      if (!sentCode.ok) {
-        // 详细失败状态（v2.2.5）：被风控限制 24h / 手机号无效 / 网络失败等原因随提示下发，
-        // 并随主键盘重新显示（用户可直接重试其它功能）
-        await ctx.reply(sys().requestLoginCodeFail(sentCode.error));
-        await sendMenu(ctx);
-        return "done";
-      }
-      const randomHash = sentCode.hash;
-      await ctx.reply(texts().afterRecvdCode, {
-        parse_mode: "HTML",
-        reply_markup: { keyboard: [[]], remove_keyboard: true },
-      });
-      const codeEvt = await conversation.waitFor("message:text");
-      lang = langOf(codeEvt);
-      if (isRestart(codeEvt)) return "restart";
-      const providedCode = extractTgWebLoginCode(codeEvt.msg?.text ?? "");
-      console.log(
-        `TGAPI bot #${botId} conversation login code received: user ${from.id} ` +
-          `forwarded=${codeEvt.message?.forward_origin ? "yes" : "no"} extracted=${providedCode ? "yes" : "no"}`,
-      );
-      if (!providedCode) {
-        await codeEvt.reply(texts().invalidCode, { parse_mode: "HTML" });
-        continue;
-      }
-
-      const progress = await codeEvt.reply(texts().beforeSuccLogin);
-      const editProgress = async (text: string, parseHtml: boolean): Promise<void> => {
-        await codeEvt.api.editMessageText(chatId, progress.message_id, text, {
-          ...(parseHtml ? { parse_mode: "HTML" } : {}),
-          link_preview_options: { is_disabled: true },
-        });
-      };
-
-      const login = await conversation.external(() =>
-        loginStepGetStelCookieSafe(phone, randomHash, providedCode),
-      );
-      if (!login.ok) {
-        // 登录被拒：进度消息编辑为原因 + 单条收尾消息（fail 模板优先）随主键盘重新显示
-        await editProgress(login.error || texts().erredPage, false);
-        console.log(
-          `TGAPI bot #${botId} conversation login rejected: user ${from.id} reason=${(login.error ?? "").slice(0, 120)}`,
-        );
-        const failRaw = slotText(templates?.fail, lang);
-        await codeEvt.reply(
-          renderMenuTemplate(
-            failRaw || texts().loginRejected,
-            {
-              ...varsFromContext(codeEvt),
-              error: login.error ?? "my.telegram.org 登录被拒绝",
-            },
-          ),
-          { reply_markup: mainMarkup },
-        );
-        return "done";
-      }
-
-      // 抓取现有 APP → 无则按参数创建 → 再抓取（与内嵌模式同一管道）
-      let scraped = await conversation.external(() => scrapeTgExistingAppSafe(login.cookie));
-      const existingAppHash = scraped && !scraped.ok ? (scraped.appHash ?? "") : "";
-      if (existingAppHash) {
-        await conversation.external(() =>
-          createNewTgAppSafe(login.cookie, existingAppHash, {
-            appTitle,
-            appShortName: effectiveShortName,
-            appUrl: cfg.appUrl,
-            appPlatforms: [chosenPlatform],
-            appDescription,
-          }),
-        );
-        scraped = await conversation.external(() => scrapeTgExistingAppSafe(login.cookie));
-      }
-
-      if (scraped?.ok && scraped.info) {
-        await conversation.external(() =>
-          saveTgApiBotUser({
-            botId,
-            userId,
-            appPhone: phone,
-            appId: scraped?.info?.appId ?? "",
-            appHash: scraped?.info?.apiHash ?? "",
-          }),
-        );
-        const resultHtml =
-          buildAppResultHTML(phone, scraped.info) + (cfg.footerText ? `\n\n${cfg.footerText}` : "");
-        await editProgress(resultHtml, true);
-        // 收尾单条消息：成功模板（配置时）或主键盘菜单消息，随主键盘一并重新显示
-        const successRaw = slotText(templates?.success, lang);
-        if (successRaw) {
-          await codeEvt.reply(
-            renderMenuTemplate(successRaw, {
-              ...varsFromContext(codeEvt),
-              phone,
-              api_id: scraped.info.appId,
-              api_hash: scraped.info.apiHash,
-            }),
-            { reply_markup: mainMarkup },
-          );
-        } else {
-          await codeEvt.reply(texts().start, { parse_mode: "HTML", reply_markup: mainMarkup });
-        }
-        console.log(
-          `TGAPI bot #${botId} conversation app credentials delivered: user ${from.id} app_id=${scraped.info.appId}`,
-        );
-      } else {
-        await editProgress(texts().erredPage, false);
-        const failRaw = slotText(templates?.fail, lang);
-        await codeEvt.reply(
-          renderMenuTemplate(failRaw || texts().erredPage, varsFromContext(codeEvt)),
-          { reply_markup: mainMarkup },
-        );
-      }
+    // 4. 发登录码（只发一次）→ 受理登录码 → 登录 → 抓取/创建 APP → 结果
+    const sentCode = await conversation.external(() => requestTgCodeGetRandomHashSafe(phone));
+    if (!sentCode.ok) {
+      // 详细失败状态（v2.2.5）：被风控限制 24h / 手机号无效 / 网络失败等原因随提示下发，
+      // 并随主键盘重新显示（用户可直接重试其它功能）
+      await ctx.reply(sys().requestLoginCodeFail(sentCode.error));
+      await sendMenu(ctx);
       return "done";
     }
+    const randomHash = sentCode.hash;
+    await ctx.reply(texts().afterRecvdCode, {
+      parse_mode: "HTML",
+      reply_markup: { keyboard: [[]], remove_keyboard: true },
+    });
+
+    /**
+     * 受理登录码：wait() 接任意更新（转发的服务通知可能带 caption 或媒体，
+     * waitFor("message:text") 会把它们过滤掉导致对话永久挂起）。
+     * 识别不出只提示重输并复用同一个 random_hash —— 重发登录码会让用户手上的码立即作废。
+     */
+    const waitForLoginCode = async (): Promise<
+      | { kind: "code"; evt: Awaited<ReturnType<typeof conversation.wait>>; code: string }
+      | { kind: "restart" }
+    > => {
+      while (true) {
+        const evt = await conversation.wait();
+        lang = langOf(evt);
+        if (isRestart(evt)) return { kind: "restart" };
+        const rawText = evt.msg?.text ?? evt.msg?.caption ?? "";
+        const extracted = extractTgWebLoginCode(rawText);
+        console.log(
+          `TGAPI bot #${botId} conversation login code message: user ${from.id} ` +
+            `forwarded=${evt.message?.forward_origin ? "yes" : "no"} ` +
+            `has_text=${Boolean(rawText)} extracted=${extracted ?? "null"}`,
+        );
+        if (!extracted) {
+          await evt.reply(texts().invalidCode, { parse_mode: "HTML" });
+          continue;
+        }
+        return { kind: "code", evt, code: extracted };
+      }
+    };
+    const codeInput = await waitForLoginCode();
+    if (codeInput.kind === "restart") return "restart";
+    const { evt: codeEvt, code: providedCode } = codeInput;
+
+    const progress = await codeEvt.reply(texts().beforeSuccLogin);
+    const editProgress = async (text: string, parseHtml: boolean): Promise<void> => {
+      await codeEvt.api.editMessageText(chatId, progress.message_id, text, {
+        ...(parseHtml ? { parse_mode: "HTML" } : {}),
+        link_preview_options: { is_disabled: true },
+      });
+    };
+
+    const login = await conversation.external(() =>
+      loginStepGetStelCookieSafe(phone, randomHash, providedCode),
+    );
+    if (!login.ok) {
+      // 登录被拒：进度消息编辑为原因 + 单条收尾消息（fail 模板优先）随主键盘重新显示
+      await editProgress(login.error, false);
+      console.log(
+        `TGAPI bot #${botId} conversation login rejected: user ${from.id} reason=${login.error.slice(0, 120)}`,
+      );
+      const failRaw = slotText(templates?.fail, lang);
+      await codeEvt.reply(
+        renderMenuTemplate(failRaw || texts().loginRejected, {
+          ...varsFromContext(codeEvt),
+          error: login.error,
+        }),
+        { reply_markup: mainMarkup },
+      );
+      return "done";
+    }
+
+    // 抓取现有 APP → 无则按确定参数创建 → 再抓取（与内嵌模式同一管道）
+    let scraped = await conversation.external(() => scrapeTgExistingAppSafe(login.cookie));
+    const existingAppHash = scraped && !scraped.ok ? scraped.appHash : "";
+    if (existingAppHash) {
+      const created = await conversation.external(() =>
+        createNewTgAppSafe(login.cookie, existingAppHash, {
+          appTitle,
+          appShortName: effectiveShortName,
+          appUrl: cfg.appUrl,
+          appPlatform: chosenPlatform,
+          appDescription,
+        }),
+      );
+      if (!created.ok) {
+        await editProgress(created.error, false);
+        const failRaw = slotText(templates?.fail, lang);
+        await codeEvt.reply(
+          renderMenuTemplate(failRaw || texts().erredPage, {
+            ...varsFromContext(codeEvt),
+            error: created.error,
+          }),
+          { reply_markup: mainMarkup },
+        );
+        return "done";
+      }
+      scraped = await conversation.external(() => scrapeTgExistingAppSafe(login.cookie));
+    }
+
+    if (scraped?.ok && scraped.info) {
+      const info = scraped.info;
+      await conversation.external(() =>
+        saveTgApiBotUser({
+          botId,
+          userId,
+          appPhone: phone,
+          appId: info.appId,
+          appHash: info.apiHash,
+        }),
+      );
+      const resultHtml =
+        buildAppResultHTML(phone, info) + (cfg.footerText ? `\n\n${cfg.footerText}` : "");
+      await editProgress(resultHtml, true);
+      // 收尾单条消息：成功模板（配置时）或主键盘菜单消息，随主键盘一并重新显示
+      const successRaw = slotText(templates?.success, lang);
+      if (successRaw) {
+        await codeEvt.reply(
+          renderMenuTemplate(successRaw, {
+            ...varsFromContext(codeEvt),
+            phone,
+            api_id: info.appId,
+            api_hash: info.apiHash,
+          }),
+          { reply_markup: mainMarkup },
+        );
+      } else {
+        await codeEvt.reply(texts().start, { parse_mode: "HTML", reply_markup: mainMarkup });
+      }
+      console.log(
+        `TGAPI bot #${botId} conversation app credentials delivered: user ${from.id} app_id=${info.appId}`,
+      );
+    } else {
+      await editProgress(texts().erredPage, false);
+      const failRaw = slotText(templates?.fail, lang);
+      await codeEvt.reply(
+        renderMenuTemplate(failRaw || texts().erredPage, varsFromContext(codeEvt)),
+        { reply_markup: mainMarkup },
+      );
+    }
+    return "done";
   };
 
   // ---------------------------------------------------------------------------
@@ -889,6 +918,10 @@ async function loginStepGetStelCookieSafe(
   try {
     return await loginStepGetStelCookie(phone, randomHash, code);
   } catch (error) {
+    console.error(
+      `TGAPI conversation /auth/login failed: phone=${phone.slice(0, 6)}**** random_hash=${randomHash}:`,
+      error,
+    );
     return { ok: false, error: briefError(error) };
   }
 }
@@ -909,13 +942,15 @@ async function createNewTgAppSafe(
     appTitle: string;
     appShortName: string;
     appUrl: string;
-    appPlatforms: string[];
+    appPlatform: string;
     appDescription: string;
   },
-): Promise<void> {
+): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
     await createNewTgApp({ stelToken, tgAppHash, ...params });
+    return { ok: true };
   } catch (error) {
-    console.error(`TGAPI conversation /apps/create failed:`, error);
+    console.error(`TGAPI conversation /apps/create failed: title="${params.appTitle}":`, error);
+    return { ok: false, error: briefError(error) };
   }
 }

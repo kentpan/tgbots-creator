@@ -14,7 +14,7 @@
  *   - 本地 Node 常驻部署由内置任务循环 (src/bot/tasks.ts) 兜底轮询同一判定。
  */
 import { getDatabase, type SqlDatabase } from "@/database/client";
-import { DATA_TABLE_WHITELIST, isWhitelistedTable } from "./whitelist";
+import { isCatalogTable, loadTableCatalog } from "./whitelist";
 
 export interface BackupConfig {
   enabled: boolean;
@@ -60,17 +60,26 @@ export async function loadBackupSettings(db?: SqlDatabase): Promise<Record<strin
   return settings;
 }
 
-/** 解析定时备份的表范围: 'all' → 全部白名单表; 否则按逗号分隔且仅保留白名单内表名。 */
-export function resolveBackupTables(tables: string): string[] {
+/** 解析定时备份的表范围: 'all' → 数据库全部业务表; 否则按逗号分隔且仅保留库中实际存在的表名。 */
+export async function resolveBackupTables(db: SqlDatabase, tables: string): Promise<string[]> {
   const t = String(tables || "all").trim();
-  if (!t || t === "all") return [...DATA_TABLE_WHITELIST];
-  return t
+  const catalog = await loadTableCatalog(db);
+  if (!t || t === "all") return [...catalog.tables];
+  const wanted = t
     .split(",")
     .map((s) => s.trim())
-    .filter((s) => s && isWhitelistedTable(s));
+    .filter((s) => s && isCatalogTable(catalog, s));
+  const unknown = t
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s && !isCatalogTable(catalog, s));
+  if (unknown.length > 0) {
+    throw new Error(`配置的备份表不存在于数据库: ${unknown.join(", ")}`);
+  }
+  return wanted;
 }
 
-/** 收集快照数据 (JSON envelope)。 */
+/** 收集快照数据 (JSON envelope)。表读失败直接抛出，绝不静默产出缺表快照。 */
 export async function collectSnapshot(
   db: SqlDatabase,
   tablesParam: string | string[],
@@ -79,15 +88,16 @@ export async function collectSnapshot(
   driver: string
   tables: Record<string, Record<string, unknown>[]>
 }> {
-  const wanted = Array.isArray(tablesParam) ? tablesParam : resolveBackupTables(tablesParam);
+  const catalog = await loadTableCatalog(db);
+  const wanted = Array.isArray(tablesParam)
+    ? tablesParam.filter((name) => {
+        if (isCatalogTable(catalog, name)) return true;
+        throw new Error(`表不存在于数据库: ${name}`);
+      })
+    : await resolveBackupTables(db, tablesParam);
   const tables: Record<string, Record<string, unknown>[]> = {};
   for (const name of wanted) {
-    if (!isWhitelistedTable(name)) continue;
-    try {
-      tables[name] = await db.all(`SELECT * FROM ${name}`);
-    } catch {
-      tables[name] = [];
-    }
+    tables[name] = await db.all(`SELECT * FROM ${name}`);
   }
   return { exported_at: new Date().toISOString(), driver: driverOf(db), tables };
 }
@@ -136,15 +146,18 @@ export async function runBackup(
   return { key, size: new TextEncoder().encode(json).length, storage: store.label, tables: tableNames, rows };
 }
 
-/** 备份后回写 last_run 设置 (app_settings.backup_last_run_at)。 */
+/** 备份后回写 last_run 设置 (app_settings.backup_last_run_at)。回写失败留痕，不影响已落盘的备份。 */
 export async function markBackupRan(db: SqlDatabase): Promise<void> {
   const value = new Date().toISOString();
-  const updated = await db
-    .run(`UPDATE app_settings SET value = ?, updated_time = CURRENT_TIMESTAMP WHERE key = 'backup_last_run_at'`, [value])
-    .catch(() => null);
-  if (!updated || updated.changes === 0) {
-    await db
-      .run(`INSERT INTO app_settings (key, value) VALUES ('backup_last_run_at', ?)`, [value])
-      .catch(() => {});
+  try {
+    const updated = await db.run(
+      `UPDATE app_settings SET value = ?, updated_time = CURRENT_TIMESTAMP WHERE key = 'backup_last_run_at'`,
+      [value],
+    );
+    if (updated.changes === 0) {
+      await db.run(`INSERT INTO app_settings (key, value) VALUES ('backup_last_run_at', ?)`, [value]);
+    }
+  } catch (error) {
+    console.error("备份 last_run_at 回写失败（下次到点将重复执行一次备份）:", error);
   }
 }

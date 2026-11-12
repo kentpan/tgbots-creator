@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { extractTgWebLoginCode } from "@/services/tgapi-flow-text";
+import { extractTgWebLoginCode, normalizeApplyPhone } from "@/services/tgapi-flow-text";
 import { getCurrentAdmin, hasPermission, logOperation } from "@/lib/auth";
 import { headers } from "next/headers";
 import {
@@ -13,11 +13,11 @@ import {
 import {
   createTgApiApplySession,
   getTgApiApplySession,
-  normalizeApplyPhone,
   removeTgApiApplySession,
   updateTgApiApplySession,
 } from "@/services/tgapi-apply-session";
 import { TGAPI_DEFAULT_APP, deriveTgApiShortName } from "@/services/tgapi-config";
+import { isValidTgApiPlatformValue } from "@/services/menu-config";
 
 /**
  * TGAPI申请 管理端「多步骤申请向导」API（v2.1.8）。
@@ -50,6 +50,7 @@ interface ApplyRoutePayload {
   code?: string;
   app_title?: string;
   app_description?: string;
+  app_platform?: string;
 }
 
 /** 统一的失败响应（错误已记录服务端日志） */
@@ -201,6 +202,10 @@ export async function POST(request: Request): Promise<NextResponse> {
     if (!description || description.length > APP_DESCRIPTION_MAX_LENGTH) {
       return fail(`APP 描述不合法：请输入 1-${APP_DESCRIPTION_MAX_LENGTH} 个字符`, 400);
     }
+    const appPlatform = String(payload.app_platform ?? "").trim();
+    if (!isValidTgApiPlatformValue(appPlatform)) {
+      return fail("APP 平台不合法：请从平台清单中选择", 400);
+    }
     // shortname 由 title 派生（my.telegram.org 要求字母开头 5-32 位），不合法回落默认
     const shortName = deriveTgApiShortName(title, TGAPI_DEFAULT_APP.appShortName);
 
@@ -227,7 +232,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         appTitle: title,
         appShortName: shortName,
         appUrl: TGAPI_DEFAULT_APP.appUrl,
-        appPlatforms: TGAPI_DEFAULT_APP.appPlatforms,
+        appPlatform,
         appDescription: description,
       });
     } catch (error) {

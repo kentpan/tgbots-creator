@@ -13,7 +13,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentAdmin, hasPermission } from "@/lib/auth";
 import { getDatabase } from "@/database/client";
-import { DATA_TABLE_WHITELIST, isWhitelistedTable } from "@/lib/backup/whitelist";
+import { isCatalogTable, loadTableCatalog } from "@/lib/backup/whitelist";
 import { driverOf } from "@/lib/backup/backup-runner";
 
 export async function GET(request: Request): Promise<Response> {
@@ -27,10 +27,11 @@ export async function GET(request: Request): Promise<Response> {
   const format = String(url.searchParams.get("format") || "json").toLowerCase();
   const tablesParam = String(url.searchParams.get("tables") || "").trim();
 
+  const catalog = await loadTableCatalog(db);
   const wanted =
     tablesParam && tablesParam !== "all"
-      ? tablesParam.split(",").map((s) => s.trim()).filter((s) => s && isWhitelistedTable(s))
-      : [...DATA_TABLE_WHITELIST];
+      ? tablesParam.split(",").map((s) => s.trim()).filter((s) => s && isCatalogTable(catalog, s))
+      : catalog.tables;
   if (!wanted.length) {
     return NextResponse.json({ ok: false, error: "未选择任何可导出的表" }, { status: 200 });
   }
@@ -74,14 +75,9 @@ export async function GET(request: Request): Promise<Response> {
       ``,
     ];
     for (const table of wanted) {
-      let rows: Record<string, unknown>[] = [];
-      let cols: string[] = [];
-      try {
-        rows = await db.all(`SELECT * FROM ${table}`);
-        if (rows.length) cols = Object.keys(rows[0]);
-      } catch {
-        rows = [];
-      }
+      // 表读失败直接抛出：部分导出比导出失败更危险（用户会误以为备份完整）
+      const rows = await db.all(`SELECT * FROM ${table}`);
+      const cols = rows.length > 0 ? Object.keys(rows[0]) : [];
       lines.push(`-- ===== table: ${table} (${rows.length} rows) =====`);
       lines.push(`DELETE FROM ${table};`);
       for (const row of rows) {
@@ -106,14 +102,10 @@ export async function GET(request: Request): Promise<Response> {
     });
   }
 
-  // json (默认): 与导入格式同源
+  // json (默认): 与导入格式同源。表读失败直接抛出，绝不静默产出缺表快照。
   const tables: Record<string, Record<string, unknown>[]> = {};
   for (const name of wanted) {
-    try {
-      tables[name] = await db.all(`SELECT * FROM ${name}`);
-    } catch {
-      tables[name] = [];
-    }
+    tables[name] = await db.all(`SELECT * FROM ${name}`);
   }
   const json = JSON.stringify({ exported_at: new Date().toISOString(), driver: driverOf(db), tables });
   return new Response(json, {

@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/dialog";
 import { inputClass, labelClass } from "@/components/admin/form-styles";
 import { TGAPI_DEFAULT_APP } from "@/services/tgapi-config";
+import { TGAPI_PLATFORM_LABELS, TGAPI_PLATFORM_VALUES } from "@/services/menu-config";
 
 /**
  * TGAPI申请 管理端「多步骤申请向导」弹窗（v2.1.8）。
@@ -164,6 +165,7 @@ export function TgApiApplyWizard({
   const [code, setCode] = useState("");
   const [appTitle, setAppTitle] = useState(TGAPI_DEFAULT_APP.appTitle);
   const [appDescription, setAppDescription] = useState(TGAPI_DEFAULT_APP.appDescription);
+  const [appPlatform, setAppPlatform] = useState<string>(TGAPI_PLATFORM_VALUES[0]);
   const [resultApp, setResultApp] = useState<TgAppInfoView | null>(null);
   const [resultCreated, setResultCreated] = useState(false);
 
@@ -178,6 +180,7 @@ export function TgApiApplyWizard({
       setCode("");
       setAppTitle(TGAPI_DEFAULT_APP.appTitle);
       setAppDescription(TGAPI_DEFAULT_APP.appDescription);
+      setAppPlatform(TGAPI_PLATFORM_VALUES[0]);
       setResultApp(null);
       setResultCreated(false);
     }
@@ -263,6 +266,7 @@ export function TgApiApplyWizard({
         session_id: sessionId,
         app_title: appTitle,
         app_description: appDescription,
+        app_platform: appPlatform,
       });
       if (!res.ok) {
         setError(res.error ?? "创建 APP 失败");
@@ -350,7 +354,7 @@ export function TgApiApplyWizard({
               </p>
               <div className="space-y-1">
                 <label className={labelClass} htmlFor="tgapi-wizard-code">
-                  登录码（可整条转发/粘贴消息，自动提取数字）*
+                  登录码（可整条转发/粘贴官方消息，或直接填登录码）*
                 </label>
                 <textarea
                   id="tgapi-wizard-code"
@@ -394,6 +398,24 @@ export function TgApiApplyWizard({
                   className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                   disabled={pending}
                 />
+              </div>
+              <div className="space-y-1">
+                <label className={labelClass} htmlFor="tgapi-wizard-platform">
+                  APP 平台（app_platform）*
+                </label>
+                <select
+                  id="tgapi-wizard-platform"
+                  value={appPlatform}
+                  onChange={(event) => setAppPlatform(event.target.value)}
+                  className={inputClass}
+                  disabled={pending}
+                >
+                  {TGAPI_PLATFORM_VALUES.map((value) => (
+                    <option key={value} value={value}>
+                      {TGAPI_PLATFORM_LABELS[value] ?? value}
+                    </option>
+                  ))}
+                </select>
               </div>
             </div>
           ) : null}

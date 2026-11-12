@@ -770,16 +770,22 @@ export async function registerTgApiHandlers(
         return;
       }
 
-      // APP 参数：键盘「设置Title/设置Description」预配置 > 管理端默认；
+      // APP 参数：键盘「设置Title/设置Description/设置平台」预配置 > 管理端默认；
       // shortname 由 title 派生（my.telegram.org 要求字母开头 5-32 位）
       const prefTitle = ctx.session.tgapiPrefTitle?.trim() ?? "";
       const prefDesc = ctx.session.tgapiPrefDesc?.trim() ?? "";
       const effectiveTitle = prefTitle || cfg.appTitle;
       const effectiveDescription = prefDesc || cfg.appDescription;
       const effectiveShortName = deriveTgApiShortName(effectiveTitle, cfg.appShortName);
+      const prefPlatform = ctx.session.tgapiPlatform;
+      const effectivePlatform =
+        prefPlatform && isValidTgApiPlatformValue(prefPlatform)
+          ? prefPlatform
+          : cfg.appPlatforms[0];
 
       // 原实现：抓取现有 APP → 无则按参数创建 → 再抓取（stars have failed us 兜底）
       let scraped: TgOrgScrapeResult | null = null;
+      let createError = "";
       try {
         scraped = await scrapeTgExistingApp(login.cookie);
       } catch (error) {
@@ -793,13 +799,15 @@ export async function registerTgApiHandlers(
             appTitle: effectiveTitle,
             appShortName: effectiveShortName,
             appUrl: cfg.appUrl,
-            appPlatforms: cfg.appPlatforms,
+            appPlatform: effectivePlatform,
             appDescription: effectiveDescription,
           });
           console.log(
-            `TGAPI bot #${botId} app created: user ${from.id} title="${effectiveTitle}" shortname=${effectiveShortName}`,
+            `TGAPI bot #${botId} app created: user ${from.id} title="${effectiveTitle}" ` +
+              `shortname=${effectiveShortName} platform=${effectivePlatform}`,
           );
         } catch (error) {
+          createError = briefError(error);
           console.error(`TGAPI bot #${botId} /apps/create failed: user ${from.id}:`, error);
         }
         try {
@@ -846,7 +854,11 @@ export async function registerTgApiHandlers(
         );
       } else {
         await editProgress(texts.erredPage, false);
-        await sendFailTemplateMessage(ctx, lang, "APP 抓取/创建失败（my.telegram.org 页面不可用）");
+        await sendFailTemplateMessage(
+          ctx,
+          lang,
+          createError || "APP 抓取/创建失败（my.telegram.org 页面不可用）",
+        );
       }
     } catch (error) {
       console.error(`TGAPI bot #${botId} login/scrape pipeline failed: user ${from.id}:`, error);
