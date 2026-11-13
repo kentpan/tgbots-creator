@@ -30,9 +30,9 @@
  *   校验更严，出现过「Network connection lost.」级别的直连失败）。
  *   因此 edge 路径对 init 做**白名单重建**：仅保留 method/headers/body，
  *   signal 一律经 toNativeSignal 桥接为原生 AbortSignal。
- * - edge 回退链：直连 →（失败）→ 系统设置代理（开启且配置了地址时）→（失败）→
- *   直连重试一次（全新连接）。直连仍是 edge 的默认与首选（v2.0.2 语义不变），
- *   代理只在直连网络层失败后作为救命通道出现。
+ * - edge 回退链（v2.3 语义变更「跟随系统配置」）：系统设置开启代理且配置了地址 →
+ *   代理优先（与 Node 同语义）→（失败）→ 直连 →（失败）→ 直连重试一次；
+ *   未配置代理 → 直连 → 直连重试（v2.0.2 直连默认语义仅在未配置时保留）。
  * - 失败诊断：整条链路的每次尝试（路径/耗时/错误消息）附着到最终抛出的错误
  *   （tgOutbound 字段），describeSyncError 会将其转成人话附在管理端错误信息里，
  *   线上不再只剩一句「网络不可达」。
@@ -589,28 +589,31 @@ async function edgeTelegramFetch(
     }
   };
 
-  // ① 直连（edge 默认传输：直连优先，v2.0.2 语义不变）
+  // ① 跟随系统配置（v2.3 语义变更）：系统设置代理开启且配置了地址 → **代理优先**
+  //   （与 Node 出站同语义：代理是用户显式配置的出站方式，不再是「直连失败后的救命通道」）；
+  //   未配置/关闭 → 保持直连优先（v2.0.2 语义），代理链路整体跳过
+  const proxyRewrite = await resolveEdgeProxyRewrite(input);
+  if (proxyRewrite) {
+    const proxyStartedAt = Date.now();
+    try {
+      const headers = new Headers(sanitized.headers ?? undefined);
+      for (const [headerName, headerValue] of Object.entries(proxyRewrite.headers)) {
+        headers.set(headerName, headerValue);
+      }
+      return await attempt("proxy", proxyRewrite.url, { ...sanitized, headers });
+    } catch (proxyError) {
+      attempts.push({ path: "proxy", ms: Date.now() - proxyStartedAt, error: outboundErrorMessage(proxyError) });
+      if (sourceSignal?.aborted) throw proxyError; // 调用方主动取消：不再回退
+    }
+  }
+
+  // ② 直连（代理优先时=回退通道；未配置代理时=默认传输）
   const directStartedAt = Date.now();
   try {
     return await attempt("direct", requestHref, sanitized);
   } catch (directError) {
     attempts.push({ path: "direct", ms: Date.now() - directStartedAt, error: outboundErrorMessage(directError) });
     if (sourceSignal?.aborted) throw directError; // 调用方主动取消：不再回退
-  }
-
-  // ② 代理回退：仅当目标为上游 Bot API 且系统设置开启代理并配置了地址
-  const proxyStartedAt = Date.now();
-  try {
-    const rewrite = await resolveEdgeProxyRewrite(input);
-    if (rewrite) {
-      const headers = new Headers(sanitized.headers ?? undefined);
-      for (const [headerName, headerValue] of Object.entries(rewrite.headers)) {
-        headers.set(headerName, headerValue);
-      }
-      return await attempt("proxy", rewrite.url, { ...sanitized, headers });
-    }
-  } catch (proxyError) {
-    attempts.push({ path: "proxy", ms: Date.now() - proxyStartedAt, error: outboundErrorMessage(proxyError) });
   }
 
   // ③ 直连重试一次（全新连接 —— workerd/网关空闲时半关 keep-alive 连接，

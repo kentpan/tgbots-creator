@@ -12,6 +12,39 @@ import {
   memoTtl,
 } from "@/database/bindings";
 
+// ---------------------------------------------------------------------------
+// v2.3 轻量自动迁移（D1 / SQLite 双端）：v2.3 新增列在运行时自动补齐 ——
+// 每 isolate 仅执行一次（成功后缓存 Promise），已存在列 PRAGMA 探测后跳过。
+// 杜绝「已部署库缺列 → upsertGroupSettings 指定列名 INSERT 报错 500」。
+// prisma/schema.sql 仍为全量建表基准（新库直接建全）。
+// ---------------------------------------------------------------------------
+let appSchemaReady: Promise<void> | null = null;
+
+export function ensureAppSchema(): Promise<void> {
+  if (!appSchemaReady) {
+    appSchemaReady = (async () => {
+      await ensureColumn("group_settings", "join_verify_bot_id", "INTEGER");
+      await ensureColumn("group_settings", "chat_type", "TEXT");
+      await ensureColumn("verification_sessions", "method_id", "INTEGER");
+      await ensureColumn("verification_sessions", "max_attempts", "INTEGER");
+    })().catch((error: unknown) => {
+      // 失败清空缓存：下次调用重试（例如首次部署 D1 偶发抖动）
+      appSchemaReady = null;
+      throw error;
+    });
+  }
+  return appSchemaReady;
+}
+
+/** 列存在性探测 + 缺失补齐（PRAGMA table_info 双端均支持） */
+async function ensureColumn(table: string, column: string, decl: string): Promise<void> {
+  const rows = await queryAll<{ name: unknown }>(`PRAGMA table_info(${table})`);
+  const exists = rows.some((row) => String(row.name) === column);
+  if (exists) return;
+  await executeRun(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  console.log(`[migrate] ${table}.${column} added (${decl})`);
+}
+
 /**
  * v2.0.6 D1 读行额度优化：热配置缓存 TTL 常量。
  * Workers isolate 空闲 ~30s 即回收，回收后冷启动若每次直读 D1，
@@ -403,6 +436,7 @@ export async function createVerificationSession(input: {
   /** 会话锁定的最大尝试次数（bot 级覆盖解析结果） */
   maxAttempts?: number | null;
 }): Promise<VerificationSessionRow | null> {
+  await ensureAppSchema();
   try {
     await executeRun(
       `UPDATE verification_sessions SET expires_at = ? WHERE token = ? AND captcha_completed = 0`,
@@ -435,6 +469,7 @@ export async function createVerificationSession(input: {
 export async function getVerificationSession(
   token: string,
 ): Promise<VerificationSessionRow | null> {
+  await ensureAppSchema();
   try {
     const row = await queryOne<Record<string, unknown>>(
       `SELECT * FROM verification_sessions WHERE token = ?`,
@@ -831,6 +866,7 @@ export async function getPendingSessionForUserChat(
   userId: bigint,
   chatId: bigint,
 ): Promise<VerificationSessionRow | null> {
+  await ensureAppSchema();
   try {
     const row = await queryOne<Record<string, unknown>>(
       `SELECT s.* FROM verification_sessions s
@@ -996,6 +1032,7 @@ export interface PendingCodeContext {
 export async function getPendingCodeContext(
   userId: bigint,
 ): Promise<PendingCodeContext | null> {
+  await ensureAppSchema();
   // v1.1.7：同时接受 code_api（外部卡密 API）与 code_self（机器人自生成验证码）会话 ——
   // 两种方式的用户交互完全一致（私聊回复/输入验证码），仅校验方不同
   const sessionRow = await queryOne<Record<string, unknown>>(
@@ -1570,6 +1607,7 @@ export async function listGroupSettings(): Promise<GroupSettingsRow[]> {
 export async function getGroupSettings(
   chatId: bigint,
 ): Promise<GroupSettingsRow | null> {
+  await ensureAppSchema();
   const cache = await loadGroupSettingsCache();
   return cache[String(chatId)] ?? null;
 }
@@ -1601,6 +1639,7 @@ export async function upsertGroupSettings(
     chatType?: string | null;
   },
 ): Promise<void> {
+  await ensureAppSchema();
   // requireApproval / verificationChannel / kickDirectJoins / replyCodeInGroup === undefined 语义为「不改动现有值」。
   // 两列都是 NOT NULL，SQLite 在 INSERT 阶段即校验约束（不会等 COALESCE 兕底），
   // 因此必须先读出现值（无行则取各自默认），绝不允许绑定 null。
