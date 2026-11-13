@@ -99,9 +99,10 @@ export async function verifyTgApiUnlockCode(
 /**
  * 解锁落库 + 回读校验（写入成功才算解锁）：回读不到记录返回 false，
  * 调用方绝不发送解锁成功提示 —— 杜绝「提示成功但台账无记录」的假门禁。
+ * deps 仅需 botId（通用门禁 composer 与 TGAPI 门禁共用同一解锁台账）。
  */
 export async function persistTgApiUnlock(
-  deps: TgApiGateDeps,
+  deps: Pick<TgApiGateDeps, "botId">,
   userId: bigint,
   username: string | null,
   mode: "captcha" | "stars",

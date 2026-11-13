@@ -651,6 +651,29 @@ function SelectedButtonPanel({ state }: { state: DesignerState }) {
         </div>
       </div>
 
+      {/* v2.3 门禁解锁（全交互类型通用，每按钮可选）：未解锁用户点击先完成门禁验证，
+          解锁一次对该机器人所有门禁入口永久生效（验证方式在功能配置弹窗「门禁解锁」面板配置） */}
+      <div className="flex items-center justify-between rounded-md border bg-background px-3 py-2">
+        <div className="min-w-0 pr-3">
+          <p className="text-sm font-medium">🔒 门禁解锁（点击先验证）</p>
+          <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+            开启：未解锁用户点击该按钮时先完成门禁验证，通过后重新点击即执行本按钮功能
+            （解锁一次永久有效，对该机器人的所有门禁入口通用）。验证方式在
+            「功能配置 → 门禁解锁」面板配置；不开启 = 点击直接执行。
+          </p>
+        </div>
+        <Switch
+          checked={action.gateRequired === true}
+          onCheckedChange={(checked) =>
+            update((draft) => {
+              if (checked) draft.action.gateRequired = true;
+              else delete draft.action.gateRequired;
+            })
+          }
+          aria-label="门禁解锁"
+        />
+      </div>
+
       {action.type === "reply" ? (
         <ContentEditor
           value={

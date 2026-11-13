@@ -37,7 +37,6 @@ const ERRORS: Record<string, string> = {
   "invalid-token": "Token 格式不合法（新建时必填，编辑时留空保留原 Token）",
   "invalid-id": "记录不存在",
   "method-required": "验证码解锁模式必须绑定一个外部 API 验证方式",
-  "invalid-stars": "星星解锁金额必须是大于等于 1 的整数",
   "invalid-menu": "内嵌按钮配置不合法（请重新打开弹窗后保存）",
   "invalid-keyboard": "自定义键盘配置不合法（请重新打开弹窗后保存）",
   "invalid-commands": "指令菜单选择数据不合法（请重新打开弹窗后保存）",
@@ -62,17 +61,11 @@ function KeyboardModeBadge({ custom }: { custom: boolean }) {
   );
 }
 
-function UnlockModeBadge({ mode }: { mode: string }) {
-  const isStars = mode === "stars";
+function UnlockModeBadge(): React.ReactNode {
+  // v2.3 星星解锁已移除：门禁固定验证码解锁（绑定验证方式，外部 API 核验）
   return (
-    <span
-      className={`inline-flex rounded-full border px-2 py-0.5 text-sm ${
-        isStars
-          ? "border-amber-200 bg-amber-50 text-amber-700"
-          : "border-emerald-200 bg-emerald-50 text-emerald-700"
-      }`}
-    >
-      {isStars ? "⭐ 星星解锁" : "🔐 验证码解锁"}
+    <span className="inline-flex rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-sm text-emerald-700">
+      🔐 验证码解锁
     </span>
   );
 }
@@ -244,15 +237,13 @@ export function TgApiPageClient({
                         {bot.username ? `@${bot.username}` : "-"}
                       </td>
                       <td className="px-4 py-3">
-                        <UnlockModeBadge mode={cfg.unlockMode} />
+                        <UnlockModeBadge />
                       </td>
                       <td className="px-4 py-3">
                         <KeyboardModeBadge custom={Boolean(cfg.customKeyboard)} />
                       </td>
                       <td className="px-4 py-3 text-sm text-muted-foreground">
-                        {cfg.unlockMode === "captcha"
-                          ? `验证方式：${methodName ?? "未配置"}`
-                          : `${cfg.starsAmount ?? "-"} ⭐${cfg.starsTitle ? `（${cfg.starsTitle}）` : ""}`}
+                        {`验证方式：${methodName ?? "未配置"}`}
                       </td>
                       <td className="max-w-52 truncate px-4 py-3 text-sm text-muted-foreground" title={`${cfg.appTitle} / ${cfg.appShortName}`}>
                         {cfg.appTitle} / {cfg.appShortName}
@@ -382,7 +373,7 @@ export function TgApiPageClient({
                         {unlock.username ? `@${unlock.username}` : "-"}
                       </td>
                       <td className="px-4 py-3">
-                        <UnlockModeBadge mode={unlock.mode} />
+                        <UnlockModeBadge />
                       </td>
                       <td className="px-4 py-3 text-sm text-muted-foreground">{unlock.time}</td>
                       <td className="px-4 py-3">

@@ -4,6 +4,7 @@ import { headers } from "next/headers";
 import { getAppSetting, getBot, listGroupBotAdmins, listGroupSettings, setAppSetting } from "@/database/operations";
 import { fetchRealGroups } from "@/services/telegram-sync";
 import { registerTelegramChat } from "@/services/chat-registry";
+import { parseGroupDeployState } from "@/services/group-deploy";
 
 /**
  * 统一「真实群组」获取通道（v1.1.1）：
@@ -27,8 +28,12 @@ import { registerTelegramChat } from "@/services/chat-registry";
 interface GroupEntry {
   chat_id: string;
   chat_title: string;
+  /** v2.3 聊天类型（group/supergroup/channel；未登记=空，前端不显示徽标） */
+  chat_type: string | null;
   source: string;
   is_new: boolean;
+  /** v2.3 该机器人对该群的部署状态（rights 部署状态，分体部署按钮绿√） */
+  deployed?: boolean;
 }
 
 interface GroupsPayload {
@@ -73,11 +78,17 @@ export async function GET(request: Request): Promise<NextResponse> {
   const titleByChat = new Map(
     settingsList.map((setting) => [String(setting.chatId), setting.chatTitle ?? ""]),
   );
+  const typeByChat = new Map(
+    settingsList.map((setting) => [String(setting.chatId), setting.chatType]),
+  );
   const groups: GroupEntry[] = links.map((link) => ({
     chat_id: String(link.chatId),
     chat_title: titleByChat.get(String(link.chatId)) ?? "",
+    chat_type: typeByChat.get(String(link.chatId)) ?? null,
     source: "cache",
     is_new: false,
+    // v2.3 真实部署状态（rights 部署状态与仿真屏列表徽章同一判定），分体部署按钮绿√ 数据源
+    deployed: parseGroupDeployState(link.rights)?.deploy_mode === "join_request",
   }));
 
   const payload: GroupsPayload = {
@@ -134,7 +145,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     );
   }
 
-  const synced: { chat_id: string; chat_title: string; source: string; is_new: boolean }[] = [];
+  const synced: { chat_id: string; chat_title: string; chat_type?: string | null; source: string; is_new: boolean }[] = [];
   for (const chat of result.chats) {
     let chatId: bigint;
     try {
@@ -145,11 +156,13 @@ export async function POST(request: Request): Promise<NextResponse> {
     const { isNew } = await registerTelegramChat({
       chatId,
       chatTitle: chat.chatTitle,
+      chatType: chat.chatType,
       botToken: bot.token,
     });
     synced.push({
       chat_id: chat.chatId,
       chat_title: chat.chatTitle,
+      chat_type: chat.chatType,
       source: chat.source,
       is_new: isNew,
     });

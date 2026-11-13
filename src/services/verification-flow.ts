@@ -124,7 +124,9 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
       submittedLabel: `code_self:${code}`,
     };
   } else if (session.method === "code_api") {
-    const methodId = settings?.methodId ?? null;
+    // 会话锁定的验证方式（method_id 随会话落库）：会话是不可篡改的验证凭据，
+    // 校验按会话记录的方式执行，管理端事后改配置不影响进行中的会话
+    const methodId = session.methodId ?? null;
     if (!methodId) {
       return { outcome: "method_missing", replyText: "当前验证方式不可用，请联系管理员" };
     }
@@ -174,7 +176,8 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
       };
     }
     const attempts = await incrementSessionAttempts(session.token);
-    const maxAttempts = settings?.maxAttempts ?? 3;
+    // 最大尝试次数：会话创建时锁定的 bot 级覆盖解析值（旧会话 NULL 回退 3）
+    const maxAttempts = session.maxAttempts ?? settings?.maxAttempts ?? 3;
     const remaining = Math.max(0, maxAttempts - attempts);
     if (remaining <= 0) {
       await expireVerificationSession(session.token);
@@ -192,15 +195,19 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
       const kickDirectAllowed = settings?.kickDirectJoins ?? false;
       const kickAllowed =
         joinRequest.requestType !== "direct" || kickDirectAllowed;
+      // 群内验证分支仅直连入群用户适用（用户已物理在群内）；申请制用户尚未进群，
+      // 走下方 decline 分支（拒绝申请）—— 群内禁言/删提示/踢出对申请者毫无意义
+      const inGroupChannel =
+        joinRequest.requestType === "direct" && settings?.verificationChannel === "group";
       const stayedInGroup =
         joinRequest.chatId !== 0n &&
         realTelegramJoin &&
-        settings?.verificationChannel === "group" &&
+        inGroupChannel &&
         !kickAllowed;
       if (
         joinRequest.chatId !== 0n &&
         realTelegramJoin &&
-        settings?.verificationChannel === "group"
+        inGroupChannel
       ) {
         await deleteSessionPromptMessage(session.token, input.eventApi);
         if (kickAllowed) {
@@ -266,10 +273,12 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
 
   let approved = false;
   let approvalNote: string | undefined;
-  // v2.0.5 群内验证分支：用户已物理在群内（入群申请链接用户 bootstrap 阶段已在
-  // Telegram 侧批准），验证通过只需落库批准 + 解禁 + 删群内提示 + 群内欢迎；
-  // 私聊模式保持旧行为（telegram → approveChatJoinRequest；direct → 落库+私聊祝贺）。
-  const groupChannel = joinRequest.chatId !== 0n && settings?.verificationChannel === "group";
+  // 群内验证分支仅直连入群用户适用（申请批准前用户不在群内，无法群内解禁/欢迎）；
+  // 申请制用户（telegram）走 autoApproveUser：approveChatJoinRequest 静默放行
+  const groupChannel =
+    joinRequest.chatId !== 0n &&
+    joinRequest.requestType === "direct" &&
+    settings?.verificationChannel === "group";
   if (joinRequest.chatId === 0n) {
     console.log(`Code verification completed for API request: ${session.token}`);
   } else if (joinRequest.requestType === "simulator") {

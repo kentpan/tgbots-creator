@@ -55,18 +55,11 @@ function parsePlatforms(formData: FormData): string[] {
  * customKeyboard 仅是可附加属性（保存/切换/清空语义见 saveTgApiBotAction）。
  */
 function buildTgApiConfig(formData: FormData, previousTgapi?: Record<string, unknown>): TgApiBotConfig {
-  const unlockModeRaw = String(formData.get("unlock_mode") ?? "captcha").trim();
-  const unlockMode: TgApiUnlockMode = unlockModeRaw === "stars" ? "stars" : "captcha";
-
+  // v2.3 星星解锁已移除：门禁固定验证码解锁（绑定验证方式）
+  const unlockMode: TgApiUnlockMode = "captcha";
   const methodRaw = String(formData.get("verification_method_id") ?? "").trim();
-  const starsRaw = String(formData.get("stars_amount") ?? "").trim();
-  const starsAmount = starsRaw === "" ? NaN : Number(starsRaw);
-
-  if (unlockMode === "captcha" && (!methodRaw || !/^\d+$/.test(methodRaw))) {
+  if (!methodRaw || !/^\d+$/.test(methodRaw)) {
     redirect(tgapiPath({ error: "method-required" }));
-  }
-  if (unlockMode === "stars" && (!Number.isFinite(starsAmount) || starsAmount < 1)) {
-    redirect(tgapiPath({ error: "invalid-stars" }));
   }
 
   // 按语言文案覆盖：表单字段 text_<lang>_<key>。v2.1.11 表单预填内置默认值，
@@ -103,11 +96,7 @@ function buildTgApiConfig(formData: FormData, previousTgapi?: Record<string, unk
     enabled: true,
     interfaceMode,
     unlockMode,
-    verificationMethodId:
-      unlockMode === "captcha" && methodRaw ? Number(methodRaw) : undefined,
-    starsAmount:
-      unlockMode === "stars" && Number.isFinite(starsAmount) ? Math.floor(starsAmount) : undefined,
-    starsTitle: String(formData.get("stars_title") ?? "").trim() || undefined,
+    verificationMethodId: Number(methodRaw),
     // v2.1.10：默认值全部中性化，不再携带原项目作者推广链接/署名
     appTitle: String(formData.get("app_title") ?? "").trim() || "usetgapibot",
     appShortName: String(formData.get("app_short_name") ?? "").trim() || "usetgapibot",
@@ -196,6 +185,20 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
     profile.commandIds = commandIds;
     savedCommandCount = commandIds.length;
   }
+  // v2.3 功能面板开关（🧩功能开关卡片随表单提交）：与 saveBotFeatureConfigAction
+  // 同字段同存储位（bots.config 顶层）—— 部署后运行实例的面板门禁/界面开关据此生效。
+  // 字段缺失 = 不触碰（兼容旧调用方）。
+  const readFeatureFlag = (key: string): void => {
+    const raw = formData.get(key);
+    if (raw !== null) (profile as unknown as Record<string, unknown>)[key] = raw === "1";
+  };
+  readFeatureFlag("menu_enabled");
+  readFeatureFlag("keyboard_enabled");
+  readFeatureFlag("commands_enabled");
+  readFeatureFlag("gate_menu_required");
+  readFeatureFlag("gate_keyboard_required");
+  readFeatureFlag("gate_commands_required");
+
   const configJson = JSON.stringify(profile);
 
   // v2.1.16：内嵌按钮配置随弹窗一并保存（bots.menu_config，含 tgapiDesigner 标记）——
@@ -261,9 +264,9 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
  * 「自定义键盘」/「菜单和键盘」键盘页签提交 —— 写入 bots.config JSON tgapi 段：
  * - customKeyboard：非空 = 自定义键盘对话流程生效（互斥：消息内嵌按钮不再渲染）；
  *   空提交 = 清除配置，回到消息内嵌按钮模式；
- * - 解锁门禁配置（unlock_mode / verification_method_id / stars_amount / stars_title）：
- *   键盘页签内嵌的门禁配置模块随表单提交（验证码模式必须绑定验证方式，
- *   星星模式必须金额≥1，校验规则与机器人保存动作一致）；字段缺失 = 不修改。
+ * - 解锁门禁配置（unlock_mode / verification_method_id）：
+ *   键盘页签内嵌的门禁配置模块随表单提交（必须绑定验证方式，
+ *   校验规则与机器人保存动作一致）；字段缺失 = 不修改。
  * 保存后热更新运行实例。
  */
 export async function saveTgApiCustomKeyboardAction(formData: FormData): Promise<void> {
@@ -290,30 +293,18 @@ export async function saveTgApiCustomKeyboardAction(formData: FormData): Promise
     delete tgapiSection.customKeyboard;
   }
 
-  // v2.2.2 门禁配置模块（键盘页签内嵌）：字段存在时才覆写（保留弹窗外维护的其他字段）
+  // v2.2.2 门禁配置模块（键盘页签内嵌）：字段存在时才覆写（保留弹窗外维护的其他字段）。
+  // v2.3 星星解锁已移除：门禁固定验证码解锁（绑定验证方式），保存时同时清除存量星星字段。
   const unlockModeRaw = formData.get("unlock_mode");
   if (typeof unlockModeRaw === "string" && unlockModeRaw.trim()) {
-    const unlockMode: TgApiUnlockMode = unlockModeRaw.trim() === "stars" ? "stars" : "captcha";
     const methodRaw = String(formData.get("verification_method_id") ?? "").trim();
-    const starsRaw = String(formData.get("stars_amount") ?? "").trim();
-    const starsAmount = starsRaw === "" ? NaN : Number(starsRaw);
-    if (unlockMode === "captcha" && (!methodRaw || !/^\d+$/.test(methodRaw))) {
+    if (!methodRaw || !/^\d+$/.test(methodRaw)) {
       redirect(tgapiPath({ error: "method-required" }));
     }
-    if (unlockMode === "stars" && (!Number.isFinite(starsAmount) || starsAmount < 1)) {
-      redirect(tgapiPath({ error: "invalid-stars" }));
-    }
-    tgapiSection.unlockMode = unlockMode;
-    if (unlockMode === "captcha") {
-      tgapiSection.verificationMethodId = Number(methodRaw);
-      delete tgapiSection.starsAmount;
-    } else {
-      tgapiSection.starsAmount = Math.floor(starsAmount);
-      delete tgapiSection.verificationMethodId;
-    }
-    const starsTitle = String(formData.get("stars_title") ?? "").trim();
-    if (starsTitle) tgapiSection.starsTitle = starsTitle;
-    else delete tgapiSection.starsTitle;
+    tgapiSection.unlockMode = "captcha";
+    tgapiSection.verificationMethodId = Number(methodRaw);
+    delete tgapiSection.starsAmount;
+    delete tgapiSection.starsTitle;
   }
 
   profile.tgapi = tgapiSection as unknown as TgApiBotConfig;

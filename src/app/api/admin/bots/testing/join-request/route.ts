@@ -2,25 +2,16 @@ import { NextResponse } from "next/server";
 import { getCurrentAdmin, hasPermission } from "@/lib/auth";
 import {
   createJoinRequest,
-  createVerificationMethod,
   createVerificationSession,
-  getBot,
-  getGroupSettings,
   getVerificationMethod,
-  getVerificationMethodByName,
   updateVerificationMethod,
-  upsertGroupSettings,
-  type GroupSettingsRow,
 } from "@/database/operations";
 import { generateJoinCode, generateVerificationToken } from "@/utils/crypto";
 import { parseCodeApiConfig, type CodeApiConfig } from "@/services/external-verify";
-import { resolveVerificationChannel } from "@/database/operations";
+import { resolveJoinVerify } from "@/services/join-verify";
 
 /** 仿真屏使用的固定模拟用户（与仿真屏模板变量保持一致） */
 export const SIMULATED_USER_ID = 777000n;
-
-/** 仿真屏自动创建/复用的验证方式固定名称（verification_methods.name 全局唯一） */
-const SIMULATOR_METHOD_NAME = "加群验证码核验（外部API）";
 
 /** 弹窗提交的验证 API 配置（与 CodeApiConfig 对应，body_template 由后端按卡密字段名生成） */
 interface JoinApiConfigInput {
@@ -64,8 +55,9 @@ function buildMethodConfig(input: JoinApiConfigInput): CodeApiConfig | null {
 }
 
 /**
- * GET /api/admin/bots/testing/join-request?chat_id=xxx
- * 读取该群组当前绑定的外部验证 API 配置，用于「模拟加群申请」弹窗预填。
+ * GET /api/admin/bots/testing/join-request?chat_id=xxx&bot_id=xxx
+ * 读取该机器人加群验证绑定的外部验证 API 配置，用于仿真弹窗预填。
+ * 验证方式为机器人级配置（bots.config.joinVerify），不再读群级字段。
  */
 export async function GET(request: Request): Promise<NextResponse> {
 
@@ -77,18 +69,28 @@ export async function GET(request: Request): Promise<NextResponse> {
     return NextResponse.json({ ok: false, error: "无权限" }, { status: 403 });
   }
 
-  const chatIdRaw = new URL(request.url).searchParams.get("chat_id") ?? "";
+  const params = new URL(request.url).searchParams;
+  const chatIdRaw = params.get("chat_id") ?? "";
+  const botIdRaw = params.get("bot_id") ?? "";
   let chatId: bigint;
   try {
     chatId = BigInt(chatIdRaw);
   } catch {
     return NextResponse.json({ ok: false, error: "群组 Chat ID 不合法" }, { status: 400 });
   }
+  let botId: bigint;
+  try {
+    botId = BigInt(botIdRaw);
+  } catch {
+    return NextResponse.json({ ok: false, error: "机器人 ID 不合法" }, { status: 400 });
+  }
 
+  const { getGroupSettings } = await import("@/database/operations");
   const settings = await getGroupSettings(chatId);
+  const resolved = await resolveJoinVerify(botId, settings);
   const method =
-    settings?.methodId !== null && settings?.methodId !== undefined
-      ? await getVerificationMethod(settings.methodId)
+    resolved?.methodDbId !== null && resolved?.methodDbId !== undefined
+      ? await getVerificationMethod(resolved.methodDbId)
       : null;
   const config = method && method.type === "code_api" ? parseCodeApiConfig(method.config) : null;
 
@@ -103,13 +105,10 @@ export async function GET(request: Request): Promise<NextResponse> {
 }
 
 /**
- * 模拟加群申请（机器人测试页仿真屏，弹窗配置式）。
- * 与真实 chat_join_request 处理（bot/handlers/chat-member.ts）完全一致：
- * 创建 join_requests（request_type=simulator，便于在加群申请列表中区分来源）
- * + verification_sessions（method=code_api），返回群组配置的验证提示文案。
- *
- * 弹窗可携带 api_config：发起前将该配置持久化到群组绑定的验证方式
- * （不存在时自动创建「加群验证码核验（外部API）」并绑定），仿真与真实验证共用同一配置。
+ * 模拟加群申请（机器人测试页仿真屏）。
+ * 验证方式 = 机器人级加群验证配置（bots.config.joinVerify → resolveJoinVerify），
+ * 会话锁定方式库 id 与最大尝试次数（与真实路径同一解析管道，保证行为一致）。
+ * captcha 方式交互无法在仿真屏复现（真实验证网页），诚实返回错误，绝不假仿真。
  */
 export async function POST(request: Request): Promise<NextResponse> {
 
@@ -134,177 +133,62 @@ export async function POST(request: Request): Promise<NextResponse> {
   } catch {
     return NextResponse.json({ ok: false, error: "群组 Chat ID 不合法" }, { status: 400 });
   }
+  let botId: bigint;
+  try {
+    botId = BigInt(payload.bot_id ?? "");
+  } catch {
+    return NextResponse.json({ ok: false, error: "请先选择机器人" }, { status: 400 });
+  }
 
-  // 弹窗配置校验（先行，避免先建方法再失败）
-  let newConfig: CodeApiConfig | null = null;
-  if (payload.api_config) {
-    newConfig = buildMethodConfig(payload.api_config);
+  const { getGroupSettings } = await import("@/database/operations");
+  const settings = await getGroupSettings(chatId);
+
+  if (settings && !settings.enabled) {
+    return NextResponse.json({ ok: false, error: "该群组验证已停用" }, { status: 400 });
+  }
+
+  // 验证方式 = 机器人级解析（与真实 chat_join_request/chat_member 路径同一管道）
+  const resolved = await resolveJoinVerify(botId, settings);
+  if (!resolved) {
+    return NextResponse.json(
+      { ok: false, error: "该机器人未开启「加群验证」或未选择验证方式：请在机器人管理的「功能配置」弹窗中开启并选择" },
+      { status: 400 },
+    );
+  }
+
+  if (resolved.method === "captcha") {
+    return NextResponse.json(
+      { ok: false, error: "仿真屏暂不支持「人机验证（WebApp）」交互仿真：该方式依赖真实验证网页，请在真实 Telegram 中验证" },
+      { status: 400 },
+    );
+  }
+
+  // 弹窗携带 api_config：更新机器人绑定的方式库配置（仅 code_api 方式且已绑定）
+  if (payload.api_config && resolved.method === "code_api" && resolved.methodDbId !== null) {
+    const newConfig = buildMethodConfig(payload.api_config);
     if (!newConfig) {
       return NextResponse.json(
         { ok: false, error: "验证 API 配置不合法：需 http/https 地址且 Bearer API Key 非空" },
         { status: 400 },
       );
     }
-  }
-
-  let settings: GroupSettingsRow | null = await getGroupSettings(chatId);
-
-  if (settings && !settings.enabled) {
-    return NextResponse.json({ ok: false, error: "该群组验证已停用" }, { status: 400 });
-  }
-
-  if (newConfig) {
-    // v2.0.1：method_id 允许在任意验证方式下作为「偏好」落库（弹窗回显），
-    // 仅 method=code_api 时才视为「已绑定」。若不加守卫，code_self 群组
-    // 携带 api_config 模拟加群会误改用户绑定的外部方法（如 #3 核验 API）配置。
-    const boundMethodId =
-      settings?.method === "code_api" &&
-      settings?.methodId !== null &&
-      settings?.methodId !== undefined
-        ? settings.methodId
-        : null;
-    const existingMethod =
-      boundMethodId !== null
-        ? await getVerificationMethod(boundMethodId)
-        : // 群组未绑定：按固定名称复用全局已有方法（name 全局唯一，
-          // 直接 INSERT 会 UNIQUE constraint failed: verification_methods.name）
-          await getVerificationMethodByName(SIMULATOR_METHOD_NAME);
-    if (existingMethod) {
-      // 更新验证方式配置（仿真与真实验证共用）
-      const updated = await updateVerificationMethod(existingMethod.id, {
-        type: "code_api",
-        config: JSON.stringify(newConfig),
-        enabled: true,
-      });
-      if (!updated) {
-        return NextResponse.json({ ok: false, error: "保存验证 API 配置失败" }, { status: 500 });
-      }
-      if (boundMethodId === null) {
-        // 复用的方法原本未绑定到本群组：补绑定
-        await upsertGroupSettings(chatId, {
-          chatTitle: settings?.chatTitle ?? null,
-          method: "code_api",
-          methodId: existingMethod.id,
-          timeoutSeconds: settings?.timeoutSeconds,
-          maxAttempts: settings?.maxAttempts,
-          promptText: settings?.promptText,
-          successText: settings?.successText,
-          failureText: settings?.failureText,
-        });
-      }
-    } else {
-      // 全局不存在同名方法：首次创建并绑定
-      const created = await createVerificationMethod({
-        name: SIMULATOR_METHOD_NAME,
-        type: "code_api",
-        config: JSON.stringify(newConfig),
-        enabled: true,
-      });
-      if (!created) {
-        return NextResponse.json({ ok: false, error: "创建验证方式失败" }, { status: 500 });
-      }
-      await upsertGroupSettings(chatId, {
-        chatTitle: settings?.chatTitle ?? null,
-        method: "code_api",
-        methodId: created.id,
-        timeoutSeconds: settings?.timeoutSeconds,
-        maxAttempts: settings?.maxAttempts,
-        promptText: settings?.promptText,
-        successText: settings?.successText,
-        failureText: settings?.failureText,
-      });
-    }
-    settings = await getGroupSettings(chatId);
-  }
-
-  if (!settings) {
-    return NextResponse.json({ ok: false, error: "该群组尚未配置验证设置" }, { status: 404 });
-  }
-
-  // v1.1.7：code_self（自动验证码）仿真 —— 与真实 bootstrap（chat-member.ts）一致：
-  // 生成验证码随会话落库，含验证码的完整提示文案回传仿真屏私聊气泡；
-  // 提交校验走同一 evaluateSubmittedCode 管道（本地比对），行为逐字一致
-  if (settings.method === "code_self") {
-    const joinCode = generateJoinCode();
-    const token = generateVerificationToken();
-    const expiresAt = new Date(Date.now() + settings.timeoutSeconds * 1000);
-
-    const joinRequest = await createJoinRequest({
-      userId: SIMULATED_USER_ID,
-      chatId,
-      username: "preview_user",
-      firstName: "预览",
-      lastName: "用户",
-      verificationToken: token,
-      requestType: "simulator",
+    const updated = await updateVerificationMethod(resolved.methodDbId, {
+      type: "code_api",
+      config: JSON.stringify(newConfig),
+      enabled: true,
     });
-    if (!joinRequest) {
-      return NextResponse.json({ ok: false, error: "创建模拟加群申请失败" }, { status: 500 });
+    if (!updated) {
+      return NextResponse.json({ ok: false, error: "保存验证 API 配置失败" }, { status: 500 });
     }
-    const session = await createVerificationSession({
-      token,
-      userId: SIMULATED_USER_ID,
-      chatId,
-      expiresAt,
-      method: "code_self",
-      expectedCode: joinCode,
-    });
-    if (!session) {
-      return NextResponse.json({ ok: false, error: "创建验证会话失败" }, { status: 500 });
-    }
-    console.log(
-      `Simulator join request created (code_self): user ${SIMULATED_USER_ID} -> chat ${chatId}`,
-    );
-
-    // 提示文案与真实消息逐字一致（纯文本形态）：
-    // 群内验证模式（auto=超级群）→ 群内验证消息（4 选 1 按钮点选，正确项随会话落库，仿真候选展示正确项）；
-    // 私聊验证模式 → 私聊验证码提示（buildCodeSelfPromptHTML 纯文本版）
-    const minutes = Math.max(1, Math.round(settings.timeoutSeconds / 60));
-    const groupChannel = resolveVerificationChannel(settings, chatId) === "group";
-    const promptText = groupChannel
-        ? `👋 欢迎 @preview_user 加入「${settings.chatTitle ?? "群组"}」！\n\n` +
-          `请在 ${minutes} 分钟内点击下方按钮，从 4 个候选验证码中点选正确的一项完成验证，验证通过前你将无法发言。\n\n` +
-          `🔒 点选结果仅机器人可见，群里其他成员不可见。\n\n` +
-          `（仿真候选码：正确项 ${joinCode}）`
-        : `${settings.promptText ?? "🔐 请回复本消息并输入验证码完成验证"}\n\n` +
-          `您的入群验证码：${joinCode}\n\n` +
-          `⏱ 验证码 ${minutes} 分钟内有效，请回复本消息并输入上述验证码完成验证，验证通过后将自动批准入群。请勿把验证码泄露给他人。`;
-
-    return NextResponse.json({
-      ok: true,
-      data: {
-        token,
-        chat_id: String(chatId),
-        chat_title: settings.chatTitle,
-        username: "preview_user",
-        user_id: String(SIMULATED_USER_ID),
-        prompt_text: promptText,
-        success_text: settings.successText,
-        failure_text: settings.failureText,
-        timeout_seconds: settings.timeoutSeconds,
-        max_attempts: settings.maxAttempts,
-        expires_at: expiresAt.toISOString(),
-        method_id: "",
-        method_name: "自动验证码（输入验证码加群）",
-        expected_code: joinCode,
-        verification_channel: settings.verificationChannel,
-      },
-    });
   }
 
-  if (settings.method !== "code_api" || settings.methodId === null) {
-    return NextResponse.json(
-      { ok: false, error: "该群组未启用验证码类验证方式（自动验证码/外部API），无法进行验证码仿真" },
-      { status: 400 },
-    );
-  }
-  const method = await getVerificationMethod(settings.methodId);
-  if (!method || !method.enabled) {
-    return NextResponse.json({ ok: false, error: "该群组绑定的验证方式不可用" }, { status: 400 });
-  }
+  const method =
+    resolved.methodDbId !== null ? await getVerificationMethod(resolved.methodDbId) : null;
 
   const token = generateVerificationToken();
-  const expiresAt = new Date(Date.now() + settings.timeoutSeconds * 1000);
+  const useSelfCode = resolved.method === "code_self";
+  const joinCode = useSelfCode ? generateJoinCode() : null;
+  const expiresAt = new Date(Date.now() + resolved.timeoutSeconds * 1000);
 
   const joinRequest = await createJoinRequest({
     userId: SIMULATED_USER_ID,
@@ -324,42 +208,46 @@ export async function POST(request: Request): Promise<NextResponse> {
     userId: SIMULATED_USER_ID,
     chatId,
     expiresAt,
-    method: "code_api",
+    method: resolved.method,
+    expectedCode: joinCode,
+    methodId: resolved.methodDbId,
+    maxAttempts: resolved.maxAttempts,
   });
   if (!session) {
     return NextResponse.json({ ok: false, error: "创建验证会话失败" }, { status: 500 });
   }
 
-  console.log(`Simulator join request created: user ${SIMULATED_USER_ID} -> chat ${chatId}`);
+  console.log(`Simulator join request created: user ${SIMULATED_USER_ID} -> chat ${chatId} (bot #${botId}, method=${resolved.method})`);
 
-  // 隐私红线（v1.1.3）：仿真动作一律只停留在仿真屏，绝不真实发送到群组 ——
-  // 验证提示/结果只会通过机器人发送给真实用户，仿真环境不调用 Telegram API。
-  // v2.0.12 三态渠道：群内验证（auto=超级群/显式 group）用群内消息文案展示
-  //（输入内容其他成员不可见：网页输码/按钮点选），基础群 auto/dm 用私聊文案。
-  const groupChannel = resolveVerificationChannel(settings, chatId) === "group";
-  const groupPromptText = groupChannel
-    ? `👋 欢迎 @preview_user 加入「${settings.chatTitle ?? "群组"}」！\n\n` +
-      `请在 ${Math.max(1, Math.round(settings.timeoutSeconds / 60))} 分钟内点击下方按钮完成验证，验证通过前你将无法发言。\n\n` +
-      "🔒 验证过程在验证页面/按钮点选中完成，群里其他成员不可见。"
-    : settings.promptText;
+  // 隐私红线：仿真动作一律只停留在仿真屏，绝不真实发送到群组 —— 不调用 Telegram API。
+  const minutes = Math.max(1, Math.round(resolved.timeoutSeconds / 60));
+  const promptText =
+    resolved.method === "code_self"
+      ? `${settings?.promptText ?? "🔐 请回复本消息并输入验证码完成验证"}\n\n` +
+        `您的入群验证码：${joinCode}\n\n` +
+        `⏱ 验证码 ${minutes} 分钟内有效，请回复本消息并输入上述验证码完成验证，验证通过后将自动批准入群。请勿把验证码泄露给他人。`
+      : `👋 欢迎 @preview_user 加入「${settings?.chatTitle ?? "群组"}」！\n\n` +
+        `请在 ${minutes} 分钟内完成验证（外部验证码核验），验证通过后将自动批准入群。\n\n` +
+        "🔒 验证过程在验证页面完成，群里其他成员不可见。";
 
   return NextResponse.json({
     ok: true,
     data: {
       token,
       chat_id: String(chatId),
-      chat_title: settings.chatTitle,
+      chat_title: settings?.chatTitle,
       username: "preview_user",
       user_id: String(SIMULATED_USER_ID),
-      prompt_text: groupPromptText,
-      success_text: settings.successText,
-      failure_text: settings.failureText,
-      timeout_seconds: settings.timeoutSeconds,
-      max_attempts: settings.maxAttempts,
+      prompt_text: promptText,
+      success_text: settings?.successText,
+      failure_text: settings?.failureText,
+      timeout_seconds: resolved.timeoutSeconds,
+      max_attempts: resolved.maxAttempts,
       expires_at: expiresAt.toISOString(),
-      method_id: String(settings.methodId),
-      method_name: method.name,
-      verification_channel: settings.verificationChannel,
+      method_id: resolved.methodDbId !== null ? String(resolved.methodDbId) : "",
+      method_name: method?.name ?? (useSelfCode ? "自动验证码（输入验证码加群）" : "外部API核验"),
+      expected_code: joinCode,
+      verification_channel: settings?.verificationChannel ?? "auto",
     },
   });
 }

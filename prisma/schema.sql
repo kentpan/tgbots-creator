@@ -31,7 +31,7 @@ CREATE TABLE "verification_sessions" (
     "expires_at" DATETIME NOT NULL,
     "method" TEXT NOT NULL DEFAULT 'captcha',
     "attempts" INTEGER NOT NULL DEFAULT 0
-, expected_code TEXT, "prompt_message_id" INTEGER, channel, group_message_id, option_codes);
+, expected_code TEXT, "prompt_message_id" INTEGER, channel, group_message_id, option_codes, method_id INTEGER, max_attempts INTEGER);
 CREATE TABLE "user_stats" (
     "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "user_id" BIGINT NOT NULL,
@@ -107,7 +107,7 @@ CREATE TABLE "group_settings" (
     "enabled" BOOLEAN NOT NULL DEFAULT true,
     "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-, "privacy_mode" BOOLEAN NOT NULL DEFAULT true, require_approval BOOLEAN NOT NULL DEFAULT false, "verification_channel" TEXT NOT NULL DEFAULT 'group', kick_direct_joins BOOLEAN NOT NULL DEFAULT false, "reply_code_in_group" BOOLEAN NOT NULL DEFAULT false, verify_channel);
+, "privacy_mode" BOOLEAN NOT NULL DEFAULT true, require_approval BOOLEAN NOT NULL DEFAULT false, "verification_channel" TEXT NOT NULL DEFAULT 'group', kick_direct_joins BOOLEAN NOT NULL DEFAULT false, "reply_code_in_group" BOOLEAN NOT NULL DEFAULT false, verify_channel, join_verify_bot_id INTEGER);
 CREATE TABLE "verification_methods" (
     "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "name" TEXT NOT NULL,

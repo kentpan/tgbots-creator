@@ -21,6 +21,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 export interface RealGroup {
   chatId: string;
   chatTitle: string;
+  /** v2.3 该机器人对该群的部署状态（rights 部署状态，分体部署按钮绿√） */
+  deployed?: boolean;
+  /** v2.3 聊天类型（group/supergroup/channel；未登记=空不显示徽标） */
+  chatType?: string | null;
   /** getchat=已关联群组经 getChat 验证仍在群内；cache=数据库已登记（未实时校验） */
   source: "getchat" | "cache";
   /** 本次同步新登记（此前数据库中不存在） */
@@ -44,13 +48,15 @@ async function readJson(response: Response): Promise<Record<string, unknown> | n
 }
 
 function mapGroups(
-  raw: { chat_id: string; chat_title: string; source: string; is_new: boolean }[] | undefined,
+  raw: { chat_id: string; chat_title: string; source: string; is_new: boolean; deployed?: boolean; chat_type?: string | null }[] | undefined,
 ): RealGroup[] {
   return (raw ?? []).map((group) => ({
     chatId: group.chat_id,
     chatTitle: group.chat_title,
     source: group.source === "getchat" ? "getchat" : "cache",
     isNew: group.is_new === true,
+    deployed: group.deployed === true,
+    chatType: group.chat_type ?? null,
   }));
 }
 

@@ -129,8 +129,34 @@ function appendButton(
   button: MenuButton,
   parentId: string,
   registry?: MenuCommandRegistry,
+  gate?: { botId: bigint; panelRequired: boolean },
 ): void {
   const action = button.action;
+  // v2.3 门禁前置（功能配置面板开关 或 按钮级 gateRequired）：未解锁点击 → 私聊解锁挑战。
+  // 导航类按钮（子菜单/返回）与 Telegram 原生按钮（url/webApp/switchInline）不拦截 ——
+  // 原生按钮点击由 Telegram 客户端直接处理，机器人无法介入（如实限制，不做假拦截）。
+  const gateRequired = gate !== undefined && (gate.panelRequired || action.gateRequired === true);
+  const withGate = (handler: (ctx: Context) => void | Promise<void>): (ctx: Context) => Promise<void> => {
+    if (!gateRequired) {
+      return async (ctx) => {
+        await handler(ctx);
+      };
+    }
+    return async (ctx) => {
+      const { ensureGateUnlocked } = await import("@/bot/composers/gate");
+      const { getBot } = await import("@/database/operations");
+      const { parseBotFeatureConfig } = await import("@/services/bot-feature-config");
+      const botRow = await getBot(gate.botId);
+      if (!botRow) {
+        await ctx.reply("⚠️ 机器人配置读取失败，请稍后重试。");
+        return;
+      }
+      const feature = parseBotFeatureConfig(botRow.config, false);
+      const ok = await ensureGateUnlocked(gate.botId, feature, ctx as unknown as BotContext);
+      if (!ok) return;
+      await handler(ctx);
+    };
+  };
   switch (action.type) {
     case "url": {
       const url = action.url?.trim() ?? "";
@@ -173,7 +199,7 @@ function appendButton(
       // v2.1.10：点击等同用户发送 /指令 —— 按指令名查注册表真实执行；
       // 注册表由运行实例在能力注册阶段填充（内置 + 已启用自定义指令）
       const commandName = (action.target ?? "").trim().replace(/^\//, "");
-      menu.text(button.text, async (ctx) => {
+      menu.text(button.text, withGate(async (ctx) => {
         const runner = registry?.runners.get(commandName);
         if (runner) {
           await runner(ctx);
@@ -182,7 +208,7 @@ function appendButton(
         await ctx.reply(
           `⚠️ 指令 /${commandName || "（未指定）"} 不存在或未在「指令菜单」中勾选：请在机器人管理页打开「⌨️ 指令菜单」，勾选该指令并保存。`,
         );
-      });
+      }));
       return;
     }
     case "language": {
@@ -208,7 +234,7 @@ function appendButton(
       const response = action.tgapi_response;
       const success = action.tgapi_success;
       const fail = action.tgapi_fail;
-      menu.text(button.text, async (ctx) => {
+      menu.text(button.text, withGate(async (ctx) => {
         if (!func || !registry?.tgapiFuncRunner) {
           await ctx.reply(
             "⚠️ TGAPI 功能按钮仅 TGAPI 申请机器人支持：请在机器人配置中启用 TGAPI 申请。",
@@ -216,7 +242,7 @@ function appendButton(
           return;
         }
         await registry.tgapiFuncRunner(ctx, { func, unlock, value, response, success, fail });
-      });
+      }));
       return;
     }
     case "back": {
@@ -248,15 +274,20 @@ function appendButton(
     }
     case "reply":
     default: {
-      menu.text(button.text, async (ctx) => {
+      menu.text(button.text, withGate(async (ctx) => {
         await sendContent(ctx, normalizeReplyContent(action));
-      });
+      }));
       return;
     }
   }
 }
 
-function buildNodeMenu(node: MenuNode, nodeId: string, registry?: MenuCommandRegistry): TGuardMenu {
+function buildNodeMenu(
+  node: MenuNode,
+  nodeId: string,
+  registry?: MenuCommandRegistry,
+  gate?: { botId: bigint; panelRequired: boolean },
+): TGuardMenu {
   const menu = new TGuardMenu(nodeId);
   const children: TGuardMenu[] = [];
   let firstRow = true;
@@ -269,11 +300,11 @@ function buildNodeMenu(node: MenuNode, nodeId: string, registry?: MenuCommandReg
         // 因此必须先把本节点全部按钮（含 submenu 导航按钮）加完，最后统一 register 子菜单；
         // 子菜单内部同理递归构建完毕后才被 register
         const childId = childMenuId(nodeId, rowIndex, colIndex);
-        children.push(buildNodeMenu(button.submenu, childId, registry));
+        children.push(buildNodeMenu(button.submenu, childId, registry, gate));
         menu.submenu(button.text, childId);
         return;
       }
-      appendButton(menu, button, nodeId, registry);
+      appendButton(menu, button, nodeId, registry, gate);
     });
   });
   if (children.length > 0) menu.register(children);
@@ -281,8 +312,12 @@ function buildNodeMenu(node: MenuNode, nodeId: string, registry?: MenuCommandReg
 }
 
 /** 由菜单配置构建官方 @grammyjs/menu 实例树（根 id 固定为 tg:root） */
-export function buildBotMenu(config: BotMenuConfig, registry?: MenuCommandRegistry): TGuardMenu {
-  return buildNodeMenu(config.root, MENU_ROOT_ID, registry);
+export function buildBotMenu(
+  config: BotMenuConfig,
+  registry?: MenuCommandRegistry,
+  gate?: { botId: bigint; panelRequired: boolean },
+): TGuardMenu {
+  return buildNodeMenu(config.root, MENU_ROOT_ID, registry, gate);
 }
 
 /**
@@ -294,8 +329,9 @@ export function installBotMenu(
   bot: Bot<BotContext>,
   config: BotMenuConfig,
   registry?: MenuCommandRegistry,
+  gate?: { botId: bigint; panelRequired: boolean },
 ): TGuardMenu {
-  const menu = buildBotMenu(config, registry);
+  const menu = buildBotMenu(config, registry, gate);
   bot.use(menu);
   return menu;
 }

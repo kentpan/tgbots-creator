@@ -19,6 +19,8 @@ const registeredChatKeys = new Set<string>();
 export async function ensureChatRegistered(input: {
   chatId: bigint;
   chatTitle: string | null;
+  /** v2.3 聊天类型（group/supergroup/channel） */
+  chatType?: string | null;
   botToken?: string;
 }): Promise<boolean> {
   const key = `${input.botToken ?? "*"}:${input.chatId}`;
@@ -47,6 +49,8 @@ export async function ensureChatRegistered(input: {
 export async function registerTelegramChat(input: {
   chatId: bigint;
   chatTitle: string | null;
+  /** v2.3 聊天类型（group/supergroup/channel） */
+  chatType?: string | null;
   /** 登记时用于关联机器人（该 Token 下的全部机器人条目都会建立链接） */
   botToken?: string;
 }): Promise<{ isNew: boolean }> {
@@ -61,9 +65,14 @@ export async function registerTelegramChat(input: {
   const existing = await getGroupSettings(input.chatId);
   const titleUnchanged =
     (input.chatTitle ?? null) === (existing?.chatTitle ?? null);
-  if (!existing || !titleUnchanged) {
+  // v2.3：类型变化也触发登记写（频道升级/类型回填）；未传时保留现值
+  const typeUnchanged =
+    input.chatType === undefined ||
+    (input.chatType ?? null) === (existing?.chatType ?? null);
+  if (!existing || !titleUnchanged || !typeUnchanged) {
     await upsertGroupSettings(input.chatId, {
       chatTitle: input.chatTitle ?? existing?.chatTitle ?? null,
+      chatType: input.chatType ?? existing?.chatType ?? null,
       // v1.1.7：新登记群组默认 code_self（自动验证码：机器人私聊发码，
       // 用户回复输入验证码即自动审批 —— 与「一键部署」宣传的主流程一致）；
       // 已有配置的群组原样回传，绝不覆盖

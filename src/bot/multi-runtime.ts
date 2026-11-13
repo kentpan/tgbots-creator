@@ -18,8 +18,16 @@ import {
   type BotRow,
 } from "@/database/operations";
 import { installBotMenu, parseBotMenuConfig, createMenuCommandRegistry, scopeCommandRunnerToGroup, sendMenuMessage, type BotMenuConfig, type MenuCommandRegistry, type MenuCommandRunner } from "@/services/bot-menu";
-import { parseCustomKeyboardConfig, renderCustomKeyboardMarkup, type CustomKeyboardButton } from "@/services/custom-keyboard";
-import { normalizeReplyContent } from "@/services/menu-config";
+import {
+  findKeyboardButtonByText,
+  findKeyboardParentRowsByText,
+  parseCustomKeyboardConfig,
+  renderCustomKeyboardMarkup,
+  type CustomKeyboardButton,
+  type CustomKeyboardConfig,
+} from "@/services/custom-keyboard";
+import { normalizeReplyContent, countMenuStats } from "@/services/menu-config";
+import { parseBotFeatureConfig, resolveInterfaceMode, type BotFeatureConfig } from "@/services/bot-feature-config";
 import { CommandGroup } from "@grammyjs/commands";
 import { codeQuestion } from "./verification-question";
 import { registerAiSupport, type AiSupportConfig } from "./handlers/ai-support";
@@ -29,7 +37,10 @@ import { normalizeTgApiSection, type TgApiBotConfig } from "@/services/tgapi-con
 import { buildSessionMiddleware } from "./session-storage";
 import { registerChatTracking } from "./chat-tracking";
 import { registerInviteLinkTracking } from "./invite-link-tracking";
-import { handleJoinRequest, handleChatMemberUpdate } from "./handlers/chat-member";
+import { handleChatMemberUpdate } from "./handlers/chat-member";
+import { startMenuVerifyFlow } from "@/bot/handlers/menu-verify";
+import { createJoinVerifyComposer } from "./composers/join-verify";
+import { createGateComposer, ensureGateUnlocked } from "./composers/gate";
 import { handleVerificationChoice } from "./handlers/group-verification";
 import { handleCodeInput } from "./handlers/code-input";
 import { menuVerifyQuestion } from "./handlers/menu-verify";
@@ -360,7 +371,12 @@ async function createMenuBot(row: BotRow, menuConfig: BotMenuConfig, mode: Effec
   // 官方 @grammyjs/menu 菜单插件（v1.1.1）：回调路由/子菜单导航/过期恢复全由插件处理
   // v2.1.10：同实例创建「执行指令」按钮注册表（能力注册阶段按指令菜单弹窗勾选填充）
   const menuCommands = createMenuCommandRegistry();
-  const instanceMenu = installBotMenu(bot, menuConfig, menuCommands);
+  // v2.3 内嵌按钮面板门禁开关：面板开启时全部功能型按钮点击先解锁（导航/原生按钮除外）
+  const menuFeature = parseBotFeatureConfig(row.config, false);
+  const instanceMenu = installBotMenu(bot, menuConfig, menuCommands, {
+    botId: row.id,
+    panelRequired: menuFeature.gateMenuRequired === true,
+  });
   // v2.1.12 菜单「外部验证 API」按钮：验证码回复通道（force-reply StatelessQuestion）。
   // 必须装在会话中间件之后（handler 读写 ctx.session.menuVerify）；与群组验证
   // codeQuestion（tgcode）并列独立问题，按消息内嵌 id 精确路由互不串扰。
@@ -404,32 +420,77 @@ async function registerBotCapabilities(
   botId?: bigint,
   menuCommands?: MenuCommandRegistry,
   menuConfig?: BotMenuConfig,
+  feature?: BotFeatureConfig,
 ): Promise<() => Promise<void>> {
   const privacyMode = effectivePrivacy;
 
-  // v2.2.0 自定义键盘（ReplyKeyboard）：配置非空时注入 ctx.customKeyboard
-  //（cmdStart 欢迎后附发键盘）并注册按钮文本响应（点击按钮=发送文本，按配置真实响应）；
+  // v2.3 界面模式互斥（唯一判定源 resolveInterfaceMode）：
+  // keyboard = 自定义键盘生效（ctx.customKeyboard 注入 + 按钮响应注册，内嵌菜单不渲染）；
+  // inline   = 内嵌按钮菜单生效（不注入键盘）；
+  // 未配置   = 旧语义推断（键盘非空 = 键盘模式），升级不静默改变行为
+  const featureMode = feature
+    ? resolveInterfaceMode(feature)
+    : parseCustomKeyboardConfig(profile.customKeyboard)
+      ? "keyboard"
+      : "inline";
+
+  // 界面模式标记注入：cmdStart 据此决定欢迎消息形态（键盘模式不发内嵌菜单；
+  // 面板全关 = 纯文本欢迎，不发菜单也不发键盘）
+  const menuEffective = feature ? feature.menu.enabled : true;
+  const keyboardEffective = feature ? feature.keyboard.enabled && featureMode === "keyboard" : featureMode === "keyboard";
+  bot.use(async (ctx, next) => {
+    ctx.interfaceKeyboardMode = keyboardEffective;
+    ctx.interfaceMenuEnabled = menuEffective;
+    await next();
+  });
+
+  // v2.3 指令菜单门禁：面板开关开启 → 未解锁用户使用任何指令前先完成门禁解锁
+  if (feature?.gate.enabled && feature.gateCommandsRequired) {
+    bot.on("message:text", async (ctx, next) => {
+      const text = ctx.msg?.text ?? "";
+      if (!text.startsWith("/")) {
+        await next();
+        return;
+      }
+      const ok = await ensureGateUnlocked(BigInt(botId ?? 0), feature, ctx);
+      if (!ok) return;
+      await next();
+    });
+  }
+
+  // 自定义键盘（ReplyKeyboard）：仅面板开关开启时注入（功能开关显式控制；旧数据按
+  // 键盘有无推断为开）。按钮点击=发送文本，按配置真实响应；
   // TGAPI 申请机器人不在此处理（互斥的对话流程由 tgapi.customKeyboard 驱动）
-  const instanceKeyboard = parseCustomKeyboardConfig(profile.customKeyboard);
+  const instanceKeyboard =
+    feature?.keyboard.enabled === false
+      ? null
+      : parseCustomKeyboardConfig(profile.customKeyboard);
   if (instanceKeyboard) {
     const keyboardMarkup = renderCustomKeyboardMarkup(instanceKeyboard);
-    const keyboardButtons = new Map<string, CustomKeyboardButton>();
-    for (const row of instanceKeyboard.root.rows) {
-      for (const button of row.buttons) {
-        if (button.kind === "text") keyboardButtons.set(button.text.trim(), button);
-      }
-    }
     bot.use(async (ctx, next) => {
       ctx.customKeyboard = keyboardMarkup;
       await next();
     });
     bot.on("message:text", async (ctx, next) => {
-      const button = keyboardButtons.get((ctx.msg?.text ?? "").trim());
-      if (!button) {
+      // v2.3 键盘树寻址：先根层（当前激活键盘），再递归子菜单键盘 —— 覆盖
+      // 「进入子菜单（整键盘替换）」后的按钮点击与「返回上一级」
+      const text = (ctx.msg?.text ?? "").trim();
+      const found = findKeyboardButtonByText(instanceKeyboard, text);
+      const button = found?.button;
+      if (!button || button.kind !== "text") {
         await next();
         return;
       }
       const action = button.action;
+      // 门禁前置验证：按钮勾选「门禁解锁」或键盘面板开关开启 → 未解锁用户先完成解锁挑战，
+      // 通过后（全局共享解锁状态）重新点击按钮才执行原动作
+      if (action?.gateRequired === true || (feature?.gate.enabled && feature.gateKeyboardRequired)) {
+        const gateFeature =
+          feature ??
+          parseBotFeatureConfig(JSON.stringify(profile), false);
+        const unlocked = await ensureGateUnlocked(BigInt(botId ?? 0), gateFeature, ctx);
+        if (!unlocked) return;
+      }
       if (action?.type === "command") {
         const target = (action.target ?? "").trim().replace(/^\//, "");
         const runner = target ? menuCommands?.runners.get(target) : undefined;
@@ -446,6 +507,77 @@ async function registerBotCapabilities(
         await sendMenuMessage(ctx.api, ctx.chat.id, normalizeReplyContent(action), {});
         return;
       }
+      // 打开链接：回复携带 InlineKeyboard URL 按钮（ReplyKeyboard 按钮不支持原生 URL）
+      if (action?.type === "url" && ctx.chat) {
+        const url = (action.url ?? "").trim();
+        if (!/^https?:\/\//.test(url)) {
+          await ctx.reply("⚠️ 该按钮的链接地址未配置或不合法，请联系管理员检查按钮配置。");
+          return;
+        }
+        await ctx.api.sendMessage(ctx.chat.id, action.text || button.text, {
+          reply_markup: { inline_keyboard: [[{ text: button.text, url }]] },
+        });
+        return;
+      }
+      // 打开 WebApp：回复携带 InlineKeyboard web_app 按钮（仅私聊可用；群聊回落为链接消息）
+      if (action?.type === "web_app" && ctx.chat) {
+        const url = (action.url ?? "").trim();
+        if (!/^https:\/\//.test(url)) {
+          await ctx.reply("⚠️ WebApp 地址必须为 https，请联系管理员检查按钮配置。");
+          return;
+        }
+        if (ctx.chat.type === "private") {
+          await ctx.api.sendMessage(ctx.chat.id, action.text || button.text, {
+            reply_markup: { inline_keyboard: [[{ text: button.text, web_app: { url } }]] },
+          });
+        } else {
+          await ctx.api.sendMessage(ctx.chat.id, `${action.text || button.text}\n${url}`);
+        }
+        return;
+      }
+      // 外部验证 API：与内嵌按钮同一验证流程（真实外部 API 核验，失败 3 次拒绝）
+      if (action?.type === "verify" && ctx.chat) {
+        await startMenuVerifyFlow(ctx, action.verify ?? { method_id: "" });
+        return;
+      }
+      // 切换内联查询 / 当前聊天预填：回复携带对应 InlineKeyboard 按钮（Telegram 原生行为）
+      if (
+        (action?.type === "switch_inline" || action?.type === "switch_inline_current") &&
+        ctx.chat
+      ) {
+        const query = action.switch_query ?? "";
+        const inlineButton =
+          action.type === "switch_inline"
+            ? { text: button.text, switch_inline_query: query }
+            : { text: button.text, switch_inline_query_current_chat: query };
+        await ctx.api.sendMessage(ctx.chat.id, action.text || button.text, {
+          reply_markup: { inline_keyboard: [[inlineButton]] },
+        });
+        return;
+      }
+      // 进入子菜单：发送子菜单键盘替换当前键盘（ReplyKeyboard 真实语义）
+      if (action?.type === "submenu" && button.submenu && ctx.chat) {
+        const submenuConfig: CustomKeyboardConfig = {
+          options: instanceKeyboard.options,
+          root: { rows: button.submenu.rows },
+        };
+        await ctx.api.sendMessage(ctx.chat.id, action.text || button.text, {
+          reply_markup: renderCustomKeyboardMarkup(submenuConfig),
+        });
+        return;
+      }
+      // 返回上一级：发送包含该返回按钮的键盘的上一级键盘
+      if (action?.type === "back" && ctx.chat) {
+        const parentRows = findKeyboardParentRowsByText(instanceKeyboard, button.text);
+        const parentConfig: CustomKeyboardConfig = {
+          options: instanceKeyboard.options,
+          root: { rows: parentRows },
+        };
+        await ctx.api.sendMessage(ctx.chat.id, action.text || button.text, {
+          reply_markup: renderCustomKeyboardMarkup(parentConfig),
+        });
+        return;
+      }
       // 无动作配置（kind=text 且未绑定行为）：点击仅作为普通文本放行
       await next();
     });
@@ -459,6 +591,10 @@ async function registerBotCapabilities(
   // 默认值，保证运行实例与管理后台读到同一份配置语义）。
   // v2.1.10：传入菜单配置与指令注册表 —— 按钮驱动新流程（欢迎+授权认证按钮→
   // 输码→成功+菜单键盘）+ 菜单「执行指令」按钮与自定义指令同源。
+  // 通用门禁解锁（Composer 模块）：TGAPI 机器人的自定义键盘按钮也支持「门禁解锁」
+  // 前置校验 —— 必须在 TGAPI 分支返回前注册（承接 tggate 挑战回复）
+  bot.use(createGateComposer(botId ?? BigInt(0)));
+
   if (profile.tgapi?.enabled) {
     const resolvedBotId = botId ?? BigInt(0);
     return await registerTgApiHandlers(
@@ -471,16 +607,19 @@ async function registerBotCapabilities(
         // 「⌨️ 指令菜单」弹窗勾选（bots.config.commandIds）：TGAPI 实例据此注册指令，
         // 弹窗保存后经 restartMenuBot 热更新生效；运行时绝不按指令库自行补注册
         commandIds: Array.isArray(profile.commandIds) ? profile.commandIds : [],
+        // v2.3 功能配置（键盘按钮「门禁解锁」/键盘面板门禁开关）
+        feature,
       },
     );
   }
 
-  // 加群验证入口：收到真实加群申请 → 群内验证（默认）/私聊验证创建验证会话
-  //（v1.1.1 修复：multi-runtime 此前完全缺失该 handler，机器人管理创建的验证机器人无法验证）
-  bot.on("chat_join_request", handleJoinRequest);
+  // 加群验证入口（Composer 模块）：chat_join_request 按「自动审核机器人」指定分发 ——
+  // 未指定=只落库手动审核；指定其他机器人=忽略（竞态守卫）；指定本机器人=自动验证
+  bot.use(createJoinVerifyComposer(botId ?? BigInt(0)));
 
   // 直连入群防线（v1.1.3）：普通邀请链接/被拉入群直接进来的成员 → 补验证，超时/失败踢出
-  bot.on("chat_member", handleChatMemberUpdate);
+  // 验证方式取收到事件的机器人（botId）的加群验证配置
+  bot.on("chat_member", (ctx) => handleChatMemberUpdate(ctx, botId ?? BigInt(0)));
 
   // 群内验证 4 选 1 点选回调（v2.0.5）：非本模块 callback 原样放行后续中间件（菜单等）
   bot.on("callback_query:data", handleVerificationChoice);
@@ -569,6 +708,8 @@ async function ensureMenuBotCapabilities(
   // v2.1.10：菜单配置 + 「执行指令」按钮注册表随能力注册一并传入
   //（TGAPI 机器人据此安装按钮驱动新流程；普通机器人据此填充自定义指令运行器）
   const menuConfig = parseBotMenuConfig(row.menuConfig);
+  // v2.3 功能面板配置（内嵌按钮/指令/键盘开关 + 界面互斥 + 门禁/加群验证）
+  const feature = parseBotFeatureConfig(row.config, countMenuStats(menuConfig.root).buttons > 0);
   const syncCommands = await registerBotCapabilities(
     instance.bot,
     profile,
@@ -576,6 +717,7 @@ async function ensureMenuBotCapabilities(
     row.id,
     instance.menuCommands,
     menuConfig,
+    feature,
   );
   // TGAPI申请 机器人是纯私聊对话工具机器人：AI 客服等附加能力不叠加
   if (profile.aiSupport?.enabled && !profile.tgapi?.enabled) {

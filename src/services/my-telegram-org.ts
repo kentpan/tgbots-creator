@@ -385,6 +385,34 @@ function extractTaggedFragments(html: string, tag: string, className: string): s
 }
 
 /**
+ * /apps/create 已知错误 → 用户可读映射：
+ * my.telegram.org 对创建 APP 有账号/IP 级频率熔断，超限返回
+ * HTTP 400 {"text":"Too many attempts. Please try again later.","field":false}
+ * —— "field":false 表示非表单字段校验错误，与传参合法性无关
+ * （字段校验错误形如 {"text":"ERROR_SHORTNAME_...","field":"shortname"}）。
+ * 传参已与 MyTelegramOrgRoBot step_four.py 逐字段对照一致。
+ */
+export function describeTgOrgCreateError(apiText: string): string {
+  let text = apiText.trim();
+  if (text.startsWith("{")) {
+    // 响应体格式探测：JSON 提取 text 字段；非 JSON 保持原文进入下方匹配（非错误吞掉）
+    try {
+      const parsed = JSON.parse(text) as { text?: unknown };
+      if (typeof parsed.text === "string" && parsed.text.trim()) text = parsed.text.trim();
+    } catch {
+      // 非 JSON 原文处理
+    }
+  }
+  if (/too many attempts/i.test(text)) {
+    return (
+      "触发 my.telegram.org 风控：同一账号/IP 短时间内创建请求过多。" +
+      "请今天不要再重试（每次重试都会延长限制），通常次日自动解除后重新走创建流程即可。"
+    );
+  }
+  return text.slice(0, 300);
+}
+
+/**
  * step_four.create_new_tg_app：创建 APP。
  * app_platform 由调用方按「用户设置 > 管理端默认」确定后单值传入，本层不再随机选平台
  * （随机会让键盘「设置平台」的预配置、管理端默认值在提交时失效）。
@@ -433,7 +461,10 @@ export async function createNewTgApp(input: {
     const text = await response.text();
     responseText = text;
     if (!response.ok) {
-      throw new Error(`my.telegram.org /apps/create HTTP ${response.status}: ${text.slice(0, 200)}`);
+      // 原始响应已由 logApi 落库；对外错误经映射（限流等给用户可读说明）
+      throw new Error(
+        `my.telegram.org /apps/create HTTP ${response.status}: ${describeTgOrgCreateError(text)}`,
+      );
     }
     logApi({
       category: "tgapi",

@@ -21,16 +21,17 @@ import {
 } from "@/components/admin/menu-designer-editor";
 import { TgApiBotGroupsPanel } from "@/components/admin/tgapi-bot-groups-panel";
 import { useRealGroups } from "@/components/admin/use-real-groups";
+import { parseBotFeatureConfig } from "@/services/bot-feature-config";
 import {
   countMenuStats,
   defaultTgApiMenuRoot,
-  isTgApiDesignerConfig,
   isValidTgApiPlatformValue,
   MENU_MAX_BUTTONS_PER_ROW,
   MENU_MAX_DEPTH,
   parseBotMenuConfig,
   renderMenuTemplate,
   TGAPI_PLATFORM_LABELS,
+  type BotMenuConfig,
   type MenuButton,
   type MenuButtonAction,
   type MenuNode,
@@ -38,78 +39,49 @@ import {
 } from "@/services/menu-config";
 import {
   TGAPI_APP_PLATFORMS,
-  TGAPI_DEFAULT_APP,
   TGAPI_TEXT_FIELD_KEYS,
   TGAPI_TEXTS_EN,
   TGAPI_TEXTS_ZH,
   tgApiInterfaceMode,
-  type TgApiBotConfig,
 } from "@/services/tgapi-config";
-import {
-  parseCustomKeyboardConfig,
-  type CustomKeyboardConfig,
-} from "@/services/custom-keyboard";
+import type { CustomKeyboardConfig } from "@/services/custom-keyboard";
 import { emptyKeyboardOptions } from "@/components/admin/custom-keyboard-editor";
 import { CustomKeyboardDesigner } from "@/components/admin/custom-keyboard-dialog";
 import { TgApiGatePanel } from "@/components/admin/tgapi-gate-panel";
 import { SubmitButton } from "@/components/admin/submit-button";
-import { TgApiKeyboardFlowSim } from "@/components/admin/tgapi-keyboard-flow";
+import { Switch } from "@/components/ui/switch";
 import {
   CommandMenuConfigFields,
   type CommandLibraryItem,
 } from "@/app/admin/bots/command-menu-dialog";
 import { saveTgApiBotAction } from "./actions";
+import {
+  DesignerBasicInfo,
+  parseDesignerProfile,
+  parseDesignerTgApiCfg,
+  type DesignerBotInfo,
+} from "./bot-designer-shared";
+import { useDesignerSimChat } from "./use-designer-sim-chat";
 
 /**
- * TGAPI 申请机器人「菜单和键盘」统一弹窗（v2.2.1）：
+ * TGAPI 申请机器人「菜单和键盘」统一弹窗（v2.3 重构：独立组件，仅 TGAPI 全模块形态）：
  *
- * - 自包含切换按钮组：内嵌按钮 ⇄ 自定义键盘（互斥模式一目了然，带「生效中」标记）；
- * - 🔘 内嵌按钮页签：与机器人管理页「消息内嵌按钮」弹窗完全同一实现
- *  （components/admin/menu-designer-editor.tsx 的 NodeEditor/SelectedButtonPanel，
- *   按钮文案/行编辑/子菜单树/交互下拉逐字一致），TGAPI 差异仅两处：
- *   ① 交互下拉前置 TGAPI 固定指令列表；② 选中指令按钮时显示「首次对话解锁门禁」
- *   开关与「指令消息配置」（发送消息/成功消息/失败消息，双语 {{变量}}）。
- * - ⌨️ 自定义键盘页签：CustomKeyboardDesigner（模块化通用组件）+
- *   TgApiKeyboardFlowSim 完整对话流程仿真（/start → 门禁 → 主键盘 →
- *   创建API（参数→手机号→登录码→结果）/ 我的API / 设置平台 / 语言 / 帮助 /
- *   客服支持 / 设置Title / 设置Description / 跳过，文案与分派与运行端同一来源）。
- * - 仿真屏：与机器人管理页完全同一 TgSimulator（Telegram 风格聊天界面、
- *   消息气泡、键盘逐像素一致）。
- * - 群组信息：仿真屏群名取机器人已部署的真实群组（useRealGroups，零假数据）；
- *   无真实群组时不显示成员数（绝不显示编造的数字）。
+ * 数据驱动模型（单一事实源）：
+ * - 左侧 = 配置状态（menuRoot 按钮树 / zhStart+enStart 双语文案 / customKeyboard 载荷 /
+ *   指令勾选 / APP 参数），全部为弹窗 state；
+ * - 右侧 = 固定仿真屏容器（TgSimulator），配置经 props 实时呈现 —— 「界面模式」checkbox
+ *   只切换左侧编辑区与生效配置，仿真屏随配置即时渲染，不改容器。
+ * - 会话状态（视图 / 加群阶段 / TGAPI 对话流程）由 useDesignerSimChat 维护。
  *
- * 存量机器人：首次打开时按钮默认按图1生成（不迁移旧 menu_config 按钮文案，
- * menu_config 无 tgapiDesigner 标记即视为未迁移）；消息正文沿用其已自定义的欢迎语。
+ * 模块：1️⃣基本信息 / 2️⃣真实群组 / 3️⃣my.telegram.org APP 创建参数 / 🔐解锁门禁 /
+ * 4️⃣消息配置（双语）/ 🧩功能开关（消息内嵌按钮 ⇄ 自定义键盘互斥 + 指令菜单，平铺模块，
+ * 与机器人管理「功能配置」弹窗同一模型）。
+ * 保存走 saveTgApiBotAction；上线/更新运行实例在「仿真APP」页部署。
  */
 
-function inputClassOf(): string {
-  return "h-10 w-full rounded-md border border-input bg-background px-3 text-sm";
-}
-
-function uidGen(prefix: string, counter: { current: number }): string {
-  return uid(prefix, counter);
-}
-
 function newRow(counter: { current: number }, buttons: MenuButton[]): MenuRow {
-  return { id: uidGen("row", counter), buttons };
+  return { id: uid("row", counter), buttons };
 }
-
-/** 仿真对话状态机（弹窗内仿真流程推进，与真实端 handlers/tgapi.ts 状态一一对应） */
-interface SimFlowState {
-  /** idle=未开始 / unlock=等待解锁验证码 / phone=手机号 / code=登录码 / prefTitle|prefDesc=设置Title|设置Description 偏好收集 */
-  stage: "idle" | "unlock" | "phone" | "code" | "prefTitle" | "prefDesc";
-  unlocked: boolean;
-  /** 仿真中已记住的平台（设置平台按钮 tgapi_value 绑定；创建时优先使用） */
-  platform?: string;
-  phone?: string;
-  /** 仿真中已创建的 API（我的API/已创建检测的数据源；demo 值明确标注仿真） */
-  created: { phone: string; apiId: string; apiHash: string } | null;
-  /** 当前按钮配置的结果消息模板（创建流程结束时渲染 success/fail 槽位） */
-  pendingSuccess?: { zh: string; en: string };
-  pendingFail?: { zh: string; en: string };
-}
-
-const SIM_DEMO_API = { apiId: "2049583", apiHash: "b6f1d4e2a9c8372f5d0e1a4b8c7d6e5f" };
 
 export function TgApiMenuKeyboardDialog({
   bot,
@@ -120,129 +92,77 @@ export function TgApiMenuKeyboardDialog({
   trigger,
   triggerClassName,
 }: {
-  bot?: {
-    id: string;
-    name: string;
-    username: string | null;
-    enabled: boolean;
-    config: string;
-    menuConfig: string;
-  };
+  bot?: DesignerBotInfo;
   methods: { id: number; name: string; enabled: boolean; type: string }[];
-  /** 指令库（v2.2.8）：SSR 按当前机器人过滤后的可见指令（内置 + 全局/群组/本机器人自定义）*/
+  /** 指令库（SSR 按当前机器人过滤后的可见指令：内置 + 全局/群组/本机器人自定义） */
   library: CommandLibraryItem[];
-  /** URL ?edit=1 时自动打开（历史「消息与按钮」跳转入口） */
+  /** URL ?edit=1 时自动打开 */
   defaultOpen?: boolean;
-  /** 打开时的页签：inline=消息内嵌按钮 / keyboard=自定义键盘（默认按生效模式） */
+  /** 打开时的编辑区：inline=消息内嵌按钮 / keyboard=自定义键盘（默认按生效模式） */
   defaultTab?: "inline" | "keyboard";
   trigger: React.ReactNode;
   triggerClassName?: string;
 }) {
   const [open, setOpen] = useState(false);
-  const cfg: TgApiBotConfig = useMemo(
-    () =>
-      bot
-        ? (() => {
-            try {
-              const parsed = JSON.parse(bot.config) as { tgapi?: unknown };
-              const tgapi = (parsed.tgapi ?? {}) as Record<string, unknown>;
-              return {
-                enabled: tgapi.enabled === true,
-                unlockMode: tgapi.unlockMode === "stars" ? ("stars" as const) : ("captcha" as const),
-                verificationMethodId:
-                  typeof tgapi.verificationMethodId === "number" ? tgapi.verificationMethodId : undefined,
-                starsAmount: typeof tgapi.starsAmount === "number" ? tgapi.starsAmount : undefined,
-                starsTitle: typeof tgapi.starsTitle === "string" ? tgapi.starsTitle : undefined,
-                appTitle: typeof tgapi.appTitle === "string" && tgapi.appTitle ? tgapi.appTitle : TGAPI_DEFAULT_APP.appTitle,
-                appShortName:
-                  typeof tgapi.appShortName === "string" && tgapi.appShortName
-                    ? tgapi.appShortName
-                    : TGAPI_DEFAULT_APP.appShortName,
-                appUrl:
-                  typeof tgapi.appUrl === "string" && tgapi.appUrl ? tgapi.appUrl : TGAPI_DEFAULT_APP.appUrl,
-                appPlatforms: Array.isArray(tgapi.appPlatforms)
-                  ? (tgapi.appPlatforms as string[])
-                  : [...TGAPI_DEFAULT_APP.appPlatforms],
-                appDescription:
-                  typeof tgapi.appDescription === "string" && tgapi.appDescription
-                    ? tgapi.appDescription
-                    : TGAPI_DEFAULT_APP.appDescription,
-                footerText: typeof tgapi.footerText === "string" ? tgapi.footerText : TGAPI_DEFAULT_APP.footerText,
-                texts:
-                  typeof tgapi.texts === "object" && tgapi.texts !== null
-                    ? (tgapi.texts as TgApiBotConfig["texts"])
-                    : undefined,
-                customKeyboard: parseCustomKeyboardConfig(tgapi.customKeyboard) ?? undefined,
-                interfaceMode:
-                  tgapi.interfaceMode === "inline" || tgapi.interfaceMode === "keyboard"
-                    ? tgapi.interfaceMode
-                    : undefined,
-              } satisfies TgApiBotConfig;
-            } catch {
-              return { enabled: false, unlockMode: "captcha" as const, ...TGAPI_DEFAULT_APP };
-            }
-          })()
-        : { enabled: false, unlockMode: "captcha" as const, ...TGAPI_DEFAULT_APP },
-    [bot],
-  );
+  const cfg = useMemo(() => parseDesignerTgApiCfg(bot), [bot]);
+  const profile = useMemo(() => parseDesignerProfile(bot), [bot]);
   const suffix = bot ? String(bot.id) : "new";
   const selectedPlatforms = useMemo(() => new Set(cfg.appPlatforms), [cfg.appPlatforms]);
-
-  // ---------------------------------------------------------------------------
-  // v2.2.6 解耦：mode 仅切换「内嵌按钮配置 ⇄ 自定义键盘配置」两个编辑区（checkbox
-  // 单选，勾选即切换编辑区草稿）；真正生效模式是 tgapi.interfaceMode（保存并部署后
-  // 生效）——「生效中」标签按已保存数据（activeMode）打标，绝不随草稿切换。
-  // ---------------------------------------------------------------------------
-  const [mode, setMode] = useState<"inline" | "keyboard">(defaultTab);
-  // 每次打开重置到宿主指定模式（新增机器人固定 inline）—— v2.2.8 移至 setMode 声明之后（lint: 不得在声明前访问）
-  useEffect(() => {
-    if (defaultOpen) {
-      setOpen(true);
-      setMode(defaultTab);
-    }
-  }, [defaultOpen, defaultTab]);
+  const botDisplayName = bot?.username ? `@${bot.username}` : bot?.name ?? "TGAPI申请机器人";
   const activeMode = tgApiInterfaceMode(cfg);
-  // 键盘编辑器当前载荷（onConfigChange 同步；初始值 = 已保存配置，未编辑过时原样回存）
+
+  // —— 🧩 功能开关（与机器人管理「功能配置」弹窗同一模型）：互斥 check 可全关 +
+  //     指令菜单独立勾选 + 各面板门禁解锁开关；每次打开按最新已保存数据重置 ——
+  const readUiDraft = (
+    botInfo?: DesignerBotInfo,
+  ): {
+    uiMode: "inline" | "keyboard" | "none";
+    commandsEnabled: boolean;
+    gateMenuRequired: boolean;
+    gateKeyboardRequired: boolean;
+    gateCommandsRequired: boolean;
+  } => {
+    if (!botInfo) {
+      return { uiMode: "inline", commandsEnabled: false, gateMenuRequired: false, gateKeyboardRequired: false, gateCommandsRequired: false };
+    }
+    const feature = parseBotFeatureConfig(botInfo.config, false);
+    return {
+      uiMode: feature.keyboard.enabled ? "keyboard" : feature.menu.enabled ? "inline" : "none",
+      commandsEnabled: feature.commands.enabled,
+      gateMenuRequired: feature.gateMenuRequired === true,
+      gateKeyboardRequired: feature.gateKeyboardRequired === true,
+      gateCommandsRequired: feature.gateCommandsRequired === true,
+    };
+  };
+  const initialUi = readUiDraft(bot);
+  const [uiMode, setUiMode] = useState<"inline" | "keyboard" | "none">(initialUi.uiMode);
+  const [commandsEnabled, setCommandsEnabled] = useState(initialUi.commandsEnabled);
+  const [gateMenuRequired, setGateMenuRequired] = useState(initialUi.gateMenuRequired);
+  const [gateKeyboardRequired, setGateKeyboardRequired] = useState(initialUi.gateKeyboardRequired);
+  const [gateCommandsRequired, setGateCommandsRequired] = useState(initialUi.gateCommandsRequired);
+  useEffect(() => {
+    if (defaultOpen) setOpen(true);
+    if (open) {
+      const draft = readUiDraft(bot);
+      setUiMode(draft.uiMode);
+      setCommandsEnabled(draft.commandsEnabled);
+      setGateMenuRequired(draft.gateMenuRequired);
+      setGateKeyboardRequired(draft.gateKeyboardRequired);
+      setGateCommandsRequired(draft.gateCommandsRequired);
+    }
+  }, [defaultOpen, open, bot]);
+
+  // —— 自定义键盘载荷（编辑器 onConfigChange 同步；初始值 = 已保存配置） ——
   const [kbPayload, setKbPayload] = useState<string>(() =>
     cfg.customKeyboard ? JSON.stringify(cfg.customKeyboard) : "",
   );
   const handleKbConfigChange = useCallback((config: CustomKeyboardConfig): void => {
-    setKbPayload(config.root.rows.length === 0 ? "" : JSON.stringify(config));
+    // CustomKeyboardDesigner 在 render 中回调 onConfigChange（React 受控同步），
+    // 直接 setState 会触发「render 期间更新其他组件」告警 —— 延迟到微任务执行
+    queueMicrotask(() => {
+      setKbPayload(config.root.rows.length === 0 ? "" : JSON.stringify(config));
+    });
   }, []);
-
-  // ---------------------------------------------------------------------------
-  // v2.2.8 指令菜单配置（模块渲染在「界面模式」上方，与机器人管理页「⌨️ 指令菜单」
-  // 弹窗同一配置模块 CommandMenuConfigFields）：隐私模式 + 指令勾选，随统一表单
-  // hidden 字段（privacyMode/commandIds）提交 saveTgApiBotAction，写入
-  // bots.config.privacyMode / bots.config.commandIds（与 saveBotCommandMenuAction
-  // 同一存储位）；运行实例注册与 setMyCommands 在「仿真APP」部署时执行。
-  // ---------------------------------------------------------------------------
-  const initialProfile = useMemo<{ privacyMode: boolean; commandIds: number[] }>(() => {
-    if (!bot) return { privacyMode: true, commandIds: [] };
-    try {
-      const parsed = JSON.parse(bot.config) as { privacyMode?: unknown; commandIds?: unknown };
-      return {
-        // parseBotPrivacyMode 同语义：未设置 = 开启
-        privacyMode: parsed.privacyMode !== false,
-        commandIds: Array.isArray(parsed.commandIds)
-          ? parsed.commandIds.map(Number).filter((item) => Number.isInteger(item) && item > 0)
-          : [],
-      };
-    } catch {
-      return { privacyMode: true, commandIds: [] };
-    }
-  }, [bot]);
-  const [privacyMode, setPrivacyMode] = useState(initialProfile.privacyMode);
-  const [selectedCommandIds, setSelectedCommandIds] = useState<number[]>(initialProfile.commandIds);
-  // 每次打开弹窗按最新已保存数据重置（组件随页面常驻挂载，useState 初始值会陈旧）
-  useEffect(() => {
-    if (open) {
-      setPrivacyMode(initialProfile.privacyMode);
-      setSelectedCommandIds(initialProfile.commandIds);
-    }
-  }, [open, initialProfile]);
-
-  // 键盘模式右屏仿真所需的当前键盘载荷（编辑器 onConfigChange 实时同步 → JSON 回解析）
   const currentKb = useMemo<CustomKeyboardConfig>(() => {
     if (!kbPayload) return { options: emptyKeyboardOptions(), root: { rows: [] } };
     try {
@@ -252,41 +172,28 @@ export function TgApiMenuKeyboardDialog({
     }
   }, [kbPayload]);
 
-  // 消息配置（中英双语；当前仿真语言文案实时同步仿真屏）
-  const [zhStart, setZhStart] = useState(
-    cfg.texts?.zh?.start?.trim() || TGAPI_TEXTS_ZH.start,
-  );
-  const [enStart, setEnStart] = useState(
-    cfg.texts?.en?.start?.trim() || TGAPI_TEXTS_EN.start,
-  );
+  // —— 指令菜单配置（隐私模式 + 指令勾选） ——
+  const [privacyMode, setPrivacyMode] = useState(profile.privacyMode);
+  const [selectedCommandIds, setSelectedCommandIds] = useState<number[]>(profile.commandIds);
+  useEffect(() => {
+    if (open) {
+      setPrivacyMode(profile.privacyMode);
+      setSelectedCommandIds(profile.commandIds);
+    }
+  }, [open, profile]);
 
-  // 内嵌按钮（存量未迁移按图1默认生成）
+  // —— 内嵌按钮配置状态（按钮树 + 双语欢迎语；配置 → 仿真屏实时呈现） ——
+  const [zhStart, setZhStart] = useState(cfg.texts?.zh?.start?.trim() || TGAPI_TEXTS_ZH.start);
+  const [enStart, setEnStart] = useState(cfg.texts?.en?.start?.trim() || TGAPI_TEXTS_EN.start);
   const counter = useRef(0);
   const [menuRoot, setMenuRoot] = useState<MenuNode>(() => {
-    if (bot && isTgApiDesignerConfig(bot.menuConfig)) {
+    if (bot) {
       const parsed = parseBotMenuConfig(bot.menuConfig);
       if (parsed.root.rows.length > 0) return parsed.root;
     }
     return defaultTgApiMenuRoot();
   });
   const [selected, setSelected] = useState<{ path: string[]; buttonId: string } | null>(null);
-  const [resetKey, setResetKey] = useState(0);
-
-  // ---------------------------------------------------------------------------
-  // 仿真屏状态（TgSimulator 宿主驱动）
-  // ---------------------------------------------------------------------------
-  const simRef = useRef<TgSimulatorHandle>(null);
-  const [simLang, setSimLang] = useState<"zh" | "en">("zh");
-  const [simView, setSimView] = useState<"group" | "private">("group");
-  const [joinPhase, setJoinPhase] = useState<"idle" | "awaiting_code" | "joined">("idle");
-  // 键盘页签：对话流程仿真重置计数（重新从 /start 开始）
-  const [kbSimKey, setKbSimKey] = useState(0);
-  // 仿真屏当前预览的菜单节点（子菜单导航；与机器人管理弹窗同一交互）
-  const [simNodeId, setSimNodeId] = useState("root");
-  const simFlow = useRef<SimFlowState>({ stage: "idle", unlocked: false, created: null });
-  // 机器人已部署的真实群组（弹窗打开时读取数据库登记，零 Telegram 请求）
-  const realGroups = useRealGroups({ botId: bot ? String(bot.id) : null, enabled: open && Boolean(bot) });
-  const realGroupTitle = realGroups.groups[0]?.chatTitle?.trim() || "My Telegram API";
 
   const mutateRoot = (mutator: (draft: MenuNode) => void): void => {
     setMenuRoot((prev) => {
@@ -332,21 +239,7 @@ export function TgApiMenuKeyboardDialog({
     });
   };
 
-  /** 当前仿真语言的初始消息文案 */
-  const langStartText = simLang === "zh" ? zhStart : enStart;
-
-  const simulatorConfig = useMemo(
-    () => ({
-      content: { type: "text" as const, text: langStartText, mediaUrl: "", items: [] },
-      root: menuRoot,
-    }),
-    [langStartText, menuRoot],
-  );
-
-  // ---------------------------------------------------------------------------
-  // 按钮树操作（与机器人管理弹窗同一语义，path 版本支持子菜单树）
-  // ---------------------------------------------------------------------------
-
+  // —— 按钮树操作（与机器人管理弹窗同一语义，path 版本支持子菜单树） ——
   const updateSelected = (mutator: (draft: MenuButton) => void): void => {
     if (!selected) return;
     updateButtonAt(selected.path, selected.buttonId, mutator);
@@ -360,7 +253,7 @@ export function TgApiMenuKeyboardDialog({
   };
 
   const addButton = (path: string[], rowId: string): void => {
-    const id = uidGen("btn", counter);
+    const id = uid("btn", counter);
     mutateAt(path, (node) => {
       for (const row of node.rows) {
         if (row.id !== rowId) continue;
@@ -459,7 +352,35 @@ export function TgApiMenuKeyboardDialog({
     });
   };
 
-  const botDisplayName = bot?.username ? `@${bot.username}` : bot?.name ?? "TGAPI申请机器人";
+  // —— 仿真屏（固定容器；会话状态在 Hook，配置状态在此处 props 下发） ——
+  const simRef = useRef<TgSimulatorHandle>(null);
+  const sim = useDesignerSimChat({ simRef, cfg });
+  const [simNodeId, setSimNodeId] = useState("root");
+  const realGroups = useRealGroups({
+    botId: bot ? String(bot.id) : null,
+    enabled: open && Boolean(bot),
+  });
+  const realGroupTitle = realGroups.groups[0]?.chatTitle?.trim() || "My Telegram API";
+
+  /** 当前仿真语言的初始消息文案（配置 → 仿真屏实时同步） */
+  const langStartText = sim.simLang === "zh" ? zhStart : enStart;
+  const simulatorConfig = useMemo<BotMenuConfig>(
+    () => ({
+      content: { type: "text", text: langStartText, mediaUrl: "", items: [] },
+      root: menuRoot,
+    }),
+    [langStartText, menuRoot],
+  );
+  const stats = countMenuStats(menuRoot);
+
+  // 指令菜单数据驱动：已勾选指令 → 仿真屏输入区「菜单」按钮 + 指令滑屏
+  const configuredCommands = useMemo(
+    () =>
+      library
+        .filter((item) => selectedCommandIds.map(String).includes(item.id))
+        .map((item) => ({ name: item.name, description: item.description })),
+    [library, selectedCommandIds],
+  );
 
   const designerState: DesignerState = {
     config: simulatorConfig,
@@ -495,298 +416,6 @@ export function TgApiMenuKeyboardDialog({
     [zhStart, menuRoot],
   );
 
-  // ---------------------------------------------------------------------------
-  // 仿真流程（与真实端 handlers/tgapi.ts 一一对应）
-  // ---------------------------------------------------------------------------
-
-  /** 双语槽位文案取值（优先当前语言，为空回落另一语言） */
-  const slotText = (template: { zh: string; en: string } | undefined): string => {
-    if (!template) return "";
-    return (simLang === "zh" ? template.zh : template.en).trim() ||
-      (simLang === "zh" ? template.en : template.zh).trim();
-  };
-
-  /** 开始创建流程（已解锁，v2.2.2 精简）：直接手机号（APP 参数用预配置或默认值，不再收集） */
-  const startSimCreate = (): void => {
-    const texts = simLang === "zh" ? TGAPI_TEXTS_ZH : TGAPI_TEXTS_EN;
-    simFlow.current.stage = "phone";
-    simRef.current?.appendMessage("dm", { from: "bot", text: texts.askPhone });
-  };
-
-  /** 「申请加群」按钮：仿真屏恢复申请加群初始状态 */
-  const handleResetSimulator = (): void => {
-    setResetKey((prev) => prev + 1);
-    setSimView("group");
-    setJoinPhase("idle");
-    setSimLang("zh");
-    setSimNodeId("root");
-    simFlow.current = { stage: "idle", unlocked: false, created: null };
-    simRef.current?.clearStream("group");
-    simRef.current?.clearStream("dm");
-  };
-
-  /** 点击「申请加入群组」：申请 → 自动通过（真实端 chat_join_request 自动 approve）→ 跳转私聊 */
-  const handleSimRequestJoin = async (): Promise<{ ok: boolean; message: string }> => {
-    simRef.current?.appendMessage("group", {
-      from: "system",
-      text: "📩 加入群组申请已发送（chat_join_request）",
-    });
-    window.setTimeout(() => {
-      simRef.current?.appendMessage("group", {
-        from: "system",
-        text: "✅ 管理员（机器人）已自动通过你的申请",
-      });
-    }, 700);
-    window.setTimeout(() => {
-      setJoinPhase("joined");
-      setSimView("private");
-      simFlow.current.stage = "idle";
-      window.setTimeout(() => {
-        simRef.current?.appendMessage("dm", {
-          from: "bot",
-          text: "🤖 机器人已发送初始消息与内嵌按钮（见上方，随左侧配置实时同步）",
-        });
-      }, 350);
-    }, 1400);
-    return { ok: true, message: "" };
-  };
-
-  /** TGAPI 功能按钮点击（创建API/我的API/启动机器人）——真实端执行流程仿真 */
-  const handleSimTgApiFunc = (button: MenuButton): void => {
-    const action = button.action;
-    if (action.type !== "tgapi_func") return;
-    const func = action.tgapi_func ?? "start";
-    const flow = simFlow.current;
-    // 私聊会话外的点击（仿真中按钮都在私聊）与真实端一致按私聊处理
-    const response = slotText(action.tgapi_response);
-    if (response) {
-      simRef.current?.appendMessage("dm", {
-        from: "bot",
-        text: renderMenuTemplate(response, {
-          user_id: "777000",
-          username: "preview_user",
-          first_name: "预览",
-          chat_id: "-1001998877661",
-        }),
-      });
-    }
-    if (func === "start") {
-      // 重发新初始消息+内嵌按钮，旧消息和按钮过时失效（真实端：旧键盘移除 + 台账拦截）
-      simRef.current?.clearStream("dm");
-      simRef.current?.appendMessage("dm", {
-        from: "system",
-        text: "🔄 已重新发送初始消息：之前的消息与内嵌按钮已过时失效",
-      });
-      flow.stage = "idle";
-      return;
-    }
-    if (func === "create") {
-      // 1. 已创建检测（解锁门禁前）
-      if (flow.created) {
-        simRef.current?.appendMessage("dm", {
-          from: "bot",
-          text: "✅ 你的 api_id 和 api_hash 已创建，点击「🗂 我的 API」按钮查看。",
-        });
-        return;
-      }
-      // 2. 解锁门禁（每按钮可选；任意按钮通过后所有按钮不再需要验证）—— 唯一门禁提示
-      if (action.tgapi_unlock === true && !flow.unlocked) {
-        const texts = simLang === "zh" ? TGAPI_TEXTS_ZH : TGAPI_TEXTS_EN;
-        flow.stage = "unlock";
-        flow.pendingSuccess = action.tgapi_success;
-        flow.pendingFail = action.tgapi_fail;
-        simRef.current?.appendMessage("dm", { from: "bot", text: texts.unlockPrompt });
-        return;
-      }
-      // 3. 已解锁/未开启门禁 → 创建流程
-      flow.pendingSuccess = action.tgapi_success;
-      flow.pendingFail = action.tgapi_fail;
-      startSimCreate();
-      return;
-    }
-    if (func === "my") {
-      if (!flow.created) {
-        const failText = slotText(action.tgapi_fail) ||
-          (simLang === "zh"
-            ? "💎 你还没有创建 API。\n\n点击 🗝 创建API 开始申请。"
-            : "💎 You haven't created an API yet.\n\nTap 🗝 Create API to start.");
-        simRef.current?.appendMessage("dm", { from: "bot", text: failText });
-        return;
-      }
-      const vars = {
-        phone: flow.created.phone,
-        api_id: flow.created.apiId,
-        api_hash: flow.created.apiHash,
-      };
-      const successText = slotText(action.tgapi_success) ||
-        (simLang === "zh"
-          ? `📱 号码：${vars.phone}\n🆔 api_id：${vars.api_id}\n🔑 api_hash：${vars.api_hash}`
-          : `📱 Number: ${vars.phone}\n🆔 api_id: ${vars.api_id}\n🔑 api_hash: ${vars.api_hash}`);
-      simRef.current?.appendMessage("dm", { from: "bot", text: renderMenuTemplate(successText, vars) });
-      return;
-    }
-    // v2.2.0 固定指令全量仿真（设置平台/帮助/客服支持/跳过/设置Title/设置Description）
-    if (func === "platform") {
-      if (action.tgapi_value && isValidTgApiPlatformValue(action.tgapi_value)) {
-        simFlow.current.platform = action.tgapi_value;
-        const label = TGAPI_PLATFORM_LABELS[action.tgapi_value] ?? action.tgapi_value;
-        simRef.current?.appendMessage("dm", {
-          from: "bot",
-          text: renderMenuTemplate(
-            slotText(action.tgapi_success) ||
-              (simLang === "zh"
-                ? `✅ APP 平台已设置为 ${label}，创建 API 时将优先使用。`
-                : `✅ App platform set to ${label}; it will be used when creating your API.`),
-            { platform: label },
-          ),
-        });
-        return;
-      }
-      simRef.current?.appendMessage("dm", {
-        from: "bot",
-        text:
-          simLang === "zh"
-            ? "📱 请在子菜单中选择平台（每行 2 个共 8 个平台按钮）；选中平台用于创建 APP 时提交。"
-            : "📱 Please pick a platform in the submenu (8 options, 2 per row).",
-      });
-      return;
-    }
-    if (func === "help") {
-      simRef.current?.appendMessage("dm", {
-        from: "bot",
-        text: renderMenuTemplate(response, {
-          user_id: "777000",
-          username: "preview_user",
-          first_name: "预览",
-        }) ||
-          (simLang === "zh"
-            ? "🆘 使用帮助：\n\n🗝 创建 API — 自动生成 api_id 和 api_hash\n🗂 我的 API — 查看已创建的 api_id 与 api_hash\n📱 设置平台 — 选择创建 APP 时的平台\n✅ 语言 — 中文/English 切换\n✏️ 设置Title / 📝 设置Description — 自定义 APP 名称与描述\n🎫 客服支持 — 联系管理员获取人工支持"
-            : "🆘 How to use:\n\n🗝 Create API — generate api_id and api_hash\n🗂 My API — view your api_id and api_hash\n📱 Set Platform — choose the APP platform\n✅ Language — 中文/English\n✏️ Set Title / 📝 Set Description\n🎫 Support — contact the admin"),
-      });
-      return;
-    }
-    if (func === "support") {
-      simRef.current?.appendMessage("dm", {
-        from: "bot",
-        text: renderMenuTemplate(response, {
-          user_id: "777000",
-          username: "preview_user",
-          first_name: "预览",
-        }) || (simLang === "zh" ? "🎫 如需人工支持，请联系管理员。" : "🎫 For human support, please contact the admin."),
-      });
-      return;
-    }
-    if (func === "settitle" || func === "setdescription") {
-      flow.stage = func === "settitle" ? "prefTitle" : "prefDesc";
-      simRef.current?.appendMessage("dm", {
-        from: "bot",
-        text:
-          func === "settitle"
-            ? TGAPI_TEXTS_ZH.askAppTitle.replaceAll("{default}", cfg.appTitle)
-            : TGAPI_TEXTS_ZH.askAppDescription.replaceAll("{default}", cfg.appDescription),
-      });
-      return;
-    }
-  };
-
-  /** 语言切换按钮：仿真屏实时切换双语文案 */
-  const handleSimLanguageToggle = (): boolean => {
-    const next = simLang === "zh" ? "en" : "zh";
-    setSimLang(next);
-    simRef.current?.appendMessage("dm", {
-      from: "bot",
-      text: `✅ 语言已切换 / Language switched：${next === "zh" ? "中文" : "English"}`,
-    });
-    return true;
-  };
-
-  /** 私聊输入（解锁验证码 / APP 名称 / 描述 / 手机号 / 登录码）——仿真状态机推进 */
-  const handleSimUserSend = async (
-    text: string,
-  ): Promise<{ ok: boolean; text: string; joined?: boolean }> => {
-    const flow = simFlow.current;
-    const texts = simLang === "zh" ? TGAPI_TEXTS_ZH : TGAPI_TEXTS_EN;
-    const input = text.trim();
-    // 设置Title/设置Description 偏好收集仿真（只记录，不进入创建流程）
-    if (flow.stage === "prefTitle") {
-      if (!input || input.length > 32) {
-        return { ok: false, text: "APP 名称不合法：请输入 1-32 个字符。" };
-      }
-      flow.stage = "idle";
-      return { ok: true, text: `✅ APP 名称已设置为：${input}` };
-    }
-    if (flow.stage === "prefDesc") {
-      if (!input || input.length > 200) {
-        return { ok: false, text: "APP 描述不合法：请输入 1-200 个字符。" };
-      }
-      flow.stage = "idle";
-      return { ok: true, text: `✅ APP 描述已设置为：${input}` };
-    }
-    if (flow.stage === "unlock") {
-      // 仿真：任意非空验证码通过（真实端走外部 API 核验）；解锁一次永久有效
-      if (!input) return { ok: false, text: "请输入解锁验证码" };
-      flow.unlocked = true;
-      flow.stage = "idle";
-      window.setTimeout(() => startSimCreate(), 300);
-      return { ok: true, text: "🔐 验证通过（仿真：任意验证码即可通过，真实端走外部 API 核验）" };
-    }
-    if (flow.stage === "phone") {
-      const phone = input.replace(/[^\d+]/g, "");
-      if (!/^\+\d{7,15}$/.test(phone)) {
-        return { ok: false, text: texts.invalidPhone };
-      }
-      flow.phone = phone;
-      flow.stage = "code";
-      return { ok: true, text: texts.afterRecvdCode };
-    }
-    if (flow.stage === "code") {
-      // 登录码 → 抓取/创建 APP → 结果（仿真演示值；真实端登录 my.telegram.org 真实抓取）
-      flow.stage = "idle";
-      window.setTimeout(() => {
-        const created = { phone: flow.phone ?? "+8613800138000", ...SIM_DEMO_API };
-        flow.created = created;
-        simRef.current?.appendMessage("dm", {
-          from: "bot",
-          text:
-            `Phone Number: ${created.phone}\n\n` +
-            "App Configuration\n" +
-            `APP ID: ${created.apiId}\n` +
-            `API HASH: ${created.apiHash}\n\n` +
-            "（仿真演示数据；真实端登录 my.telegram.org 抓取/创建后返回真实值）",
-        });
-        const successRaw = slotText(flow.pendingSuccess);
-        if (successRaw) {
-          simRef.current?.appendMessage("dm", {
-            from: "bot",
-            text: renderMenuTemplate(successRaw, { ...created, api_id: created.apiId, api_hash: created.apiHash }),
-          });
-        }
-      }, 1200);
-      return { ok: true, text: texts.beforeSuccLogin };
-    }
-    return { ok: true, text: texts.start };
-  };
-
-  const stats = countMenuStats(menuRoot);
-
-  /**
-   * 解锁门禁配置模块（v2.2.5 抽为全站通用组件 src/components/admin/tgapi-gate-panel.tsx）：
-   * 内嵌页签与自定义键盘页签共用同一渲染（两表单互斥渲染，id 无冲突）；
-   * unlock_mode/verification_method_id/stars_amount/stars_title 随宿主表单提交 ——
-   * 键盘页签由 saveTgApiCustomKeyboardAction 兼收，内嵌页签由 saveTgApiBotAction 收取。
-   * 机器人管理页「自定义键盘」弹窗（TGAPI 机器人）同用本组件。
-   */
-  const gateConfigPanel = (idScope: string) => (
-    <TgApiGatePanel
-      idScope={idScope}
-      methods={methods}
-      unlockMode={cfg.unlockMode}
-      verificationMethodId={cfg.verificationMethodId}
-      starsAmount={cfg.starsAmount}
-      starsTitle={cfg.starsTitle}
-    />
-  );
-
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
@@ -802,76 +431,37 @@ export function TgApiMenuKeyboardDialog({
           </DialogTitle>
           <DialogDescription>
             通用配置（基本信息 / 机器人所在真实群组 / my.telegram.org APP 创建参数 / 门禁 / 消息 / 指令菜单）为内嵌按钮与自定义键盘共用；
-            「界面模式」checkbox 单选仅切换下方两个配置编辑区，勾选并保存（部署）后才对运行实例生效，此处仅按已保存数据打「生效中」标签。
-            保存仅落库配置；上线/更新运行实例请到「仿真APP」页面部署（指令菜单与隐私模式也在部署时注册并同步 Telegram）。
+            「界面模式」checkbox 单选仅切换左侧编辑区，勾选并保存（部署）后才对运行实例生效；右侧仿真屏随配置实时预览（数据驱动）。
+            保存仅落库配置；上线/更新运行实例请到「仿真APP」页面部署。
           </DialogDescription>
         </DialogHeader>
         <form action={saveTgApiBotAction} className="flex min-h-0 flex-1 flex-col">
           <input type="hidden" name="id" value={bot ? String(bot.id) : ""} />
           <input type="hidden" name="menu_config" value={menuConfigPayload} />
-          {/* v2.2.6：生效模式（checkbox 单选，保存并部署后生效）+ 自定义键盘附加属性载荷 */}
-          <input type="hidden" name="kb_mode" value={mode} />
+          <input type="hidden" name="kb_mode" value={uiMode === "none" ? "" : uiMode} />
+          <input type="hidden" name="menu_enabled" value={uiMode === "inline" ? "1" : "0"} />
+          <input type="hidden" name="keyboard_enabled" value={uiMode === "keyboard" ? "1" : "0"} />
+          <input type="hidden" name="commands_enabled" value={commandsEnabled ? "1" : "0"} />
+          <input type="hidden" name="gate_menu_required" value={gateMenuRequired ? "1" : "0"} />
+          <input type="hidden" name="gate_keyboard_required" value={gateKeyboardRequired ? "1" : "0"} />
+          <input type="hidden" name="gate_commands_required" value={gateCommandsRequired ? "1" : "0"} />
           <input type="hidden" name="custom_keyboard" value={kbPayload} />
-          {/* v2.2.8：指令菜单配置（隐私模式 + 指令勾选）→ saveTgApiBotAction 写入 bots.config */}
           <input type="hidden" name="privacyMode" value={privacyMode ? "1" : "0"} />
           <input type="hidden" name="commandIds" value={JSON.stringify(selectedCommandIds)} />
+
           <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-4">
             <div className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[1fr_430px]">
-              {/* 左侧配置区 */}
+              {/* —— 左侧配置区 —— */}
               <div className="min-w-0 space-y-4">
-                {/* 1. 基本信息 */}
-                <div className="space-y-4 rounded-xl border bg-card p-4">
-                  <p className="text-sm font-semibold">1️⃣ 基本信息</p>
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <div className="space-y-1">
-                      <label className="text-sm font-medium" htmlFor={`name-${suffix}`}>
-                        名称 *
-                      </label>
-                      <input
-                        id={`name-${suffix}`}
-                        name="name"
-                        required
-                        defaultValue={bot?.name ?? "TGAPI申请机器人"}
-                        placeholder="例如：TGAPI申请机器人"
-                        className={inputClassOf()}
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-sm font-medium" htmlFor={`token-${suffix}`}>
-                        Bot Token {bot ? "（留空保留原值）" : "*"}
-                      </label>
-                      <input
-                        id={`token-${suffix}`}
-                        name="token"
-                        defaultValue=""
-                        placeholder={bot ? "留空保留原 Token" : "从 @BotFather 获取：123456:AA..."}
-                        className={inputClassOf()}
-                        autoComplete="off"
-                      />
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <input
-                      id={`enabled-${suffix}`}
-                      name="enabled"
-                      type="checkbox"
-                      value="1"
-                      defaultChecked={bot ? bot.enabled : true}
-                      className="h-4 w-4"
-                    />
-                    <label className="text-sm font-medium" htmlFor={`enabled-${suffix}`}>
-                      启用机器人
-                    </label>
-                  </div>
-                </div>
+                <DesignerBasicInfo bot={bot} suffix={suffix} defaultName="TGAPI申请机器人" />
 
-                {/* 2. 真实群组 + 申请加群按钮 */}
+                {/* 2️⃣ 真实群组 + 申请加群按钮 */}
                 <div className="rounded-xl border bg-card p-4">
                   <div className="flex items-center justify-between gap-3">
                     <p className="text-sm font-semibold">2️⃣ 🧭 机器人所在真实群组</p>
                     <button
                       type="button"
-                      onClick={handleResetSimulator}
+                      onClick={sim.resetSimChat}
                       className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md border border-primary/50 bg-primary/10 px-3 text-sm font-medium text-primary hover:bg-primary/20"
                       title="右侧仿真屏恢复到申请加群的初始状态（群组界面 + 底部「申请加入群组」按钮）"
                     >
@@ -893,7 +483,7 @@ export function TgApiMenuKeyboardDialog({
                   </div>
                 </div>
 
-                {/* 3. my.telegram.org APP 创建参数 */}
+                {/* 3️⃣ my.telegram.org APP 创建参数 */}
                 <div className="rounded-lg border bg-muted/20 p-4 space-y-4">
                   <p className="text-sm font-semibold">3️⃣ 📱 my.telegram.org APP 创建参数</p>
                   <p className="text-xs text-muted-foreground">
@@ -910,7 +500,7 @@ export function TgApiMenuKeyboardDialog({
                         id={`app-title-${suffix}`}
                         name="app_title"
                         defaultValue={cfg.appTitle}
-                        className={inputClassOf()}
+                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                       />
                     </div>
                     <div className="space-y-1">
@@ -921,7 +511,7 @@ export function TgApiMenuKeyboardDialog({
                         id={`app-short-name-${suffix}`}
                         name="app_short_name"
                         defaultValue={cfg.appShortName}
-                        className={inputClassOf()}
+                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                       />
                     </div>
                     <div className="space-y-1">
@@ -932,7 +522,7 @@ export function TgApiMenuKeyboardDialog({
                         id={`app-url-${suffix}`}
                         name="app_url"
                         defaultValue={cfg.appUrl}
-                        className={inputClassOf()}
+                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                       />
                     </div>
                     <div className="space-y-1">
@@ -943,7 +533,7 @@ export function TgApiMenuKeyboardDialog({
                         id={`footer-${suffix}`}
                         name="footer_text"
                         defaultValue={cfg.footerText}
-                        className={inputClassOf()}
+                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                       />
                     </div>
                   </div>
@@ -980,10 +570,14 @@ export function TgApiMenuKeyboardDialog({
                   </div>
                 </div>
 
-                {/* 解锁门禁全局配置（通用组件：内嵌/键盘两页签共用同一渲染） */}
-                {gateConfigPanel(suffix)}
+                {/* 🔐 解锁门禁全局配置（通用组件：unlock_mode 恒 captcha + verification_method_id 随表单提交） */}
+                <TgApiGatePanel
+                  idScope={`gate-${suffix}`}
+                  methods={methods}
+                  verificationMethodId={cfg.verificationMethodId}
+                />
 
-                {/* 4. 消息配置（中英双语） */}
+                {/* 4️⃣ 消息配置（中英双语；当前仿真语言文案实时同步仿真屏） */}
                 <div className="rounded-lg border bg-muted/20 p-4 space-y-3">
                   <p className="text-sm font-semibold">
                     4️⃣ 💬 消息配置（中英文双语：按用户语言自动识别，「✅ 语言」按钮可手动切换）
@@ -994,7 +588,7 @@ export function TgApiMenuKeyboardDialog({
                     </label>
                     <textarea
                       id={`text-zh-start-${suffix}`}
-                      name={`text_zh_start`}
+                      name="text_zh_start"
                       rows={4}
                       value={zhStart}
                       onChange={(event) => setZhStart(event.target.value)}
@@ -1007,7 +601,7 @@ export function TgApiMenuKeyboardDialog({
                     </label>
                     <textarea
                       id={`text-en-start-${suffix}`}
-                      name={`text_en_start`}
+                      name="text_en_start"
                       rows={4}
                       value={enStart}
                       onChange={(event) => setEnStart(event.target.value)}
@@ -1024,9 +618,7 @@ export function TgApiMenuKeyboardDialog({
                           id={`text-zh-${field.name}-${suffix}`}
                           name={`text_zh_${field.name}`}
                           rows={2}
-                          defaultValue={
-                            cfg.texts?.zh?.[field.name] ?? TGAPI_TEXTS_ZH[field.name]
-                          }
+                          defaultValue={cfg.texts?.zh?.[field.name] ?? TGAPI_TEXTS_ZH[field.name]}
                           className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"
                         />
                       </div>
@@ -1038,9 +630,7 @@ export function TgApiMenuKeyboardDialog({
                           id={`text-en-${field.name}-${suffix}`}
                           name={`text_en_${field.name}`}
                           rows={2}
-                          defaultValue={
-                            cfg.texts?.en?.[field.name] ?? TGAPI_TEXTS_EN[field.name]
-                          }
+                          defaultValue={cfg.texts?.en?.[field.name] ?? TGAPI_TEXTS_EN[field.name]}
                           className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"
                         />
                       </div>
@@ -1048,214 +638,225 @@ export function TgApiMenuKeyboardDialog({
                   ))}
                 </div>
 
-                {/* 5. 指令菜单配置（v2.2.8）：与机器人管理页「⌨️ 指令菜单」弹窗同一配置模块，
-                    渲染在「界面模式」上方；保存写入 bots.config.privacyMode/commandIds，
-                    部署后由运行实例注册并同步 Telegram */}
+                {/* 🧩 功能开关（显式开启才生效）：消息内嵌按钮 ⇄ 自定义键盘互斥 + 指令菜单独立；
+                    平铺配置模块 —— 与机器人管理「功能配置」弹窗同一模型（复用，无割裂模块） */}
                 <div className="space-y-3 rounded-xl border bg-card p-4">
-                  <p className="text-sm font-semibold">5️⃣ 📋 指令菜单（来自指令库）</p>
-                  <p className="text-xs text-muted-foreground">
-                    指令注册的唯一来源（与机器人管理页「⌨️ 指令菜单」弹窗同源同存储）：勾选的指令在部署后注册响应并同步 Telegram 指令菜单；未勾选的指令不注册、不响应。
-                  </p>
-                  <CommandMenuConfigFields
-                    privacyMode={privacyMode}
-                    onPrivacyModeChange={setPrivacyMode}
-                    selected={selectedCommandIds}
-                    onToggle={(id) =>
-                      setSelectedCommandIds((prev) =>
-                        prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
-                      )
-                    }
-                    library={library}
-                  />
-                </div>
-
-                {/* 6. 界面模式选择（v2.2.6 checkbox 单选）：仅切换下方两个编辑区；生效标签按已保存数据打标 */}
-                <div className="space-y-3 rounded-xl border bg-card p-4">
-                  <p className="text-sm font-semibold">6️⃣ 界面模式（checkbox 单选：勾选即切换下方编辑区）</p>
-                  <p className="text-xs text-muted-foreground">
-                    两种界面互斥生效：勾选并「保存机器人」（再到「仿真APP」页部署）后才对运行实例正式生效 —— 此处「生效中」标签按已保存数据打标，不随草稿切换。
-                  </p>
-                  <div className="flex flex-col gap-2">
+                  <div>
+                    <p className="text-sm font-semibold">🧩 功能开关（显式开启才生效）</p>
+                    <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                      消息内嵌按钮与自定义键盘互斥（check 单选，可都取消）；指令菜单独立勾选。
+                      关闭后配置保留不清空，重新开启原样回显；右侧仿真屏随开关实时响应。
+                    </p>
+                  </div>
+                  <div className="grid gap-2 md:grid-cols-3">
                     <label
-                      className={`inline-flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
-                        mode === "inline" ? "border-primary/50 bg-primary/5" : ""
+                      className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2.5 text-sm ${
+                        uiMode === "inline" ? "border-primary/50 bg-primary/5" : ""
                       }`}
                     >
                       <input
                         type="checkbox"
-                        name="kb_mode"
-                        value="inline"
-                        checked={mode === "inline"}
-                        onChange={() => setMode("inline")}
+                        checked={uiMode === "inline"}
+                        onChange={() => setUiMode(uiMode === "inline" ? "none" : "inline")}
                         className="h-4 w-4"
                       />
-                      🔘 消息内嵌按钮（初始消息底部 InlineKeyboard）
-                      {activeMode === "inline" ? (
-                        <span className="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">生效中</span>
-                      ) : null}
+                      <span className="min-w-0">
+                        <span className="block font-medium">💬 消息内嵌按钮
+                          {activeMode === "inline" ? <span className="ml-1 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">生效中</span> : null}
+                        </span>
+                        <span className="block text-[11px] text-muted-foreground">初始消息底部 InlineKeyboard</span>
+                      </span>
                     </label>
                     <label
-                      className={`inline-flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
-                        mode === "keyboard" ? "border-primary/50 bg-primary/5" : ""
+                      className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2.5 text-sm ${
+                        uiMode === "keyboard" ? "border-sky-500/50 bg-sky-500/5" : ""
                       } ${!bot ? "opacity-60" : ""}`}
                     >
                       <input
                         type="checkbox"
-                        name="kb_mode"
-                        value="keyboard"
-                        checked={mode === "keyboard"}
-                        onChange={() => setMode("keyboard")}
+                        checked={uiMode === "keyboard"}
+                        onChange={() => setUiMode(uiMode === "keyboard" ? "none" : "keyboard")}
                         disabled={!bot}
                         className="h-4 w-4"
                       />
-                      ⌨️ 自定义键盘（ReplyKeyboard 对话流程）
-                      {activeMode === "keyboard" ? (
-                        <span className="rounded-full bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700">生效中</span>
-                      ) : null}
-                      {!bot ? <span className="text-xs text-muted-foreground">（先保存机器人，再配置自定义键盘）</span> : null}
+                      <span className="min-w-0">
+                        <span className="block font-medium">⌨️ 自定义键盘
+                          {activeMode === "keyboard" ? <span className="ml-1 rounded-full bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700">生效中</span> : null}
+                        </span>
+                        <span className="block text-[11px] text-muted-foreground">ReplyKeyboard 对话流程{!bot ? "（先保存机器人）" : ""}</span>
+                      </span>
+                    </label>
+                    <label
+                      className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2.5 text-sm ${
+                        commandsEnabled ? "border-emerald-500/50 bg-emerald-500/5" : ""
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={commandsEnabled}
+                        onChange={(event) => setCommandsEnabled(event.target.checked)}
+                        className="h-4 w-4"
+                      />
+                      <span className="min-w-0">
+                        <span className="block font-medium">📋 指令菜单</span>
+                        <span className="block text-[11px] text-muted-foreground">独立勾选，可与上面共存</span>
+                      </span>
                     </label>
                   </div>
-                  <p className="text-xs text-muted-foreground">
-                    {kbPayload
-                      ? "自定义键盘配置已保留（附加属性）：切换到内嵌按钮模式不会清除键盘配置。"
-                      : "尚未配置自定义键盘；勾选键盘模式后可在下方编辑区设计。"}
-                  </p>
-                </div>
 
-                {/* 6. 内嵌按钮配置（与机器人管理「消息内嵌按钮」弹窗完全同一编辑器实现；仅内嵌模式显示，切换保留草稿） */}
-                <div className={mode === "inline" ? "space-y-3" : "hidden"}>
-                  <div className="rounded-lg border bg-muted/20 p-4">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <p className="text-sm font-semibold">
-                        🔘 内嵌按钮配置（初始消息底部的按钮，仿真屏实时预览；交互下拉 = TGAPI 固定指令列表（10 条）+ 通用项）
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setMenuRoot(defaultTgApiMenuRoot());
-                          setSelected(null);
-                          setSimNodeId("root");
-                        }}
-                        className="inline-flex h-8 shrink-0 items-center rounded-md border px-3 text-sm hover:bg-accent"
-                        title="重新生成默认按钮组：9 个按钮（创建API/我的API/设置平台/语言/帮助/客服支持/设置Title/设置Description/跳过），设置平台含 8 平台子菜单"
-                      >
-                        ↺ 恢复默认按钮组
-                      </button>
-                    </div>
-                    {cfg.customKeyboard && activeMode === "keyboard" ? (
-                      <p className="mt-2 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-relaxed text-sky-700">
-                        ⌨️ 自定义键盘对话流程当前生效（互斥）：本弹窗配置的内嵌按钮不会被发送；
-                        勾选「消息内嵌按钮」并保存即可切回内嵌模式（键盘配置保留不清除）。
-                      </p>
+                    {/* —— 平铺：消息内嵌按钮配置（TGAPI 固定指令 + 通用项；配置 → 仿真屏实时同步） —— */}
+                    {uiMode === "inline" ? (
+                      <div className="space-y-2 rounded-xl border border-primary/30 bg-muted/10 p-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="text-sm font-semibold">🔘 内嵌按钮配置（初始消息底部 InlineKeyboard，右侧仿真屏实时预览）</p>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setMenuRoot(defaultTgApiMenuRoot());
+                                setSelected(null);
+                                setSimNodeId("root");
+                              }}
+                              className="inline-flex h-8 shrink-0 items-center rounded-md border px-3 text-sm hover:bg-accent"
+                              title="重新生成默认按钮组：9 个按钮（创建API/我的API/设置平台/语言/帮助/客服支持/设置Title/设置Description/跳过），设置平台含 8 平台子菜单"
+                            >
+                              ↺ 恢复默认按钮组
+                            </button>
+                            <div className="flex items-center gap-2 rounded-md border bg-background px-3 py-1.5">
+                              <span className="text-xs font-medium">🔒 门禁解锁（本面板全部按钮点击先验证）</span>
+                              <Switch
+                                checked={gateMenuRequired}
+                                onCheckedChange={setGateMenuRequired}
+                                aria-label="内嵌按钮门禁解锁"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                        <NodeEditor
+                          node={menuRoot}
+                          levelName={
+                            <>
+                              主菜单按钮布局
+                              <span className="text-sm font-normal text-muted-foreground">
+                                （每行最多 {MENU_MAX_BUTTONS_PER_ROW} 个按钮，最多 {MENU_MAX_DEPTH} 层）
+                              </span>
+                            </>
+                          }
+                          path={[]}
+                          depth={1}
+                          state={designerState}
+                          isRoot
+                        />
+                        {!selected ? (
+                          <p className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
+                            点击任意按钮可配置名称、交互（TGAPI 指令列表）、解锁门禁与指令消息；选择「进入子菜单」后可直接创建下一级菜单
+                          </p>
+                        ) : null}
+                      </div>
                     ) : null}
-                  </div>
-                  <NodeEditor
-                    node={menuRoot}
-                    levelName={
-                      <>
-                        主菜单按钮布局
-                        <span className="text-sm font-normal text-muted-foreground">
-                          （每行最多 {MENU_MAX_BUTTONS_PER_ROW} 个按钮，最多 {MENU_MAX_DEPTH} 层）
-                        </span>
-                      </>
-                    }
-                    path={[]}
-                    depth={1}
-                    state={designerState}
-                    isRoot
-                  />
-                  {!selected ? (
-                    <p className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-                      点击任意按钮可配置名称、交互（TGAPI 指令列表）、解锁门禁与指令消息；选择「进入子菜单」后可直接创建下一级菜单
-                    </p>
-                  ) : null}
+
+                    {/* —— 平铺：自定义键盘配置（TGAPI 对话流程；载荷 → 仿真屏底部 ReplyKeyboard 实时同步） —— */}
+                    {uiMode === "keyboard" ? (
+                      <div className="space-y-2 rounded-xl border border-sky-500/30 bg-muted/10 p-3">
+                        <div className="flex items-center justify-between">
+                          <p className="text-sm font-semibold">⌨️ 自定义键盘配置（点击按钮=发送按钮文本，对话流程真实响应；右侧仿真屏底部实时预览）</p>
+                          <div className="flex items-center gap-2 rounded-md border bg-background px-3 py-1.5">
+                            <span className="text-xs font-medium">🔒 门禁解锁（本面板全部按钮点击先验证）</span>
+                            <Switch
+                              checked={gateKeyboardRequired}
+                              onCheckedChange={setGateKeyboardRequired}
+                              aria-label="自定义键盘门禁解锁"
+                            />
+                          </div>
+                        </div>
+                        {bot ? (
+                          <CustomKeyboardDesigner
+                            botId={String(bot.id)}
+                            botName={botDisplayName}
+                            initialConfig={cfg.customKeyboard ?? null}
+                            isTgApi
+                            embedded
+                            onConfigChange={handleKbConfigChange}
+                          />
+                        ) : (
+                          <p className="rounded-md border border-dashed bg-muted/20 px-3 py-6 text-center text-sm text-muted-foreground">
+                            ⌨️ 自定义键盘：先保存机器人（填写名称与 Token 后点「保存机器人」），再次打开本弹窗即可配置。
+                          </p>
+                        )}
+                      </div>
+                    ) : null}
+
+                    {/* —— 平铺：指令菜单配置 —— */}
+                    {commandsEnabled ? (
+                      <div className="space-y-2 rounded-xl border border-emerald-500/30 bg-muted/10 p-3">
+                        <div className="flex items-center justify-between">
+                          <p className="text-sm font-semibold">📋 指令菜单配置（指令注册唯一来源，部署后同步 Telegram；仿真屏输入框左侧「菜单」按钮）</p>
+                          <div className="flex items-center gap-2 rounded-md border bg-background px-3 py-1.5">
+                            <span className="text-xs font-medium">🔒 门禁解锁（使用指令前先验证）</span>
+                            <Switch
+                              checked={gateCommandsRequired}
+                              onCheckedChange={setGateCommandsRequired}
+                              aria-label="指令菜单门禁解锁"
+                            />
+                          </div>
+                        </div>
+                        <CommandMenuConfigFields
+                          privacyMode={privacyMode}
+                          onPrivacyModeChange={setPrivacyMode}
+                          selected={selectedCommandIds}
+                          onToggle={(id) =>
+                            setSelectedCommandIds((prev) =>
+                              prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
+                            )
+                          }
+                          library={library}
+                        />
+                      </div>
+                    ) : null}
                 </div>
 
-                {/* ⌨️ 自定义键盘配置区（v2.2.8 移入主两栏网格左列；仅键盘模式显示，切换保留草稿 ——
-                    编辑器始终保持挂载仅 CSS 隐藏；键盘载荷经 onConfigChange 同步统一表单 hidden
-                    custom_keyboard 字段提交，仿真屏见右列键盘模式分支） */}
-                <div className={mode === "keyboard" ? "space-y-4" : "hidden"}>
-                  {bot ? (
-                    <CustomKeyboardDesigner
-                      botId={String(bot.id)}
-                      botName={botDisplayName}
-                      initialConfig={cfg.customKeyboard ?? null}
-                      isTgApi
-                      embedded
-                      onConfigChange={handleKbConfigChange}
-                      tgapiModeHint={
-                        activeMode === "keyboard"
-                          ? "自定义键盘对话流程当前生效：消息内嵌按钮不再渲染（互斥）。勾选「消息内嵌按钮」并保存可切回内嵌模式（本键盘配置保留不清除）。"
-                          : "当前生效的是消息内嵌按钮模式：设计好键盘并保存后，勾选「自定义键盘」为生效模式（保存并部署后生效）。"
-                      }
-                    />
-                  ) : (
-                    <p className="rounded-md border border-dashed bg-muted/20 px-3 py-6 text-center text-sm text-muted-foreground">
-                      ⌨️ 自定义键盘：先保存机器人（填写名称与 Token 后点「保存机器人」），再次打开本弹窗即可配置。
-                    </p>
-                  )}
-                </div>
               </div>
 
-              {/* 右侧仿真屏（v2.2.8：随界面模式切换 —— 内嵌模式=TgSimulator 内嵌按钮实时预览；
-                  键盘模式=TGAPI 对话流程仿真。两种模式都在主网格右列 sticky 跟随滚动，
-                  修复键盘模式下布局断裂与 sticky 失效） */}
+              {/* —— 右侧仿真屏（固定容器，数据驱动）：配置 state → props 即时呈现 —— */}
               <div className="min-w-0 lg:sticky lg:top-0 lg:self-start">
-                {mode === "inline" ? (
-                  <div key={resetKey}>
-                    <TgSimulator
-                      ref={simRef}
-                      config={simulatorConfig}
-                      botName={botDisplayName}
-                      groupTitle={realGroupTitle}
-                      memberCount={realGroups.groups.length > 0 ? "已部署的真实群组" : ""}
-                      nodeId={simNodeId}
-                      onNodeNavigate={setSimNodeId}
-                      systemNote={
-                        simView === "group"
-                          ? "TGAPI 申请群组 · 点击下方「申请加入群组」开始仿真"
+                <div key={sim.resetKey}>
+                  <TgSimulator
+                    ref={simRef}
+                    config={simulatorConfig}
+                    botName={botDisplayName}
+                    groupTitle={realGroupTitle}
+                    memberCount={realGroups.groups.length > 0 ? "已部署的真实群组" : ""}
+                    nodeId={simNodeId}
+                    onNodeNavigate={setSimNodeId}
+                    view={sim.simView}
+                    joinPhase={sim.joinPhase}
+                    onRequestJoin={sim.requestJoin}
+                    onUserSend={sim.onUserSend}
+                    showMenuInPrivate={sim.simView === "private" && uiMode === "inline"}
+                    replyKeyboard={uiMode === "keyboard" ? currentKb : undefined}
+                    onTgApiFunc={sim.onTgApiFunc}
+                    onLanguageToggle={sim.onLanguageToggle}
+                    commands={commandsEnabled ? configuredCommands : undefined}
+                    systemNote={
+                      sim.simView === "group"
+                        ? "TGAPI 申请群组 · 点击下方「申请加入群组」开始仿真"
+                        : uiMode === "none"
+                          ? "未开启消息内嵌按钮 / 自定义键盘：机器人 /start 仅回复纯文本欢迎语"
                           : undefined
-                      }
-                      view={simView}
-                      joinPhase={joinPhase}
-                      onRequestJoin={handleSimRequestJoin}
-                      onUserSend={handleSimUserSend}
-                      showMenuInPrivate={simView === "private"}
-                      onTgApiFunc={handleSimTgApiFunc}
-                      onLanguageToggle={handleSimLanguageToggle}
-                    />
-                    <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-                      仿真流程与真实机器人完全一致：申请加入群组 → 自动通过并跳转私聊 → 初始消息+内嵌按钮 →
-                      创建API（解锁门禁 → APP 参数 → 手机号 → 登录码 → api_id/api_hash）→ 我的API → 语言切换 → /start 重发。
-                      共 {stats.buttons} 个按钮 · {stats.submenus} 个子菜单。
-                    </p>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <p className="text-xs font-medium text-muted-foreground">
-                        TGAPI 对话流程仿真（与部署后真实行为一致）：/start → 门禁 → 主键盘 → 按钮交互
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => setKbSimKey((prev) => prev + 1)}
-                        className="inline-flex h-7 shrink-0 items-center rounded-md border px-2 text-xs hover:bg-accent"
-                        title="重新从 /start 开始仿真"
-                      >
-                        🔄 重新仿真
-                      </button>
-                    </div>
-                    <TgApiKeyboardFlowSim
-                      key={`kbflow-${kbSimKey}`}
-                      cfg={cfg}
-                      keyboard={currentKb}
-                      botName={botDisplayName}
-                    />
-                  </div>
-                )}
+                    }
+                  />
+                  <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                    仿真屏随功能开关实时响应：
+                    {uiMode === "inline" ? `内嵌按钮 ${stats.buttons} 个 · ${stats.submenus} 个子菜单（初始消息随文案实时同步）` : "内嵌按钮未开启"}
+                    {uiMode === "keyboard" ? "；自定义键盘面板在私聊输入框下方（⌨️ 展开）" : ""}
+                    {uiMode === "none" ? "；界面模块全部关闭 → /start 纯文本欢迎" : ""}
+                    。仿真流程与真实机器人完全一致：申请加入群组 → 自动通过并跳转私聊 → 创建API（解锁门禁 → 手机号 → 登录码）→ /start 重发。
+                  </p>
+                </div>
               </div>
             </div>
           </div>
+
           <div className="flex shrink-0 items-center justify-end gap-2 border-t bg-muted/30 px-6 py-3">
             <button
               type="button"

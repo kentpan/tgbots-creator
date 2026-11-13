@@ -112,6 +112,23 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
     }
   }
 
+  // v2.3 界面模式互斥：键盘模式 = 欢迎语 + 自定义键盘（不发内嵌菜单）；
+  // 内嵌按钮面板关闭 = 纯文本欢迎（不发菜单）；否则 = 欢迎语 + 内嵌菜单
+  if (ctx.interfaceMenuEnabled === false) {
+    await ctx.reply(
+      "🤖 *TGuard 机器人*\n\n发送 /help 查看可用指令。",
+      { parse_mode: "MarkdownV2" },
+    );
+    return;
+  }
+  if (ctx.interfaceKeyboardMode && ctx.customKeyboard) {
+    await ctx.reply(
+      "🤖 *TGuard 机器人*\n\n👇 请使用下方自定义键盘按钮：",
+      { parse_mode: "MarkdownV2", reply_markup: ctx.customKeyboard },
+    );
+    return;
+  }
+
   await ctx.reply(
     "🤖 *TGuard 群组验证机器人*\n\n" +
       "🛡️ *自动验证新成员身份，防止机器人和恶意用户进入群组*\n\n" +
@@ -125,10 +142,9 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
     // 优先发自己安装的菜单（ctx.botMenu），主 bot 无 botMenu 注入走全局 mainMenu
     { parse_mode: "MarkdownV2", reply_markup: ctx.botMenu ?? mainMenu },
   );
-  // v2.2.0 自定义键盘：实例配置了 customKeyboard 时随 /start 附发（一条消息只能携带
-  // 一种 reply_markup —— 欢迎语保留内嵌菜单，自定义键盘用附加消息承载）；
-  // 点击键盘按钮=发送按钮文本，multi-runtime 按按钮配置真实响应
-  if (ctx.customKeyboard) {
+  // v2.3：内嵌模式下不注入 ctx.customKeyboard（multi-runtime 已按界面模式互斥注入），
+  // 此分支仅作为主 bot（无界面模式标记）的旧语义兜底保留
+  if (ctx.customKeyboard && ctx.interfaceKeyboardMode === undefined) {
     await ctx.reply("👇 请使用下方自定义键盘按钮：", { reply_markup: ctx.customKeyboard });
   }
 }

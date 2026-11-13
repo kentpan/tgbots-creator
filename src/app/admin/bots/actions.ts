@@ -777,3 +777,145 @@ export async function saveBotRuntimeAction(formData: FormData): Promise<void> {
   revalidatePath("/admin/bots");
   redirect(botPath({ saved: "runtime" }));
 }
+
+/**
+ * 保存机器人「功能配置」弹窗（v2.3，feature 形态统一保存）：
+ * 一次落库：基本信息（名称/Token/启用）+ menu_config + 界面互斥（kb_mode）+
+ * customKeyboard + privacyMode/commandIds + 功能面板开关（menu/commands/keyboardEnabled）+
+ * 加群验证（bots.config.joinVerify）+ 通用门禁（bots.config.gate）。
+ * 验证方式/参数覆盖只写 bot 配置，绝不回写验证方式库；保存后热更新运行实例。
+ */
+export async function saveBotFeatureConfigAction(formData: FormData): Promise<void> {
+  const admin = await requirePermission("bots:manage");
+  const idRaw = String(formData.get("id") ?? "").trim();
+  const name = String(formData.get("name") ?? "").trim();
+  const token = String(formData.get("token") ?? "").trim();
+  const enabled = formData.get("enabled") === "1";
+  if (!idRaw || !/^\d+$/.test(idRaw)) redirect(botPath({ error: "invalid-id" }));
+  if (!name) redirect(botPath({ error: "name-required" }));
+  const existing = await getBot(BigInt(idRaw));
+  if (!existing) redirect(botPath({ error: "invalid-id" }));
+  if (token && !/^\d{6,}:[\w-]{30,}$/.test(token)) redirect(botPath({ error: "invalid-token" }));
+
+  const profile = parseBotProfile(existing.config);
+  const next = profile as unknown as Record<string, unknown>;
+
+  // —— 隐私模式 + 指令勾选（与 saveTgApiBotAction / saveBotCommandMenuAction 同存储位） ——
+  const privacyRaw = formData.get("privacyMode");
+  if (privacyRaw !== null) next.privacyMode = privacyRaw === "1";
+  const commandIdsRaw = formData.get("commandIds");
+  if (commandIdsRaw !== null) {
+    let commandIds: number[] = [];
+    try {
+      const parsedIds = JSON.parse(String(commandIdsRaw)) as unknown;
+      if (Array.isArray(parsedIds)) {
+        commandIds = parsedIds.map(Number).filter((item) => Number.isInteger(item) && item > 0);
+      }
+    } catch {
+      redirect(botPath({ error: "invalid-commands" }));
+    }
+    next.commandIds = commandIds;
+  }
+
+  // —— 界面互斥 + 自定义键盘（键盘载荷空串 = 清空配置，与 TGAPI 保存同语义） ——
+  const kbModeRaw = String(formData.get("kb_mode") ?? "").trim();
+  if (kbModeRaw === "inline" || kbModeRaw === "keyboard") {
+    next.interfaceMode = kbModeRaw;
+  }
+  const keyboardRaw = String(formData.get("custom_keyboard") ?? "").trim();
+  if (formData.has("custom_keyboard")) {
+    if (keyboardRaw) {
+      let source: unknown;
+      try {
+        source = JSON.parse(keyboardRaw);
+      } catch {
+        redirect(botPath({ error: "invalid-keyboard" }));
+      }
+      const parsedKeyboard = parseCustomKeyboardConfig(source);
+      if (!parsedKeyboard) redirect(botPath({ error: "invalid-keyboard" }));
+      next.customKeyboard = parsedKeyboard;
+    } else {
+      delete next.customKeyboard;
+    }
+  }
+
+  // —— 功能面板开关（显式 boolean；表单缺字段不触碰） ——
+  const readFlag = (key: string): void => {
+    const raw = formData.get(key);
+    if (raw !== null) next[key] = raw === "1";
+  };
+  readFlag("menu_enabled");
+  readFlag("commands_enabled");
+  readFlag("keyboard_enabled");
+
+  // —— 加群验证（bots.config.joinVerify）：方式单选 + 超时/次数覆盖 ——
+  if (formData.has("join_verify_enabled")) {
+    const methodIdRaw = String(formData.get("join_verify_method_id") ?? "").trim();
+    const timeoutRaw = Number(formData.get("join_verify_timeout") ?? "");
+    const attemptsRaw = Number(formData.get("join_verify_attempts") ?? "");
+    const override: Record<string, number> = {};
+    if (Number.isFinite(timeoutRaw) && timeoutRaw >= 1) override.timeout_seconds = Math.floor(timeoutRaw);
+    if (Number.isFinite(attemptsRaw) && attemptsRaw >= 1) override.max_attempts = Math.floor(attemptsRaw);
+    next.joinVerify = {
+      enabled: formData.get("join_verify_enabled") === "1",
+      methodId: methodIdRaw && /^\d+$/.test(methodIdRaw) ? methodIdRaw : null,
+      ...(Object.keys(override).length > 0 ? { override } : {}),
+    };
+  }
+
+  // —— 面板门禁开关（内嵌按钮/键盘/指令三面板各一） ——
+  const readGateFlag = (key: string): void => {
+    const raw = formData.get(key);
+    if (raw !== null) next[key] = raw === "1";
+  };
+  readGateFlag("gate_menu_required");
+  readGateFlag("gate_keyboard_required");
+  readGateFlag("gate_commands_required");
+
+  // —— 通用门禁（bots.config.gate）：绑定验证方式（v2.3 星星解锁已移除，固定验证码解锁） ——
+  if (formData.has("gate_enabled")) {
+    const gateMethodIdRaw = String(formData.get("verification_method_id") ?? "").trim();
+    next.gate = {
+      enabled: formData.get("gate_enabled") === "1",
+      verificationMethodId: gateMethodIdRaw && /^\d+$/.test(gateMethodIdRaw) ? gateMethodIdRaw : null,
+    };
+  }
+
+  // —— 内嵌按钮配置（menu_config payload，轻校验同 saveTgApiBotAction） ——
+  const menuConfigRaw = String(formData.get("menu_config") ?? "").trim();
+  let menuConfigJson: string | null = null;
+  let menuTextValue: string | null = null;
+  if (menuConfigRaw) {
+    try {
+      const parsed = parseBotMenuConfig(menuConfigRaw);
+      menuConfigJson = JSON.stringify({ content: parsed.content, root: parsed.root });
+      menuTextValue = parsed.content.text;
+    } catch {
+      redirect(botPath({ error: "invalid-menu" }));
+    }
+  }
+
+  await updateBotRecord(BigInt(idRaw), {
+    name,
+    token: token || existing.token,
+    enabled,
+    config: JSON.stringify(profile),
+    ...(menuConfigJson ? { menuConfig: menuConfigJson, menuText: menuTextValue ?? "" } : {}),
+  });
+
+  // 保存后热更新运行实例（启用中的实例即时应用新配置；失败全量输出日志不静默）
+  if (enabled) {
+    await restartMenuBot(BigInt(idRaw)).catch((error: unknown) => {
+      console.error(`[bots] 功能配置保存后重启运行实例失败（#id ${idRaw}）:`, error);
+    });
+  }
+
+  await logOperation(admin, {
+    action: "保存机器人功能配置",
+    target: name,
+    detail: `面板：内嵌按钮=${formData.get("menu_enabled") ?? "?"} 指令=${formData.get("commands_enabled") ?? "?"} 键盘=${formData.get("keyboard_enabled") ?? "?"}；加群验证=${formData.get("join_verify_enabled") ?? "?"}；门禁=${formData.get("gate_enabled") ?? "?"}`,
+    headers: await headers(),
+  });
+  revalidatePath("/admin/bots");
+  redirect(botPath({ saved: "1" }));
+}

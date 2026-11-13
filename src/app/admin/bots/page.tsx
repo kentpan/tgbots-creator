@@ -13,14 +13,11 @@ import { isEdgeRuntime } from "@/lib/telegram/runtime-mode";
 import { parseBotProfile, parseBotPrivacyMode } from "@/bot/multi-runtime";
 import { parseCustomKeyboardConfig } from "@/services/custom-keyboard";
 import { requirePermission } from "@/lib/auth";
-import { deleteBotAction, deployBotAction, saveBotCustomKeyboardAction } from "./actions";
-import { saveTgApiCustomKeyboardAction } from "@/app/admin/tgapi/actions";
+import { deleteBotAction, deployBotAction } from "./actions";
 import { SubmitButton } from "@/components/admin/submit-button";
 import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import { BotFormDialog } from "./bot-form-dialog";
-import { CommandMenuDialog } from "./command-menu-dialog";
-import { MenuDesignerDialog } from "./menu-designer-dialog";
-import { CustomKeyboardDialog } from "@/components/admin/custom-keyboard-dialog";
+import { FeatureConfigDialog } from "./feature-config-dialog";
 import { BotRuntimeDialog } from "./bot-runtime-dialog";
 import { BotCreateGuide } from "./bot-create-guide";
 
@@ -164,26 +161,11 @@ export default async function BotsPage({
                 bots.map((bot) => {
                   const stats = countMenuStats(parseBotMenuConfig(bot.menuConfig).root);
                   const profile = parseBotProfile(bot.config);
-                  // v2.2.5：TGAPI 申请机器人在机器人管理列表用同一「自定义键盘」通用弹窗的
-                  // TGAPI 形态（isTgApi=true：门禁配置模块 + 对话流程仿真，保存走
-                  // saveTgApiCustomKeyboardAction 写 tgapi.customKeyboard + 门禁字段）——
-                  // 与 TGAPI申请页「菜单和键盘」键盘页签完全同一形态；普通机器人保持原有模式
-                  const isTgApiBot = Boolean(profile.tgapi?.enabled);
-                  // 指令归属过滤（v2.1.13）：本机器人可见的自定义指令 = 全局 + 群组私有 + 本机器人私有；
-                  // 其他机器人私有指令对本机器人完全不可见（勾选/按钮/指令菜单三处同一规则）
+                  // v2.3 指令归属过滤：本机器人可见的自定义指令 = 全局 + 群组私有 + 本机器人私有
                   const visibleCommands = commandLibrary.filter(
                     (item) =>
                       item.type === "builtin" || item.botId === null || item.botId === String(bot.id),
                   );
-                  const scopeLabelOf = (item: (typeof visibleCommands)[number]): string | undefined => {
-                    if (item.type !== "custom") return undefined;
-                    if (item.botId !== null) return `🤖 ${bot.name} 私有`;
-                    if (item.groupId !== null) {
-                      const title = groups.find((g) => String(g.chatId) === item.groupId)?.chatTitle;
-                      return `👥 群组私有${title ? `（${title}）` : ""}`;
-                    }
-                    return undefined;
-                  };
                   return (
                     <tr key={bot.id} className="border-b last:border-0">
                       <td className="px-4 py-3 text-sm font-mono">{bot.id}</td>
@@ -241,131 +223,43 @@ export default async function BotsPage({
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex flex-wrap items-center gap-2">
-                          <form action={deployBotAction}>
-                            <input type="hidden" name="id" value={String(bot.id)} />
-                            <SubmitButton
-                              className="inline-flex h-8 items-center rounded-md border border-emerald-200 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 hover:bg-emerald-100"
-                              title="显式部署：重启运行实例并回传真实结果（webhook=setWebhook 注册结果 / polling=长轮询确认）"
-                              pendingLabel="部署中…"
-                            >
-                              🚀 部署
-                            </SubmitButton>
-                          </form>
-                          {Boolean(profile.tgapi?.enabled) ? (
-                            /* v2.1.16：TGAPI 申请机器人的内嵌按钮在「TGAPI申请」页面
-                               的设计器弹窗中配置（仿真屏+消息配置+按钮配置一体化），
-                               通用菜单设计器不再适用 —— 点击直接跳转 */
-                            <a
-                              href={`/admin/tgapi?bot=${bot.id}&edit=1`}
-                              title="TGAPI 申请机器人：跳转到「TGAPI申请」页面的设计器弹窗配置消息与内嵌按钮"
-                              className="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
-                            >
-                              ⚙️ 消息内嵌按钮
-                            </a>
-                          ) : (
-                            <MenuDesignerDialog
-                              bot={{
-                                id: String(bot.id),
-                                name: bot.name,
-                                menuConfig: bot.menuConfig,
-                                menuText: bot.menuText,
-                                username: bot.username,
-                                privacyMode: parseBotPrivacyMode(profile),
-                                isTgApi: false,
-                              }}
-                              builtinCommands={commandLibrary
-                                .filter((item) => item.type === "builtin")
-                                .map((item) => ({
-                                  name: item.name,
-                                  label: `/${item.name} — ${item.description}`,
-                                }))}
-                              customCommands={visibleCommands
-                                .filter((item) => item.type === "custom")
-                                .map((item) => ({
-                                  name: item.name,
-                                  label: `/${item.name} — ${item.description}`,
-                                }))}
-                              verificationMethods={verificationMethods.map((method) => ({
-                                id: String(method.id),
-                                name: method.name,
-                                type: method.type,
-                                enabled: method.enabled,
-                              }))}
-                              groups={groups.map((group) => ({
-                                chatId: String(group.chatId),
-                                chatTitle: group.chatTitle,
-                              }))}
-                              storageKind={getStorage().kind}
-                              trigger="⚙️ 消息内嵌按钮"
-                              triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
-                            />
-                          )}
-                          {/* ⌨️ 指令菜单弹窗：全部机器人类型统一入口（含 TGAPI申请机器人）——
-                              勾选保存（bots.config.commandIds）后热更新注册并同步 Telegram，
-                              是指令注册唯一来源；未勾选的指令不注册、不响应 */}
-                          <CommandMenuDialog
+                          {/* v2.3 部署改 confirm：明确部署范围（全部群组/频道），单群部署引流到仿真页 */}
+                          <ConfirmDialog
+                            title={`部署「${bot.name}」`}
+                            description={`将上线/更新该机器人运行实例，并部署到其全部已登记群组/频道（生成/刷新邀请链接）。需要部署到单个群组，请到「仿真APP」页面使用分体部署按钮单独选择。`}
+                            action={deployBotAction}
+                            fields={{ id: String(bot.id) }}
+                            trigger="🚀 部署"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border border-emerald-200 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 hover:bg-emerald-100"
+                            confirmLabel="确认部署"
+                          />
+                          {/* v2.3 功能配置（三按钮合一）：原「消息内嵌按钮 / 指令菜单 / 自定义键盘」
+                              三个弹窗合并为同一「功能配置」弹窗（复刻 TGAPI 菜单和键盘，去掉
+                              APP创建参数/消息配置，新增 加群验证 / 通用门禁 / 功能面板开关） */}
+                          <FeatureConfigDialog
                             bot={{
                               id: String(bot.id),
                               name: bot.name,
-                              privacyMode: parseBotPrivacyMode(profile),
-                              selectedCommandIds: Array.isArray(profile.commandIds)
-                                ? profile.commandIds
-                                : [],
+                              username: bot.username,
+                              enabled: bot.enabled,
+                              config: bot.config,
+                              menuConfig: bot.menuConfig,
                             }}
+                            methods={verificationMethods.map((method) => ({
+                              id: Number(method.id),
+                              name: method.name,
+                              enabled: method.enabled,
+                              type: method.type,
+                            }))}
                             library={visibleCommands.map((item) => ({
                               id: item.id,
                               name: item.name,
                               description: item.description,
                               intro: item.intro,
                               type: item.type,
-                              scopeLabel: scopeLabelOf(item),
+                              scopeLabel: undefined,
                             }))}
-                            trigger="⌨️ 指令菜单"
-                            triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
-                          />
-                          {/* ⌨️ 自定义键盘（v2.2.0）：配置 ReplyKeyboard（复用仿真屏+复刻内嵌按钮配置），
-                              附加到 /start 欢迎消息；按钮点击=发送文本，运行时按按钮配置真实响应。
-                              v2.2.5：TGAPI 申请机器人用同一弹窗的 TGAPI 形态（门禁配置模块 +
-                              对话流程仿真，保存 tgapi.customKeyboard + 门禁字段）——不再与
-                              TGAPI 申请页割裂（此前普通形态写入顶层 customKeyboard，TGAPI
-                              对话流程根本不读，配置无效） */}
-                          <CustomKeyboardDialog
-                            botId={String(bot.id)}
-                            botName={bot.name}
-                            initialConfig={parseCustomKeyboardConfig(
-                              isTgApiBot ? profile.tgapi?.customKeyboard : profile.customKeyboard,
-                            )}
-                            isTgApi={isTgApiBot}
-                            action={isTgApiBot ? saveTgApiCustomKeyboardAction : saveBotCustomKeyboardAction}
-                            methods={
-                              isTgApiBot
-                                ? verificationMethods.map((method) => ({
-                                    id: Number(method.id),
-                                    name: method.name,
-                                    enabled: method.enabled,
-                                    type: method.type,
-                                  }))
-                                : undefined
-                            }
-                            tgapiConfig={isTgApiBot ? bot.config : undefined}
-                            tgapiModeHint={
-                              isTgApiBot && !parseCustomKeyboardConfig(profile.tgapi?.customKeyboard)
-                                ? "保存非空键盘后，机器人切换为自定义键盘对话流程（互斥：消息内嵌按钮不再渲染）。"
-                                : undefined
-                            }
-                            builtinCommands={commandLibrary
-                              .filter((item) => item.type === "builtin")
-                              .map((item) => ({
-                                name: item.name,
-                                label: `/${item.name} — ${item.description}`,
-                              }))}
-                            customCommands={visibleCommands
-                              .filter((item) => item.type === "custom")
-                              .map((item) => ({
-                                name: item.name,
-                                label: `/${item.name} — ${item.description}`,
-                              }))}
-                            trigger="⌨️ 自定义键盘"
+                            trigger="⚙️ 功能配置"
                             triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
                           />
                           <BotRuntimeDialog

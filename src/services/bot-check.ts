@@ -332,7 +332,8 @@ export async function runBotCheckNode(
         const parsed = parseCodeApiConfig(method?.config ?? "");
         return { ok: true, detail: `验证码门禁 · 验证方式「${method?.name ?? "?"}」（#${String(cfg.verificationMethodId)}）外部核验配置有效（${parsed?.http_method ?? "?"} ${parsed?.url ?? "?"}）` } as const;
       }
-      return { ok: true, detail: `星星门禁 · ${String(cfg.starsAmount)} ⭐（发票标题：${cfg.starsTitle?.trim() || "TGAPI 解锁"}）` } as const;
+      // v2.3 星星解锁已移除：非 captcha 视为未配置门禁
+      return { ok: false, error: "门禁解锁方式无效（星星解锁已移除，仅支持验证码解锁）", suggestion: "在「TGAPI申请 → 门禁」绑定一个启用中的 code_api 验证方式。" } as const;
     });
     if (out.ok) {
       return { key, label, ok: true, ms, detail: out.detail };

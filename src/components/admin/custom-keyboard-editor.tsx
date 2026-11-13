@@ -1,6 +1,7 @@
 "use client";
 
-import { ArrowDown, ArrowUp, Trash2 } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import { ArrowDown, ArrowUp, ChevronRight, Plus, Trash2 } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import {
@@ -12,13 +13,18 @@ import {
   countCustomKeyboardStats,
   CUSTOM_KEYBOARD_MAX_BUTTONS_PER_ROW,
   CUSTOM_KEYBOARD_MAX_BUTTONS_TOTAL,
+  CUSTOM_KEYBOARD_MAX_DEPTH,
   CUSTOM_KEYBOARD_MAX_ROWS,
   CUSTOM_KEYBOARD_TEXT_MAX_LENGTH,
   type CustomKeyboardButton,
   type CustomKeyboardButtonKind,
+  type CustomKeyboardRow,
   type CustomKeyboardButtonStyle,
   type CustomKeyboardConfig,
 } from "@/services/custom-keyboard";
+import { ACTION_OPTIONS } from "@/components/admin/menu-designer-editor";
+import { TgApiUnlockMethodBinding } from "@/components/admin/tgapi-unlock-api-config";
+import type { VerificationMethodOption } from "@/components/admin/menu-designer-editor";
 import {
   isValidTgApiPlatformValue,
   TGAPI_MENU_FUNCS,
@@ -66,6 +72,10 @@ export interface KeyboardDesignerState {
   isTgApi: boolean;
   builtinCommands: MenuCommandOption[];
   customCommands: MenuCommandOption[];
+  /** v2.3 验证方式库（verify 动作绑定验证方法；与内嵌按钮同一数据源） */
+  verificationMethods?: VerificationMethodOption[];
+  /** 当前键盘层级（根键盘 = 1；子菜单编辑器递归 +1，达上限不可再建子菜单） */
+  depth?: number;
   actions: {
     addRow: () => void;
     moveRow: (rowIndex: number, direction: -1 | 1) => void;
@@ -352,9 +362,20 @@ function SelectedKeyboardButtonPanel({ state }: { state: KeyboardDesignerState }
           >
             {isTgApi ? (
               <>
+                {/* v2.3：TGAPI 固定指令前置 + 通用交互全量（与消息内嵌按钮/机器人管理页
+                    同一动作模型；通用动作在 TGAPI 对话流程运行时真实承载） */}
                 {TGAPI_MENU_FUNCS.map((item) => (
                   <option key={item.func} value={`tgapi_func:${item.func}`}>
                     {item.label}
+                  </option>
+                ))}
+                {ACTION_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.value === "submenu"
+                      ? "进入子菜单（机器人发送子菜单键盘替换当前键盘）"
+                      : option.value === "back"
+                        ? "返回上一级菜单（机器人发送上一级键盘）"
+                        : option.label}
                   </option>
                 ))}
                 <option value="language">语言切换（中文/English，点击即切换）</option>
@@ -362,8 +383,16 @@ function SelectedKeyboardButtonPanel({ state }: { state: KeyboardDesignerState }
               </>
             ) : (
               <>
-                <option value="reply">回复一条消息（文本/图文/视频/相册）</option>
-                <option value="command">执行指令（点击等同用户发送 /指令）</option>
+                {/* v2.3：与消息内嵌按钮交互系统完全一致（ACTION_OPTIONS 单一来源） */}
+                {ACTION_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.value === "submenu"
+                      ? "进入子菜单（机器人发送子菜单键盘替换当前键盘）"
+                      : option.value === "back"
+                        ? "返回上一级菜单（机器人发送上一级键盘）"
+                        : option.label}
+                  </option>
+                ))}
                 <option value="none">（无 —— 仅发送按钮文本，机器人不响应）</option>
               </>
             )}
@@ -422,6 +451,31 @@ function SelectedKeyboardButtonPanel({ state }: { state: KeyboardDesignerState }
         </>
       ) : null}
 
+      {/* v2.3 门禁解锁（非 TGAPI 全交互类型通用，每按钮可选；与内嵌按钮同字段同语义） */}
+      {!isTgApi && action ? (
+        <div className="flex items-center justify-between rounded-md border bg-background px-3 py-2">
+          <div className="min-w-0 pr-3">
+            <p className="text-sm font-medium">🔒 门禁解锁（点击先验证）</p>
+            <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+              开启：未解锁用户点击该按钮时先完成门禁验证，通过后重新点击即执行本按钮功能
+              （解锁一次永久有效，对该机器人的所有门禁入口通用）。验证方式在
+              「功能配置 → 门禁解锁」面板配置；不开启 = 点击直接执行。
+            </p>
+          </div>
+          <Switch
+            checked={action.gateRequired === true}
+            onCheckedChange={(checked) =>
+              update((draft) => {
+                if (!draft.action) draft.action = { type: "reply" };
+                if (checked) draft.action.gateRequired = true;
+                else delete draft.action.gateRequired;
+              })
+            }
+            aria-label="门禁解锁"
+          />
+        </div>
+      ) : null}
+
       {/* 通用机器人：回复内容配置（复用消息内嵌按钮的 ContentEditor） */}
       {action?.type === "reply" ? (
         <ContentEditor
@@ -465,6 +519,157 @@ function SelectedKeyboardButtonPanel({ state }: { state: KeyboardDesignerState }
             点击键盘按钮等同用户发送 /指令：运行实例按指令名真实执行（内置指令 + 指令管理中启用的自定义指令）。
           </p>
         </div>
+      ) : null}
+
+      {/* 打开链接（URL）：ReplyKeyboard 按钮不支持原生 URL —— 运行时回复携带 InlineKeyboard URL 按钮 */}
+      {action?.type === "url" ? (
+        <div className="space-y-1">
+          <label className="block text-sm font-medium">链接地址（https）</label>
+          <input
+            value={action.url ?? ""}
+            onChange={(event) =>
+              update((draft) => {
+                if (!draft.action) draft.action = { type: "url" };
+                draft.action.url = event.target.value;
+              })
+            }
+            placeholder="https://example.com"
+            className="flex h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+          />
+          <p className="text-xs text-muted-foreground">
+            点击键盘按钮后机器人发送一条携带 URL 内联按钮的消息（ReplyKeyboard 按钮不支持原生 URL，这是真实 Telegram 的标准承载方式）。
+          </p>
+        </div>
+      ) : null}
+
+      {/* 打开 WebApp：运行时回复携带 InlineKeyboard web_app 按钮 */}
+      {action?.type === "web_app" ? (
+        <div className="space-y-1">
+          <label className="block text-sm font-medium">WebApp 地址（https）</label>
+          <input
+            value={action.url ?? ""}
+            onChange={(event) =>
+              update((draft) => {
+                if (!draft.action) draft.action = { type: "web_app" };
+                draft.action.url = event.target.value;
+              })
+            }
+            placeholder="https://example.com/app"
+            className="flex h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+          />
+          <p className="text-xs text-muted-foreground">
+            点击键盘按钮后机器人发送携带 WebApp 内联按钮的消息（私聊中点击直接打开 WebApp）。
+            也可把「按钮类型」选为「打开 WebApp」获得原生键盘按钮（等价能力）。
+          </p>
+        </div>
+      ) : null}
+
+      {/* 外部验证 API：绑定验证方法 + 自定义文案（与内嵌按钮同一组件、同一数据源） */}
+      {action?.type === "verify" ? (
+        <div className="space-y-3">
+          <TgApiUnlockMethodBinding
+            initialMethods={(state.verificationMethods ?? []).map((method) => ({
+              id: Number(method.id),
+              name: method.name,
+              enabled: method.enabled,
+              type: method.type,
+            }))}
+            initialMethodId={action.verify?.method_id ? Number(action.verify.method_id) : null}
+            typeFilter="code_api"
+            onChange={(methodId) =>
+              update((draft) => {
+                if (!draft.action) draft.action = { type: "verify" };
+                if (!draft.action.verify) draft.action.verify = { method_id: "" };
+                draft.action.verify.method_id = methodId === null ? "" : String(methodId);
+              })
+            }
+          />
+          <div className="space-y-1">
+            <label className="block text-sm font-medium">输入提示文案（点击按钮后先发送的提示）</label>
+            <textarea
+              value={action.verify?.input_hint_text ?? ""}
+              onChange={(event) =>
+                update((draft) => {
+                  if (draft.action?.verify) draft.action.verify.input_hint_text = event.target.value;
+                })
+              }
+              rows={2}
+              placeholder="✍🏻 请在下方的输入框进行输入:（留空用默认）"
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+          </div>
+        </div>
+      ) : null}
+
+      {/* 切换内联查询 / 预填内容：运行时回复携带对应 InlineKeyboard 按钮 */}
+      {action?.type === "switch_inline" || action?.type === "switch_inline_current" ? (
+        <div className="space-y-1">
+          <label className="block text-sm font-medium">预填查询内容</label>
+          <input
+            value={action.switch_query ?? ""}
+            onChange={(event) =>
+              update((draft) => {
+                if (!draft.action) draft.action = { type: "switch_inline" };
+                draft.action.switch_query = event.target.value;
+              })
+            }
+            className="flex h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+          />
+          <p className="text-xs text-muted-foreground">
+            点击键盘按钮后机器人发送携带内联按钮的消息：switch_inline 切换到其他聊天并预填；
+            switch_inline_current 在当前聊天输入框预填。
+          </p>
+        </div>
+      ) : null}
+
+      {/* 进入子菜单：嵌套子菜单键盘编辑器（递归；达深度上限不可再建） */}
+      {action?.type === "submenu" ? (
+        button.submenu ? (
+          <SubmenuKeyboardEditor
+            rows={button.submenu.rows}
+            depth={(state.depth ?? 1) + 1}
+            isTgApi={isTgApi}
+            builtinCommands={state.builtinCommands}
+            customCommands={state.customCommands}
+            verificationMethods={state.verificationMethods ?? []}
+            onChangeRows={(rows) =>
+              update((draft) => {
+                if (draft.submenu) draft.submenu.rows = rows;
+              })
+            }
+            onDelete={() =>
+              update((draft) => {
+                delete draft.submenu;
+              })
+            }
+          />
+        ) : (
+          <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed p-3">
+            <span className="text-sm text-muted-foreground">该按钮还没有子菜单键盘。</span>
+            <button
+              type="button"
+              disabled={(state.depth ?? 1) >= CUSTOM_KEYBOARD_MAX_DEPTH}
+              onClick={() =>
+                update((draft) => {
+                  draft.submenu = { rows: [] };
+                })
+              }
+              className="inline-flex h-8 items-center gap-1 rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            >
+              <Plus className="h-4 w-4" /> 创建子菜单键盘
+            </button>
+            {(state.depth ?? 1) >= CUSTOM_KEYBOARD_MAX_DEPTH ? (
+              <span className="text-sm text-red-600">已达到最大层级（{CUSTOM_KEYBOARD_MAX_DEPTH} 层）</span>
+            ) : null}
+          </div>
+        )
+      ) : null}
+
+      {/* 返回上一级：运行时发送上一级键盘 */}
+      {action?.type === "back" ? (
+        <p className="text-sm text-muted-foreground">
+          返回按钮将让机器人发送上一级键盘（子菜单返回父键盘；根键盘层级默认重发主键盘）。
+        </p>
       ) : null}
 
       {/* TGAPI 指令消息配置（发送/成功/失败槽位，双语 {{变量}}） */}
@@ -592,5 +797,156 @@ export function buildKeyboardActionForType(
   if (type === "language") {
     return { action: { type: "language" } };
   }
+  if (type === "url") {
+    return { action: { type: "url", text: "打开链接", url: "https://" } };
+  }
+  if (type === "web_app") {
+    return { action: { type: "web_app", text: "打开 WebApp", url: "https://" } };
+  }
+  if (type === "verify") {
+    return { action: { type: "verify", text: "验证", verify: { method_id: "" } } };
+  }
+  if (type === "switch_inline") {
+    return { action: { type: "switch_inline", text: "分享", switch_query: "" } };
+  }
+  if (type === "switch_inline_current") {
+    return { action: { type: "switch_inline_current", text: "预填内容", switch_query: "" } };
+  }
+  if (type === "submenu") {
+    return { action: { type: "submenu", text: "子菜单" } };
+  }
+  if (type === "back") {
+    return { action: { type: "back", text: "🔙 返回上一级" } };
+  }
   return { action: undefined };
+}
+
+/**
+ * 子菜单键盘编辑器（v2.3 递归组件）：复用 KeyboardRowList 编辑按钮的子菜单键盘，
+ * 子菜单内还可以再建子菜单（深度上限 CUSTOM_KEYBOARD_MAX_DEPTH）。
+ * ReplyKeyboard 语义：进入子菜单 = 机器人发送该子菜单键盘（整键盘替换）。
+ */
+function SubmenuKeyboardEditor({
+  rows,
+  depth,
+  isTgApi,
+  builtinCommands,
+  customCommands,
+  verificationMethods,
+  onChangeRows,
+  onDelete,
+}: {
+  rows: CustomKeyboardRow[];
+  depth: number;
+  isTgApi: boolean;
+  builtinCommands: MenuCommandOption[];
+  customCommands: MenuCommandOption[];
+  verificationMethods: VerificationMethodOption[];
+  onChangeRows: (rows: CustomKeyboardRow[]) => void;
+  onDelete: () => void;
+}) {
+  const counter = useRef(0);
+  const [selected, setSelected] = useState<string | null>(null);
+
+  const config = useMemo<CustomKeyboardConfig>(
+    () => ({ options: emptyKeyboardOptions(), root: { rows } }),
+    [rows],
+  );
+  const mutate = (mutator: (draft: CustomKeyboardConfig) => void): void => {
+    const draft: CustomKeyboardConfig = JSON.parse(JSON.stringify(config));
+    mutator(draft);
+    onChangeRows(draft.root.rows);
+  };
+
+  const state: KeyboardDesignerState = {
+    config,
+    selected,
+    isTgApi,
+    builtinCommands,
+    customCommands,
+    verificationMethods,
+    depth,
+    actions: {
+      addRow: () =>
+        mutate((draft) => {
+          if (draft.root.rows.length >= CUSTOM_KEYBOARD_MAX_ROWS) return;
+          draft.root.rows.push({ id: createKeyboardRowId(), buttons: [] });
+        }),
+      moveRow: (rowIndex, direction) =>
+        mutate((draft) => {
+          const target = rowIndex + direction;
+          if (target < 0 || target >= draft.root.rows.length) return;
+          const [row] = draft.root.rows.splice(rowIndex, 1);
+          draft.root.rows.splice(target, 0, row);
+        }),
+      deleteRow: (rowId) =>
+        mutate((draft) => {
+          draft.root.rows = draft.root.rows.filter((row) => row.id !== rowId);
+        }),
+      addButton: (rowId) => {
+        const id = createKeyboardButtonId(counter);
+        mutate((draft) => {
+          for (const row of draft.root.rows) {
+            if (row.id !== rowId) continue;
+            row.buttons.push({
+              id,
+              text: `按钮 ${row.buttons.length + 1}`,
+              kind: "text",
+              style: "default",
+              ...(isTgApi ? { action: defaultKeyboardAction() } : {}),
+            });
+            break;
+          }
+        });
+        setSelected(id);
+      },
+      selectButton: (buttonId) => setSelected(buttonId),
+      updateButton: (buttonId, mutator) =>
+        mutate((draft) => {
+          const button = findKeyboardButton(draft, buttonId);
+          if (button) mutator(button);
+        }),
+      deleteButton: (buttonId) => {
+        mutate((draft) => {
+          for (const row of draft.root.rows) {
+            row.buttons = row.buttons.filter((item) => item.id !== buttonId);
+          }
+          draft.root.rows = draft.root.rows.filter((row) => row.buttons.length > 0);
+        });
+        setSelected(null);
+      },
+      changeActionType: (buttonId, value) => {
+        mutate((draft) => {
+          const button = findKeyboardButton(draft, buttonId);
+          if (!button) return;
+          if (value === "none") {
+            delete button.action;
+            return;
+          }
+          const next = buildKeyboardActionForType(value, button.action);
+          if (next.action) button.action = next.action;
+        });
+      },
+    },
+  };
+
+  return (
+    <div className="space-y-2 rounded-lg border border-dashed border-primary/40 p-3">
+      <div className="flex items-center justify-between">
+        <p className="flex items-center gap-1 text-sm font-medium">
+          <ChevronRight className="h-4 w-4 text-primary" />
+          子菜单键盘（第 {depth} 层，部署后点击该按钮由机器人发送本键盘替换当前键盘）
+        </p>
+        <ConfirmDialog
+          trigger="删除子菜单"
+          triggerClassName="inline-flex h-8 items-center rounded-md border border-red-200 px-3 text-sm text-red-600 hover:bg-red-50"
+          title="删除该子菜单键盘？"
+          description="子菜单内的全部按钮（含下级子菜单）将一并删除，删除后不可恢复。"
+          confirmLabel="确认删除"
+          onConfirm={onDelete}
+        />
+      </div>
+      <KeyboardRowList state={state} />
+    </div>
+  );
 }

@@ -22,7 +22,7 @@ import {
   findKeyboardButton,
   type KeyboardDesignerState,
 } from "@/components/admin/custom-keyboard-editor";
-import type { MenuCommandOption } from "@/components/admin/menu-designer-editor";
+import type { MenuCommandOption, VerificationMethodOption } from "@/components/admin/menu-designer-editor";
 import {
   defaultTgApiCustomKeyboard,
   type CustomKeyboardButton,
@@ -96,6 +96,7 @@ export function CustomKeyboardDesigner({
   onCancel,
   builtinCommands = [],
   customCommands = [],
+  verificationMethods = [],
   tgapiModeHint,
   renderSimulator,
   extraFields,
@@ -117,6 +118,8 @@ export function CustomKeyboardDesigner({
   onCancel?: () => void;
   builtinCommands?: MenuCommandOption[];
   customCommands?: MenuCommandOption[];
+  /** v2.3 验证方式库（键盘按钮「外部验证 API」动作绑定验证方法，与内嵌按钮同一数据源） */
+  verificationMethods?: VerificationMethodOption[];
   /** TGAPI 模式下的互斥说明 */
   tgapiModeHint?: string;
   /** 宿主替换右侧仿真屏（TGAPI 统一弹窗注入对话流程仿真组件） */
@@ -161,6 +164,8 @@ export function CustomKeyboardDesigner({
     isTgApi,
     builtinCommands,
     customCommands,
+    verificationMethods,
+    depth: 1,
     actions: {
       addRow: () =>
         mutate((draft) => {
@@ -250,6 +255,38 @@ export function CustomKeyboardDesigner({
     const action = button.action;
     if (!action) {
       handleSimAppend("bot", "（该按钮未配置点击后的交互：机器人不会响应）");
+      return;
+    }
+    if (action.gateRequired === true) {
+      handleSimAppend("bot", "🔒 该按钮已开启「门禁解锁」：真实端未解锁用户点击会先收到验证挑战（输码核验），解锁一次永久有效后重新点击执行本功能。");
+    }
+    if (action.type === "url") {
+      handleSimAppend("bot", `🔗 打开链接：${action.url || "（未配置）"}\n（真实端机器人发送携带 URL 内联按钮的消息，点击打开）`);
+      return;
+    }
+    if (action.type === "web_app") {
+      handleSimAppend("bot", `🪟 打开 WebApp：${action.url || "（未配置）"}\n（真实端机器人发送携带 WebApp 内联按钮的消息，私聊中点击直接打开）`);
+      return;
+    }
+    if (action.type === "verify") {
+      handleSimAppend("bot", "🔐 外部验证 API：真实端点击后发送输入提示并要求回复验证码，调用绑定验证方式真实核验（通过放行 / 失败 3 次拒绝）。");
+      return;
+    }
+    if (action.type === "switch_inline" || action.type === "switch_inline_current") {
+      handleSimAppend(
+        "bot",
+        action.type === "switch_inline"
+          ? `↗️ 切换到其他聊天的内联查询（预填：${action.switch_query || "（未配置）"}）`
+          : `⌨️ 在当前聊天输入框预填内容：${action.switch_query || "（未配置）"}`,
+      );
+      return;
+    }
+    if (action.type === "submenu") {
+      handleSimAppend("bot", "📂 进入子菜单：真实端机器人发送子菜单键盘替换当前键盘（在右侧预览中点击子菜单按钮可继续）。");
+      return;
+    }
+    if (action.type === "back") {
+      handleSimAppend("bot", "🔙 返回上一级：真实端机器人发送上一级键盘替换当前键盘。");
       return;
     }
     if (action.type === "reply") {
@@ -522,10 +559,7 @@ export function CustomKeyboardDialog({
       <TgApiGatePanel
         idScope={`bots-kb-${botId}`}
         methods={methods}
-        unlockMode={tgapiCfg.unlockMode}
         verificationMethodId={tgapiCfg.verificationMethodId}
-        starsAmount={tgapiCfg.starsAmount}
-        starsTitle={tgapiCfg.starsTitle}
       />
     ) : undefined;
 

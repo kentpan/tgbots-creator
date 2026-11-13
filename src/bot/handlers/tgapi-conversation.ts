@@ -54,6 +54,11 @@ import {
   sendTgApiStarsInvoice,
   verifyTgApiUnlockCode,
 } from "../tgapi-gate";
+import { ensureGateUnlocked } from "@/bot/composers/gate";
+import { startMenuVerifyFlow } from "@/bot/handlers/menu-verify";
+import { findKeyboardButtonByText, findKeyboardParentRowsByText } from "@/services/custom-keyboard";
+import type { BotFeatureConfig } from "@/services/bot-feature-config";
+import type { MenuCommandRegistry } from "@/services/bot-menu";
 
 /**
  * TGAPI 申请机器人 · 自定义键盘对话流程（v2.2.2；v2.2.7 入口门禁）：
@@ -93,6 +98,22 @@ const TGAPI_GATE_CALLBACK = "tgapi:gate";
 /** 对话上下文（conversations 插件 flavor） */
 type ConvCtx = ConversationFlavor<BotContext>;
 
+
+/** 门禁前置回退（deps.feature 未传入时按「门禁关闭」处理 —— 不拦即放行） */
+function parseBotFeatureConfigFallback(): BotFeatureConfig {
+  return {
+    menu: { enabled: false },
+    gateMenuRequired: false,
+    gateKeyboardRequired: false,
+    gateCommandsRequired: false,
+    commands: { enabled: false, commandIds: [] },
+    keyboard: { enabled: false },
+    gate: { enabled: false, verificationMethodId: null },
+    joinVerify: { enabled: false, methodId: null, override: {} },
+    interfaceMode: "inline",
+  } as BotFeatureConfig;
+}
+
 /** 对话流内子函数的目标上下文（wait 返回的 FilteredContext 与主 ctx 的公共结构） */
 type FlowCtx = {
   reply: ConvCtx["reply"];
@@ -107,6 +128,10 @@ export interface TgApiConversationDeps {
   cfg: TgApiBotConfig;
   botId: bigint;
   keyboard: CustomKeyboardConfig;
+  /** v2.3 指令注册表（键盘按钮「执行指令」动作真实执行；与手输 /指令 同源） */
+  registry?: MenuCommandRegistry;
+  /** v2.3 机器人功能配置（键盘按钮「门禁解锁」/键盘面板门禁开关前置校验） */
+  feature?: BotFeatureConfig;
 }
 
 /** 子流程返回状态：done=回主键盘继续 / restart=整体重来（等价 /start） */
@@ -275,7 +300,9 @@ async function tgapiMainFlow(
         return { func: button.action.tgapi_func ?? "start", action: button.action };
       }
       if (button.action.type === "language") return { func: "language" };
-      return null; // reply/command 键盘动作用户自定义，TGAPI 流程不在此处理
+      // v2.3 通用动作（与消息内嵌按钮同一 MenuButtonAction 模型）：标记 generic，
+      // 由 dispatchGenericKeyboardAction 按 ReplyKeyboard 语义真实承载
+      return { func: "generic", action: button.action };
     }
     const func = COMMAND_FUNC_MAP[text];
     return func ? { func } : null;
@@ -287,6 +314,108 @@ async function tgapiMainFlow(
       parse_mode: "HTML",
       reply_markup: mainMarkup,
     });
+  };
+
+  /**
+   * v2.3 通用键盘动作分发（与消息内嵌按钮同一 MenuButtonAction 模型；
+   * ReplyKeyboard 语义差异：url/web_app/switch_inline* 经回复消息携带对应
+   * InlineKeyboard 按钮真实承载，submenu/back 为整键盘替换）。
+   */
+  const dispatchGenericKeyboardAction = async (
+    evt: FlowCtx,
+    text: string,
+    button: CustomKeyboardButton | null,
+    action: MenuButtonAction,
+  ): Promise<void> => {
+    const label = button?.text ?? text;
+    const chatId = evt.chat?.id;
+    switch (action.type) {
+      case "command": {
+        const target = (action.target ?? "").trim().replace(/^\//, "");
+        const runner = target ? deps.registry?.runners.get(target) : undefined;
+        if (runner) {
+          await runner(evt as unknown as BotContext);
+          return;
+        }
+        await evt.reply(
+          `⚠️ 指令 /${target || "（未指定）"} 不存在或未在「⌨️ 指令菜单」中勾选：请在机器人管理页勾选后保存。`,
+        );
+        return;
+      }
+      case "reply": {
+        const raw = action.content?.text || action.text || "";
+        await evt.reply(renderMenuTemplate(raw, varsFromContext(evt)) || "（未配置回复内容）");
+        return;
+      }
+      case "url": {
+        const url = (action.url ?? "").trim();
+        if (!/^https?:\/\//.test(url) || !chatId) {
+          await evt.reply("⚠️ 该按钮的链接地址未配置或不合法，请联系管理员检查按钮配置。");
+          return;
+        }
+        await evt.api.sendMessage(chatId, action.text || label, {
+          reply_markup: { inline_keyboard: [[{ text: label, url }]] },
+        });
+        return;
+      }
+      case "web_app": {
+        const url = (action.url ?? "").trim();
+        if (!/^https:\/\//.test(url) || !chatId) {
+          await evt.reply("⚠️ WebApp 地址必须为 https，请联系管理员检查按钮配置。");
+          return;
+        }
+        if (evt.chat?.type === "private") {
+          await evt.api.sendMessage(chatId, action.text || label, {
+            reply_markup: { inline_keyboard: [[{ text: label, web_app: { url } }]] },
+          });
+        } else {
+          await evt.api.sendMessage(chatId, `${action.text || label}\n${url}`);
+        }
+        return;
+      }
+      case "verify": {
+        await startMenuVerifyFlow(evt as unknown as BotContext, action.verify ?? { method_id: "" });
+        return;
+      }
+      case "switch_inline":
+      case "switch_inline_current": {
+        const query = action.switch_query ?? "";
+        if (!chatId) return;
+        const inlineButton =
+          action.type === "switch_inline"
+            ? { text: label, switch_inline_query: query }
+            : { text: label, switch_inline_query_current_chat: query };
+        await evt.api.sendMessage(chatId, action.text || label, {
+          reply_markup: { inline_keyboard: [[inlineButton]] },
+        });
+        return;
+      }
+      case "submenu": {
+        if (!button?.submenu || !chatId) return;
+        const submenuConfig: CustomKeyboardConfig = {
+          options: keyboard.options,
+          root: { rows: button.submenu.rows },
+        };
+        await evt.api.sendMessage(chatId, action.text || label, {
+          reply_markup: renderCustomKeyboardMarkup(submenuConfig),
+        });
+        return;
+      }
+      case "back": {
+        if (!chatId) return;
+        const parentRows = findKeyboardParentRowsByText(keyboard, text);
+        const parentConfig: CustomKeyboardConfig = {
+          options: keyboard.options,
+          root: { rows: parentRows },
+        };
+        await evt.api.sendMessage(chatId, action.text || label, {
+          reply_markup: renderCustomKeyboardMarkup(parentConfig),
+        });
+        return;
+      }
+      default:
+        return;
+    }
   };
 
   /** 按按钮 action 里的槽位渲染模板消息（{{变量}} 按真实上下文解析；模板与回落都为空时不发送） */
@@ -705,6 +834,31 @@ async function tgapiMainFlow(
         }
         await evt.reply(texts().unknownInputHint);
         continue;
+      }
+
+      // —— v2.3 通用动作（与消息内嵌按钮同一动作模型）：门禁前置 + ReplyKeyboard 语义承载 ——
+      if (resolved.func === "generic" && resolved.action && text) {
+        const genericAction = resolved.action;
+        const genericButton =
+          buttonByText.get(text) ??
+          (findKeyboardButtonByText(keyboard, text)?.button ?? null);
+        // 门禁前置：按钮勾选「门禁解锁」或键盘面板开关开启 → 未解锁先完成挑战
+        if (
+          genericAction.gateRequired === true ||
+          (deps.feature?.gate.enabled && deps.feature.gateKeyboardRequired)
+        ) {
+          const featureCfg =
+            deps.feature ??
+            (await conversation.external(() => Promise.resolve(null))) ?? undefined;
+          void featureCfg;
+          const gateFeature =
+            deps.feature ??
+            parseBotFeatureConfigFallback();
+          const unlocked = await ensureGateUnlocked(botId, gateFeature, evt as unknown as BotContext);
+          if (!unlocked) continue outer;
+        }
+        await dispatchGenericKeyboardAction(evt, text, genericButton, genericAction);
+        continue outer;
       }
 
       // —— 通用门禁中间件步（tgapi-gate 组件）：按钮声明 tgapi_unlock 且未解锁 → 先过门禁 ——

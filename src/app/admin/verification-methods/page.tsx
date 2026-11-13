@@ -2,9 +2,13 @@ import { listVerificationMethods, type VerificationMethodRow } from "@/database/
 import { formatBeijingDateTimeMinute } from "@/utils/datetime";
 import { requirePermission } from "@/lib/auth";
 import { parseCodeApiConfig } from "@/services/external-verify";
+import {
+  parseMethodConfigByType,
+  parseVerificationParams,
+  verificationMethodTypeLabel,
+} from "@/services/verification-methods";
 import { hasRadsIssueConfig } from "@/services/rads-issue";
 import { CopyField } from "@/components/admin/copy-field";
-import { ConfigPresetButtons } from "@/components/admin/config-presets";
 import { FormDialog } from "@/components/admin/form-dialog";
 import { inputClass, labelClass } from "@/components/admin/form-styles";
 import {
@@ -14,6 +18,7 @@ import {
   testMethodAction,
 } from "./actions";
 import { ConfirmDialog } from "@/components/admin/confirm-dialog";
+import { MethodFormFields } from "@/components/admin/verification-method-form-fields";
 
 export const dynamic = "force-dynamic";
 
@@ -25,46 +30,11 @@ const NOTICES: Record<string, string> = {
 const ERRORS: Record<string, string> = {
   "name-required": "请填写方法名称",
   "invalid-config": "配置 JSON 不合法：需要 url 与 api_key 字段",
+  "invalid-type": "方式类型不合法",
   "invalid-id": "验证方法不存在",
   "code-required": "请输入测试验证码",
   "invalid-price": "交易金额必须是大于等于 0 的数字",
 };
-
-const GENERIC_PRESET = JSON.stringify(
-  {
-    url: "https://api.example.com/members/verify",
-    api_key: "sk-your-apikey",
-    http_method: "POST",
-    body_template: '{"user_id":{{user_id}},"code":"{{code}}"}',
-    success_status: 200,
-    success_field: "valid",
-    success_value: "true",
-    timeout_seconds: 10,
-  },
-  null,
-  2,
-);
-
-const RADS_PRESET = JSON.stringify(
-  {
-    url: "http://127.0.0.1:3001/api/redeem",
-    api_key: "rads-public-redeem",
-    http_method: "POST",
-    body_template: '{"key":"{{code}}"}',
-    success_status: 200,
-    success_field: "ok",
-    success_value: "true",
-    timeout_seconds: 10,
-    rads_base_url: "http://127.0.0.1:3001",
-    rads_issue_key: "ak-86f5b3bc34c3ed383035e40603e159",
-    rads_script_id: 2,
-    rads_title: "TGuard 入群验证卡",
-    rads_price: 9.9,
-    rads_max_uses: 3,
-  },
-  null,
-  2,
-);
 
 // v2.0.13：时间展示统一北京时间（服务器/Edge 运行时时区为 UTC）
 function formatDateTime(date: Date): string {
@@ -81,69 +51,26 @@ function MethodFormDialog({
   triggerClassName?: string;
 }) {
   const fieldId = method ? `config-${String(method.id)}` : "config-new";
+  const parsed = method
+    ? parseMethodConfigByType(method.type, method.config)
+    : null;
+  const defaults = {
+    name: method?.name ?? "",
+    type: method?.type ?? "code_api",
+    config: method?.config ?? "",
+    enabled: method ? method.enabled : true,
+    params: method ? parseVerificationParams(method.config) : {},
+  };
   return (
     <FormDialog
       trigger={trigger}
       triggerClassName={triggerClassName}
       title={method ? `编辑验证方式 · ${method.name}` : "新增验证方式"}
-      description="用户输入验证码后，Bot 使用 Authorization: Bearer <apikey> 请求外部 API 完成核验；对接资源自动交付系统时验证码即 8 位卡密。"
+      description="验证方式是全站唯一的方式定义源：加群验证与门禁解锁都从这里选择方式；默认参数只在这里改，机器人在功能配置弹窗中只能按机器人临时覆盖。"
       action={saveMethodAction}
       submitLabel="保存方法"
     >
-      <input type="hidden" name="id" value={method ? String(method.id) : ""} />
-      <div className="grid gap-4 md:grid-cols-2">
-        <div className="space-y-1">
-          <label className={labelClass} htmlFor={`name-${fieldId}`}>
-            方法名称 *
-          </label>
-          <input
-            id={`name-${fieldId}`}
-            name="name"
-            required
-            defaultValue={method?.name ?? ""}
-            placeholder="例如：外部会员系统核验"
-            className={inputClass}
-          />
-        </div>
-        <div className="flex items-center gap-2 pt-7">
-          <input
-            id={`enabled-${fieldId}`}
-            name="enabled"
-            type="checkbox"
-            value="1"
-            defaultChecked={method ? method.enabled : true}
-            className="h-4 w-4"
-          />
-          <label className={labelClass} htmlFor={`enabled-${fieldId}`}>
-            启用该方法
-          </label>
-        </div>
-      </div>
-      <div className="space-y-2">
-        <label className={labelClass} htmlFor={fieldId}>
-          外部 API 配置（JSON）*
-        </label>
-        <ConfigPresetButtons
-          targetId={fieldId}
-          presets={[
-            { label: "通用外部 API", value: GENERIC_PRESET },
-            { label: "资源自动交付系统（卡密核销）", value: RADS_PRESET },
-          ]}
-        />
-        <textarea
-          id={fieldId}
-          name="config"
-          rows={12}
-          required
-          defaultValue={method?.config ?? GENERIC_PRESET}
-          className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
-        />
-        <p className="text-sm text-muted-foreground">
-          请求自动携带 <span className="font-mono">Authorization: Bearer api_key</span>；
-          <span className="font-mono">{"{{user_id}} {{code}} {{username}}"}</span> 会被替换为实际值；
-          判定规则：HTTP 状态等于 success_status 且响应 JSON 中 success_field 等于 success_value。
-        </p>
-      </div>
+      <MethodFormFields defaults={defaults} fieldId={fieldId} methodId={method ? String(method.id) : null} />
     </FormDialog>
   );
 }
@@ -180,8 +107,10 @@ export default async function VerificationMethodsPage({
         <div>
           <h1 className="text-2xl font-bold">验证方式</h1>
           <p className="text-sm text-muted-foreground">
-            自定义验证方式：用户输入验证码后，Bot 使用 <span className="font-mono">Authorization: Bearer &lt;apikey&gt;</span> 请求外部 API 完成核验。
-            对接资源自动交付系统时，验证码即买家持有的 8 位卡密，Bot 调用其卡密核销接口完成验证。
+            全站唯一的方式定义源：加群验证与门禁解锁都在这里选择方式。
+            「验证码核验 API」= 用户输入验证码后，Bot 用 <span className="font-mono">Authorization: Bearer &lt;apikey&gt;</span> 请求外部接口核验；
+            「自动验证码」= 机器人发码用户回输；「人机验证」= WebApp 验证网页。默认参数只在这里改；
+            机器人在功能配置弹窗中只能按机器人临时覆盖，覆盖不会回写到这里。
           </p>
         </div>
         <MethodFormDialog
@@ -259,21 +188,28 @@ export default async function VerificationMethodsPage({
                 </tr>
               ) : (
                 methods.map((method) => {
+                  const parsedByType = parseMethodConfigByType(method.type, method.config);
+                  // 摘要列：code_api 显示接口地址；内置方式显示固定说明
+                  let summary = "-";
                   let apiUrl = "-";
-                  try {
-                    apiUrl = (JSON.parse(method.config) as { url?: string }).url ?? "-";
-                  } catch {
-                    apiUrl = "-";
+                  if (parsedByType?.kind === "code_api") {
+                    apiUrl = parsedByType.config.url;
+                    summary = apiUrl;
+                  } else if (parsedByType?.kind === "code_self") {
+                    summary = "自动验证码（输入验证码加群）";
+                  } else if (parsedByType?.kind === "captcha") {
+                    summary = "人机验证（WebApp）";
                   }
                   const parsedConfig = parseCodeApiConfig(method.config);
                   const canIssue = parsedConfig ? hasRadsIssueConfig(parsedConfig) : false;
+                  const isCodeApi = method.type === "code_api";
                   return (
                     <tr key={String(method.id)} className="border-b last:border-0">
                       <td className="px-4 py-3 text-sm font-mono">{String(method.id)}</td>
                       <td className="px-4 py-3 text-sm">{method.name}</td>
-                      <td className="px-4 py-3 text-sm">验证码核验 API</td>
-                      <td className="max-w-60 truncate px-4 py-3 font-mono text-sm" title={apiUrl}>
-                        {apiUrl}
+                      <td className="px-4 py-3 text-sm">{verificationMethodTypeLabel(method.type)}</td>
+                      <td className="max-w-60 truncate px-4 py-3 font-mono text-sm" title={summary}>
+                        {summary}
                       </td>
                       <td className="px-4 py-3">
                         <span
@@ -296,29 +232,31 @@ export default async function VerificationMethodsPage({
                             trigger="编辑"
                             triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
                           />
-                          <FormDialog
-                            trigger="测试"
-                            triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
-                            title={`发送测试验证码 · ${method.name}`}
-                            description="直接调用外部 API 验证一次输入的验证码，用于联调。"
-                            action={testMethodAction}
-                            submitLabel="调用外部 API 测试"
-                          >
-                            <input type="hidden" name="id" value={String(method.id)} />
-                            <div className="space-y-1">
-                              <label className={labelClass} htmlFor={`test-${String(method.id)}`}>
-                                测试验证码
-                              </label>
-                              <input
-                                id={`test-${String(method.id)}`}
-                                name="code"
-                                required
-                                placeholder="输入要测试的验证码"
-                                className={inputClass}
-                              />
-                            </div>
-                          </FormDialog>
-                          {canIssue && parsedConfig ? (
+                          {isCodeApi ? (
+                            <>
+                              <FormDialog
+                                trigger="测试"
+                                triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"
+                                title={`发送测试验证码 · ${method.name}`}
+                                description="直接调用外部 API 验证一次输入的验证码，用于联调。"
+                                action={testMethodAction}
+                                submitLabel="调用外部 API 测试"
+                              >
+                                <input type="hidden" name="id" value={String(method.id)} />
+                                <div className="space-y-1">
+                                  <label className={labelClass} htmlFor={`test-${String(method.id)}`}>
+                                    测试验证码
+                                  </label>
+                                  <input
+                                    id={`test-${String(method.id)}`}
+                                    name="code"
+                                    required
+                                    placeholder="输入要测试的验证码"
+                                    className={inputClass}
+                                  />
+                                </div>
+                              </FormDialog>
+                              {canIssue && parsedConfig ? (
                             <FormDialog
                               trigger="发卡"
                               triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm text-primary hover:bg-primary/10"
@@ -362,6 +300,8 @@ export default async function VerificationMethodsPage({
                                 ，可用次数：<span className="font-mono">{parsedConfig.rads_max_uses ?? 3}</span>。
                               </p>
                             </FormDialog>
+                            ) : null}
+                            </>
                           ) : null}
                           <ConfirmDialog
                             title={`删除验证方式「${method.name}」`}

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { opsFetch } from "@/lib/remote-ops";
+import { SplitDeployButton } from "@/components/admin/split-deploy-button";
 import {
   Check,
   ChevronRight,
@@ -70,6 +71,8 @@ function nameColor(name: string): string {
 export interface AppSimGroup {
   chatId: string;
   chatTitle: string;
+  /** v2.3 聊天类型（group/supergroup/channel；未登记=空不显示徽标） */
+  chatType?: string | null;
   enabled: boolean;
   method: string;
   methodId: string | null;
@@ -292,7 +295,7 @@ function DoodleWallpaper() {
   );
 }
 
-type Screen = "chat" | "settings" | "admins" | "proxy" | "newgroup" | "apiconfig" | "botcheck";
+type Screen = "chat" | "settings" | "admins" | "proxy" | "newgroup" | "apiconfig" | "botcheck" | "chattype";
 
 /** v2.1.2 真实群消息（chat_messages 台账，/api/admin/telegram/chat-messages 返回项） */
 export interface RealChatMessage {
@@ -598,7 +601,8 @@ export function TgAppSimulator({
   // —— 群组设置页状态 ——
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
-  const [settingsMethods, setSettingsMethods] = useState<{ id: string; name: string; enabled: boolean }[]>([]);
+  // v2.3 自动审核机器人候选（bots.config.joinVerify.enabled 的机器人，服务端过滤）
+  const [joinVerifyCandidates, setJoinVerifyCandidates] = useState<{ id: string; name: string }[]>([]);
   const [form, setForm] = useState({
     chat_title: "",
     method: "code_self",
@@ -613,6 +617,10 @@ export function TgAppSimulator({
     verification_channel: "auto" as "auto" | "group" | "dm",
     kick_direct_joins: false,
     reply_code_in_group: false,
+    /** v2.3 新成员审核（审批制入群）开关 */
+    require_approval: false,
+    /** v2.3 自动审核机器人（"" = 手动审核） */
+    join_verify_bot_id: "",
   });
 
   const loadGroupSettings = useCallback(async (chatId: string): Promise<void> => {
@@ -628,20 +636,14 @@ export function TgAppSimulator({
         data?: {
           settings: {
             chat_title: string | null;
-            method: string;
-            method_id: string | null;
-            timeout_seconds: number;
-            max_attempts: number;
+            enabled: boolean;
             prompt_text: string;
             success_text: string;
             failure_text: string;
-            enabled: boolean;
-            privacy_mode: boolean;
-            verification_channel?: string;
-            kick_direct_joins?: boolean;
-            reply_code_in_group?: boolean;
+            require_approval?: boolean;
+            join_verify_bot_id?: string | null;
           } | null;
-          methods: { id: string; name: string; enabled: boolean }[];
+          join_verify_candidates?: { id: string; name: string }[];
         };
       }>(response);
       if (!payload) {
@@ -652,28 +654,18 @@ export function TgAppSimulator({
         showFlash(false, payload.error ?? "读取群组配置失败");
         return;
       }
-      setSettingsMethods(payload.data.methods);
+      setJoinVerifyCandidates(payload.data.join_verify_candidates ?? []);
       const settings = payload.data.settings;
-      setForm({
+      setForm((prev) => ({
+        ...prev,
         chat_title: settings?.chat_title ?? "",
-        method: settings?.method ?? "code_self",
-        method_id: settings?.method_id ?? "",
-        timeout_seconds: settings?.timeout_seconds ?? 300,
-        max_attempts: settings?.max_attempts ?? 3,
+        enabled: settings?.enabled ?? true,
         prompt_text: settings?.prompt_text ?? "",
         success_text: settings?.success_text ?? "",
         failure_text: settings?.failure_text ?? "",
-        enabled: settings?.enabled ?? true,
-        privacy_mode: settings?.privacy_mode ?? true,
-        verification_channel:
-          settings?.verification_channel === "dm"
-            ? "dm"
-            : settings?.verification_channel === "group"
-              ? "group"
-              : "auto",
-        kick_direct_joins: settings?.kick_direct_joins ?? false,
-        reply_code_in_group: settings?.reply_code_in_group ?? false,
-      });
+        require_approval: settings?.require_approval ?? false,
+        join_verify_bot_id: settings?.join_verify_bot_id ?? "",
+      }));
     } catch (error) {
       showFlash(false, error instanceof Error ? error.message : "读取群组配置失败");
     } finally {
@@ -697,19 +689,13 @@ export function TgAppSimulator({
         body: JSON.stringify({
           chat_id: activeChatId,
           chat_title: form.chat_title,
-          method: form.method,
-          // 透传所选绑定方法（服务端与群组管理 saveGroupAction 同语义落库保留）
-          method_id: form.method_id || null,
-          timeout_seconds: Number(form.timeout_seconds) || 300,
-          max_attempts: Number(form.max_attempts) || 3,
+          // v2.3：验证方式配置已迁机器人级，群级只保存 文案 + 新成员审核 + 自动审核机器人
           prompt_text: form.prompt_text,
           success_text: form.success_text,
           failure_text: form.failure_text,
           enabled: form.enabled,
-          privacy_mode: form.privacy_mode,
-          verification_channel: form.verification_channel,
-          kick_direct_joins: form.kick_direct_joins,
-          reply_code_in_group: form.reply_code_in_group,
+          require_approval: form.require_approval,
+          join_verify_bot_id: form.join_verify_bot_id || null,
         }),
       });
       const payload = await readJson<{ ok: boolean; error?: string }>(response);
@@ -721,7 +707,7 @@ export function TgAppSimulator({
         showFlash(false, payload.error ?? "保存失败");
         return;
       }
-      showFlash(true, "群组配置已保存（与群组管理同源生效）");
+      showFlash(true, "群组配置已保存（新成员审核与自动审核机器人即时生效）");
       onSettingsSaved();
       // iOS 群组信息语义：右上角 ✓ = 保存并返回上一页（聊天区）
       setScreen("chat");
@@ -1245,13 +1231,12 @@ export function TgAppSimulator({
     [activeChatId, inviteBusyId, selectedBotId, showFlash, loadInviteLinks],
   );
 
-  // 打开权限浮层时加载当前机器人对该群的权限 + 邀请链接台账
+  // 打开权限浮层时加载当前机器人对该群的权限（邀请链接台账已迁到群组类型子屏）
   useEffect(() => {
     if (screen === "admins" && activeChatId) {
       void loadBotAdmins(activeChatId);
-      void loadInviteLinks(activeChatId);
     }
-  }, [screen, activeChatId, loadBotAdmins, loadInviteLinks]);
+  }, [screen, activeChatId, loadBotAdmins]);
 
   // —— 邀请链接聚合面板（群组信息「邀请链接」行上滑；与群组管理弹窗同一台账 API） ——
   // 全创建者视角：不带 bot_id 过滤，列出该群全部已创建链接（真实台账数据，
@@ -1433,177 +1418,45 @@ export function TgAppSimulator({
               />
             </div>
 
-            {/* 加群验证配置（功能与群组管理完全一致） */}
+            {/* v2.3 加群审核（新成员审核开关 + 自动审核机器人指定；验证方式已迁机器人级配置） */}
             <div className="overflow-hidden rounded-xl bg-white">
-              <div className="px-4 pt-3 pb-1 text-[13px]" style={{ color: IOS_TEXT_SECONDARY }}>
-                加群验证配置（与「群组管理」同一数据源）
-              </div>
               <div className="flex items-center justify-between px-4 py-2.5">
-                <span className="text-[17px] text-black">启用验证</span>
-                <Switch
-                  checked={form.enabled}
-                  onCheckedChange={(checked) => setForm((prev) => ({ ...prev, enabled: checked }))}
-                  className="data-[state=checked]:bg-[#34c759]"
-                  aria-label="启用验证"
-                />
-              </div>
-              <div className="border-t border-black/[0.06] px-4 py-2.5">
-                <p className="mb-2 text-[17px] text-black">验证渠道</p>
-                <div className="flex rounded-lg bg-black/[0.05] p-0.5">
-                  {([
-                    { value: "auto", label: "自动" },
-                    { value: "group", label: "群内验证" },
-                    { value: "dm", label: "私聊验证" },
-                  ] as const).map((option) => (
-                    <button
-                      key={option.value}
-                      type="button"
-                      onClick={() => setForm((prev) => ({ ...prev, verification_channel: option.value }))}
-                      className={`flex-1 rounded-[7px] py-1.5 text-[13px] font-medium transition-all ${
-                        form.verification_channel === option.value
-                          ? "bg-white text-black shadow-sm"
-                          : "text-[#8e8e93]"
-                      }`}
-                    >
-                      {option.label}
-                    </button>
-                  ))}
-                </div>
-                <p className="mt-1.5 text-[12px] leading-relaxed text-[#8e8e93]">
-                  {form.verification_channel === "group"
-                    ? "群内验证：申请后自动进群，在群内点击按钮完成验证（输入内容其他成员不可见），超时未验证移出群组"
-                    : form.verification_channel === "dm"
-                      ? "私聊验证：验证提示通过机器人私聊发送（用户须先启动机器人），群内零消息"
-                      : "自动（默认）：超级群/频道 → 群内验证；基础群 → 私聊验证（Telegram 限制：基础群不支持申请制入群）"}
-                </p>
-              </div>
-              {/* 直连入群踢出开关（默认关闭）：公开邀请链接/被拉入群的已有用户超时/失败是否移出 */}
-              <div className="flex items-center justify-between border-t border-black/[0.06] px-4 py-2.5">
                 <span className="text-[17px] leading-snug text-black">
-                  直连入群超时踢出
-                  <span className="block text-[12px] text-[#8e8e93]">
-                    默认关闭：邀请链接/被拉入群的成员验证超时或失败后保留在群内
+                  新成员审核
+                  <span className="block text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+                    开启后入群需要审核：部署生成的邀请链接变为「申请制」，申请由下方自动审核机器人自动验证，或人工审批
                   </span>
                 </span>
                 <Switch
-                  checked={form.kick_direct_joins}
-                  onCheckedChange={(checked) => setForm((prev) => ({ ...prev, kick_direct_joins: checked }))}
+                  checked={form.require_approval}
+                  onCheckedChange={(checked) => setForm((prev) => ({ ...prev, require_approval: checked }))}
                   className="data-[state=checked]:bg-[#34c759]"
-                  aria-label="直连入群超时踢出"
+                  aria-label="新成员审核"
                 />
               </div>
-              {/* v2.1.5 群内回复输码快速验证（默认关闭）：force_reply 定位输入框 + 验证后自动删除消息 */}
-              <div className="flex items-center justify-between border-t border-black/[0.06] px-4 py-2.5">
-                <span className="text-[17px] leading-snug text-black">
-                  群内回复输码快速验证
-                  <span className="block text-[12px] text-[#8e8e93]">
-                    默认关闭：开启后群内提示送达即定位输入框，回复输码后自动删除验证码消息
-                  </span>
-                </span>
-                <Switch
-                  checked={form.reply_code_in_group}
-                  onCheckedChange={(checked) => setForm((prev) => ({ ...prev, reply_code_in_group: checked }))}
-                  className="data-[state=checked]:bg-[#34c759]"
-                  aria-label="群内回复输码快速验证"
-                />
-              </div>
-              <div className="border-t border-black/[0.06] px-4 py-2.5">
-                <p className="mb-2 text-[17px] text-black">验证方式</p>
-                <div className="flex rounded-lg bg-black/[0.05] p-0.5">
-                  {[
-                    { value: "code_self", label: "自动验证码" },
-                    { value: "captcha", label: "人机验证" },
-                    { value: "code_api", label: "外部API" },
-                  ].map((option) => (
-                    <button
-                      key={option.value}
-                      type="button"
-                      onClick={() => setForm((prev) => ({ ...prev, method: option.value }))}
-                      className={`flex-1 rounded-[7px] py-1.5 text-[13px] font-medium transition-all ${
-                        form.method === option.value
-                          ? "bg-white text-black shadow-sm"
-                          : "text-[#8e8e93]"
-                      }`}
-                    >
-                      {option.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              {form.method === "code_api" ? (
+              {form.require_approval ? (
                 <div className="border-t border-black/[0.06] px-4 py-2.5">
-                  <p className="mb-1.5 text-[17px] text-black">绑定验证方法</p>
+                  <p className="mb-1.5 text-[17px] text-black">自动审核机器人</p>
                   <select
-                    value={form.method_id}
-                    onChange={(event) => setForm((prev) => ({ ...prev, method_id: event.target.value }))}
+                    value={form.join_verify_bot_id}
+                    onChange={(event) =>
+                      setForm((prev) => ({ ...prev, join_verify_bot_id: event.target.value }))
+                    }
                     className="h-10 w-full rounded-lg border border-black/10 bg-white px-2 text-[15px] text-black outline-none"
                   >
-                    <option value="">请选择验证方法</option>
-                    {settingsMethods.map((method) => (
-                      <option key={method.id} value={method.id}>
-                        #{method.id} {method.name}（{method.enabled ? "启用" : "停用"}）
+                    <option value="">手动审核（在「加群申请」页人工审批）</option>
+                    {joinVerifyCandidates.map((bot) => (
+                      <option key={bot.id} value={bot.id}>
+                        {bot.name}（自动验证加群申请）
                       </option>
                     ))}
                   </select>
-                  {/* v2.1.2 验证 API 配置入口：URL + apikey + 传参 + 响应解析 + 联调测试（与「验证方式」页同源） */}
-                  <button
-                    type="button"
-                    onClick={() => setScreen("apiconfig")}
-                    className="mt-2 flex w-full cursor-pointer items-center gap-2 rounded-lg bg-[#3390ec]/10 px-3 py-2.5 text-left transition-transform active:scale-[0.99]"
-                  >
-                    <Settings2 className="h-4 w-4 shrink-0 text-[#3390ec]" />
-                    <span className="min-w-0 flex-1">
-                      <span className="block text-[15px] font-medium text-[#3390ec]">配置外部验证 API</span>
-                      <span className="block truncate text-[12px] text-[#8e8e93]">
-                        {apiConfigMethodName
-                          ? `${apiConfigMethodName}（方法 #${apiConfigMethodId ?? "-"}）· 点击修改`
-                          : "验证 API 地址 / Bearer apikey / 传参 / 响应解析 / 超时"}
-                      </span>
-                    </span>
-                    <ChevronRight className="h-4 w-4 shrink-0 text-[#c7c7cc]" />
-                  </button>
+                  <p className="mt-1.5 text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+                    列表只显示已开启「自动响应加群申请」的机器人；机器人未出现？到
+                    机器人管理 → 功能配置 开启「自动响应加群申请」并选择验证方式，然后点「部署」更新运行实例。
+                  </p>
                 </div>
               ) : null}
-              <div className="flex items-center justify-between border-t border-black/[0.06] px-4 py-2.5">
-                <span className="text-[17px] text-black">验证超时（秒）</span>
-                <input
-                  type="number"
-                  min={30}
-                  value={form.timeout_seconds}
-                  onChange={(event) =>
-                    setForm((prev) => ({ ...prev, timeout_seconds: Number(event.target.value) }))
-                  }
-                  className="w-24 rounded-lg bg-black/[0.04] px-2 py-1.5 text-right text-[16px] text-black outline-none"
-                  aria-label="验证超时秒数"
-                />
-              </div>
-              <div className="flex items-center justify-between border-t border-black/[0.06] px-4 py-2.5">
-                <span className="text-[17px] text-black">最大尝试次数</span>
-                <input
-                  type="number"
-                  min={1}
-                  value={form.max_attempts}
-                  onChange={(event) =>
-                    setForm((prev) => ({ ...prev, max_attempts: Number(event.target.value) }))
-                  }
-                  className="w-24 rounded-lg bg-black/[0.04] px-2 py-1.5 text-right text-[16px] text-black outline-none"
-                  aria-label="最大尝试次数"
-                />
-              </div>
-              <div className="flex items-center justify-between border-t border-black/[0.06] px-4 py-2.5">
-                <span className="text-[17px] leading-snug text-black">
-                  隐私模式
-                  <span className="block text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
-                    机器人在群里怎么收验证码。开启（默认）：入群者「回复」机器人发的验证消息提交验证码，机器人只收得到回复，无需读取群内普通消息的权限；关闭：入群者直接在群里发验证码，但机器人必须能读到群内全部消息（需 BotFather 关闭隐私模式或设为群管理员）
-                  </span>
-                </span>
-                <Switch
-                  checked={form.privacy_mode}
-                  onCheckedChange={(checked) => setForm((prev) => ({ ...prev, privacy_mode: checked }))}
-                  className="data-[state=checked]:bg-[#34c759]"
-                  aria-label="隐私模式"
-                />
-              </div>
             </div>
 
             {/* 验证文案（与群组管理同源） */}
@@ -1634,7 +1487,11 @@ export function TgAppSimulator({
 
             {/* 群组信息行（v2.2.7：右侧全部为展示时实时获取的真实状态，无硬编码假数据） */}
             <div className="overflow-hidden rounded-xl bg-white">
-              <div className="flex items-center gap-3 border-b border-black/[0.06] px-4 py-2.5">
+              <button
+                type="button"
+                onClick={() => setScreen("chattype")}
+                className="flex w-full cursor-pointer items-center gap-3 border-b border-black/[0.06] px-4 py-2.5 text-left"
+              >
                 <IosRowIcon bg="#3390ec">
                   <Users className="h-4 w-4" />
                 </IosRowIcon>
@@ -1643,7 +1500,7 @@ export function TgAppSimulator({
                   {chatStateValue("type")}
                 </span>
                 <ChevronRight className="h-4 w-4 text-[#c7c7cc]" />
-              </div>
+              </button>
               <div className="flex items-center gap-3 border-b border-black/[0.06] px-4 py-2.5">
                 <IosRowIcon bg="#34c759">
                   <MessageSquareText className="h-4 w-4" />
@@ -1801,70 +1658,6 @@ export function TgAppSimulator({
               ))}
             </div>
 
-            {/* 机器人创建的邀请链接台账（与群组管理邀请链接弹窗同一 API） */}
-            <div className="overflow-hidden rounded-xl bg-white">
-              <div className="flex items-center justify-between px-4 py-2.5">
-                <span className="text-[17px] text-black">
-                  邀请链接
-                  <span className="block text-[12px] text-[#8e8e93]">
-                    机器人创建的入群邀请链接（台账）
-                  </span>
-                </span>
-                {inviteLinksLoading ? (
-                  <Loader2 className="h-4 w-4 animate-spin text-[#8e8e93]" />
-                ) : (
-                  <span className="text-[13px]" style={{ color: IOS_TEXT_SECONDARY }}>
-                    {inviteLinks.length} 条
-                  </span>
-                )}
-              </div>
-              {inviteLinks.length > 0 ? (
-                inviteLinks.map((entry, index) => (
-                  <div
-                    key={entry.id}
-                    className="border-t border-black/[0.06]"
-                  >
-                    <div className="flex items-center gap-3 px-4 py-2.5">
-                      <div className="min-w-0 flex-1">
-                        <p
-                          className="truncate font-mono text-[13px] text-black"
-                          title={entry.link}
-                        >
-                          {entry.link}
-                        </p>
-                        <p className="mt-0.5 truncate text-[12px]" style={{ color: IOS_TEXT_SECONDARY }}>
-                          <ListTime iso={entry.created_time} />
-                          {" · "}
-                          {entry.is_revoked ? "已撤销/失效" : "有效"}
-                          {entry.name ? ` · ${entry.name}` : ""}
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => void deleteInviteLink(entry.id)}
-                        disabled={inviteBusyId === entry.id}
-                        aria-label="删除邀请链接记录"
-                        className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-full text-[#ff3b30] transition-transform active:scale-90 disabled:opacity-50"
-                      >
-                        {inviteBusyId === entry.id ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <Trash2 className="h-4 w-4" />
-                        )}
-                      </button>
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <div
-                  className="border-t border-black/[0.06] px-4 py-4 text-center text-[13px]"
-                  style={{ color: IOS_TEXT_SECONDARY }}
-                >
-                  暂无记录：机器人在该群创建邀请链接后会自动登记
-                </div>
-              )}
-            </div>
-
             <p className="px-1 text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
               「添加成员（邀请用户）」是一键部署生成申请制入群链接的必需权限。
             </p>
@@ -1890,6 +1683,151 @@ export function TgAppSimulator({
             "保存更改"
           )}
         </button>
+      </div>
+    </div>
+  );
+
+  // —— v2.3 群组类型左滑子屏（真实展示，无修改 API 的项绝不提供假开关） ——
+  // 公开群分享链接 = t.me/<username>（getChat 实时读取）；私密群 = 邀请链接台账真实链接
+  const publicShareLink =
+    chatState && chatState.active_usernames.length > 0
+      ? `https://t.me/${chatState.active_usernames[0]}`
+      : null;
+  const primaryInviteLink =
+    allInviteLinks.find((entry) => !entry.is_revoked)?.link ?? null;
+  const [chatTypeLinkCopied, setChatTypeLinkCopied] = useState(false);
+  const copyChatTypeLink = useCallback(async (link: string): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(link);
+      setChatTypeLinkCopied(true);
+      window.setTimeout(() => setChatTypeLinkCopied(false), 2000);
+    } catch (error) {
+      console.error("复制分享链接失败:", error);
+      showFlash(false, "复制失败：请手动长按链接复制");
+    }
+  }, [showFlash]);
+
+  const chatTypeOverlay = (
+    <div className="flex h-full flex-col" style={{ backgroundColor: IOS_GRAY_BG }}>
+      <div className="flex items-center justify-between border-b border-black/[0.06] bg-white/85 px-3 py-2 backdrop-blur">
+        <button
+          type="button"
+          onClick={() => setScreen("settings")}
+          aria-label="返回群组设置"
+          className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] text-black transition-transform active:scale-95"
+        >
+          <X className="h-5 w-5" />
+        </button>
+        <span className="text-[17px] font-semibold text-black">群组类型</span>
+        <span className="h-9 w-9" aria-hidden />
+      </div>
+
+      <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+        {/* 当前真实类型（getChat 展示时实时读取，绝不硬编码） */}
+        <div className="space-y-2 rounded-xl bg-white px-4 py-3">
+          <div className="flex items-center justify-between">
+            <span className="text-[17px] text-black">当前类型</span>
+            <span className="text-[15px]" style={{ color: IOS_TEXT_SECONDARY }}>
+              {chatStateLoading ? "…" : chatStateValue("type")}
+            </span>
+          </div>
+          {chatStateLoading ? null : chatStateError ? (
+            <p className="text-[12px] leading-relaxed text-amber-700">实时状态获取失败：{chatStateError}</p>
+          ) : null}
+          <p className="text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+            Telegram Bot API 未开放「修改群组类型 / 用户名」接口，类型只能在 Telegram 客户端的群管理中切换；
+            这里展示的是实时真实状态。
+          </p>
+        </div>
+
+        {/* 真实分享链接 */}
+        <div className="space-y-2 rounded-xl bg-white px-4 py-3">
+          <p className="text-[15px] font-medium text-black">分享链接</p>
+          {publicShareLink ? (
+            <div className="flex items-center gap-2">
+              <span className="min-w-0 flex-1 truncate text-[15px] text-[#3390ec]" title={publicShareLink}>
+                {publicShareLink}
+              </span>
+              <button
+                type="button"
+                onClick={() => void copyChatTypeLink(publicShareLink)}
+                className="shrink-0 rounded-md bg-[#3390ec]/10 px-3 py-1.5 text-[13px] font-medium text-[#3390ec]"
+              >
+                {chatTypeLinkCopied ? "已复制" : "复制"}
+              </button>
+            </div>
+          ) : primaryInviteLink ? (
+            <div className="flex items-center gap-2">
+              <span className="min-w-0 flex-1 truncate text-[15px] text-[#3390ec]" title={primaryInviteLink}>
+                {primaryInviteLink}
+              </span>
+              <button
+                type="button"
+                onClick={() => void copyChatTypeLink(primaryInviteLink)}
+                className="shrink-0 rounded-md bg-[#3390ec]/10 px-3 py-1.5 text-[13px] font-medium text-[#3390ec]"
+              >
+                {chatTypeLinkCopied ? "已复制" : "复制"}
+              </button>
+            </div>
+          ) : (
+            <p className="text-[13px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+              私密群还没有可用的邀请链接：点下方「邀请链接」生成，或回到群组列表点「部署」自动生成。
+            </p>
+          )}
+          <p className="text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+            {publicShareLink
+              ? "公开群：任何人都能通过用户名链接找到本群；开启「新成员审核」后搜索进入同样需要审批。"
+              : "私密群：只能通过邀请链接进入；链接是否需要审批由「新成员审核」开关决定（返回上一页设置）。"}
+          </p>
+        </div>
+
+        {/* 邀请链接模块（自管理员子屏迁入：台账真实数据 + 上滑面板） */}
+        <button
+          type="button"
+          onClick={() => setInviteSheetOpen(true)}
+          className="flex w-full cursor-pointer items-center gap-3 rounded-xl bg-white px-4 py-3 text-left transition-transform active:scale-[0.99]"
+        >
+          <IosRowIcon bg="#f5a623">
+            <Link2 className="h-4 w-4" />
+          </IosRowIcon>
+          <span className="flex-1 text-[17px] text-black">邀请链接</span>
+          <span className="text-[17px]" style={{ color: IOS_TEXT_SECONDARY }}>
+            {allInviteLoading ? "…" : String(allInviteLinks.length)}
+          </span>
+          <ChevronRight className="h-4 w-4 text-[#c7c7cc]" />
+        </button>
+
+        {/* 只读真实状态项（Telegram 未开放机器人写入，绝不提供假开关） */}
+        <div className="overflow-hidden rounded-xl bg-white">
+          <div className="flex items-center justify-between border-b border-black/[0.06] px-4 py-2.5">
+            <span className="text-[15px] leading-snug text-black">
+              群级「审核新成员」
+              <span className="block text-[12px]" style={{ color: IOS_TEXT_SECONDARY }}>
+                影响公开搜索入口是否需要审批；需在 Telegram 客户端群管理中操作（Bot API 只读）
+              </span>
+            </span>
+            <span className="text-[13px]" style={{ color: IOS_TEXT_SECONDARY }}>
+              {chatStateLoading ? "…" : "客户端设置"}
+            </span>
+          </div>
+          <div className="flex items-center justify-between px-4 py-2.5">
+            <span className="text-[15px] leading-snug text-black">
+              限制保存内容
+              <span className="block text-[12px]" style={{ color: IOS_TEXT_SECONDARY }}>
+                禁止转发/保存群内内容；需在 Telegram 客户端群管理中操作（Bot API 只读）
+              </span>
+            </span>
+            <span className="text-[13px]" style={{ color: IOS_TEXT_SECONDARY }}>
+              {chatStateLoading
+                ? "…"
+                : chatState
+                  ? chatState.has_protected_content
+                    ? "已开启"
+                    : "未开启"
+                  : "—"}
+            </span>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -2393,6 +2331,20 @@ export function TgAppSimulator({
               {adminsOverlay}
             </motion.div>
           ) : null}
+          {/* v2.3 群组类型左滑子屏（与机器人管理员权限子屏同一交互模式） */}
+          {screen === "chattype" ? (
+            <motion.div
+              key="chattype"
+              variants={OVERLAY_VARIANTS}
+              initial="enter"
+              animate="center"
+              exit="exit"
+              transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
+              className="absolute inset-0 z-40"
+            >
+              {chatTypeOverlay}
+            </motion.div>
+          ) : null}
           {/* v2.1.2 外部验证 API 配置浮层 */}
           {screen === "apiconfig" ? (
             <motion.div
@@ -2699,6 +2651,27 @@ export function TgAppSimulator({
                             }`}
                           >
                             {group.chatTitle || `群组 ${group.chatId}`}
+                            {group.chatType === "channel" ? (
+                              <span
+                                className={`ml-1.5 rounded px-1 py-0.5 align-middle text-[10px] font-medium ${
+                                  isSelected
+                                    ? "bg-white/25 text-white"
+                                    : "bg-purple-100 text-purple-700"
+                                }`}
+                              >
+                                📢 频道
+                              </span>
+                            ) : group.chatType === "group" || group.chatType === "supergroup" ? (
+                              <span
+                                className={`ml-1.5 rounded px-1 py-0.5 align-middle text-[10px] font-medium ${
+                                  isSelected
+                                    ? "bg-white/25 text-white"
+                                    : "bg-sky-100 text-sky-700"
+                                }`}
+                              >
+                                👥 群组
+                              </span>
+                            ) : null}
                             {group.enabled ? null : (
                               <span
                                 className={`ml-1.5 rounded px-1 py-0.5 align-middle text-[10px] font-medium ${
@@ -2732,35 +2705,15 @@ export function TgAppSimulator({
                         </div>
                       </div>
                     </button>
-                    {/* 每个群组底部的操作行：一键部署 / 模拟加群申请 */}
-                    <div className="flex gap-2 px-3 pb-2.5">
-                      <button
-                        type="button"
-                        onClick={() => void handleDeploy(group.chatId)}
-                        disabled={deployingChatId === group.chatId}
-                        className={`flex h-[30px] flex-1 items-center justify-center gap-1.5 rounded-lg text-[13px] font-medium transition-colors ${
-                          group.deployed
-                            ? "border border-[#34c759]/40 bg-[#34c759]/10 text-[#1e8e3e]"
-                            : "bg-[#3390ec]/10 text-[#3390ec]"
-                        } disabled:opacity-60`}
-                        title={group.deployed ? "已部署：重新校验并刷新入群申请链接" : "校验机器人身份并生成申请制入群链接"}
-                      >
-                        {deployingChatId === group.chatId ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <Rocket className="h-3.5 w-3.5" />
-                        )}
-                        {group.deployed ? "重新部署" : "一键部署"}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void onSimulateJoinForGroup(group.chatId)}
-                        className="flex h-[30px] flex-1 items-center justify-center gap-1.5 rounded-lg bg-black/[0.05] text-[13px] font-medium text-[#3b4a54] transition-colors hover:bg-black/[0.09]"
-                        title="以模拟用户身份发起加群申请，由加群验证机器人接管验证"
-                      >
-                        <PlayCircle className="h-3.5 w-3.5" />
-                        模拟加群申请
-                      </button>
+                    {/* 每个群组底部的操作行：分体部署按钮（主点击=部署该群全部机器人管理员；▾=单选，已部署绿√） */}
+                    <div className="flex px-3 pb-2.5">
+                      <GroupDeployButton
+                        chatId={group.chatId}
+                        fallbackDeployed={group.deployed}
+                        fallbackBusy={deployingChatId === group.chatId}
+                        onDeployChat={handleDeploy}
+                        showFlash={showFlash}
+                      />
                     </div>
                   </div>
                 );
@@ -3110,5 +3063,146 @@ export function TgAppSimulator({
         ) : null}
       </AnimatePresence>
     </div>
+  );
+}
+
+/**
+ * v2.3 群组列表分体部署按钮（自包含子组件）：
+ * - 主点击 = 部署该群全部机器人管理员（逐个真实调用 deploy API，逐个回显结果）；
+ * - ▾浮层 = 该群机器人管理员列表（group-bots API 真实数据），单选部署，已部署绿√；
+ * - 部署状态判定与列表徽章同一来源（group_bot_admins.rights 部署状态）。
+ */
+function GroupDeployButton({
+  chatId,
+  fallbackDeployed,
+  fallbackBusy,
+  onDeployChat,
+  showFlash,
+}: {
+  chatId: string;
+  /** 当前选中机器人的部署状态（浮层未加载时的回退判定） */
+  fallbackDeployed: boolean;
+  fallbackBusy: boolean;
+  /** 父组件单机器人部署（当前选中机器人，含迁移刷新等副作用） */
+  onDeployChat: (chatId: string) => Promise<void>;
+  showFlash: (ok: boolean, text: string) => void;
+}) {
+  const [bots, setBots] = useState<{ id: string; name: string; deployed: boolean }[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [mainBusy, setMainBusy] = useState(false);
+  const [busyBotId, setBusyBotId] = useState<string | null>(null);
+
+  const loadBots = useCallback(async (): Promise<void> => {
+    try {
+      const response = await opsFetch(
+        `/api/admin/bots/testing/group-bots?chat_id=${encodeURIComponent(chatId)}`,
+        { cache: "no-store" },
+      );
+      const payload = (await response.json()) as {
+        ok: boolean;
+        error?: string;
+        data?: { items: { id: string; name: string; deployed: boolean }[] };
+      };
+      if (!payload.ok || !payload.data) {
+        showFlash(false, payload.error ?? "读取群组机器人列表失败");
+        return;
+      }
+      setBots(payload.data.items);
+      setLoaded(true);
+    } catch (error) {
+      showFlash(false, error instanceof Error ? error.message : "读取群组机器人列表失败");
+    }
+  }, [chatId, showFlash]);
+
+  const deployOne = useCallback(
+    async (botId: string, botName: string): Promise<boolean> => {
+      try {
+        const response = await opsFetch("/api/admin/bots/testing/deploy", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ bot_id: botId, chat_id: chatId }),
+        });
+        const payload = (await response.json()) as { ok: boolean; error?: string; stage?: string; reused?: boolean };
+        if (!payload.ok) {
+          showFlash(false, `${botName}：${payload.error ?? "部署校验失败"}`);
+          return false;
+        }
+        if (payload.stage === "deployed") {
+          showFlash(true, `${botName}：${payload.reused ? "复用已生成的有效邀请链接" : "入群申请链接已生成并保存"}`);
+          return true;
+        }
+        showFlash(false, `${botName}：部署校验未通过（${payload.stage ?? "未知阶段"}），请按部署面板指引操作`);
+        return false;
+      } catch (error) {
+        showFlash(false, `${botName}：${error instanceof Error ? error.message : "部署失败"}`);
+        return false;
+      }
+    },
+    [chatId, showFlash],
+  );
+
+  const deployAll = useCallback(async (): Promise<void> => {
+    if (mainBusy) return;
+    setMainBusy(true);
+    try {
+      let list = bots;
+      if (!loaded) {
+        try {
+          const response = await opsFetch(
+            `/api/admin/bots/testing/group-bots?chat_id=${encodeURIComponent(chatId)}`,
+            { cache: "no-store" },
+          );
+          const payload = (await response.json()) as {
+            ok: boolean;
+            data?: { items: { id: string; name: string; deployed: boolean }[] };
+          };
+          if (payload.ok && payload.data) {
+            list = payload.data.items;
+            setBots(list);
+            setLoaded(true);
+          }
+        } catch {
+          /* 加载失败时回退：部署当前选中机器人 */
+        }
+      }
+      if (list.length === 0) {
+        // 该群没有机器人管理员登记（如基础群未登记）：回退部署当前选中机器人
+        await onDeployChat(chatId);
+        return;
+      }
+      let okCount = 0;
+      for (const bot of list) {
+        setBusyBotId(bot.id);
+        if (await deployOne(bot.id, bot.name)) okCount += 1;
+      }
+      setBusyBotId(null);
+      showFlash(okCount === list.length, `部署完成：${okCount}/${list.length} 个机器人成功`);
+      await loadBots();
+    } finally {
+      setMainBusy(false);
+      setBusyBotId(null);
+    }
+  }, [bots, loaded, chatId, mainBusy, onDeployChat, deployOne, showFlash, loadBots]);
+
+  const allDeployed = loaded && bots.length > 0 ? bots.every((bot) => bot.deployed) : fallbackDeployed;
+
+  return (
+    <SplitDeployButton
+      mainLabel={allDeployed ? "重新部署所有机器人" : "一键部署所有机器人"}
+      mainBusy={mainBusy || fallbackBusy}
+      onMain={() => void deployAll()}
+      items={bots.map((bot) => ({ id: bot.id, label: bot.name, deployed: bot.deployed }))}
+      itemBusyId={busyBotId}
+      onSelectItem={(botId) => {
+        const bot = bots.find((entry) => entry.id === botId);
+        setBusyBotId(botId);
+        void deployOne(botId, bot?.name ?? `#${botId}`).then(() => {
+          setBusyBotId(null);
+          return loadBots();
+        });
+      }}
+      onLoadItems={() => void loadBots()}
+      emptyHint="该群还没有机器人管理员登记：先把机器人添加为群管理员并点部署"
+    />
   );
 }

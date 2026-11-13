@@ -744,6 +744,13 @@ export interface BotSessionData {
   tgapiLang?: "zh" | "en";
   /** TGAPI 星星解锁发票已发送（防任意文本重复弹发票） */
   tgapiStarsInvoiceSent?: boolean;
+  /** v2.3 通用门禁挑战（bot/composers/gate.ts）：进行中的解锁验证方式与自生成验证码 */
+  gateChallenge?: {
+    /** 绑定的验证方式 id（verification_methods，code_api 外部核验） */
+    methodId: string;
+  };
+  /** v2.3 通用门禁挑战所属机器人 id（挑战回复时定位解锁台账） */
+  gateBotId?: string;
   /**
    * v2.2.0 自定义键盘对话流程（@grammyjs/conversations）：
    * entry=start 表示本次进入由 /start 触发（重发主键盘消息）；auto=其他消息自动进入（不重发）。

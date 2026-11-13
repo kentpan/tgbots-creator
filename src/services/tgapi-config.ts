@@ -26,7 +26,10 @@ import {
 /** 机器人对话语言（v2.1.7 起仅支持中英文两套） */
 export type TgApiLang = "zh" | "en";
 
-/** 验证码解锁 / 星星解锁（可在管理后台切换，对应原项目没有的增值门禁） */
+/**
+ * 门禁解锁方式（v2.3 星星解锁已移除：类型保留 "stars" 仅为兼容存量字段与运行时类型签名，
+ * 解析层强制归一为 "captcha"，任何配置路径都无法再产生 stars 门禁）。
+ */
 export type TgApiUnlockMode = "captcha" | "stars";
 
 /** my.telegram.org APP 创建平台清单（原 Config.APP_PLATFORM 逐字保留） */
@@ -431,7 +434,8 @@ export function normalizeTgApiSection(tgapi: unknown): TgApiBotConfig {
     return { enabled: false, unlockMode: "captcha", ...TGAPI_DEFAULT_APP };
   }
   const cfg = tgapi as Record<string, unknown>;
-  const unlockMode = cfg.unlockMode === "stars" ? "stars" : "captcha";
+  // v2.3 星星解锁已移除：门禁固定验证码解锁（存量 stars 配置读取时强制归一，运行时星星分支不可达）
+  const unlockMode: TgApiUnlockMode = "captcha";
   const platforms = Array.isArray(cfg.appPlatforms)
     ? (cfg.appPlatforms as unknown[])
         .filter(
@@ -472,11 +476,8 @@ export function normalizeTgApiSection(tgapi: unknown): TgApiBotConfig {
       typeof cfg.verificationMethodId === "number" && cfg.verificationMethodId > 0
         ? Math.floor(cfg.verificationMethodId)
         : undefined,
-    starsAmount:
-      typeof cfg.starsAmount === "number" && Number.isFinite(cfg.starsAmount) && cfg.starsAmount >= 1
-        ? Math.floor(cfg.starsAmount)
-        : undefined,
-    starsTitle: stringValue(cfg.starsTitle),
+    starsAmount: undefined,
+    starsTitle: undefined,
     // v2.1.10：读取时迁移旧垃圾默认值（运行实例与管理后台读到同一份干净配置）
     appTitle: pickMigratedString(cfg.appTitle) ?? TGAPI_DEFAULT_APP.appTitle,
     appShortName: pickMigratedString(cfg.appShortName) ?? TGAPI_DEFAULT_APP.appShortName,

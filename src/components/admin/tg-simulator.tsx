@@ -9,7 +9,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { Mic, Paperclip, Pin, Search, SendHorizontal, Smile, MoreVertical } from "lucide-react";
+import { Keyboard, Menu as MenuIcon, Mic, Paperclip, Pin, Search, SendHorizontal, Smile, MoreVertical } from "lucide-react";
 import {
   renderMenuTemplate,
   type BotMenuConfig,
@@ -240,8 +240,12 @@ export interface TgSimulatorProps {
   onTgApiFunc?: (button: MenuButton) => void | Promise<void>;
   /** v2.1.16 TGAPI 弹窗：语言切换按钮点击交给宿主（返回 true=已处理，不再显示内置提示） */
   onLanguageToggle?: () => boolean;
-  /** v2.2.0 自定义键盘（ReplyKeyboard）：传入后在输入框下方渲染底部键盘（样式=KeyboardButton.style） */
+  /** v2.2.0 自定义键盘（ReplyKeyboard）：传入后在输入框下方渲染底部键盘（样式=KeyboardButton.style）；
+   *  v2.3 面板默认收起，经输入框右侧 ⌨️ 图标切换展开/收起 */
   replyKeyboard?: CustomKeyboardConfig;
+  /** v2.3 已配置的指令菜单（宿主在「指令菜单」开关开启且已勾选指令时传入，按部署后真实注册顺序）：
+   *  传入后输入框左侧显示「菜单」按钮，点击向上滑出指令列表（/name 描述，点按发送该指令） */
+  commands?: { name: string; description: string }[];
   /** v2.2.0 自定义键盘按钮点击交给宿主（未传时回显按钮文本） */
   onReplyButtonClick?: (button: CustomKeyboardButton) => void | Promise<void>;
   /** v2.2.1 静默发送：宿主自行追加全部机器人消息（对话流程仿真），不再插入 loading 气泡 */
@@ -290,6 +294,7 @@ export const TgSimulator = forwardRef<TgSimulatorHandle, TgSimulatorProps>(funct
   replyKeyboard,
   onReplyButtonClick,
   silentUserSend = false,
+  commands,
 }, ref) {
   const history = useRef<string[]>([]);
   const [messages, setMessages] = useState<SimMessage[]>([]);
@@ -297,6 +302,11 @@ export const TgSimulator = forwardRef<TgSimulatorHandle, TgSimulatorProps>(funct
   const [dmMessages, setDmMessages] = useState<SimMessage[]>([]);
   const [input, setInput] = useState("");
   const [pressed, setPressed] = useState<string | null>(null);
+  // v2.3 输入区扩展：指令菜单滑屏（左侧「菜单」按钮 / 右侧「/」图标）与自定义键盘面板（⌨️ 图标）
+  const [cmdMenuOpen, setCmdMenuOpen] = useState(false);
+  const [kbPanelOpen, setKbPanelOpen] = useState(false);
+  const commandsConfigured = Boolean(commands && commands.length > 0);
+  const keyboardConfigured = Boolean(replyKeyboard && replyKeyboard.root.rows.length > 0);
   const [requestingJoin, setRequestingJoin] = useState(false);
   const nextId = useRef(1);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -851,9 +861,53 @@ export const TgSimulator = forwardRef<TgSimulatorHandle, TgSimulatorProps>(funct
         </div>
       ) : (
         <div style={WALLPAPER_STYLE}>
-          {/* v2.2.1 输入框：自定义键盘与真实 Telegram 一致 —— 键盘面板位于输入框下方 */}
+          {/* v2.3 指令菜单滑屏（向上滑出）：左侧「菜单」按钮 / 右侧「/」图标均可开合；
+              点按指令行 = 发送该指令（真实端等价于用户发送 /name 触发对应 handler） */}
+          <div
+            aria-hidden={!cmdMenuOpen}
+            className={`overflow-hidden transition-all duration-200 ease-out ${
+              cmdMenuOpen && commandsConfigured ? "max-h-72 opacity-100" : "max-h-0 opacity-0"
+            }`}
+          >
+            <div className="mx-2 mb-1 rounded-xl border border-black/10 bg-white shadow-md">
+              <p className="px-3 pt-2 text-[11px] font-medium text-[#a0adb8]">指令菜单</p>
+              <div className="max-h-60 overflow-y-auto py-1">
+                {(commands ?? []).map((command) => (
+                  <button
+                    key={command.name}
+                    type="button"
+                    onClick={() => {
+                      setCmdMenuOpen(false);
+                      void sendText(`/${command.name}`);
+                    }}
+                    className="flex w-full items-start gap-2 px-3 py-1.5 text-left hover:bg-black/[0.04]"
+                  >
+                    <span className="shrink-0 text-sm font-medium text-[#3390ec]">/{command.name}</span>
+                    <span className="min-w-0 flex-1 truncate text-sm text-[#3b4a54]" title={command.description}>
+                      {command.description}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* v2.2.1 输入框：左侧「菜单」按钮（已配置指令时显示）+ 输入框内右侧固定的「/」与「⌨️」图标 */}
           <div className="flex items-center gap-2 px-3 py-2.5">
-          <div className="flex min-w-0 flex-1 items-center gap-2 rounded-full bg-white px-3 py-2 shadow-sm">
+          {commandsConfigured ? (
+            <button
+              type="button"
+              onClick={() => setCmdMenuOpen((prev) => !prev)}
+              aria-label="指令菜单"
+              title={cmdMenuOpen ? "收起指令菜单" : "展开指令菜单"}
+              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full shadow-sm transition-colors ${
+                cmdMenuOpen ? "bg-[#3390ec] text-white" : "bg-white text-[#3390ec]"
+              }`}
+            >
+              <MenuIcon className="h-4 w-4" />
+            </button>
+          ) : null}
+          <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded-full bg-white px-3 py-2 shadow-sm">
             <Smile className="h-5 w-5 shrink-0 text-[#a0adb8]" />
             <input
               ref={inputRef}
@@ -882,6 +936,40 @@ export const TgSimulator = forwardRef<TgSimulatorHandle, TgSimulatorProps>(funct
               className="min-w-0 flex-1 bg-transparent text-sm text-[#0f0f0f] outline-none placeholder:text-[#a0adb8]"
             />
             <Paperclip className="h-4 w-4 shrink-0 text-[#a0adb8]" />
+            {/* 「/」图标：固定显示；已配置指令时点击开合指令菜单滑屏，未配置时置灰 */}
+            <button
+              type="button"
+              onClick={() => commandsConfigured && setCmdMenuOpen((prev) => !prev)}
+              disabled={!commandsConfigured}
+              aria-label="斜杠指令"
+              title={commandsConfigured ? (cmdMenuOpen ? "收起指令菜单" : "指令菜单") : "未配置指令菜单"}
+              className={`flex h-6 w-7 shrink-0 items-center justify-center rounded-md border text-sm font-semibold transition-colors ${
+                commandsConfigured
+                  ? cmdMenuOpen
+                    ? "border-[#3390ec] bg-[#3390ec] text-white"
+                    : "border-[#c4d3de] bg-white text-[#3390ec]"
+                  : "border-[#e2e8ed] bg-white text-[#c4cfda]"
+              }`}
+            >
+              /
+            </button>
+            {/* 「⌨️」图标：启用并配置自定义键盘后显示（「/」右侧并排）；默认置灰（面板收起），
+                点击在输入框下方滑动展开/收起自定义键盘 */}
+            {keyboardConfigured ? (
+              <button
+                type="button"
+                onClick={() => setKbPanelOpen((prev) => !prev)}
+                aria-label="自定义键盘"
+                title={kbPanelOpen ? "收起自定义键盘" : "展开自定义键盘"}
+                className={`flex h-6 w-7 shrink-0 items-center justify-center rounded-md border transition-colors ${
+                  kbPanelOpen
+                    ? "border-[#3390ec] bg-[#3390ec] text-white"
+                    : "border-[#c4d3de] bg-white text-[#8fa3b0]"
+                }`}
+              >
+                <Keyboard className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
           </div>
           <button
             type="button"
@@ -898,7 +986,14 @@ export const TgSimulator = forwardRef<TgSimulatorHandle, TgSimulatorProps>(funct
             )}
           </button>
           </div>
-          {/* v2.2.1 自定义键盘（ReplyKeyboard）：底部键盘面板，样式对应 KeyboardButton.style */}
+          {/* v2.2.1 自定义键盘（ReplyKeyboard）：底部键盘面板（样式=KeyboardButton.style）；
+              v2.3 默认收起，经输入框内「⌨️」图标切换，滑动展开/收起 */}
+          <div
+            aria-hidden={!kbPanelOpen}
+            className={`overflow-hidden transition-all duration-200 ease-out ${
+              kbPanelOpen && keyboardConfigured ? "max-h-72 opacity-100" : "max-h-0 opacity-0"
+            }`}
+          >
           {replyKeyboard && replyKeyboard.root.rows.length > 0 ? (
             <div className="border-t border-black/10 px-2 pb-1 pt-2">
               {replyKeyboard.root.rows.map((row, rowIndex) => (
@@ -931,6 +1026,7 @@ export const TgSimulator = forwardRef<TgSimulatorHandle, TgSimulatorProps>(funct
               ))}
             </div>
           ) : null}
+          </div>
         </div>
       )}
     </div>

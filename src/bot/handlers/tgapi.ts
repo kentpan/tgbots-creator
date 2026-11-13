@@ -49,6 +49,7 @@ import {
 } from "@/services/tgapi-flow-text";
 import { registerBuiltinCommandHandlers } from "./builtin-commands";
 import { registerTgApiConversation } from "./tgapi-conversation";
+import type { BotFeatureConfig } from "@/services/bot-feature-config";
 import {
   checkTgApiGateMethod,
   createTgApiGateRouter,
@@ -138,6 +139,8 @@ export interface TgApiHandlerOptions {
   registry: MenuCommandRegistry;
   /** 「⌨️ 指令菜单」弹窗勾选的指令库条目 id（bots.config.commandIds）：指令注册唯一来源 */
   commandIds: number[];
+  /** v2.3 机器人功能配置（自定义键盘按钮「门禁解锁」/键盘面板门禁开关前置校验） */
+  feature?: BotFeatureConfig;
 }
 
 export async function registerTgApiHandlers(
@@ -165,8 +168,13 @@ export async function registerTgApiHandlers(
     .map((id) => BigInt(id));
   // 指令归属过滤（v2.1.13）：机器人私有指令仅本 TGAPI 机器人可注册；
   // 群组私有指令注册是机器人级，群组限制由 runner 校验（scopeCommandRunnerToGroup）
+  // v2.3 功能面板开关：指令菜单显式开启才注册/同步（关闭 = 不注册不响应，
+  // 与机器人管理「功能配置」弹窗同一语义；旧数据无该字段时按勾选推断 = 开）
+  const commandsEnabled =
+    options.feature?.commands.enabled ??
+    (selectedIds.length > 0);
   const selectedItems =
-    selectedIds.length > 0
+    commandsEnabled && selectedIds.length > 0
       ? await listBotCommandsByIds(selectedIds, { botId })
       : [];
   // 指令同步（v2.1.14）：仅勾选的指令写入 Telegram 指令菜单
@@ -190,7 +198,7 @@ export async function registerTgApiHandlers(
   // 生效条件 = 键盘模式 && 键盘配置非空（空键盘回落内嵌按钮）。
   // ---------------------------------------------------------------------------
   if (tgApiInterfaceMode(cfg) === "keyboard" && cfg.customKeyboard) {
-    registerTgApiConversation(bot, { cfg, botId, keyboard: cfg.customKeyboard });
+    registerTgApiConversation(bot, { cfg, botId, keyboard: cfg.customKeyboard, registry, feature: options.feature });
     // 加群申请自动通过（与内嵌模式同一能力，对话模式下仍需生效）
     bot.on("chat_join_request", async (ctx) => {
       const joinRequest = ctx.chatJoinRequest;

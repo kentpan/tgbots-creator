@@ -101,6 +101,8 @@ export function TgApiUnlockMethodBinding({
   typeFilter,
   /** 调用来源（v2.1.13）：随 PUT body 传给 method-config API，日志按来源区分 */
   source,
+  /** v2.3 绑定结果 hidden 字段名（默认 verification_method_id；同表单多处绑定时区分） */
+  hiddenName,
 }: {
   initialMethods: MethodOption[];
   initialMethodId: number | null;
@@ -108,6 +110,7 @@ export function TgApiUnlockMethodBinding({
   autoCreateName?: string;
   typeFilter?: string;
   source?: string;
+  hiddenName?: string;
 }) {
   // 类型过滤统一应用：初始列表与保存后刷新列表同一谓词，保证下拉选项稳定
   const filterMethods = (methods: MethodOption[]): MethodOption[] =>
@@ -232,7 +235,7 @@ export function TgApiUnlockMethodBinding({
 
   return (
     <div className="space-y-2">
-      <input type="hidden" name="verification_method_id" value={methodId} />
+      <input type="hidden" name={hiddenName ?? "verification_method_id"} value={methodId} />
       <label className={labelClass} htmlFor="tgapi-unlock-method-binding">
         绑定验证方法（验证方式库全部方法）
       </label>

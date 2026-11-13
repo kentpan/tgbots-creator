@@ -4,7 +4,7 @@ import { apiThrottler } from "@grammyjs/transformer-throttler";
 import { CommandGroup } from "@grammyjs/commands";
 import type { BotContext } from "./context";
 import { mainMenu } from "./menus";
-import { handleJoinRequest, handleChatMemberUpdate } from "./handlers/chat-member";
+import { recordJoinRequestOnly } from "./handlers/chat-member";
 import { handleCodeInput } from "./handlers/code-input";
 import { handleVerificationChoice } from "./handlers/group-verification";
 import { codeQuestion } from "./verification-question";
@@ -115,10 +115,31 @@ export async function createBot(
   // v2.1.2 邀请链接台账：任何路径 createChatInviteLink 成功后统一落库（群组管理可查看/撤销）
   registerInviteLinkTracking(bot, token);
 
-  bot.on("chat_join_request", handleJoinRequest);
+  // 主 bot（平台兜底实例，无 bots 行 id、无加群验证配置）：
+  // 加群申请/直连入群一律只落库记录，「加群申请」页人工审批 —— 不自动验证、不假验证
+  bot.on("chat_join_request", (ctx) => {
+    const joinRequest = ctx.chatJoinRequest;
+    if (!joinRequest) return;
+    void recordJoinRequestOnly(
+      ctx.api,
+      joinRequest.from,
+      joinRequest.chat,
+      "telegram",
+    );
+  });
 
-  // 直连入群防线（v1.1.3）：普通邀请链接/被拉入群直接进来的成员 → 补验证，超时/失败踢出
-  bot.on("chat_member", handleChatMemberUpdate);
+  // 直连入群：同样只落库（人工审批）
+  bot.on("chat_member", (ctx) => {
+    const memberUpdate = ctx.chatMember;
+    if (!memberUpdate) return;
+    const { new_chat_member: newMember, old_chat_member: oldMember } = memberUpdate;
+    const joinedFresh = oldMember.status === "left" || oldMember.status === "kicked";
+    const joinedAsMember = newMember.status === "member" || newMember.status === "restricted";
+    if (!joinedFresh || !joinedAsMember || newMember.user.is_bot || memberUpdate.via_join_request) {
+      return;
+    }
+    void recordJoinRequestOnly(ctx.api, newMember.user, memberUpdate.chat, "direct");
+  });
 
   // 群内验证 4 选 1 点选回调（v2.0.5）：非本模块 callback 原样放行后续中间件（菜单等）
   bot.on("callback_query:data", handleVerificationChoice);

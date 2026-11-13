@@ -301,6 +301,8 @@ export interface MenuButtonAction {
   tgapi_value?: string;
   /** tgapi_func 类型专用：首次对话解锁门禁（true=未解锁用户点击先进入验证码验证流程） */
   tgapi_unlock?: boolean;
+  /** v2.3 通用门禁前置验证（所有动作类型可用）：点击先过通用门禁解锁（bots.config.gate） */
+  gateRequired?: boolean;
   /** tgapi_func 类型专用：点击后的响应提示消息（中英双语，先于功能执行发送） */
   tgapi_response?: MenuTgApiResponse;
   /** tgapi_func 类型专用：功能成功消息（中英双语，{{phone}}/{{api_id}}/{{api_hash}} 可用；留空用内置默认） */

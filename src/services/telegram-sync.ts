@@ -247,6 +247,8 @@ export async function withTelegramTimeout<T>(promise: Promise<T>): Promise<T> {
 export interface RealChatInfo {
   chatId: string;
   chatTitle: string;
+  /** v2.3 聊天类型（group/supergroup/channel，getChat 实时返回；群组/频道统一展示） */
+  chatType: string | null;
   /** 发现来源：getchat=已关联群组经 getChat+getChatMember 验证机器人仍在群内 */
   source: "getchat";
 }
@@ -392,8 +394,10 @@ export async function fetchRealGroups(token: string): Promise<RealGroupsResult> 
           // 保留 getChat 成功结果的原有处理
           console.warn(`getChatMember(${candidate}) failed:`, error instanceof Error ? error.message : error);
         }
-        if ((chatType === "group" || chatType === "supergroup") && chatTitle) {
-          chats.set(Number(candidate), { chatId: candidate, chatTitle, source: "getchat" });
+        // v2.3：频道纳入真实群组列表（群组/频道统一管理；群内验证等能力差异由
+        // services/chat-type.ts 能力声明在源头拦截）
+        if ((chatType === "group" || chatType === "supergroup" || chatType === "channel") && chatTitle) {
+          chats.set(Number(candidate), { chatId: candidate, chatTitle, chatType: chatType ?? null, source: "getchat" });
         }
       }),
     );

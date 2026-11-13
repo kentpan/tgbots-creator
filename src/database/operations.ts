@@ -82,6 +82,14 @@ export interface VerificationSessionRow {
    * 验证通过/失败/超时后用于删除该消息，保持群内整洁；私聊模式恒为 NULL。
    */
   promptMessageId: number | null;
+  /**
+   * 会话创建时锁定的验证方式库 id（verification_sessions.method_id）：
+   * 会话是不可篡改的验证凭据 —— 校验时按会话记录的方式执行，
+   * 管理端事后改配置不影响进行中的会话。旧会话（列添加前创建）为 NULL。
+   */
+  methodId: bigint | null;
+  /** 会话创建时锁定的最大尝试次数（bot 级覆盖解析结果）；旧会话为 NULL（回退 3） */
+  maxAttempts: number | null;
 }
 
 export interface VerificationStats {
@@ -206,6 +214,16 @@ export interface GroupSettingsRow {
    *   机器人自动删除验证提示与验证码消息（需机器人具备「删除消息」管理员权限）。
    */
   replyCodeInGroup: boolean;
+  /**
+   * 加群验证机器人指定（v2.3，群组信息弹窗「自动审核机器人」下拉）：
+   * - NULL = 手动审核：chat_join_request 只落库记录，不自动验证、不自动审批；
+   * - 指定 bot id = 只有该机器人响应 chat_join_request 走自动验证
+   *   （其 bots.config.joinVerify 必须同时开启且已选验证方式），
+   *   其他管理员机器人即使开启了加群验证也忽略 —— 杜绝多机器人竞态。
+   */
+  joinVerifyBotId: bigint | null;
+  /** v2.3 聊天类型（group/supergroup/channel，运行时事件登记；旧数据/未登记为 NULL=未知） */
+  chatType: string | null;
   createdTime: Date;
   updatedTime: Date;
 }
@@ -304,6 +322,8 @@ function mapSession(row: Record<string, unknown>): VerificationSessionRow {
     method: (row.method as string) ?? "captcha",
     attempts: toNumber(row.attempts ?? 0),
     expectedCode: (row.expected_code as string | null) ?? null,
+    methodId: row.method_id === undefined || row.method_id === null || row.method_id === "" ? null : toBigIntOrNull(row.method_id),
+    maxAttempts: row.max_attempts === undefined || row.max_attempts === null ? null : toNumber(row.max_attempts),
     promptMessageId:
       row.prompt_message_id === undefined || row.prompt_message_id === null
         ? null
@@ -378,6 +398,10 @@ export async function createVerificationSession(input: {
   method?: string;
   /** v1.1.7 code_self：机器人自生成的入群验证码，随会话落库，输入时本地比对 */
   expectedCode?: string | null;
+  /** 会话锁定的验证方式库 id（机器人加群验证配置解析结果；校验按会话记录执行） */
+  methodId?: bigint | null;
+  /** 会话锁定的最大尝试次数（bot 级覆盖解析结果） */
+  maxAttempts?: number | null;
 }): Promise<VerificationSessionRow | null> {
   try {
     await executeRun(
@@ -386,8 +410,8 @@ export async function createVerificationSession(input: {
     );
     const result = await executeRun(
       `INSERT INTO verification_sessions
-         (token, user_id, chat_id, captcha_completed, created_time, expires_at, method, attempts, expected_code)
-       VALUES (?, ?, ?, 0, ?, ?, ?, 0, ?)`,
+         (token, user_id, chat_id, captcha_completed, created_time, expires_at, method, attempts, expected_code, method_id, max_attempts)
+       VALUES (?, ?, ?, 0, ?, ?, ?, 0, ?, ?, ?)`,
       [
         input.token,
         Number(input.userId),
@@ -396,6 +420,8 @@ export async function createVerificationSession(input: {
         dateText(input.expiresAt),
         input.method ?? "captcha",
         input.expectedCode ?? null,
+        input.methodId === undefined || input.methodId === null ? null : Number(input.methodId),
+        input.maxAttempts === undefined || input.maxAttempts === null ? null : Math.trunc(input.maxAttempts),
       ],
     );
     if (result.changes !== 1) return null;
@@ -1094,6 +1120,10 @@ function mapGroupSettings(row: Record<string, unknown>): GroupSettingsRow {
     kickDirectJoins: row.kick_direct_joins === undefined ? false : toBoolean(row.kick_direct_joins),
     // v2.1.5 群内回复输码开关：列缺失/值为空 → 默认 false（维持隐私红线）
     replyCodeInGroup: row.reply_code_in_group === undefined ? false : toBoolean(row.reply_code_in_group),
+    // v2.3 加群验证机器人指定：列缺失/空 → null（手动审核）
+    joinVerifyBotId: row.join_verify_bot_id === undefined || row.join_verify_bot_id === null || row.join_verify_bot_id === "" ? null : toBigIntOrNull(row.join_verify_bot_id),
+    // v2.3 聊天类型：运行时事件登记（group/supergroup/channel）；未登记 = NULL
+    chatType: (row.chat_type as string | null) ?? null,
     createdTime: toDate(row.created_time),
     updatedTime: toDate(row.updated_time),
   };
@@ -1565,6 +1595,10 @@ export async function upsertGroupSettings(
     kickDirectJoins?: boolean;
     /** v2.1.5 群内回复输码快速验证（force_reply + 验证后自动删除消息）；undefined = 不改动现有值 */
     replyCodeInGroup?: boolean;
+    /** v2.3 加群验证机器人指定（null=手动审核）；undefined = 不改动现有值 */
+    joinVerifyBotId?: bigint | null;
+    /** v2.3 聊天类型（group/supergroup/channel）；undefined = 不改动现有值 */
+    chatType?: string | null;
   },
 ): Promise<void> {
   // requireApproval / verificationChannel / kickDirectJoins / replyCodeInGroup === undefined 语义为「不改动现有值」。
@@ -1574,11 +1608,14 @@ export async function upsertGroupSettings(
   let verificationChannelValue = input.verificationChannel;
   let kickDirectJoinsValue = input.kickDirectJoins;
   let replyCodeInGroupValue = input.replyCodeInGroup;
+  let joinVerifyBotIdValue = input.joinVerifyBotId;
   if (
     requireApprovalValue === undefined ||
     verificationChannelValue === undefined ||
     kickDirectJoinsValue === undefined ||
-    replyCodeInGroupValue === undefined
+    replyCodeInGroupValue === undefined ||
+    joinVerifyBotIdValue === undefined ||
+    input.chatType === undefined
   ) {
     const existing = await getGroupSettings(chatId);
     if (requireApprovalValue === undefined) {
@@ -1594,12 +1631,21 @@ export async function upsertGroupSettings(
     if (replyCodeInGroupValue === undefined) {
       replyCodeInGroupValue = existing ? existing.replyCodeInGroup : false;
     }
+    if (joinVerifyBotIdValue === undefined) {
+      joinVerifyBotIdValue = existing ? existing.joinVerifyBotId : null;
+    }
+  }
+  // chatType 独立读现值（existing 在上方 if 块作用域内，可能未查询）
+  let chatTypeValue: string | null | undefined = input.chatType;
+  if (chatTypeValue === undefined) {
+    const existingRow = await getGroupSettings(chatId);
+    chatTypeValue = existingRow?.chatType ?? null;
   }
 
   await executeRun(
     `INSERT INTO group_settings
-       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, require_approval, verification_channel, kick_direct_joins, reply_code_in_group, created_time, updated_time)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, require_approval, verification_channel, kick_direct_joins, reply_code_in_group, join_verify_bot_id, chat_type, created_time, updated_time)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(chat_id) DO UPDATE SET
        chat_title = COALESCE(excluded.chat_title, group_settings.chat_title),
        method = COALESCE(excluded.method, group_settings.method),
@@ -1615,6 +1661,8 @@ export async function upsertGroupSettings(
        verification_channel = excluded.verification_channel,
        kick_direct_joins = excluded.kick_direct_joins,
        reply_code_in_group = excluded.reply_code_in_group,
+       join_verify_bot_id = excluded.join_verify_bot_id,
+       chat_type = COALESCE(excluded.chat_type, group_settings.chat_type),
        updated_time = excluded.updated_time`,
     [
       Number(chatId),
@@ -1637,6 +1685,8 @@ export async function upsertGroupSettings(
         : "auto",
       kickDirectJoinsValue ? 1 : 0,
       replyCodeInGroupValue ? 1 : 0,
+      joinVerifyBotIdValue === null || joinVerifyBotIdValue === undefined ? null : Number(joinVerifyBotIdValue),
+      chatTypeValue,
       dateText(new Date()),
       dateText(new Date()),
     ],
@@ -1660,14 +1710,29 @@ export async function listVerificationMethods(): Promise<VerificationMethodRow[]
   return rows.map(mapVerificationMethod);
 }
 
+const VERIFICATION_METHOD_CACHE_MS = 60_000;
+
+/** v2.0.6 D1 读额度优化：验证方式按 id 60s 进程内缓存（加群验证/门禁每次核验都会读取），
+ *  写路径 invalidateVerificationMethodMemos 保证本 isolate 立即一致 */
 export async function getVerificationMethod(
   id: bigint,
 ): Promise<VerificationMethodRow | null> {
-  const row = await queryOne<Record<string, unknown>>(
-    `SELECT * FROM verification_methods WHERE id = ?`,
-    [Number(id)],
+  return memoTtl<VerificationMethodRow | null>(
+    `vmethod:${id}`,
+    VERIFICATION_METHOD_CACHE_MS,
+    async () => {
+      const row = await queryOne<Record<string, unknown>>(
+        `SELECT * FROM verification_methods WHERE id = ?`,
+        [Number(id)],
+      );
+      return row ? mapVerificationMethod(row) : null;
+    },
   );
-  return row ? mapVerificationMethod(row) : null;
+}
+
+/** v2.3：验证方式写路径统一失效（创建/更新/删除后本 isolate 立即读到新值） */
+function invalidateVerificationMethodMemos(): void {
+  invalidateMemoByPrefix("vmethod:");
 }
 
 /** 按名称精确查找验证方式（verification_methods.name 全局唯一） */
@@ -1700,6 +1765,7 @@ export async function createVerificationMethod(input: {
     ],
   );
   if (result.changes !== 1) return null;
+  invalidateVerificationMethodMemos();
   return getVerificationMethod(BigInt(result.lastInsertRowid));
 }
 
@@ -1733,20 +1799,18 @@ export async function updateVerificationMethod(
       `UPDATE verification_methods SET ${sets.join(", ")} WHERE id = ?`,
       params,
     );
+    invalidateVerificationMethodMemos();
   }
   return getVerificationMethod(id);
 }
 
 export async function deleteVerificationMethod(id: bigint): Promise<boolean> {
-  await executeRun(
-    `UPDATE group_settings SET method = 'captcha', method_id = NULL WHERE method_id = ?`,
-    [Number(id)],
-  );
-  await invalidateCache(GROUP_SETTINGS_CACHE_KEY);
+  // v2.3：群级 method_id 已停用（方式在机器人级配置），删除方式不再回写群表
   const result = await executeRun(
     `DELETE FROM verification_methods WHERE id = ?`,
     [Number(id)],
   );
+  invalidateVerificationMethodMemos();
   return result.changes > 0;
 }
 

@@ -3,8 +3,7 @@ import { getCurrentAdmin, hasPermission, logOperation } from "@/lib/auth";
 import { headers } from "next/headers";
 import {
   getGroupSettings,
-  getVerificationMethod,
-  listVerificationMethods,
+  listBots,
   upsertGroupSettings,
 } from "@/database/operations";
 
@@ -16,7 +15,8 @@ import {
  * 校验规则一致（method 合法性、code_api 必须绑定 method），保证两处配置互不漂移。
  */
 
-const VALID_METHODS = new Set(["captcha", "code_api", "code_self"]);
+// v2.3：群级验证方式配置已停用（方式统一在机器人级 joinVerify 配置），
+// 本路由只负责：群名 / 启用 / 三段文案 / 新成员审核开关 / 自动审核机器人指定。
 
 export async function GET(request: Request): Promise<NextResponse> {
 
@@ -37,7 +37,16 @@ export async function GET(request: Request): Promise<NextResponse> {
   }
 
   const settings = await getGroupSettings(chatId);
-  const methods = await listVerificationMethods();
+  // v2.3 自动审核机器人候选：bots.config.joinVerify.enabled 的机器人（Q4：只有开启了
+  // 自动响应加群申请的机器人才进入下拉；群未指定时默认手动审核）
+  const bots = await listBots();
+  const { parseBotFeatureConfig } = await import("@/services/bot-feature-config");
+  const joinVerifyCandidates = bots
+    .filter((bot) => {
+      const feature = parseBotFeatureConfig(bot.config, false);
+      return feature.joinVerify.enabled && feature.joinVerify.methodId;
+    })
+    .map((bot) => ({ id: String(bot.id), name: bot.name }));
 
   return NextResponse.json({
     ok: true,
@@ -58,14 +67,12 @@ export async function GET(request: Request): Promise<NextResponse> {
             verification_channel: settings.verificationChannel,
             kick_direct_joins: settings.kickDirectJoins,
             reply_code_in_group: settings.replyCodeInGroup,
+            require_approval: settings.requireApproval,
+            join_verify_bot_id:
+              settings.joinVerifyBotId === null ? null : String(settings.joinVerifyBotId),
           }
         : null,
-      methods: methods.map((method) => ({
-        id: String(method.id),
-        name: method.name,
-        type: method.type,
-        enabled: method.enabled,
-      })),
+      join_verify_candidates: joinVerifyCandidates,
     },
   });
 }
@@ -83,6 +90,7 @@ export async function PUT(request: Request): Promise<NextResponse> {
   let payload: {
     chat_id?: string | number;
     chat_title?: string;
+    /** v2.3 群级验证方式配置已停用：字段仅保留接收以兼容旧调用方，值不再落库 */
     method?: string;
     method_id?: string | number | null;
     timeout_seconds?: number;
@@ -97,6 +105,10 @@ export async function PUT(request: Request): Promise<NextResponse> {
     kick_direct_joins?: boolean;
     /** v2.1.5 群内回复输码快速验证（默认关闭） */
     reply_code_in_group?: boolean;
+    /** v2.3 新成员审核（审批制入群）开关 */
+    require_approval?: boolean;
+    /** v2.3 自动审核机器人（null=手动审核） */
+    join_verify_bot_id?: string | number | null;
   };
   try {
     payload = (await request.json()) as typeof payload;
@@ -110,32 +122,20 @@ export async function PUT(request: Request): Promise<NextResponse> {
   }
   const chatId = BigInt(chatIdRaw);
 
-  const method = String(payload.method ?? "code_self");
-  if (!VALID_METHODS.has(method)) {
-    return NextResponse.json(
-      { ok: false, error: "验证方式不合法（code_self / captcha / code_api）" },
-      { status: 400 },
-    );
-  }
-  // 与群组管理 saveGroupAction 一致：自定义验证码必须绑定具体验证方法
-  const methodIdRaw = payload.method_id === null || payload.method_id === undefined ? "" : String(payload.method_id).trim();
-  if (method === "code_api" && (!methodIdRaw || !/^\d+$/.test(methodIdRaw))) {
-    return NextResponse.json(
-      { ok: false, error: "选择自定义验证码方式时必须绑定具体验证方法" },
-      { status: 400 },
-    );
-  }
-  const methodId = methodIdRaw ? BigInt(methodIdRaw) : null;
-  if (methodId !== null) {
-    const methodRow = await getVerificationMethod(methodId);
-    if (!methodRow) {
-      return NextResponse.json({ ok: false, error: "绑定的验证方法不存在" }, { status: 400 });
+  const existing = await getGroupSettings(chatId);
+
+  // 自动审核机器人指定：显式传 null = 手动审核；未传 = 不改动
+  let joinVerifyBotIdValue: bigint | null | undefined;
+  if (payload.join_verify_bot_id !== undefined) {
+    const raw = payload.join_verify_bot_id === null ? "" : String(payload.join_verify_bot_id).trim();
+    if (!raw) {
+      joinVerifyBotIdValue = null;
+    } else if (/^\d+$/.test(raw)) {
+      joinVerifyBotIdValue = BigInt(raw);
+    } else {
+      return NextResponse.json({ ok: false, error: "自动审核机器人 ID 不合法" }, { status: 400 });
     }
   }
-
-  const existing = await getGroupSettings(chatId);
-  const timeoutSeconds = Number(payload.timeout_seconds ?? existing?.timeoutSeconds ?? 300);
-  const maxAttempts = Number(payload.max_attempts ?? existing?.maxAttempts ?? 3);
 
   await upsertGroupSettings(chatId, {
     // 群名与群组管理页同源可编辑：未传时保留现值，避免被清空
@@ -143,14 +143,7 @@ export async function PUT(request: Request): Promise<NextResponse> {
       payload.chat_title === undefined
         ? (existing?.chatTitle ?? null)
         : String(payload.chat_title ?? "").trim() || null,
-    method,
-    // v2.0.1 与群组管理 saveGroupAction 一致：选中即落库保留（重开弹窗回显偏好），
-    // 仅 code_api 会话消费绑定方法（chat-member / verification-flow 有守卫），
-    // 其他方式下仅作偏好记录，绝不影响验证行为
-    methodId,
-    timeoutSeconds:
-      Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? Math.trunc(timeoutSeconds) : 300,
-    maxAttempts: Number.isFinite(maxAttempts) && maxAttempts > 0 ? Math.trunc(maxAttempts) : 3,
+    enabled: payload.enabled ?? existing?.enabled ?? true,
     promptText:
       payload.prompt_text === undefined
         ? undefined
@@ -163,32 +156,21 @@ export async function PUT(request: Request): Promise<NextResponse> {
       payload.failure_text === undefined
         ? undefined
         : String(payload.failure_text ?? "").trim() || undefined,
-    enabled: payload.enabled ?? existing?.enabled ?? true,
-    privacyMode: payload.privacy_mode ?? existing?.privacyMode ?? true,
-    verificationChannel:
-      payload.verification_channel === "dm"
-        ? "dm"
-        : payload.verification_channel === "group"
-          ? "group"
-          : payload.verification_channel === "auto"
-            ? "auto"
-            : existing?.verificationChannel,
-    // v2.0.7 直连入群踢出开关：未传时保留现值（undefined 语义 = 不改动）
-    kickDirectJoins: payload.kick_direct_joins ?? existing?.kickDirectJoins,
-    // v2.1.5 群内回复输码开关：未传时保留现值（undefined 语义 = 不改动）
-    replyCodeInGroup: payload.reply_code_in_group ?? existing?.replyCodeInGroup,
+    // v2.3 新成员审核开关：未传时保留现值（undefined 语义 = 不改动）
+    requireApproval: payload.require_approval ?? existing?.requireApproval,
+    joinVerifyBotId: joinVerifyBotIdValue,
   });
 
   const requestHeaders = await headers();
   await logOperation(admin, {
-    action: "仿真屏保存群组验证配置",
+    action: "仿真屏保存群组配置",
     target: chatIdRaw,
-    detail: `验证方式：${
-      method === "code_api"
-        ? `自定义验证码（方法 #${methodIdRaw}）`
-        : method === "code_self"
-          ? "自动验证码（输入验证码加群）"
-          : "人机验证码"
+    detail: `新成员审核：${payload.require_approval === undefined ? "未改动" : payload.require_approval ? "开启" : "关闭"}；自动审核机器人：${
+      payload.join_verify_bot_id === undefined
+        ? "未改动"
+        : joinVerifyBotIdValue === null
+          ? "手动审核"
+          : `#${String(joinVerifyBotIdValue)}`
     }`,
     headers: requestHeaders,
   });
@@ -200,18 +182,13 @@ export async function PUT(request: Request): Promise<NextResponse> {
       ? {
           chat_id: String(settings.chatId),
           chat_title: settings.chatTitle,
-          method: settings.method,
-          method_id: settings.methodId === null ? null : String(settings.methodId),
-          timeout_seconds: settings.timeoutSeconds,
-          max_attempts: settings.maxAttempts,
           prompt_text: settings.promptText,
           success_text: settings.successText,
           failure_text: settings.failureText,
           enabled: settings.enabled,
-          privacy_mode: settings.privacyMode,
-          verification_channel: settings.verificationChannel,
-          kick_direct_joins: settings.kickDirectJoins,
-          reply_code_in_group: settings.replyCodeInGroup,
+          require_approval: settings.requireApproval,
+          join_verify_bot_id:
+            settings.joinVerifyBotId === null ? null : String(settings.joinVerifyBotId),
         }
       : null,
   });

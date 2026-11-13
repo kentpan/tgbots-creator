@@ -418,8 +418,35 @@ export function TgApiKeyboardFlowSim({
         action = matched.action;
       } else if (matched.action.type === "language") {
         func = "language";
+      } else {
+        // v2.3 通用动作：与运行端 dispatchGenericKeyboardAction 同一语义的仿真预览
+        const genericAction = matched.action;
+        append("user", text);
+        if (genericAction.gateRequired === true) {
+          append("bot", "🔒 已开启「门禁解锁」：真实端未解锁用户点击先收到验证挑战，解锁后重新点击执行。");
+        }
+        if (genericAction.type === "reply") {
+          append("bot", genericAction.content?.text || genericAction.text || "（未配置回复内容）");
+        } else if (genericAction.type === "url") {
+          append("bot", `🔗 打开链接：${genericAction.url || "（未配置）"}（真实端发送携带 URL 内联按钮的消息）`);
+        } else if (genericAction.type === "web_app") {
+          append("bot", `🪟 打开 WebApp：${genericAction.url || "（未配置）"}（真实端发送携带 WebApp 内联按钮的消息）`);
+        } else if (genericAction.type === "command") {
+          append("bot", `⌨️ 执行指令 /${genericAction.target || "（未选择）"}：真实端等同用户发送该指令`);
+        } else if (genericAction.type === "verify") {
+          append("bot", "🔐 外部验证 API：真实端点击后要求回复验证码，调用绑定验证方式真实核验。");
+        } else if (genericAction.type === "switch_inline" || genericAction.type === "switch_inline_current") {
+          append("bot", `⌨️ 预填内容：${genericAction.switch_query || "（未配置）"}`);
+        } else if (genericAction.type === "submenu") {
+          append("bot", "📂 进入子菜单：真实端机器人发送子菜单键盘替换当前键盘（保存并部署后生效）。");
+        } else if (genericAction.type === "back") {
+          append("bot", "🔙 返回上一级：真实端机器人发送上一级键盘替换当前键盘（保存并部署后生效）。");
+        } else {
+          append("bot", "（该按钮未配置点击后的交互：机器人不会响应）");
+        }
+        return;
       }
-      // reply/command 等键盘动作 = 用户自定义，TGAPI 对话流程不处理（与运行端一致 → 未知输入提示）
+      // （保留原注释位：TGAPI 固定指令与语言切换继续走下方 func 分派）
     } else {
       func = COMMAND_FUNC_MAP[text] ?? null;
     }

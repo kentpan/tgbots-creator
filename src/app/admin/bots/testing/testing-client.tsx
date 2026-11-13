@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TgAppSimulator, type AppSimGroup, type RealChatMessage } from "@/components/admin/tg-app-simulator";
+import { SplitDeployButton } from "@/components/admin/split-deploy-button";
 import { useRealGroups } from "@/components/admin/use-real-groups";
 import { BotDeployBadge } from "@/components/admin/bot-deploy-badge";
 import type { BotDeployCheck } from "@/services/bot-deploy";
@@ -41,6 +42,8 @@ interface BotOption {
 interface GroupOption {
   chatId: string;
   chatTitle: string;
+  /** v2.3 聊天类型（group/supergroup/channel；未登记=空不显示徽标） */
+  chatType?: string | null;
   enabled: boolean;
   method: string;
   methodId: string | null;
@@ -398,6 +401,7 @@ export function TestingClient({
         return {
           chatId: group.chatId,
           chatTitle: group.chatTitle,
+          chatType: group.chatType,
           enabled: group.enabled,
           method: group.method,
           methodId: group.methodId,
@@ -700,6 +704,30 @@ export function TestingClient({
   const simulatorConfig = selectedBot ? menuConfigs[selectedBot.id] : null;
   const botName = selectedBot?.name ?? "机器人";
 
+  // v2.3 分体部署：主点击 = 部署当前机器人到其全部已登记群组（逐群真实部署，结果逐群回显）
+  const [deployAllGroupsBusy, setDeployAllGroupsBusy] = useState(false);
+  const deployToAllGroups = useCallback(async (): Promise<void> => {
+    if (!selectedBotId || deployAllGroupsBusy) return;
+    const targets = realGroups.groups;
+    if (targets.length === 0) {
+      alert("该机器人还没有已登记的群组：先把机器人拉进群，再点「同步真实群组」登记后部署。");
+      return;
+    }
+    setDeployAllGroupsBusy(true);
+    try {
+      let okCount = 0;
+      for (const group of targets) {
+        const result = await handleDeployForGroup(group.chatId);
+        if (result?.ok && result.stage === "deployed") okCount += 1;
+      }
+      alert(`部署完成：${okCount}/${targets.length} 个群组成功（详情见各群部署面板/徽章）`);
+      realGroups.reload();
+      router.refresh();
+    } finally {
+      setDeployAllGroupsBusy(false);
+    }
+  }, [selectedBotId, deployAllGroupsBusy, realGroups, handleDeployForGroup, router]);
+
   return (
     <div className="flex flex-col gap-4 lg:h-[calc(100vh-6.5rem)] lg:min-h-[680px]">
       <div className="space-y-1">
@@ -752,17 +780,36 @@ export function TestingClient({
                 状态探测中…
               </Badge>
             )}
+            {/* v2.3 分体部署按钮：主点击=部署当前机器人到其全部群组（逐群真实部署）；
+                ▾浮层=单群部署，已部署群组绿√；运行实例上线/更新保留为独立「上线」按钮 */}
             <Button
               type="button"
               variant="outline"
+              size="sm"
               onClick={() => void deploySelectedBot()}
               disabled={!selectedBotId || deployingBot}
-              aria-label="部署机器人（上线/更新运行实例）"
-              className="gap-1.5"
+              aria-label="上线/更新运行实例（注册 Webhook 或重启轮询）"
+              className="h-[30px] gap-1 px-2.5 text-[13px]"
             >
-              {deployingBot ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
-              🚀 部署机器人
+              {deployingBot ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Rocket className="h-3.5 w-3.5" />}
+              上线
             </Button>
+            <SplitDeployButton
+              mainLabel="部署到所有群组"
+              mainBusy={deployAllGroupsBusy}
+              mainDisabled={!selectedBotId}
+              onMain={() => void deployToAllGroups()}
+              items={realGroups.groups.map((group) => ({
+                id: group.chatId,
+                label: group.chatTitle || group.chatId,
+                deployed: group.deployed === true,
+              }))}
+              onSelectItem={(chatId) => {
+                void handleDeployForGroup(chatId).then(() => realGroups.reload());
+              }}
+              onLoadItems={() => realGroups.reload()}
+              emptyHint="该机器人还没有已登记的群组：先把机器人拉进群并点「上线」"
+            />
           </div>
         </div>
 

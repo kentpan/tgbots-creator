@@ -2,11 +2,11 @@ import {
   listBots,
   listGroupBotAdmins,
   listGroupSettings,
-  listVerificationMethods,
   type BotRow,
   type GroupBotAdminRow,
   type GroupSettingsRow,
 } from "@/database/operations";
+import { parseBotFeatureConfig } from "@/services/bot-feature-config";
 import { requirePermission } from "@/lib/auth";
 import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import { FormDialog } from "@/components/admin/form-dialog";
@@ -33,12 +33,12 @@ const ERRORS: Record<string, string> = {
 };
 
 function GroupFormDialog({
-  methods,
+  joinVerifyCandidates,
   group,
   trigger,
   triggerClassName,
 }: {
-  methods: { id: string; name: string; enabled: boolean }[];
+  joinVerifyCandidates: { id: string; name: string }[];
   group?: GroupSettingsRow;
   trigger: React.ReactNode;
   triggerClassName?: string;
@@ -48,7 +48,7 @@ function GroupFormDialog({
       trigger={trigger}
       triggerClassName={triggerClassName}
       title={group ? `编辑群组配置 · ${group.chatTitle ?? group.chatId}` : "新增群组配置"}
-      description="为群组选择验证方式：自动验证码（机器人发码，输入验证码加群）、人机验证码（WebApp）或自定义验证码（外部 API 核验）。"
+      description="群级配置：群名 / 验证文案 / 新成员审核 / 自动审核机器人。验证方式与超时/次数在机器人的「功能配置」弹窗中配置（机器人级）。"
       action={saveGroupAction}
       submitLabel="保存配置"
     >
@@ -78,65 +78,6 @@ function GroupFormDialog({
             type="text"
             defaultValue={group?.chatTitle ?? ""}
             placeholder="群组备注名称"
-            className={inputClass}
-          />
-        </div>
-        <div className="space-y-1">
-          <label className={labelClass} htmlFor={`method-${group?.chatId ?? "new"}`}>
-            验证方式
-          </label>
-          <select
-            id={`method-${group?.chatId ?? "new"}`}
-            name="method"
-            defaultValue={group?.method ?? "code_self"}
-            className={selectClass}
-          >
-            <option value="code_self">自动验证码（输入验证码加群）</option>
-            <option value="captcha">人机验证码（WebApp）</option>
-            <option value="code_api">自定义验证码（外部 API）</option>
-          </select>
-        </div>
-        <div className="space-y-1">
-          <label className={labelClass} htmlFor={`method-id-${group?.chatId ?? "new"}`}>
-            绑定验证方法（仅自定义验证码）
-          </label>
-          <select
-            id={`method-id-${group?.chatId ?? "new"}`}
-            name="method_id"
-            defaultValue={group?.methodId ? String(group.methodId) : ""}
-            className={selectClass}
-          >
-            <option value="">不绑定</option>
-            {methods.map((method) => (
-              <option key={method.id} value={method.id}>
-                #{method.id} {method.name}（{method.enabled ? "启用" : "停用"}）
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="space-y-1">
-          <label className={labelClass} htmlFor={`timeout-${group?.chatId ?? "new"}`}>
-            验证超时（秒）
-          </label>
-          <input
-            id={`timeout-${group?.chatId ?? "new"}`}
-            name="timeout_seconds"
-            type="number"
-            min={30}
-            defaultValue={group?.timeoutSeconds ?? 300}
-            className={inputClass}
-          />
-        </div>
-        <div className="space-y-1">
-          <label className={labelClass} htmlFor={`attempts-${group?.chatId ?? "new"}`}>
-            最大尝试次数
-          </label>
-          <input
-            id={`attempts-${group?.chatId ?? "new"}`}
-            name="max_attempts"
-            type="number"
-            min={1}
-            defaultValue={group?.maxAttempts ?? 3}
             className={inputClass}
           />
         </div>
@@ -208,6 +149,36 @@ function GroupFormDialog({
         defaultChecked={group ? group.replyCodeInGroup : false}
         id={`reply-code-${group?.chatId ?? "new"}`}
       />
+      <SwitchField
+        name="require_approval"
+        label="新成员审核（审批制入群）"
+        description="开启后部署生成的邀请链接变为「申请制」：用户申请加入时，由下方自动审核机器人自动验证（私聊验证，通过后静默放行、失败 3 次拒绝），或在「加群申请」页人工审批。"
+        defaultChecked={group ? group.requireApproval : false}
+        id={`require-approval-${group?.chatId ?? "new"}`}
+      />
+      <div className="space-y-1">
+        <label className={labelClass} htmlFor={`jv-bot-${group?.chatId ?? "new"}`}>
+          自动审核机器人（默认手动审核）
+        </label>
+        <select
+          id={`jv-bot-${group?.chatId ?? "new"}`}
+          name="join_verify_bot_id"
+          defaultValue={group?.joinVerifyBotId ? String(group.joinVerifyBotId) : ""}
+          className={selectClass}
+        >
+          <option value="">手动审核（在「加群申请」页人工审批）</option>
+          {joinVerifyCandidates.map((bot) => (
+            <option key={bot.id} value={bot.id}>
+              {bot.name}（自动验证加群申请）
+            </option>
+          ))}
+        </select>
+        <p className="text-xs text-muted-foreground">
+          列表只显示已开启「自动响应加群申请」的机器人；机器人未出现？到
+          <a href="/admin/bots" className="mx-1 text-primary underline">机器人管理 → 功能配置</a>
+          开启「自动响应加群申请」并选择验证方式，然后点「部署」更新运行实例。
+        </p>
+      </div>
     </FormDialog>
   );
 }
@@ -219,9 +190,8 @@ export default async function GroupsPage({
 }) {
   await requirePermission("groups:view");
   const params = await searchParams;
-  const [groups, methods, bots, botAdmins] = await Promise.all([
+  const [groups, bots, botAdmins] = await Promise.all([
     listGroupSettings(),
-    listVerificationMethods(),
     listBots(),
     listGroupBotAdmins(),
   ]);
@@ -231,6 +201,14 @@ export default async function GroupsPage({
     name: bot.name,
     username: bot.username,
   }));
+
+  // v2.3 自动审核机器人候选：bots.config.joinVerify.enabled 的机器人
+  const joinVerifyCandidates = bots
+    .filter((bot: BotRow) => {
+      const feature = parseBotFeatureConfig(bot.config, false);
+      return feature.joinVerify.enabled && feature.joinVerify.methodId;
+    })
+    .map((bot: BotRow) => ({ id: String(bot.id), name: bot.name }));
 
   const adminsByChat = new Map<string, GroupBotAdminRow[]>();
   for (const admin of botAdmins) {
@@ -245,15 +223,11 @@ export default async function GroupsPage({
         <div>
           <h1 className="text-2xl font-bold">群组管理</h1>
           <p className="text-sm text-muted-foreground">
-            为每个群组配置验证方式，并可将已接入的机器人设为群管理员。
+            为每个群组配置验证文案、新成员审核与自动审核机器人，并可将已接入的机器人设为群管理员；验证方式在机器人「功能配置」弹窗中配置。
           </p>
         </div>
         <GroupFormDialog
-          methods={methods.map((method) => ({
-            id: String(method.id),
-            name: method.name,
-            enabled: method.enabled,
-          }))}
+          joinVerifyCandidates={joinVerifyCandidates}
           trigger="+ 新增群组配置"
           triggerClassName="inline-flex h-10 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
         />
@@ -281,9 +255,8 @@ export default async function GroupsPage({
               <tr className="border-b text-left text-sm text-muted-foreground">
                 <th className="px-4 py-3 font-medium">Chat ID</th>
                 <th className="px-4 py-3 font-medium">群组名称</th>
-                <th className="px-4 py-3 font-medium">验证方式</th>
-                <th className="px-4 py-3 font-medium">超时（秒）</th>
-                <th className="px-4 py-3 font-medium">最大尝试</th>
+                <th className="px-4 py-3 font-medium">新成员审核</th>
+                <th className="px-4 py-3 font-medium">自动审核机器人</th>
                 <th className="px-4 py-3 font-medium">机器人管理员</th>
                 <th className="px-4 py-3 font-medium">状态</th>
                 <th className="px-4 py-3 font-medium">操作</th>
@@ -305,14 +278,21 @@ export default async function GroupsPage({
                       <td className="px-4 py-3 font-mono text-sm">{chatKey}</td>
                       <td className="px-4 py-3 text-sm">{group.chatTitle ?? "-"}</td>
                       <td className="px-4 py-3 text-sm">
-                        {group.method === "code_api"
-                          ? `自定义验证码（方法 #${String(group.methodId ?? 0)}）`
-                          : group.method === "code_self"
-                            ? "自动验证码（输入验证码加群）"
-                            : "人机验证码（WebApp）"}
+                        <span
+                          className={`inline-flex rounded-full border px-2 py-0.5 text-xs ${
+                            group.requireApproval
+                              ? "border-amber-200 bg-amber-50 text-amber-700"
+                              : "border-gray-200 bg-gray-50 text-gray-500"
+                          }`}
+                        >
+                          {group.requireApproval ? "审核开" : "审核关"}
+                        </span>
                       </td>
-                      <td className="px-4 py-3 text-sm">{group.timeoutSeconds}</td>
-                      <td className="px-4 py-3 text-sm">{group.maxAttempts}</td>
+                      <td className="px-4 py-3 text-sm">
+                        {group.joinVerifyBotId
+                          ? botNameById.get(String(group.joinVerifyBotId))?.name ?? `#${String(group.joinVerifyBotId)}`
+                          : "手动审核"}
+                      </td>
                       <td className="px-4 py-3 text-sm">
                         {chatAdmins.length === 0
                           ? "-"
@@ -334,11 +314,7 @@ export default async function GroupsPage({
                       <td className="px-4 py-3">
                         <div className="flex flex-wrap items-center gap-2">
                           <GroupFormDialog
-                            methods={methods.map((method) => ({
-                              id: String(method.id),
-                              name: method.name,
-                              enabled: method.enabled,
-                            }))}
+                            joinVerifyCandidates={joinVerifyCandidates}
                             group={group}
                             trigger="编辑"
                             triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm hover:bg-accent"

@@ -15,4 +15,8 @@ export type BotContext = Context &
     botMenu?: Menu<Context>;
     /** v2.2.0 自定义键盘（ReplyKeyboard）：multi-runtime 按实例配置注入，cmdStart 欢迎消息附带 */
     customKeyboard?: KeyboardMarkup;
+    /** v2.3 界面模式标记：true = 键盘模式（cmdStart 不发内嵌菜单，只发键盘欢迎） */
+    interfaceKeyboardMode?: boolean;
+    /** v2.3 内嵌按钮面板开关：false = cmdStart 不发内嵌菜单（面板全关时发纯文本） */
+    interfaceMenuEnabled?: boolean;
   };
