@@ -185,6 +185,12 @@ export async function processCodeAnswer(
     return null;
   }
 
+  // 私聊回执目标：用户在哪个私聊输码就回哪个私聊。
+  // chat_join_request 流程下用户在 user_chat_id 会话输码（ctx.chat.id === user_chat_id），
+  // 此时向 from.id 发消息会 403（用户未 /start 机器人），必须回 ctx.chat.id。
+  // 直连 /start 流程下 ctx.chat.id === from.id，行为不变。
+  const replyChatId = ctx.chat && ctx.chat.type === "private" ? ctx.chat.id : from.id;
+
   // v2.0.5 群内验证模式前提条件：群聊内禁止明文输码（回复消息全员可见）。
   // 群内验证的输入只发生在验证网页（URL 按钮）或 4 选 1 callback 里；
   // 用户私聊（DM）输码不受限 —— 私聊内容群友本就不可见，作为兼容通道保留。
@@ -218,7 +224,7 @@ export async function processCodeAnswer(
     preloaded: preloaded ?? undefined,
     eventApi: ctx.api,
     onNetworkRetry: async () => {
-      await ctx.api.sendMessage(from.id, NETWORK_RETRY_NOTICE);
+      await ctx.api.sendMessage(replyChatId, NETWORK_RETRY_NOTICE);
     },
   });
 
@@ -252,10 +258,10 @@ export async function processCodeAnswer(
   // 通知层失败不允许中断后续「申请加群」按钮发送，也不允许让 webhook 处理以异常收场，
   // 否则用户看到的现象就是「输入验证码后无任何反应」（v1.1.4 同类反馈根因之一）。
   try {
-    await ctx.api.sendMessage(from.id, result.replyText);
+    await ctx.api.sendMessage(replyChatId, result.replyText);
   } catch (error) {
     console.error(
-      `Failed to DM verification result to user ${from.id} (outcome=${result.outcome}):`,
+      `Failed to DM verification result to chat ${replyChatId} (user ${from.id}, outcome=${result.outcome}):`,
       error,
     );
   }
@@ -271,7 +277,7 @@ export async function processCodeAnswer(
       if (result.stayedInGroup) {
         try {
           await ctx.api.sendMessage(
-            from.id,
+            replyChatId,
             "本次验证已失效，你仍保留在群组中，无需重新申请。",
           );
           console.log(
@@ -280,7 +286,7 @@ export async function processCodeAnswer(
           );
         } catch (error) {
           console.error(
-            `Failed to send stayed-in-group notice to user ${from.id}:`,
+            `Failed to send stayed-in-group notice to chat ${replyChatId} (user ${from.id}):`,
             error,
           );
         }
@@ -304,7 +310,7 @@ export async function processCodeAnswer(
             name: "TGuard 加群验证",
           });
           await ctx.api.sendMessage(
-            from.id,
+            replyChatId,
             kicked
               ? "本次验证已失效，你已被移出群组。请点击下方按钮重新申请加群。"
               : "本次验证已失效，请点击下方按钮重新申请加群。",
@@ -313,17 +319,17 @@ export async function processCodeAnswer(
             },
           );
           console.log(
-            `Direct-join re-apply button sent to user ${from.id} for chat ${result.reapplyChatId} (kicked=${kicked})`,
+            `Direct-join re-apply button sent to chat ${replyChatId} (user ${from.id}) for chat ${result.reapplyChatId} (kicked=${kicked})`,
           );
         } catch (error) {
           console.error(
-            `Failed to send direct-join re-apply notice to user ${from.id} for chat ${result.reapplyChatId} (kicked=${kicked}):`,
+            `Failed to send direct-join re-apply notice to chat ${replyChatId} (user ${from.id}) for chat ${result.reapplyChatId} (kicked=${kicked}):`,
             error,
           );
         }
       }
     } else {
-      await sendReapplyJoinButton(ctx, from.id, result.reapplyChatId);
+      await sendReapplyJoinButton(ctx, replyChatId, result.reapplyChatId);
     }
   }
 

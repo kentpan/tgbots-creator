@@ -49,19 +49,41 @@ export function describeTgOrgSendCodeError(apiError: string): string {
 const REQUEST_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 TGuardTGApiBot/2.1.8";
 
-/** step_one.request_tg_code_get_random_hash：请求发送 Telegram 登录码，返回 random_hash */
+/** step_one.request_tg_code_get_random_hash：请求发送 Telegram 登录码，返回 random_hash
+ *  与 tgapi-proxy-toolkit worker.js 一致：先 warm GET /auth/login?to=/apps 建立 stel_ss 会话 cookie，
+ *  再 POST /auth/send_password（携带 stel_ss），避免裸请求被 my.telegram.org 风控拦截。 */
 export async function requestTgCodeGetRandomHash(inputPhone: string): Promise<string> {
   const startedAt = Date.now();
   const requestPayload = JSON.stringify({ phone: inputPhone });
   let statusCode: number | null = null;
   let responseText = "";
   try {
+    // warm GET：建立匿名会话（stel_ss cookie），与 worker.js send-code 第一步一致
+    let sessionCookie = "";
+    try {
+      const warmResp = await fetch(`${MY_TELEGRAM_ORG_ORIGIN}/auth/login?to=/apps`, {
+        method: "GET",
+        headers: { "User-Agent": REQUEST_UA },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      const rawCookies =
+        typeof warmResp.headers.getSetCookie === "function"
+          ? warmResp.headers.getSetCookie()
+          : [warmResp.headers.get("set-cookie") ?? ""].filter(Boolean);
+      for (const line of rawCookies) {
+        const first = line.split(";")[0]?.trim() ?? "";
+        if (first.toLowerCase().startsWith("stel_ss=")) { sessionCookie = first; break; }
+      }
+    } catch (warmErr) {
+      console.warn("[my-telegram-org] warm GET /auth/login failed, continuing without stel_ss:", warmErr);
+    }
     const response = await fetch(`${MY_TELEGRAM_ORG_ORIGIN}/auth/send_password`, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
         "User-Agent": REQUEST_UA,
         Referer: `${MY_TELEGRAM_ORG_ORIGIN}/auth/login`,
+        ...(sessionCookie ? { Cookie: sessionCookie } : {}),
       },
       body: new URLSearchParams({ phone: inputPhone }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),

@@ -12,7 +12,19 @@ export async function GET(): Promise<NextResponse> {
   if (!hasPermission(admin, "settings:view")) {
     return NextResponse.json({ ok: false, error: "无权限" }, { status: 403 });
   }
-  const store = await getBackupStore();
-  const items = await store.list();
+  let store;
+  try {
+    store = await getBackupStore();
+  } catch (e) {
+    console.error("[backup/list] getBackupStore 失败:", e);
+    return NextResponse.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 502 });
+  }
+  let items;
+  try {
+    items = await store.list();
+  } catch (e) {
+    console.error("[backup/list] store.list 失败:", e);
+    return NextResponse.json({ ok: false, error: "备份列表读取失败: " + (e instanceof Error ? e.message : String(e)) }, { status: 502 });
+  }
   return NextResponse.json({ ok: true, data: { driver: store.driver, storage: store.label, items } });
 }

@@ -697,7 +697,7 @@ export async function saveBotCommandMenuAction(formData: FormData): Promise<void
   await updateBotRecord(existing.id, { config: JSON.stringify(profile) });
 
   const sync = await syncBotCommandsToTelegram(existing.id);
-  await restartMenuBot(existing.id).catch((error: unknown) => {
+  void restartMenuBot(existing.id).catch((error: unknown) => {
     console.error(`[bots] 指令菜单保存后重启运行实例失败（#id ${existing.id}）:`, error);
   });
 
@@ -724,7 +724,7 @@ export async function saveBotPrivacyModeAction(formData: FormData): Promise<void
   const profile = parseBotProfile(existing.config);
   profile.privacyMode = privacyMode;
   await updateBotRecord(existing.id, { config: JSON.stringify(profile) });
-  await restartMenuBot(existing.id).catch((error: unknown) => {
+  void restartMenuBot(existing.id).catch((error: unknown) => {
     console.error(`[bots] 隐私模式切换后重启运行实例失败（#id ${existing.id}）:`, error);
   });
 
@@ -762,7 +762,7 @@ export async function saveBotRuntimeAction(formData: FormData): Promise<void> {
   await updateBotRecord(existing.id, { config: JSON.stringify(profile) });
 
   if (existing.enabled) {
-    await restartMenuBot(existing.id).catch((error: unknown) => {
+    void restartMenuBot(existing.id).catch((error: unknown) => {
       console.error(`[bots] 运行配置保存后重启运行实例失败（#id ${existing.id}）:`, error);
     });
   }
@@ -904,8 +904,10 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
   });
 
   // 保存后热更新运行实例（启用中的实例即时应用新配置；失败全量输出日志不静默）
+  // fire-and-forget：不 await 重启，避免 Telegram API + grammy 初始化的同步耗时
+  // 触发 edge Worker "exceeded resource limits" 503；与 saveBotAction 等同款 void 模式
   if (enabled) {
-    await restartMenuBot(BigInt(idRaw)).catch((error: unknown) => {
+    void restartMenuBot(BigInt(idRaw)).catch((error: unknown) => {
       console.error(`[bots] 功能配置保存后重启运行实例失败（#id ${idRaw}）:`, error);
     });
   }

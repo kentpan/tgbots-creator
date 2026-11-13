@@ -14,10 +14,28 @@ export async function POST(): Promise<NextResponse> {
   if (!hasPermission(admin, "settings:manage")) {
     return NextResponse.json({ ok: false, error: "无权限" }, { status: 403 });
   }
-  const db = await getDatabase();
-  const store = await getBackupStore();
+  let db;
+  try {
+    db = await getDatabase();
+  } catch (e) {
+    console.error("[backup/run] getDatabase 失败:", e);
+    return NextResponse.json({ ok: false, error: "数据库不可用: " + (e instanceof Error ? e.message : String(e)) }, { status: 502 });
+  }
+  let store;
+  try {
+    store = await getBackupStore();
+  } catch (e) {
+    console.error("[backup/run] getBackupStore 失败:", e);
+    return NextResponse.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 502 });
+  }
   const cfg = parseBackupConfig(await loadBackupSettings(db));
-  const result = await runBackup(db, store, cfg.tables);
+  let result;
+  try {
+    result = await runBackup(db, store, cfg.tables);
+  } catch (e) {
+    console.error("[backup/run] runBackup 失败:", e);
+    return NextResponse.json({ ok: false, error: "备份执行失败: " + (e instanceof Error ? e.message : String(e)) }, { status: 502 });
+  }
   await markBackupRan(db);
   return NextResponse.json({
     ok: true,

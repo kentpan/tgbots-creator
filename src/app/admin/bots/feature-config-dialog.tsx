@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ListTree } from "lucide-react";
+import { TgapiProxyConfigSection } from "@/components/admin/tgapi-proxy-config-section";
 import {
   Dialog,
   DialogContent,
@@ -653,6 +654,9 @@ export function FeatureConfigDialog({
                   </p>
                 </div>
               </div>
+            </div>
+            <div className="pt-2">
+              <TgapiProxyConfigSection />
             </div>
           </div>
 

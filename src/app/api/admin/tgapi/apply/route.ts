@@ -11,6 +11,13 @@ import {
   type TgOrgScrapeResult,
 } from "@/services/my-telegram-org";
 import {
+  isTgapiProxyEnabled,
+  proxySendCode,
+  proxyVerifyCode,
+  proxyGetApp,
+  proxyCreateApp,
+} from "@/services/tgapi-proxy";
+import {
   createTgApiApplySession,
   getTgApiApplySession,
   removeTgApiApplySession,
@@ -95,8 +102,17 @@ export async function POST(request: Request): Promise<NextResponse> {
       return fail("手机号不合法：请输入国际格式（如 +8613800138000）", 400);
     }
     try {
-      const randomHash = await requestTgCodeGetRandomHash(phone);
-      const sessionId = createTgApiApplySession(phone, randomHash);
+      const proxyOn = await isTgapiProxyEnabled();
+      let randomHash: string;
+      let proxyCookies: Record<string, string> | null = null;
+      if (proxyOn) {
+        const r = await proxySendCode(phone);
+        randomHash = r.randomHash;
+        proxyCookies = r.cookies;
+      } else {
+        randomHash = await requestTgCodeGetRandomHash(phone);
+      }
+      const sessionId = createTgApiApplySession(phone, randomHash, proxyCookies);
       await logOperation(admin, {
         action: "TGAPI申请向导发送验证码",
         target: `phone=${maskPhone(phone)}`,
@@ -130,6 +146,52 @@ export async function POST(request: Request): Promise<NextResponse> {
     const code = extractTgWebLoginCode(String(payload.code ?? ""));
     if (!code) {
       return fail("无法从输入中识别验证码：请输入 Telegram 收到的登录码数字", 400);
+    }
+    // proxy 模式: session.proxyCookies !== null 表示 send_code 走了代理, 后续步骤一致走代理
+    const proxyMode = session.proxyCookies !== null;
+    if (proxyMode) {
+      let verifyResult: { ok: boolean; stelToken: string; cookies: Record<string, string>; error: string };
+      try {
+        verifyResult = await proxyVerifyCode(session.phone, session.randomHash, code, session.proxyCookies ?? {});
+      } catch (error) {
+        console.error(`TGAPI apply wizard proxy verify failed: phone=${maskPhone(session.phone)}:`, error);
+        const message = error instanceof Error ? error.message : String(error);
+        return fail(`登录请求失败(代理): ${message.slice(0, 300)}`, 502);
+      }
+      if (!verifyResult.ok) {
+        console.log(`TGAPI apply wizard proxy login rejected: admin=${admin.user.username ?? String(admin.user.id)} phone=${maskPhone(session.phone)} reason=${verifyResult.error.slice(0, 120)}`);
+        return NextResponse.json({ ok: true, data: { login_ok: false, error: verifyResult.error } });
+      }
+      let getAppResult: { appExists: boolean; appId: string; apiHash: string; appHash: string; cookies: Record<string, string> };
+      try {
+        getAppResult = await proxyGetApp(verifyResult.stelToken, verifyResult.cookies);
+      } catch (error) {
+        console.error(`TGAPI apply wizard proxy get-app failed: phone=${maskPhone(session.phone)}:`, error);
+        const message = error instanceof Error ? error.message : String(error);
+        return fail(`登录成功但抓取 APP 信息失败(代理): ${message.slice(0, 300)}`, 502);
+      }
+      await updateTgApiApplySession(sessionId, {
+        stelToken: verifyResult.stelToken,
+        proxyCookies: getAppResult.cookies,
+        appHash: getAppResult.appExists ? null : getAppResult.appHash,
+      });
+      await logOperation(admin, {
+        action: "TGAPI申请向导登录成功(代理)",
+        target: `phone=${maskPhone(session.phone)}`,
+        detail: getAppResult.appExists ? "已有 APP" : "尚未创建 APP",
+        headers: requestHeaders,
+      });
+      if (getAppResult.appExists && getAppResult.appId) {
+        removeTgApiApplySession(sessionId);
+        const info: TgAppInfo = {
+          appId: getAppResult.appId,
+          apiHash: getAppResult.apiHash,
+          testConfiguration: { ip: "", dc: "" },
+          productionConfiguration: { ip: "", dc: "" },
+        };
+        return NextResponse.json({ ok: true, data: { login_ok: true, status: "existing", app: info } });
+      }
+      return NextResponse.json({ ok: true, data: { login_ok: true, status: "no_app" } });
     }
     let login: Awaited<ReturnType<typeof loginStepGetStelCookie>>;
     try {
@@ -208,6 +270,41 @@ export async function POST(request: Request): Promise<NextResponse> {
     }
     // shortname 由 title 派生（my.telegram.org 要求字母开头 5-32 位），不合法回落默认
     const shortName = deriveTgApiShortName(title, TGAPI_DEFAULT_APP.appShortName);
+
+    // proxy 模式: session.proxyCookies !== null 表示全程走代理
+    const proxyMode = session.proxyCookies !== null;
+    if (proxyMode) {
+      try {
+        const createResult = await proxyCreateApp({
+          stelToken: session.stelToken ?? "",
+          cookies: session.proxyCookies ?? {},
+          appTitle: title,
+          appShortName: shortName,
+          appPlatform: appPlatform,
+          appUrl: TGAPI_DEFAULT_APP.appUrl,
+          appDescription: description,
+        });
+        await updateTgApiApplySession(sessionId, { proxyCookies: createResult.cookies });
+        removeTgApiApplySession(sessionId);
+        await logOperation(admin, {
+          action: "TGAPI申请向导创建APP成功(代理)",
+          target: `phone=${maskPhone(session.phone)}`,
+          detail: `app_id=${createResult.appId} title="${title}" shortname=${shortName}`,
+          headers: requestHeaders,
+        });
+        const info: TgAppInfo = {
+          appId: createResult.appId,
+          apiHash: createResult.apiHash,
+          testConfiguration: { ip: "", dc: "" },
+          productionConfiguration: { ip: "", dc: "" },
+        };
+        return NextResponse.json({ ok: true, data: { status: "created", app: info } });
+      } catch (error) {
+        console.error(`TGAPI apply wizard proxy create failed: phone=${maskPhone(session.phone)}:`, error);
+        const message = error instanceof Error ? error.message : String(error);
+        return fail(`创建 APP 失败(代理): ${message.slice(0, 300)}`, 502);
+      }
+    }
 
     try {
       // 会话中已有创建表单 hash 可直接创建；否则重新抓取（可能期间已在别处创建过 APP）

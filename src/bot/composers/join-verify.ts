@@ -1,6 +1,6 @@
 import { Composer } from "grammy";
 import type { BotContext } from "../context";
-import { recordJoinRequestOnly, bootstrapJoinVerification } from "../handlers/chat-member";
+import { recordJoinRequestOnly, bootstrapJoinVerification, type JoinVerificationUser } from "../handlers/chat-member";
 import { loadGroupSettingsForChat, resolveDesignatedBot, resolveJoinVerify } from "@/services/join-verify";
 
 /**
@@ -52,7 +52,18 @@ export function createJoinVerifyComposer(botId: bigint): Composer<BotContext> {
       return;
     }
 
-    const result = await bootstrapJoinVerification(ctx.api, user, chat, "telegram", botId);
+    // chat_join_request 携带 user_chat_id：机器人可向该会话发消息（无需用户事先 /start）。
+    // 透传给 bootstrap，私聊验证提示发送到 user_chat_id 而非 user.id（根因修复：
+    // 用户点击"申请加入群组"后未 /start 机器人时，向 user.id 发消息会 403 Forbidden）。
+    const userWithChat: JoinVerificationUser = {
+      id: user.id,
+      username: user.username,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      userChatId: joinRequest.user_chat_id,
+    };
+
+    const result = await bootstrapJoinVerification(ctx.api, userWithChat, chat, "telegram", botId);
     if (!result) {
       console.error(
         `[join-verify] bootstrap returned null unexpectedly for chat ${chat.id} (bot #${botId}) — recorded for manual review`,

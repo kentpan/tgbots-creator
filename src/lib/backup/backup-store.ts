@@ -245,8 +245,8 @@ export async function getBackupStore(): Promise<BackupStore> {
     const db = await getDatabase();
     const st = await getStorageSettings(db);
     if (st.s3Config) return settingsStore(st.s3Config, st.driver);
-  } catch {
-    // 库不可用 (极端场景) → 继续走绑定/本地链路
+  } catch (e) {
+    console.error("[getBackupStore] 读取 app_settings 存储配置失败, 继续走绑定/本地链路:", e);
   }
   // 2. Cloudflare R2 平台绑定 (零配置)
   const env = await resolveCloudflareEnv();

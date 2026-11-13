@@ -665,6 +665,22 @@ jobs:
           fi
           echo "✅ D1 schema 已就绪(差异驱动增量应用, 对既有库零副作用): $D1_NAME"
 
+      - name: Apply versioned SQL update (prisma/sql-update-{version}.sql, if present)
+        # 版本化 SQL 增量: 每次打包若 sqlite/D1 schema 有新增/修改/删除,
+        # 固定新增 prisma/sql-update-{本次打包版本号}.sql; 此步骤检测是否存在该文件,
+        # 有则经 wrangler d1 execute 应用到线上 D1, 无则跳过。
+        if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != ''
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          SQL_FILE="prisma/sql-update-v${PKG_VERSION}.sql"
+          if [ -f "$SQL_FILE" ]; then
+            echo "检测到版本化 SQL 增量: $SQL_FILE → 应用到 D1"
+            npx wrangler d1 execute "$D1_NAME" --remote -y --file="$SQL_FILE"
+            echo "✅ 版本化 SQL 增量已应用: $SQL_FILE"
+          else
+            echo "未检测到 prisma/sql-update-v${PKG_VERSION}.sql → 跳过版本化 SQL 增量"
+          fi
+
       - name: Migrate D1 schema (additive, data-preserving)
         # TGuard 适配③(照抄生产版 v8.9.18, 修复"首次部署 D1 只建表无数据 →
         # 管理后台无管理员账号无法登录"): 仓库携带数据库文件(DB_FILE_EXISTS=true,

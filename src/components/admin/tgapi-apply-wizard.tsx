@@ -169,7 +169,16 @@ export function TgApiApplyWizard({
   const [resultApp, setResultApp] = useState<TgAppInfoView | null>(null);
   const [resultCreated, setResultCreated] = useState(false);
 
-  /** 打开时重置向导（关闭仅隐藏，下次打开回到第一步） */
+  // TGAPI代理配置(可折叠面板)
+  const [proxyOpen, setProxyOpen] = useState(false);
+  const [proxyCfg, setProxyCfg] = useState({
+    enabled: false, proxyUrl: "", authType: "bearer" as "bearer" | "basic",
+    bearerKey: "", basicUser: "", basicPass: "",
+  });
+  const [proxySaving, setProxySaving] = useState(false);
+  const [proxyMsg, setProxyMsg] = useState<string | null>(null);
+
+  /** 打开时重置向导（关闭仅隐藏，下次打开回到第一步） + 加载代理配置 */
   useEffect(() => {
     if (open) {
       setStep(1);
@@ -183,6 +192,11 @@ export function TgApiApplyWizard({
       setAppPlatform(TGAPI_PLATFORM_VALUES[0]);
       setResultApp(null);
       setResultCreated(false);
+      // 加载 TGAPI代理配置
+      fetch("/api/admin/tgapi/proxy", { headers: { "Content-Type": "application/json" } })
+        .then((r) => r.json())
+        .then((d) => { if (d.ok && d.data?.config) setProxyCfg(d.data.config); })
+        .catch((e) => console.error("加载TGAPI代理配置失败:", e));
     }
   }, [open]);
 
@@ -197,6 +211,26 @@ export function TgApiApplyWizard({
       return { ok: false, error: `HTTP ${response.status}：服务端无响应` };
     }
     return json;
+  }
+
+  /** 保存 TGAPI代理配置 */
+  async function saveProxyCfg(): Promise<void> {
+    setProxySaving(true);
+    setProxyMsg(null);
+    try {
+      const res = await fetch("/api/admin/tgapi/proxy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(proxyCfg),
+      });
+      const d = (await res.json().catch(() => null)) as { ok?: boolean; message?: string; error?: string } | null;
+      if (d?.ok) { setProxyMsg(d.message ?? "已保存"); }
+      else { setProxyMsg(d?.error ?? `保存失败(HTTP ${res.status})`); }
+    } catch (e) {
+      setProxyMsg("保存失败: " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setProxySaving(false);
+    }
   }
 
   /** Step 1 → 发送验证码 */
@@ -316,6 +350,100 @@ export function TgApiApplyWizard({
         </DialogHeader>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-4">
+          {/* TGAPI代理配置(可折叠) */}
+          <div className="rounded-md border border-slate-200 bg-slate-50">
+            <button
+              type="button"
+              onClick={() => setProxyOpen((v) => !v)}
+              className="flex w-full items-center justify-between px-3 py-2 text-left text-sm font-medium text-slate-700"
+            >
+              <span>TGAPI代理 {proxyCfg.enabled ? "(已启用)" : ""}</span>
+              <span className="text-xs text-slate-400">{proxyOpen ? "收起 ▲" : "展开 ▼"}</span>
+            </button>
+            {proxyOpen ? (
+              <div className="space-y-3 border-t border-slate-200 px-3 py-3">
+                <p className="text-xs text-muted-foreground">
+                  将 my.telegram.org 申请四步调用经 tgapi-proxy-toolkit 代理转发(代理端用其上游 PROXIES 访问 my.telegram.org)。仅需配置代理地址 + 鉴权。
+                </p>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={proxyCfg.enabled}
+                    onChange={(e) => setProxyCfg({ ...proxyCfg, enabled: e.target.checked })}
+                  />
+                  启用 TGAPI代理
+                </label>
+                <div className="space-y-1">
+                  <label className={labelClass}>代理地址(tgapi-proxy-toolkit 部署 URL)</label>
+                  <input
+                    className={inputClass}
+                    value={proxyCfg.proxyUrl}
+                    onChange={(e) => setProxyCfg({ ...proxyCfg, proxyUrl: e.target.value })}
+                    placeholder="https://your-tgapi-proxy.workers.dev"
+                    autoComplete="off"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className={labelClass}>鉴权方式</label>
+                  <select
+                    className={inputClass}
+                    value={proxyCfg.authType}
+                    onChange={(e) => setProxyCfg({ ...proxyCfg, authType: e.target.value as "bearer" | "basic" })}
+                  >
+                    <option value="bearer">Bearer APIKEY</option>
+                    <option value="basic">Basic user:pass</option>
+                  </select>
+                </div>
+                {proxyCfg.authType === "bearer" ? (
+                  <div className="space-y-1">
+                    <label className={labelClass}>APIKEY(代理端 APIKEYS)</label>
+                    <input
+                      className={inputClass}
+                      value={proxyCfg.bearerKey}
+                      onChange={(e) => setProxyCfg({ ...proxyCfg, bearerKey: e.target.value })}
+                      placeholder="tgx_..."
+                      autoComplete="off"
+                    />
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-1">
+                      <label className={labelClass}>用户名</label>
+                      <input
+                        className={inputClass}
+                        value={proxyCfg.basicUser}
+                        onChange={(e) => setProxyCfg({ ...proxyCfg, basicUser: e.target.value })}
+                        placeholder="user"
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className={labelClass}>密码</label>
+                      <input
+                        className={inputClass}
+                        type="password"
+                        value={proxyCfg.basicPass}
+                        onChange={(e) => setProxyCfg({ ...proxyCfg, basicPass: e.target.value })}
+                        placeholder="pass"
+                        autoComplete="off"
+                      />
+                    </div>
+                  </div>
+                )}
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={saveProxyCfg}
+                    disabled={proxySaving}
+                    className="inline-flex h-9 items-center rounded-md bg-emerald-600 px-4 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                  >
+                    {proxySaving ? "保存中…" : "保存代理配置"}
+                  </button>
+                  {proxyMsg ? <span className="text-xs text-muted-foreground">{proxyMsg}</span> : null}
+                </div>
+              </div>
+            ) : null}
+          </div>
           <StepIndicator step={step} />
           {error ? (
             <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">

@@ -23,6 +23,8 @@ export interface TgApiApplySession {
   stelToken: string | null;
   /** /apps 页面解析出的创建表单 hash（verify 确认无 APP 时写入，create 步骤复用） */
   appHash: string | null;
+  /** TGAPI代理模式: 透传代理返回的 cookies（直连模式为 null） */
+  proxyCookies: Record<string, string> | null;
   /** 过期时间戳 */
   expiresAt: number;
 }
@@ -46,7 +48,7 @@ function purgeExpired(): void {
 }
 
 /** 创建申请会话：记录手机号 + random_hash，返回 sessionId */
-export function createTgApiApplySession(phone: string, randomHash: string): string {
+export function createTgApiApplySession(phone: string, randomHash: string, proxyCookies: Record<string, string> | null = null): string {
   purgeExpired();
   while (sessions.size >= MAX_SESSIONS) {
     // 超上限：淘汰最早过期的会话（Map 保持插入序，首个即最旧）
@@ -60,6 +62,7 @@ export function createTgApiApplySession(phone: string, randomHash: string): stri
     randomHash,
     stelToken: null,
     appHash: null,
+    proxyCookies,
     expiresAt: Date.now() + APPLY_SESSION_TTL_MS,
   });
   return id;
@@ -75,10 +78,10 @@ export function getTgApiApplySession(sessionId: string): TgApiApplySession | nul
   return session;
 }
 
-/** 更新会话（登录成功后写入 stel_token / appHash；每次操作顺带续期） */
+/** 更新会话（登录成功后写入 stel_token / appHash / proxyCookies；每次操作顺带续期） */
 export function updateTgApiApplySession(
   sessionId: string,
-  patch: Partial<Pick<TgApiApplySession, "stelToken" | "appHash">>,
+  patch: Partial<Pick<TgApiApplySession, "stelToken" | "appHash" | "proxyCookies">>,
 ): TgApiApplySession | null {
   const session = getTgApiApplySession(sessionId);
   if (!session) return null;

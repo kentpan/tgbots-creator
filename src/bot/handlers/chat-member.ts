@@ -45,6 +45,13 @@ export interface JoinVerificationUser {
   username?: string;
   first_name?: string;
   last_name?: string;
+  /**
+   * chat_join_request 专属：user_chat_id（加群申请私聊会话 ID）。
+   * 来自 ChatJoinRequest.user_chat_id —— 机器人可向该会话发消息，
+   * 无需用户事先 /start 机器人（与 user.id 不同，user.id 私聊需先 /start）。
+   * requestType="telegram" 时必填；"direct" 时为 undefined（回落 user.id）。
+   */
+  userChatId?: number;
 }
 
 export interface JoinVerificationChat {
@@ -257,12 +264,13 @@ async function bootstrapDmVerification(
 
   if (resolved.method === "code_api") {
     const promptText = settings?.promptText ?? "🔐 请回复本消息并输入验证码完成验证";
+    const targetChatId = user.userChatId ?? user.id;
     try {
       // stateless-question：问题消息末尾附加用户不可见的后缀（HTML 模式需转义正文），
       // 配合 force_reply 引导用户回复该消息——机器人无需关闭 Telegram 隐私模式
       // 即可在用户回复时收到验证码
       await api.sendMessage(
-        user.id,
+        targetChatId,
         htmlEscape(promptText) + codeQuestion.messageSuffixHTML(),
         {
           parse_mode: "HTML",
@@ -273,14 +281,14 @@ async function bootstrapDmVerification(
           },
         },
       );
-      console.log(`Code verification prompt sent to user ${user.id} (${requestType})`);
+      console.log(`Code verification prompt sent to chat ${targetChatId} (user ${user.id}, ${requestType})`);
       return { created: true, promptDelivered: true, method: "code_api" };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (message.toLowerCase().includes("chat not found")) {
+      if (message.toLowerCase().includes("chat not found") || message.toLowerCase().includes("forbidden")) {
         // 私聊不可达：/start 时会重发验证提示；超时未验证按失效处理
         console.warn(
-          `Cannot send code prompt to user ${user.id} (${requestType}): user hasn't started bot; ` +
+          `Cannot send code prompt to chat ${targetChatId} (user ${user.id}, ${requestType}): chat not reachable; ` +
             "prompt will be resent when the user /starts the bot; session expires per timeout",
         );
         return { created: true, promptDelivered: false, method: "code_api" };
@@ -293,7 +301,8 @@ async function bootstrapDmVerification(
   // code_self：私聊发送自生成的入群验证码（含隐形后缀 + force_reply，与 code_api 同一输码通道）
   if (useSelfCode && joinCode) {
     const promptText = settings?.promptText || CODE_SELF_DEFAULT_PROMPT;
-    const delivery = await sendCodeSelfPrompt(api, user.id, {
+    const targetChatId = user.userChatId ?? user.id;
+    const delivery = await sendCodeSelfPrompt(api, targetChatId, {
       promptText,
       code: joinCode,
       expiresAt,
@@ -309,15 +318,16 @@ async function bootstrapDmVerification(
   try {
     const chatTitle = htmlEscape(chat.title ?? "群组");
     const welcomeText = `欢迎加入群组${chatTitle}！请点击下方链接完成人机验证`;
-
-    await api.sendMessage(user.id, welcomeText, { reply_markup: keyboard });
-    console.log(`Verification message sent to user ${user.id} (${requestType})`);
+    const targetChatId = user.userChatId ?? user.id;
+    await api.sendMessage(targetChatId, welcomeText, { reply_markup: keyboard });
+    console.log(`Verification message sent to chat ${targetChatId} (user ${user.id}, ${requestType})`);
     return { created: true, promptDelivered: true, method: "captcha" };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (message.toLowerCase().includes("chat not found")) {
+    if (message.toLowerCase().includes("chat not found") || message.toLowerCase().includes("forbidden")) {
+      const targetChatId = user.userChatId ?? user.id;
       console.warn(
-        `Cannot send verification message to user ${user.id} (${requestType}): user hasn't started bot; ` +
+        `Cannot send verification message to chat ${targetChatId} (user ${user.id}, ${requestType}): chat not reachable; ` +
           "prompt will be resent when the user /starts the bot; session expires per timeout",
       );
       return { created: true, promptDelivered: false, method: "captcha" };

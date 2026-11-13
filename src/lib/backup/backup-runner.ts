@@ -129,21 +129,38 @@ export interface BackupRunResult {
   rows: number;
 }
 
-/** 执行一次备份并落存储 (定时/手动共用)。 */
+/** 执行一次备份并落存储 (定时/手动共用)。
+ *  增量构建 JSON(逐表 SELECT + 逐表 JSON.stringify 拼接), 不再 materialize 全量 snapshot
+ *  对象后整体 JSON.stringify —— 降低 edge Worker 峰值内存与 CPU 耗时, 避免 "exceeded resource limits"。 */
 export async function runBackup(
   db: SqlDatabase,
   store: Awaited<ReturnType<typeof import("./backup-store").getBackupStore>>,
   tablesParam: string | string[],
 ): Promise<BackupRunResult> {
-  const snapshot = await collectSnapshot(db, tablesParam);
-  const tableNames = Object.keys(snapshot.tables);
-  const json = JSON.stringify(snapshot);
+  const catalog = await loadTableCatalog(db);
+  const wanted = Array.isArray(tablesParam)
+    ? tablesParam.filter((name) => {
+        if (isCatalogTable(catalog, name)) return true;
+        throw new Error(`表不存在于数据库: ${name}`);
+      })
+    : await resolveBackupTables(db, tablesParam);
   const d = new Date();
   const pad = (n: number, l = 2) => String(n).padStart(l, "0");
   const key = `backup-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.json`;
+  // 逐表增量拼接 JSON: 不持有完整 snapshot 对象, 逐表 SELECT 后立即 stringify 释放行集
+  let json = `{"exported_at":"${d.toISOString()}","driver":"${driverOf(db)}","tables":{`;
+  let rows = 0;
+  for (let i = 0; i < wanted.length; i++) {
+    const name = wanted[i];
+    if (i > 0) json += ",";
+    json += JSON.stringify(name) + ":";
+    const tableRows = await db.all(`SELECT * FROM ${name}`);
+    rows += tableRows.length;
+    json += JSON.stringify(tableRows);
+  }
+  json += `}}`;
   await store.put(key, json);
-  const rows = tableNames.reduce((acc, t) => acc + (snapshot.tables[t]?.length || 0), 0);
-  return { key, size: new TextEncoder().encode(json).length, storage: store.label, tables: tableNames, rows };
+  return { key, size: new TextEncoder().encode(json).length, storage: store.label, tables: wanted, rows };
 }
 
 /** 备份后回写 last_run 设置 (app_settings.backup_last_run_at)。回写失败留痕，不影响已落盘的备份。 */
