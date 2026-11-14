@@ -663,7 +663,7 @@ export function TgApiMenuKeyboardDialog({
                     </div>
                   ))}
                   </div>
-                  )}
+                  ) : <></>}
                 </div>
 
                 {/* 🧩 功能开关（显式开启才生效）：消息内嵌按钮 ⇄ 自定义键盘互斥 + 指令菜单独立；
