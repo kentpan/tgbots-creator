@@ -13,7 +13,7 @@ import {
 } from "@/database/bindings";
 
 // ---------------------------------------------------------------------------
-// v2.3 轻量自动迁移（D1 / SQLite 双端）：v2.3 新增列在运行时自动补齐 ——
+// v2.3.5 轻量自动迁移（D1 / SQLite 双端）：新增列在运行时自动补齐 ——
 // 每 isolate 仅执行一次（成功后缓存 Promise），已存在列 PRAGMA 探测后跳过。
 // 杜绝「已部署库缺列 → upsertGroupSettings 指定列名 INSERT 报错 500」。
 // prisma/schema.sql 仍为全量建表基准（新库直接建全）。
@@ -25,6 +25,8 @@ export function ensureAppSchema(): Promise<void> {
     appSchemaReady = (async () => {
       await ensureColumn("group_settings", "join_verify_bot_id", "INTEGER");
       await ensureColumn("group_settings", "chat_type", "TEXT");
+      await ensureColumn("group_settings", "join_verify_mode", "TEXT");
+      await ensureColumn("group_settings", "join_verify_method_id", "INTEGER");
       await ensureColumn("verification_sessions", "method_id", "INTEGER");
       await ensureColumn("verification_sessions", "max_attempts", "INTEGER");
     })().catch((error: unknown) => {
@@ -257,6 +259,10 @@ export interface GroupSettingsRow {
    *   其他管理员机器人即使开启了加群验证也忽略 —— 杜绝多机器人竞态。
    */
   joinVerifyBotId: bigint | null;
+  /** 群组私有审核策略：verify=按群组绑定验证方式；direct=直接审批 */
+  joinVerifyMode: "verify" | "direct" | null;
+  /** 群组私有验证方式库 ID */
+  joinVerifyMethodId: bigint | null;
   /** v2.3 聊天类型（group/supergroup/channel，运行时事件登记；旧数据/未登记为 NULL=未知） */
   chatType: string | null;
   createdTime: Date;
@@ -1174,7 +1180,10 @@ function mapGroupSettings(row: Record<string, unknown>): GroupSettingsRow {
     replyCodeInGroup: row.reply_code_in_group === undefined ? false : toBoolean(row.reply_code_in_group),
     // v2.3 加群验证机器人指定：列缺失/空 → null（手动审核）
     joinVerifyBotId: row.join_verify_bot_id === undefined || row.join_verify_bot_id === null || row.join_verify_bot_id === "" ? null : toBigIntOrNull(row.join_verify_bot_id),
-    // v2.3 聊天类型：运行时事件登记（group/supergroup/channel）；未登记 = NULL
+    joinVerifyMode: row.join_verify_mode === "direct" ? "direct" : row.join_verify_mode === "verify" ? "verify" : null,
+    joinVerifyMethodId: row.join_verify_method_id === undefined || row.join_verify_method_id === null || row.join_verify_method_id === "" ? null : toBigIntOrNull(row.join_verify_method_id),
+    // v2.3.5 群组策略列：NULL 表示历史群组尚未显式选择，兼容旧机器人默认值；
+    // 聊天类型：运行时事件登记（group/supergroup/channel）；未登记 = NULL
     chatType: (row.chat_type as string | null) ?? null,
     createdTime: toDate(row.created_time),
     updatedTime: toDate(row.updated_time),
@@ -1650,6 +1659,10 @@ export async function upsertGroupSettings(
     replyCodeInGroup?: boolean;
     /** v2.3 加群验证机器人指定（null=手动审核）；undefined = 不改动现有值 */
     joinVerifyBotId?: bigint | null;
+    /** 群组私有审核方式；undefined = 保留 */
+    joinVerifyMode?: "verify" | "direct" | null;
+    /** 群组私有验证方式库 ID；undefined = 保留，null = 清除 */
+    joinVerifyMethodId?: bigint | null;
     /** v2.3 聊天类型（group/supergroup/channel）；undefined = 不改动现有值 */
     chatType?: string | null;
   },
@@ -1663,12 +1676,16 @@ export async function upsertGroupSettings(
   let kickDirectJoinsValue = input.kickDirectJoins;
   let replyCodeInGroupValue = input.replyCodeInGroup;
   let joinVerifyBotIdValue = input.joinVerifyBotId;
+  let joinVerifyModeValue = input.joinVerifyMode;
+  let joinVerifyMethodIdValue = input.joinVerifyMethodId;
   if (
     requireApprovalValue === undefined ||
     verificationChannelValue === undefined ||
     kickDirectJoinsValue === undefined ||
     replyCodeInGroupValue === undefined ||
     joinVerifyBotIdValue === undefined ||
+    joinVerifyModeValue === undefined ||
+    joinVerifyMethodIdValue === undefined ||
     input.chatType === undefined
   ) {
     const existing = await getGroupSettings(chatId);
@@ -1688,6 +1705,8 @@ export async function upsertGroupSettings(
     if (joinVerifyBotIdValue === undefined) {
       joinVerifyBotIdValue = existing ? existing.joinVerifyBotId : null;
     }
+    if (joinVerifyModeValue === undefined) joinVerifyModeValue = existing?.joinVerifyMode ?? null;
+    if (joinVerifyMethodIdValue === undefined) joinVerifyMethodIdValue = existing?.joinVerifyMethodId ?? null;
   }
   // chatType 独立读现值（existing 在上方 if 块作用域内，可能未查询）
   let chatTypeValue: string | null | undefined = input.chatType;
@@ -1698,8 +1717,8 @@ export async function upsertGroupSettings(
 
   await executeRun(
     `INSERT INTO group_settings
-       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, require_approval, verification_channel, kick_direct_joins, reply_code_in_group, join_verify_bot_id, chat_type, created_time, updated_time)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (chat_id, chat_title, method, method_id, timeout_seconds, max_attempts, prompt_text, success_text, failure_text, enabled, privacy_mode, require_approval, verification_channel, kick_direct_joins, reply_code_in_group, join_verify_bot_id, join_verify_mode, join_verify_method_id, chat_type, created_time, updated_time)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(chat_id) DO UPDATE SET
        chat_title = COALESCE(excluded.chat_title, group_settings.chat_title),
        method = COALESCE(excluded.method, group_settings.method),
@@ -1716,6 +1735,8 @@ export async function upsertGroupSettings(
        kick_direct_joins = excluded.kick_direct_joins,
        reply_code_in_group = excluded.reply_code_in_group,
        join_verify_bot_id = excluded.join_verify_bot_id,
+       join_verify_mode = excluded.join_verify_mode,
+       join_verify_method_id = excluded.join_verify_method_id,
        chat_type = COALESCE(excluded.chat_type, group_settings.chat_type),
        updated_time = excluded.updated_time`,
     [
@@ -1740,6 +1761,8 @@ export async function upsertGroupSettings(
       kickDirectJoinsValue ? 1 : 0,
       replyCodeInGroupValue ? 1 : 0,
       joinVerifyBotIdValue === null || joinVerifyBotIdValue === undefined ? null : Number(joinVerifyBotIdValue),
+      joinVerifyModeValue === "direct" ? "direct" : joinVerifyModeValue === "verify" ? "verify" : null,
+      joinVerifyMethodIdValue === null || joinVerifyMethodIdValue === undefined ? null : Number(joinVerifyMethodIdValue),
       chatTypeValue,
       dateText(new Date()),
       dateText(new Date()),

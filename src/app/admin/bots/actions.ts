@@ -782,7 +782,7 @@ export async function saveBotRuntimeAction(formData: FormData): Promise<void> {
  * 保存机器人「功能配置」弹窗（v2.3，feature 形态统一保存）：
  * 一次落库：基本信息（名称/Token/启用）+ menu_config + 界面互斥（kb_mode）+
  * customKeyboard + privacyMode/commandIds + 功能面板开关（menu/commands/keyboardEnabled）+
- * 加群验证（bots.config.joinVerify）+ 通用门禁（bots.config.gate）。
+ * 加群验证能力开关/机器人级参数（bots.config.joinVerify）+ 通用门禁（bots.config.gate）。
  * 验证方式/参数覆盖只写 bot 配置，绝不回写验证方式库；保存后热更新运行实例。
  */
 export async function saveBotFeatureConfigAction(formData: FormData): Promise<void> {
@@ -869,17 +869,16 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
 
   // —— 加群验证（bots.config.joinVerify）：方式单选 + 超时/次数覆盖 ——
   if (formData.has("join_verify_enabled")) {
-    const methodIdRaw = String(formData.get("join_verify_method_id") ?? "").trim();
-    const joinVerifyMode = String(formData.get("join_verify_mode") ?? "verify") === "direct" ? "direct" : "verify";
+    // 机器人级只保存自动响应能力与全局超时/尝试次数；申请处理方式和验证方式由群组设置保存。
     const timeoutRaw = Number(formData.get("join_verify_timeout") ?? "");
     const attemptsRaw = Number(formData.get("join_verify_attempts") ?? "");
     const override: Record<string, number> = {};
     if (Number.isFinite(timeoutRaw) && timeoutRaw >= 1) override.timeout_seconds = Math.floor(timeoutRaw);
     if (Number.isFinite(attemptsRaw) && attemptsRaw >= 1) override.max_attempts = Math.floor(attemptsRaw);
+    const previousJoinVerify = next.joinVerify && typeof next.joinVerify === "object" ? (next.joinVerify as Record<string, unknown>) : {};
     next.joinVerify = {
+      ...previousJoinVerify,
       enabled: formData.get("join_verify_enabled") === "1",
-      mode: joinVerifyMode,
-      methodId: joinVerifyMode === "verify" && methodIdRaw && /^\d+$/.test(methodIdRaw) ? methodIdRaw : null,
       ...(Object.keys(override).length > 0 ? { override } : {}),
     };
   }
@@ -927,14 +926,8 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
     ...(menuConfigJson ? { menuConfig: menuConfigJson, menuText: menuTextValue ?? "" } : {}),
   });
 
-  // 保存后热更新运行实例（启用中的实例即时应用新配置；失败全量输出日志不静默）
-  // fire-and-forget：不 await 重启，避免 Telegram API + grammy 初始化的同步耗时
-  // 触发 edge Worker "exceeded resource limits" 503；与 saveBotAction 等同款 void 模式
-  if (enabled) {
-    void restartMenuBot(BigInt(idRaw)).catch((error: unknown) => {
-      console.error(`[bots] 功能配置保存后重启运行实例失败（#id ${idRaw}）:`, error);
-    });
-  }
+  // v2.3.5：机器人管理只保存默认能力配置，不部署/重启运行实例。
+  // 运行实例上线与群组私有配置生效统一由仿真 APP 的部署入口完成。
 
   await logOperation(admin, {
     action: "保存机器人功能配置",

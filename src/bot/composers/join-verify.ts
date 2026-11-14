@@ -29,6 +29,12 @@ export function createJoinVerifyComposer(botId: bigint): Composer<BotContext> {
         `user_chat_id=${joinRequest.user_chat_id} username=${user.username ?? "-"}`,
     );
     const settings = await loadGroupSettingsForChat(BigInt(chat.id));
+    // 群组「新成员审核」是群级总开关：关闭时保留机器人/模式/方式配置，但自动审核机器人不生效。
+    if (settings?.requireApproval !== true) {
+      console.log(`[join-verify] approval disabled for chat=${chat.id}; auto-review bot config retained but inactive`);
+      await recordJoinRequestOnly(ctx.api, user, chat, "telegram");
+      return;
+    }
     const role = resolveDesignatedBot(settings, botId);
     console.log(
       `[join-verify] routing chat=${chat.id} bot=#${botId} role=${role} ` +

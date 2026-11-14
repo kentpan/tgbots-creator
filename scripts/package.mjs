@@ -110,9 +110,16 @@ function dumpShippedConfig(dbFile) {
     .prepare("SELECT id, name, enabled, type FROM verification_methods ORDER BY id")
     .all();
   db.close();
-  console.log(`   ── ${dbFile} 随包全局配置（交付前必须逐项核对） ──`);
+  console.log(`   ── ${dbFile} 随包全局配置（交付前必须逐项核对；敏感值脱敏） ──`);
   for (const row of settings) {
-    console.log(`   · ${row.key} = ${row.value}`);
+    let displayValue = String(row.value ?? "");
+    if (/proxy_url/i.test(row.key)) {
+      // URL userinfo（用户名/密码）绝不能出现在打包日志或交付报告中。
+      displayValue = displayValue.replace(/(https?:\/\/)[^/@]+@/i, "$1***@");
+    } else if (/(api[_-]?key|token|secret|password)/i.test(row.key)) {
+      displayValue = displayValue ? "[已配置，内容已隐藏]" : "";
+    }
+    console.log(`   · ${row.key} = ${displayValue}`);
   }
   console.log(`   ── ${dbFile} 随包验证方式（严禁 mock/假数据） ──`);
   if (methods.length === 0) console.log("   · （无）");
@@ -217,6 +224,38 @@ for (const d of includeDirs) {
   });
 }
 
+// 4.4 版本化 schema 升级：本地 SQLite staging 副本与线上 D1 使用同一文件名规则。
+//     只操作 staging 副本，不修改开发者当前数据库；无升级文件时零操作。
+const versionedUpgrade = path.join(stage, "prisma", `sql-upgrade-v${pkg.version}.sql`);
+if (existsSync(versionedUpgrade)) {
+  const sql = readFileSync(versionedUpgrade, "utf8");
+  for (const dbRel of ["prisma/bot-groups.db"]) {
+    const stagedDb = path.join(stage, dbRel);
+    if (!existsSync(stagedDb)) continue;
+    const db = new DatabaseSync(stagedDb);
+    try {
+      db.exec("PRAGMA foreign_keys=ON;");
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        db.exec(sql);
+        db.exec("COMMIT;");
+      } catch (error) {
+        db.exec("ROLLBACK;");
+        throw error;
+      }
+      const integrity = db.prepare("PRAGMA integrity_check").get();
+      if (!integrity || Object.values(integrity)[0] !== "ok") {
+        throw new Error(`${dbRel} integrity_check failed after ${path.basename(versionedUpgrade)}`);
+      }
+      console.log(`   ✓ SQLite upgrade applied to staging: ${dbRel} ← ${path.basename(versionedUpgrade)}`);
+    } finally {
+      db.close();
+    }
+  }
+} else {
+  console.log(`   · 未检测到 ${path.relative(root, versionedUpgrade)}，SQLite staging 跳过版本升级`);
+}
+
 // 4.5 沙盒残留清洗（staging 副本上执行，绝不写回沙盒本地库），随后从副本读出
 //     随包全局配置/验证方式打印 —— 这里才是真正随包分发的最终数据，交付前逐项核对
 for (const dbFile of ["prisma/bot-groups.db", "db/custom.db"]) {
@@ -298,6 +337,9 @@ function isPackagedPath(rel) {
 }
 
 function collectLegacyGhosts() {
+  // ZIP 解压源码通常不包含 .git；无 Git 历史时无法可靠推导幽灵文件，
+  // 以空清单继续打包（不猜测、不删除任何源码文件）。
+  if (!existsSync(path.join(root, ".git"))) return [];
   const gitOutput = execSync("git -c core.quotepath=false log HEAD --pretty=format: --name-only", {
     cwd: root,
     encoding: "utf-8",

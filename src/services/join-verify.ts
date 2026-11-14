@@ -1,18 +1,19 @@
 /**
- * 加群验证解析服务（机器人级验证方式配置的唯一解析口）：
+ * 加群验证解析服务（机器人能力 + 群组策略的统一解析口）：
  *
- * 数据来源（验证方式配置已从群级迁到机器人级）：
- *   bots.config.joinVerify = { enabled, mode, methodId?, override? }
+ * 数据来源：
+ *   bots.config.joinVerify = { enabled, override? }（机器人级能力开关 + 全局参数覆盖）
+ *   group_settings.join_verify_mode / join_verify_method_id = 群组私有策略
  *   验证方式行 = verification_methods（type: code_api / code_self / captcha）
  *   生效参数 = 方式默认参数 ← bot 级 override（mergeVerificationParams）
  *
  * 渠道语义（源头规则，无配置项）：
- *   - 申请制入群（chat_join_request，被指定的加群验证机器人）：按 mode 选择私聊验证或直接审批；
+ *   - 申请制入群（chat_join_request，被指定的加群验证机器人）：按群组 mode 选择验证或直接审批；
  *   - 直连入群（chat_member 补验证）：超级群 → 群内验证，基础群 → 私聊验证（auto 语义）；
  *   - 频道：物理不支持群内验证（订阅者不能发言），强制私聊验证。
  *
  * 运行时文本（提示/成功/失败）= group_settings 三列（群信息弹窗维护，
- * 表单预填生效值：群组覆盖 > 机器人默认 > 方式默认），运行时只读群列，单一来源。
+ * 表单预填文案保存在群组列；超时/次数由机器人级 override 覆盖验证方式默认值。
  */
 
 import { getBot, getGroupSettings, getVerificationMethod, type GroupSettingsRow } from "@/database/operations";
@@ -48,14 +49,16 @@ export async function resolveJoinVerify(
   }
   const feature = parseBotFeatureConfig(bot.config, false);
   if (!feature.joinVerify.enabled) return null;
-  if (feature.joinVerify.mode === "direct") {
+  if (settings?.joinVerifyMode === "direct" || ((!settings || settings.joinVerifyMode === null) && feature.joinVerify.mode === "direct")) {
     return { method: "direct", methodDbId: null, timeoutSeconds: 0, maxAttempts: 0 };
   }
-  if (!feature.joinVerify.methodId) return null;
-  const method = await getVerificationMethod(BigInt(feature.joinVerify.methodId));
+  // v2.3.5 群组绑定方式优先；仅对尚未显式设置群组策略的历史群组回退旧机器人级 methodId。
+  const methodId = settings?.joinVerifyMethodId ?? ((!settings || settings.joinVerifyMode === null) && feature.joinVerify.methodId ? BigInt(feature.joinVerify.methodId) : null);
+  if (!methodId) return null;
+  const method = await getVerificationMethod(methodId);
   if (!method || !method.enabled) {
     console.error(
-      `[join-verify] bot #${botId} joinVerify method ${feature.joinVerify.methodId} missing or disabled`,
+      `[join-verify] bot #${botId} joinVerify method ${methodId} missing or disabled`,
     );
     return null;
   }
@@ -99,14 +102,14 @@ export function resolveDesignatedBot(
   return designated === botId ? "designated" : "other";
 }
 
-/** 加群验证机器人候选（群信息弹窗「自动审核机器人」下拉数据源）：bots.config.joinVerify.enabled 的机器人 id 集合 */
+/** 加群验证机器人候选：机器人级只控制自动响应能力开关，审核策略由群组设置决定。 */
 export async function listJoinVerifyCapableBotIds(): Promise<Set<string>> {
   const { listBots } = await import("@/database/operations");
   const bots = await listBots();
   const result = new Set<string>();
   for (const bot of bots) {
     const feature = parseBotFeatureConfig(bot.config, false);
-    if (bot.enabled && feature.joinVerify.enabled && (feature.joinVerify.mode === "direct" || feature.joinVerify.methodId)) {
+    if (bot.enabled && feature.joinVerify.enabled) {
       result.add(String(bot.id));
     }
   }

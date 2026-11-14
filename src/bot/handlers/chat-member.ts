@@ -19,6 +19,7 @@ import { registerTelegramChat } from "@/services/chat-registry";
 import {
   loadGroupSettingsForChat,
   resolveJoinVerify,
+  resolveDesignatedBot,
   type ResolvedJoinVerify,
 } from "@/services/join-verify";
 import { chatCapabilities, chatKindFromChatType } from "@/services/chat-type";
@@ -26,7 +27,7 @@ import { chatCapabilities, chatKindFromChatType } from "@/services/chat-type";
 /**
  * 加群验证引导（真实 Telegram 路径）：
  *
- * 验证方式配置已从群级迁到机器人级（bots.config.joinVerify），本模块只负责
+ * 机器人级只负责能力开关与全局参数，群组策略/验证方式保存在 group_settings，本模块只负责
  * bootstrap：解析（services/join-verify.ts）→ 落库 → 发送验证提示。
  *
  * 三条入口：
@@ -114,7 +115,7 @@ export async function recordJoinRequestOnly(
 /**
  * 群内验证 bootstrap（直连入群 + 超级群 auto 渠道）：用户已物理在群内，
  * 创建会话 → 禁言 → 群内验证消息；通过解禁 / 失败超时踢出。
- * 验证方式/超时/尝试次数全部来自 resolved（机器人级配置解析结果）。
+ * 验证方式来自群组绑定，超时/尝试次数使用机器人级默认覆盖。
  */
 async function bootstrapGroupVerification(
   api: Api,
@@ -497,9 +498,19 @@ export async function handleChatMemberUpdate(ctx: BotContext, botId: bigint): Pr
     }
   }
 
-  // 直连入群验证方式 = 收到事件的机器人的加群验证配置；
-  // 未配置/面板关闭 → 只落库记录（手动审核），不拦截不验证
-  const directResolved = await resolveJoinVerify(botId, await loadGroupSettingsForChat(BigInt(chat.id)));
+  // v2.3.5 群组「新成员审核」总开关关闭时，群组自动审核机器人配置保留但不生效；
+  // 开启时，普通邀请链接直连入群也按该群绑定的 verify/direct 策略执行。
+  const groupSettings = await loadGroupSettingsForChat(BigInt(chat.id));
+  if (groupSettings?.requireApproval !== true) {
+    console.log(`[join-verify] approval disabled for chat=${chat.id}; direct-join verification skipped`);
+    return;
+  }
+  const directRole = resolveDesignatedBot(groupSettings, botId);
+  if (directRole !== "designated") {
+    console.log(`[join-verify] direct-join event ignored for bot=#${botId} chat=${chat.id}; role=${directRole}`);
+    return;
+  }
+  const directResolved = await resolveJoinVerify(botId, groupSettings);
   if (directResolved?.method === "direct") {
     console.log(`[join-verify] direct mode: user=${user.id} joined chat=${chat.id}; no verification required`);
     return;

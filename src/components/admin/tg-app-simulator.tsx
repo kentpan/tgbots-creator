@@ -320,6 +320,7 @@ export function TgAppSimulator({
   const [settingsSaving, setSettingsSaving] = useState(false);
   // v2.3 自动审核机器人候选（bots.config.joinVerify.enabled 的机器人，服务端过滤）
   const [joinVerifyCandidates, setJoinVerifyCandidates] = useState<JoinVerifyCandidate[]>([]);
+  const [verificationMethods, setVerificationMethods] = useState<{ id: string; name: string; type: string }[]>([]);
   const [form, setForm] = useState<GroupSettingsFormState>({
     chat_title: "",
     method: "code_self",
@@ -338,6 +339,8 @@ export function TgAppSimulator({
     require_approval: false,
     /** v2.3 自动审核机器人（"" = 手动审核） */
     join_verify_bot_id: "",
+    join_verify_mode: "verify",
+    join_verify_method_id: "",
   });
 
   const loadGroupSettings = useCallback(async (chatId: string): Promise<void> => {
@@ -359,8 +362,11 @@ export function TgAppSimulator({
             failure_text: string;
             require_approval?: boolean;
             join_verify_bot_id?: string | null;
+            join_verify_mode?: "verify" | "direct";
+            join_verify_method_id?: string | null;
           } | null;
           join_verify_candidates?: { id: string; name: string }[];
+          verification_methods?: { id: string; name: string; type: string }[];
         };
       }>(response);
       if (!payload) {
@@ -372,6 +378,7 @@ export function TgAppSimulator({
         return;
       }
       setJoinVerifyCandidates(payload.data.join_verify_candidates ?? []);
+      setVerificationMethods(payload.data.verification_methods ?? []);
       const settings = payload.data.settings;
       setForm((prev) => ({
         ...prev,
@@ -382,6 +389,8 @@ export function TgAppSimulator({
         failure_text: settings?.failure_text ?? "",
         require_approval: settings?.require_approval ?? false,
         join_verify_bot_id: settings?.join_verify_bot_id ?? "",
+        join_verify_mode: settings?.join_verify_mode ?? "verify",
+        join_verify_method_id: settings?.join_verify_method_id ?? "",
       }));
     } catch (error) {
       showFlash(false, error instanceof Error ? error.message : "读取群组配置失败");
@@ -406,13 +415,15 @@ export function TgAppSimulator({
         body: JSON.stringify({
           chat_id: activeChatId,
           chat_title: form.chat_title,
-          // v2.3：验证方式配置已迁机器人级，群级只保存 文案 + 新成员审核 + 自动审核机器人
+          // v2.3.5：审核模式和验证方式是群组私有配置。
           prompt_text: form.prompt_text,
           success_text: form.success_text,
           failure_text: form.failure_text,
           enabled: form.enabled,
           require_approval: form.require_approval,
           join_verify_bot_id: form.join_verify_bot_id || null,
+          join_verify_mode: form.join_verify_mode,
+          join_verify_method_id: form.join_verify_mode === "verify" ? (form.join_verify_method_id || null) : null,
         }),
       });
       const payload = await readJson<{ ok: boolean; error?: string }>(response);
@@ -424,7 +435,7 @@ export function TgAppSimulator({
         showFlash(false, payload.error ?? "保存失败");
         return;
       }
-      showFlash(true, "群组配置已保存；若切换了新成员审核状态，请重新部署群组以更新已生成的邀请链接");
+      showFlash(true, "群组私有审核配置已保存；请在仿真APP中部署该群组使邀请链接与运行配置生效");
       onSettingsSaved();
       // iOS 群组信息语义：右上角 ✓ = 保存并返回上一页（聊天区）
       setScreen("chat");
@@ -1131,9 +1142,41 @@ export function TgAppSimulator({
                     ))}
                   </select>
                   <p className="mt-1.5 text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
-                    列表只显示已开启「自动响应加群申请」的机器人；机器人未出现？到
-                    机器人管理 → 功能配置 开启「自动响应加群申请」并选择验证方式，然后点「部署」更新运行实例。
+                    列表只显示已启用自动响应能力的机器人。机器人管理只配置默认能力；本群的审核策略在此独立设置，关闭新成员审核不会清空下面已保存的配置。
                   </p>
+                  {form.join_verify_bot_id ? (
+                    <div className="mt-3 space-y-2 rounded-xl border border-black/10 bg-black/[0.02] p-3">
+                      <label className="block text-[13px] font-medium text-[#3b4a54]">申请处理方式</label>
+                      <select
+                        value={form.join_verify_mode}
+                        onChange={(event) => setForm((prev) => ({ ...prev, join_verify_mode: event.target.value === "direct" ? "direct" : "verify" }))}
+                        className="h-10 w-full rounded-lg border border-black/10 bg-white px-3 text-[15px] text-black outline-none"
+                        aria-label="群组申请处理方式"
+                      >
+                        <option value="verify">验证码验证后通过</option>
+                        <option value="direct">直接通过申请</option>
+                      </select>
+                      {form.join_verify_mode === "verify" ? (
+                        <>
+                          <label className="block pt-1 text-[13px] font-medium text-[#3b4a54]">绑定验证方式</label>
+                          <select
+                            value={form.join_verify_method_id}
+                            onChange={(event) => setForm((prev) => ({ ...prev, join_verify_method_id: event.target.value }))}
+                            className="h-10 w-full rounded-lg border border-black/10 bg-white px-3 text-[15px] text-black outline-none"
+                            aria-label="群组绑定验证方式"
+                          >
+                            <option value="">请选择验证方式</option>
+                            {verificationMethods.map((method) => <option key={method.id} value={method.id}>{method.name}（{method.type}）</option>)}
+                          </select>
+                          <p className="text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+                            验证方式由本群单独绑定；超时和最大尝试次数使用机器人管理中的默认参数。不同群组可以绑定不同方式。
+                          </p>
+                        </>
+                      ) : (
+                        <p className="text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>申请事件到达后立即调用 Telegram 审批接口；不创建验证码会话。</p>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </div>

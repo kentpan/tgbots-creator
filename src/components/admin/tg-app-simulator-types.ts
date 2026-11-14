@@ -98,6 +98,8 @@ export interface GroupSettingsFormState {
   reply_code_in_group: boolean;
   require_approval: boolean;
   join_verify_bot_id: string;
+  join_verify_mode: "verify" | "direct";
+  join_verify_method_id: string;
 }
 
 /** Bot API getChat 返回的群组只读状态快照。 */

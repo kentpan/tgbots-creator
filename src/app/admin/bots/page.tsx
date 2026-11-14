@@ -14,7 +14,7 @@ import { parseBotProfile, parseBotPrivacyMode } from "@/bot/multi-runtime";
 import { parseTgApiBotConfig } from "@/services/tgapi-config";
 import { parseCustomKeyboardConfig } from "@/services/custom-keyboard";
 import { requirePermission } from "@/lib/auth";
-import { deleteBotAction, deployBotAction } from "./actions";
+import { deleteBotAction } from "./actions";
 import { SubmitButton } from "@/components/admin/submit-button";
 import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import { BotFormDialog } from "./bot-form-dialog";
@@ -226,16 +226,6 @@ export default async function BotsPage({
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex flex-wrap items-center gap-2">
-                          {/* v2.3 部署改 confirm：明确部署范围（全部群组/频道），单群部署引流到仿真页 */}
-                          <ConfirmDialog
-                            title={`部署「${bot.name}」`}
-                            description={`将上线/更新该机器人运行实例，并部署到其全部已登记群组/频道（生成/刷新邀请链接）。需要部署到单个群组，请到「仿真APP」页面使用分体部署按钮单独选择。`}
-                            action={deployBotAction}
-                            fields={{ id: String(bot.id) }}
-                            trigger="🚀 部署"
-                            triggerClassName="inline-flex h-8 items-center rounded-md border border-emerald-200 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 hover:bg-emerald-100"
-                            confirmLabel="确认部署"
-                          />
                           {/* v2.3 功能配置（三按钮合一）：原「消息内嵌按钮 / 指令菜单 / 自定义键盘」
                               三个弹窗合并为同一「功能配置」弹窗（复刻 TGAPI 菜单和键盘，去掉
                               APP创建参数/消息配置，新增 加群验证 / 通用门禁 / 功能面板开关） */}

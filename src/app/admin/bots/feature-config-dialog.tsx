@@ -24,7 +24,6 @@ import type { CustomKeyboardConfig } from "@/services/custom-keyboard";
 import { ConfigPanel } from "@/components/admin/config-panel";
 import { SubmitButton } from "@/components/admin/submit-button";
 import { TgApiGatePanel } from "@/components/admin/tgapi-gate-panel";
-import { TgApiUnlockMethodBinding } from "@/components/admin/tgapi-unlock-api-config";
 import { MenuDesignerFields } from "@/components/admin/menu-designer-fields";
 import {
   CommandMenuConfigFields,
@@ -61,7 +60,7 @@ import {
  *   生效」，仿真屏随配置变化即时渲染，不改容器、不做两套仿真屏。
  *
  * 模块：基本信息 / 加群验证 / 门禁解锁 / 功能开关（消息内嵌按钮 ⇄ 自定义键盘互斥 +
- * 指令菜单独立）/ 真实群组。保存走 saveBotFeatureConfigAction（一次落库 + 热更新）。
+ * 指令菜单独立）/ 真实群组。保存走 saveBotFeatureConfigAction（仅落库；部署统一在仿真 APP 按群组执行）。
  */
 
 interface FeatureDraft {
@@ -72,7 +71,6 @@ interface FeatureDraft {
   gateKeyboardRequired: boolean;
   gateCommandsRequired: boolean;
   joinVerifyEnabled: boolean;
-  joinVerifyMode: "verify" | "direct";
   gateEnabled: boolean;
 }
 
@@ -85,7 +83,6 @@ function readFeatureDraft(bot?: DesignerBotInfo): FeatureDraft {
       gateKeyboardRequired: false,
       gateCommandsRequired: false,
       joinVerifyEnabled: false,
-      joinVerifyMode: "verify",
       gateEnabled: false,
     };
   }
@@ -102,7 +99,6 @@ function readFeatureDraft(bot?: DesignerBotInfo): FeatureDraft {
     gateKeyboardRequired: feature.gateKeyboardRequired === true,
     gateCommandsRequired: feature.gateCommandsRequired === true,
     joinVerifyEnabled: feature.joinVerify.enabled,
-    joinVerifyMode: feature.joinVerify.mode,
     gateEnabled: feature.gate.enabled,
   };
 }
@@ -188,10 +184,6 @@ export function FeatureConfigDialog({
   const featureGate = useMemo<GateFeatureConfig>(() => {
     if (!bot) return { enabled: false, verificationMethodId: null };
     return parseBotFeatureConfig(bot.config, false).gate;
-  }, [bot]);
-  const joinVerifyMethodId = useMemo(() => {
-    if (!bot) return null;
-    return parseBotFeatureConfig(bot.config, false).joinVerify.methodId;
   }, [bot]);
   const joinVerifyOverride = useMemo(() => {
     if (!bot) return {} as { timeout_seconds?: number; max_attempts?: number };
@@ -382,7 +374,6 @@ export function FeatureConfigDialog({
           <input type="hidden" name="gate_keyboard_required" value={feature.gateKeyboardRequired ? "1" : "0"} />
           <input type="hidden" name="gate_commands_required" value={feature.gateCommandsRequired ? "1" : "0"} />
           <input type="hidden" name="join_verify_enabled" value={feature.joinVerifyEnabled ? "1" : "0"} />
-          <input type="hidden" name="join_verify_mode" value={feature.joinVerifyMode} />
           <input type="hidden" name="welcome_text" value={welcomeText} />
           <input type="hidden" name="gate_enabled" value={feature.gateEnabled ? "1" : "0"} />
 
@@ -476,37 +467,15 @@ export function FeatureConfigDialog({
                 <div id="join-verify-config" className="scroll-mt-16">
                 <ConfigPanel
                   title="🚪 自动响应加群申请（加群验证）"
-                  description="开启后，被群组指定为「自动审核机器人」时处理申请。可选择验证码验证后通过，或直接通过申请。还需在群组设置中选择本机器人。"
+                  description="开启后，该机器人可被群组指定为自动审核机器人。每个群组独立选择申请处理方式与绑定验证方式；此处仅配置机器人能力及全局验证参数。"
                   checked={feature.joinVerifyEnabled}
                   onCheckedChange={(checked) => patch({ joinVerifyEnabled: checked })}
                 >
                   <div className="space-y-4">
-                    <div className="space-y-2">
-                      <label className="text-sm font-medium">申请处理方式</label>
-                      <select
-                        value={feature.joinVerifyMode}
-                        onChange={(event) => patch({ joinVerifyMode: event.target.value === "direct" ? "direct" : "verify" })}
-                        className={designerInputClass()}
-                        aria-label="加群申请处理方式"
-                      >
-                        <option value="verify">验证码验证后通过</option>
-                        <option value="direct">直接通过申请（不验证）</option>
-                      </select>
-                    </div>
-                    {feature.joinVerifyMode === "verify" ? <>
-                      <TgApiUnlockMethodBinding
-                        initialMethods={methods}
-                        initialMethodId={joinVerifyMethodId && /^\d+$/.test(joinVerifyMethodId) ? Number(joinVerifyMethodId) : null}
-                        hiddenName="join_verify_method_id"
-                      />
-                    <p className="text-xs text-muted-foreground">
-                      上方下拉选择验证方式（验证方式库全部方式），点击「配置外部验证 API」可直接编辑该方式的
-                      API 地址 / apikey / 传参 / 响应解析（保存到验证方式库，同一数据源）。列表没有需要的方式？到
-                      <a href="/admin/verification-methods" className="mx-1 text-primary underline">验证方式页</a>
-                      新增（支持 验证码核验 API / 自动验证码 / 人机验证）。
+                    <p className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
+                      这里仅开启/关闭该机器人的自动响应能力。具体群组选择本机器人后，再在「仿真APP → 群组信息」中分别设置申请处理方式与绑定验证方式；不同群组可以使用不同策略。
                     </p>
-                    </> : <p className="rounded-md border border-amber-300/50 bg-amber-50/50 p-3 text-xs text-muted-foreground">收到 Telegram 加群申请事件后立即调用 approveChatJoinRequest；普通邀请链接直接入群时不启动验证码流程。此模式不会检查卡密或人机验证。</p>}
-                    <div className={`grid gap-3 md:grid-cols-2 ${feature.joinVerifyMode === "direct" ? "hidden" : ""}`}>
+                    <div className="grid gap-3 md:grid-cols-2">
                       <div className="space-y-1">
                         <label className="text-sm font-medium" htmlFor={`jv-timeout-${suffix}`}>
                           验证超时（秒，留空用默认）

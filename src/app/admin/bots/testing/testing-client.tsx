@@ -252,8 +252,7 @@ export function TestingClient({
     }
   }, [selectedBotId, deployingBot, probeBotDeploy]);
   // v2.1.0：Edge 环境代理提醒 —— 进入仿真APP页面后，若当前为 edge 环境（线上部署）
-  // 且代理开关开启（edge 出站会被代理回退链改写），在仿真屏上方与选择机器人面板
-  // 之间显示醒目横幅：检测到当前为Edge环境, 请关闭代理!
+  // 且代理开关开启时显示环境提示；不再要求用户关闭全局代理。
   const [edgeProxyWarning, setEdgeProxyWarning] = useState(false);
   useEffect(() => {
     void (async () => {
@@ -878,10 +877,7 @@ export function TestingClient({
         >
           <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
           <span>
-            检测到当前为Edge环境, 请关闭代理!
-            <span className="ml-1.5 font-normal text-amber-700/80">
-              （在仿真屏盾牌图标 →「代理偏好设置」中关闭「代理」总开关，Edge 站直连 api.telegram.org 无需代理）
-            </span>
+            当前运行于 Edge 环境，Telegram 请求使用当前环境的传输配置。
           </span>
         </div>
       ) : null}

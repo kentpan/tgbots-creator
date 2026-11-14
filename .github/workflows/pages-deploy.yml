@@ -1,6 +1,12 @@
 # ============================================================================
 # pages-deploy.yml — TGuard Cloudflare 部署工作流(OpenNext + Pages/Workers 双部署类型)
 # ----------------------------------------------------------------------------
+# 数据库迁移固定规则（所有后续版本必须遵守）：SQLite/D1 schema 有新增、修改或删除时，
+# 必须新增 prisma/sql-upgrade-v<package.json.version>.sql；文件名版本必须与 package.json
+# 一致。迁移只写增量 SQL，兼容 SQLite/D1，数据迁移必须先复制/校验再清理旧结构。工作流
+# 固定检测该精确文件：存在则应用线上 D1，不存在则跳过；Node SQLite 升级也必须执行同版
+# 脚本。无 schema 变化不创建空文件。详细规范见 prisma/README.md。
+#
 # 来源: 生产环境验证过的通用工作流(upload/next-deploy.zip, gem-td 同源 v9.x,
 # npm + Pages/Workers 双部署类型版), 按 TGuard 项目实际情况做如下适配:
 #   ① D1 绑定名 DATABASE(KV=KV / R2=BUCKET, 与 src/database/client.ts、
@@ -665,20 +671,20 @@ jobs:
           fi
           echo "✅ D1 schema 已就绪(差异驱动增量应用, 对既有库零副作用): $D1_NAME"
 
-      - name: Apply versioned SQL update (prisma/sql-update-{version}.sql, if present)
+      - name: Apply versioned SQL upgrade (prisma/sql-upgrade-v{version}.sql, if present)
         # 版本化 SQL 增量: 每次打包若 sqlite/D1 schema 有新增/修改/删除,
-        # 固定新增 prisma/sql-update-{本次打包版本号}.sql; 此步骤检测是否存在该文件,
+        # 固定新增 prisma/sql-upgrade-v{本次打包版本号}.sql; 此步骤检测是否存在该文件,
         # 有则经 wrangler d1 execute 应用到线上 D1, 无则跳过。
         if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != ''
         run: |
           PKG_VERSION=$(node -p "require('./package.json').version")
-          SQL_FILE="prisma/sql-update-v${PKG_VERSION}.sql"
+          SQL_FILE="prisma/sql-upgrade-v${PKG_VERSION}.sql"
           if [ -f "$SQL_FILE" ]; then
             echo "检测到版本化 SQL 增量: $SQL_FILE → 应用到 D1"
             npx wrangler d1 execute "$D1_NAME" --remote -y --file="$SQL_FILE"
             echo "✅ 版本化 SQL 增量已应用: $SQL_FILE"
           else
-            echo "未检测到 prisma/sql-update-v${PKG_VERSION}.sql → 跳过版本化 SQL 增量"
+            echo "未检测到 prisma/sql-upgrade-v${PKG_VERSION}.sql → 跳过版本化 SQL 增量"
           fi
 
       - name: Migrate D1 schema (additive, data-preserving)
