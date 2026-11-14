@@ -720,17 +720,20 @@ export async function completeGroupVerification(
       }
     }
 
-    // 群内欢迎（mention + 可配置成功文案）
+    // 群内欢迎（mention + 可配置成功文案）；v3.0.2：文案显式置空 = 不发送
     const settings = await getGroupSettings(joinRequest.chatId);
-    await sendGroupWelcome(
-      joinRequest.chatId,
-      joinRequest.userId,
-      joinRequest.username,
-      joinRequest.firstName,
-      joinRequest.lastName,
-      settings?.successText ?? "✅ 验证成功，欢迎加入！",
-      eventApi,
-    );
+    const welcomeText = settings?.successText ?? "✅ 验证成功，欢迎加入！";
+    if (welcomeText.trim()) {
+      await sendGroupWelcome(
+        joinRequest.chatId,
+        joinRequest.userId,
+        joinRequest.username,
+        joinRequest.firstName,
+        joinRequest.lastName,
+        welcomeText,
+        eventApi,
+      );
+    }
 
     console.log(
       `Group verification completed: user ${joinRequest.userId} for chat ${joinRequest.chatId}`,

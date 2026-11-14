@@ -1,17 +1,21 @@
 import { Menu } from "@grammyjs/menu";
 import type { Context } from "grammy";
+import type { BotContext } from "./context";
 import { getGlobalStats } from "@/database/operations";
 import { config } from "@/config/settings";
 import { isAdmin } from "./filters";
-import { DEFAULT_BOT_HELP_MARKDOWN_V2 } from "@/services/bot-messages";
+import { BOT_TEXT_DEFAULTS } from "@/services/bot-messages";
 
 function formatPercent(rate: number): string {
   return `${rate.toFixed(1)}%`;
 }
 
-function sendHelp(ctx: Context): Promise<unknown> {
-  return ctx.editMessageText(DEFAULT_BOT_HELP_MARKDOWN_V2, {
-    parse_mode: "MarkdownV2",
+function sendHelp(ctx: BotContext | Context): Promise<unknown> {
+  // v3.0.2：/help 文案走配置中心（菜单回调场景无 botTexts 注入时回落默认值）；空串 = 不发送
+  const texts = (ctx as BotContext).botTexts ?? BOT_TEXT_DEFAULTS;
+  const text = (texts.help_text ?? "").trim();
+  if (!text) return Promise.resolve(undefined);
+  return ctx.editMessageText(text, {
     link_preview_options: { is_disabled: true },
     reply_markup: mainMenu,
   });

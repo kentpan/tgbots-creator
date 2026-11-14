@@ -72,12 +72,14 @@ export function mergeGroupBotAdminRights(
 }
 
 export interface AcquireInviteLinkResult {
-  /** 可直接发给买家的邀请链接（公开群=公开链接；复用或新建） */
-  invite_link: string;
+  /** 可直接发给买家的邀请链接（公开群=公开链接；复用或新建）；createIfMissing=false 且无可用链接时为 null */
+  invite_link: string | null;
   /** true = 复用了已保存的链接（未新建） */
   reused: boolean;
   /** 部署状态中的 deployed_at（复用时返回原值，新建时返回当前时间） */
   deployed_at: string;
+  /** v3.0.2：createIfMissing=false 且没有可用链接时为 true（调用方据此引导用户手动建链） */
+  missing?: boolean;
 }
 
 /** 链接形态：public=公开群自定义链接（t.me/<username>）；join_request=申请制邀请链接；direct=普通邀请链接 */
@@ -118,6 +120,10 @@ export function isDefinitiveInviteLinkDeath(error: unknown): boolean {
  *   邀请链接 —— 那正是「部署后生成私密分享链接而不是公开自定义链接」的根因）
  * @param input.botId       提供时读取/合并落库部署状态；null 时仅新建、不落库
  * @param input.meta        新建落库时合并进 rights 的附加字段（bot_username / chat_title）
+ * @param input.createIfMissing v3.0.2：false = 部署场景绝不调用 createChatInviteLink 新建链接
+ *   （用户要求「部署时不生成新邀请链接」），rights/台账都没有可用链接时返回 invite_link=null
+ *   + missing=true，由调用方引导用户在「邀请链接」面板手动创建；默认 true（运行时深链等
+ *   场景维持旧语义：死链自动重建）。
  */
 export async function acquireStableGroupInviteLink(input: {
   api: Api;
@@ -127,10 +133,12 @@ export async function acquireStableGroupInviteLink(input: {
   publicUsername?: string | null;
   botId?: bigint | null;
   meta?: Record<string, unknown>;
+  createIfMissing?: boolean;
 }): Promise<AcquireInviteLinkResult> {
   const { api, chatId, superGroup } = input;
   const botId = input.botId ?? null;
   const publicUsername = input.publicUsername?.trim() ?? "";
+  const createIfMissing = input.createIfMissing ?? true;
   const joinRequestMode = superGroup && (input.requireApproval ?? true);
   const deployedAt = new Date().toISOString();
 
@@ -164,21 +172,29 @@ export async function acquireStableGroupInviteLink(input: {
     api,
     chatId,
     joinRequestMode,
+    createIfMissing,
     ...(botId !== null ? { botId } : {}),
     ...(input.meta ? { meta: input.meta } : {}),
   });
 }
 
-/** 非公开群路径：申请制/普通邀请链接（复用探测 + 新建，v2.0.14 原逻辑） */
+/** 非公开群路径：申请制/普通邀请链接（复用探测 + 按需新建，v2.0.14 原逻辑） */
 async function acquireInviteLinkViaBot(input: {
   api: Api;
   chatId: bigint;
   joinRequestMode: boolean;
+  createIfMissing: boolean;
   botId?: bigint | null;
   meta?: Record<string, unknown>;
 }): Promise<AcquireInviteLinkResult> {
-  const { api, chatId, joinRequestMode } = input;
+  const { api, chatId, joinRequestMode, createIfMissing } = input;
   const botId = input.botId ?? null;
+  const missingResult = (deployedAt: string): AcquireInviteLinkResult => ({
+    invite_link: null,
+    reused: false,
+    deployed_at: deployedAt,
+    missing: true,
+  });
 
   // 部署状态行只读一次（复用探测与新建落库共用）
   const stateRow = botId !== null ? await getGroupBotAdminByBotAndChat(botId, chatId) : null;
@@ -230,7 +246,35 @@ async function acquireInviteLinkViaBot(input: {
     }
   }
 
+  // 1.5) v3.0.2：rights 无链接时回退 invite_links 台账（机器人运行时/手动创建的
+  //     该群未撤销链接，按创建时间倒序取最近一条）—— 「获取机器人管理员默认生成的
+  //     邀请链接」的数据来源；deploy 场景绝不新建，台账也没有 → 返回 missing。
+  if (!storedLink && botId !== null) {
+    try {
+      const { listInviteLinks } = await import("@/database/operations");
+      const ledger = await listInviteLinks(chatId, botId);
+      const candidate = ledger.find((entry) => !entry.isRevoked && entry.link);
+      if (candidate) {
+        return {
+          invite_link: candidate.link,
+          reused: true,
+          deployed_at: candidate.createdTime ? candidate.createdTime.toISOString() : new Date().toISOString(),
+        };
+      }
+    } catch (error) {
+      console.error(`[invite-link] ledger fallback failed (chat=${chatId}):`, error);
+    }
+  }
+
   // 2) 新建（超级群按 requireApproval 选择申请制/普通链接；基础群始终普通链接）
+  //    v3.0.2：createIfMissing=false（部署场景）绝不新建 —— 无可用链接时返回 missing，
+  //    由部署链路引导用户在「邀请链接」面板手动创建（备注渠道来源）。
+  if (!createIfMissing) {
+    console.log(
+      `[invite-link] deploy without link creation (chat=${chatId}): no reusable link, user should create one in the invite-links panel`,
+    );
+    return missingResult(new Date().toISOString());
+  }
   const invite = await api.createChatInviteLink(Number(chatId), {
     ...(joinRequestMode ? { creates_join_request: true } : {}),
     name: DEPLOY_LINK_NAME,

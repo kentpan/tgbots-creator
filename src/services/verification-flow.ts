@@ -15,6 +15,7 @@ import {
   type VerificationSessionRow,
 } from "@/database/operations";
 import { parseCodeApiConfig, verifyCodeExternally } from "./external-verify";
+import { BOT_TEXT_DEFAULTS } from "./bot-messages";
 import type { Api } from "grammy";
 import {
   autoApproveUser,
@@ -85,6 +86,8 @@ export interface CodeCheckInput {
    * （bot 路径传入私聊发送回调，立即私聊发送「网络波动，正在重试...」；仿真路径不传）。
    */
   onNetworkRetry?: () => void | Promise<void>;
+  /** v3.0.3 文案配置中心：bot 路径传入 ctx.botTexts（bots.config.texts），次数用尽等提示按配置回复；不传走默认值 */
+  texts?: Record<string, string>;
 }
 
 /**
@@ -246,9 +249,9 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
       }
       return {
         outcome: "failed_expired",
-        replyText: stayedInGroup
-          ? `${settings?.failureText ?? "❌ 验证码错误，请重试。"}\n错误原因：${verdict.reason}\n尝试次数已达上限，本次验证已失效，你仍保留在群组中。`
-          : `${settings?.failureText ?? "❌ 验证码错误，请重试。"}\n错误原因：${verdict.reason}\n尝试次数已达上限，本次验证已失效，请重新申请加群。`,
+        // v3.0.3：次数用尽回复走文案配置中心 texts.attempts_exhausted（默认
+        // 「超出验证次数, 请重新申请加入群组」）；置空 = 不发送（空串调用方跳过）。
+        replyText: composeAttemptsExhaustedReply(input.texts, stayedInGroup),
         reason: verdict.reason,
         remaining: 0,
         reapplyChatId: joinRequest.chatId !== 0n ? joinRequest.chatId.toString() : null,
@@ -259,7 +262,11 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
     }
     return {
       outcome: "failed_retry",
-      replyText: `${settings?.failureText ?? "❌ 验证码错误，请重试。"}\n错误原因：${verdict.reason}\n剩余尝试次数：${remaining}`,
+      // v3.0.2：失败文案显式置空 = 不发送（replyText 空串，调用方判空跳过）
+      replyText: composeFailureReply(
+        settings?.failureText,
+        `错误原因：${verdict.reason}\n剩余尝试次数：${remaining}`,
+      ),
       reason: verdict.reason,
       remaining,
     };
@@ -320,12 +327,38 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
 
   return {
     outcome: "success",
+    // v3.0.2：成功文案显式置空 = 不发送（replyText 空串，调用方判空跳过）
     replyText: approved
-      ? settings?.successText ?? "✅ 验证成功，欢迎加入！"
+      ? composeSuccessReply(settings?.successText)
       : `验证码正确，但自动批准入群失败：${approvalNote ?? "Telegram 审批未完成"}。请联系群管理员处理。`,
     approved,
     approvalNote,
   };
+}
+
+/** 失败文案组装：NULL = 未配置回落默认；显式空串 = 用户选择不发送（返回空串，调用方跳过） */
+function composeFailureReply(base: string | null | undefined, detail: string): string {
+  const text = base ?? "❌ 验证码错误，请重试。";
+  if (!text.trim()) return "";
+  return `${text}\n${detail}`;
+}
+
+/** 成功文案组装：NULL = 未配置回落默认；显式空串 = 用户选择不发送（返回空串，调用方跳过） */
+function composeSuccessReply(base: string | null | undefined): string {
+  return base ?? "✅ 验证成功，欢迎加入！";
+}
+
+/**
+ * 次数用尽提示组装（v3.0.3）：走文案配置中心 texts.attempts_exhausted
+ * （默认「超出验证次数, 请重新申请加入群组」）；置空 = 不发送（返回空串）。
+ */
+function composeAttemptsExhaustedReply(
+  texts: Record<string, string> | undefined,
+  stayedInGroup: boolean,
+): string {
+  const text = (texts?.attempts_exhausted ?? BOT_TEXT_DEFAULTS.attempts_exhausted ?? "").trim();
+  if (!text) return "";
+  return stayedInGroup ? `${text}（你仍保留在群组中）` : text;
 }
 
 /**

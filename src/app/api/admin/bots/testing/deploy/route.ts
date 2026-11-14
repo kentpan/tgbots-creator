@@ -213,6 +213,9 @@ export async function POST(request: Request): Promise<NextResponse> {
     let groupSettings = await getGroupSettings(effectiveChatId);
     let linkAcquired: Awaited<ReturnType<typeof acquireStableGroupInviteLink>>;
     try {
+      // v3.0.2：部署绝不调用 createChatInviteLink 新建链接（用户要求「部署时禁止
+      // 生成邀请链接」）—— 复用 rights/台账已有链接，都没有则返回 missing，
+      // 引导用户在「邀请链接」面板右上角手动创建（可填备注区分渠道）。
       linkAcquired = await withTelegramTimeout(
         acquireStableGroupInviteLink({
           api,
@@ -221,6 +224,7 @@ export async function POST(request: Request): Promise<NextResponse> {
           requireApproval: groupSettings?.requireApproval ?? false,
           publicUsername,
           botId: bot.id,
+          createIfMissing: false,
           meta: { bot_username: me.username ?? null, chat_title: chatTitle },
         }),
       );
@@ -263,6 +267,7 @@ export async function POST(request: Request): Promise<NextResponse> {
           requireApproval: groupSettings?.requireApproval ?? false,
           publicUsername,
           botId: bot.id,
+          createIfMissing: false,
           meta: { bot_username: me.username ?? null, chat_title: chatTitle },
         }),
       );
@@ -274,7 +279,9 @@ export async function POST(request: Request): Promise<NextResponse> {
       target: bot.name,
       detail:
         `群组 ${chatTitle}（${effectiveChatId}${migratedFromChatId !== null ? ` ← 由 ${migratedFromChatId} 迁移` : ""}）` +
-        `${linkAcquired.reused ? "复用已有邀请链接" : "生成新邀请链接"}并保存部署状态`,
+        (linkAcquired.invite_link
+          ? `${linkAcquired.reused ? "复用已有邀请链接" : "使用既有邀请链接"}并保存部署状态`
+          : "部署完成，无可用邀请链接（按策略未自动新建，需在邀请链接面板手动创建）"),
       headers: requestHeaders,
     });
 
@@ -291,11 +298,18 @@ export async function POST(request: Request): Promise<NextResponse> {
 
     // v2.1.16：公开群（getChat.username 非空）→ 公开自定义链接 t.me/<username>；
     // 群开启「加入审核」时点链接 → 「申请加入」→ chat_join_request → 机器人自动审批。
-    const isPublicLink = /^https:\/\/t\.me\/[^+]/.test(linkAcquired.invite_link) && !linkAcquired.invite_link.includes("/+") && !linkAcquired.invite_link.includes("joinchat");
-    const guide = isPublicLink
+    // v3.0.2：linkAcquired.invite_link 可为 null（部署不建链且无既有链接）→ 引导手动创建。
+    const inviteLink = linkAcquired.invite_link;
+    const guide: string[] = inviteLink === null
+      ? [
+          "部署完成！本群当前没有可复用的邀请链接（按策略部署不再自动生成新链接）。",
+          "请打开本群 → 「邀请链接」面板 → 右上角「创建邀请链接」，填写备注（用于区分来源渠道，如：闲鱼店铺A / 朋友圈投放）后创建。",
+          "创建成功后把链接发给买家（或配置到闲鱼自动发货）；再次部署将直接复用该链接。",
+        ]
+      : /^https:\/\/t\.me\/[^+]/.test(inviteLink) && !inviteLink.includes("/+") && !inviteLink.includes("joinchat")
       ? [
           "部署完成！本群是公开群（有 @用户名），已直接使用公开自定义链接：",
-          linkAcquired.invite_link,
+          inviteLink ?? "",
           "把该链接发给买家（或配置到闲鱼自动发货）：点链接 → 群资料 → 「申请加入」（需群已开启「加入审核」）→ 机器人自动批准进群",
           "⚠️ 若点链接直接进群（无「申请加入」按钮）：请在 Telegram 群设置 → 管理员审核权限中开启「加入群组需管理员审批」（Approve new members），Bot API 无法代开该开关",
           "✅ 公开链接永久有效（与机器人无关）；机器人拥有「邀请用户」权限时将自动批准入群申请",
@@ -328,7 +342,7 @@ export async function POST(request: Request): Promise<NextResponse> {
           "💡 基础群买家必须先启动机器人（t.me/<机器人用户名>?start=join_<群组chat_id>）才能收到私聊验证码",
           "💡 如需「申请加入」审批制入群体验，请将群组升级为超级群（Telegram 群设置 → 将群组变为可见/超级群）",
         ];
-    if (linkAcquired.reused) {
+    if (inviteLink !== null && linkAcquired.reused) {
       guide.unshift("✅ 该群组已有有效邀请链接，本次直接复用（未生成新链接）——历史发出的链接仍然可用");
     }
     if (migratedFromChatId !== null) {
@@ -346,10 +360,15 @@ export async function POST(request: Request): Promise<NextResponse> {
       bot_status: status,
       chat_id: String(effectiveChatId),
       migrated_from_chat_id: migratedFromChatId !== null ? String(migratedFromChatId) : null,
-      invite_link: linkAcquired.invite_link,
+      invite_link: inviteLink,
       reused: linkAcquired.reused,
+      missing_link: inviteLink === null,
       deployed_at: linkAcquired.deployed_at,
-      deploy_mode: isPublicLink ? "public" : superGroup ? "join_request" : "direct",
+      deploy_mode: inviteLink !== null && /^https:\/\/t\.me\/[^+]/.test(inviteLink) && !inviteLink.includes("/+") && !inviteLink.includes("joinchat")
+        ? "public"
+        : superGroup
+          ? "join_request"
+          : "direct",
       guide,
     });
   } catch (error) {

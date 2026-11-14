@@ -13,6 +13,7 @@ import { htmlEscape } from "@/utils/html";
 import { utcnow } from "@/utils/time";
 import { InlineKeyboard, type Api } from "grammy";
 import { CODE_SELF_DEFAULT_PROMPT, sendCodeSelfPrompt } from "../verification-prompt";
+import { BOT_TEXT_DEFAULTS } from "@/services/bot-messages";
 import { muteAndSendGroupPrompt } from "./group-verification";
 import { approveTelegramJoinRequest } from "@/services/approval";
 import { registerTelegramChat } from "@/services/chat-registry";
@@ -195,6 +196,24 @@ async function bootstrapGroupVerification(
  * 失败 3 次 → declineChatJoinRequest（评估管道 verification-flow 已实现）。
  * stars 方式：发送星星发票（payload=join_verify:<token>），支付成功事件放行。
  */
+/** v3.0.3：读取 bots.config.texts.dm_join_prompt（申请入群私聊提示）；缺失回落默认，置空 = 不发送 */
+async function resolveDmJoinPrompt(botId?: bigint | null): Promise<string> {
+  try {
+    if (botId) {
+      const { getBot } = await import("@/database/operations");
+      const botRow = await getBot(botId);
+      if (botRow) {
+        const parsed = JSON.parse(botRow.config || "{}") as { texts?: Record<string, unknown> };
+        const value = parsed.texts?.dm_join_prompt;
+        if (typeof value === "string") return value;
+      }
+    }
+  } catch {
+    /* 配置读取失败回落默认文案 */
+  }
+  return BOT_TEXT_DEFAULTS.dm_join_prompt;
+}
+
 async function bootstrapDmVerification(
   api: Api,
   user: JoinVerificationUser,
@@ -204,6 +223,7 @@ async function bootstrapDmVerification(
   settings: Awaited<ReturnType<typeof getGroupSettings>>,
   resolved: ResolvedJoinVerify,
   requestDate?: Date,
+  botId?: bigint | null,
 ): Promise<BootstrapResult> {
   // 同一 Telegram update 重投（date 相同）保持幂等；真实再次申请（date 更新）
   // 必须创建新 token 和 attempts=0 的新会话，不能继承上次输错次数。
@@ -220,21 +240,34 @@ async function bootstrapDmVerification(
     let promptDelivered = false;
     try {
       if (existingPending.method === "code_self" && existingPending.expectedCode) {
-        const delivery = await sendCodeSelfPrompt(api, targetChatId, {
-          promptText: settings?.promptText || CODE_SELF_DEFAULT_PROMPT,
-          code: existingPending.expectedCode,
-          expiresAt: existingPending.expiresAt,
-          contextLabel: `${requestType} retry`,
-        });
-        promptDelivered = delivery.delivered;
+        // v3.0.3：提示文案 NULL = 未配置回落默认；空串 = 用户选择不发送
+        const promptText = settings?.promptText ?? CODE_SELF_DEFAULT_PROMPT;
+        if (promptText.trim()) {
+          const delivery = await sendCodeSelfPrompt(api, targetChatId, {
+            promptText,
+            code: existingPending.expectedCode,
+            expiresAt: existingPending.expiresAt,
+            contextLabel: `${requestType} retry`,
+          });
+          promptDelivered = delivery.delivered;
+        }
       } else if (existingPending.method === "code_api") {
-        const promptText = settings?.promptText ?? "🔐 请在下方输入框直接发送验证码完成验证";
-        await api.sendMessage(
-          targetChatId,
-          `${htmlEscape(promptText)}\n\n请直接在下方输入框发送验证码，无需回复本消息。`,
-          { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+        // v3.0.3：重投的 chat_join_request 同样发送入群私聊提示（文案可配置、置空不发）
+        const joinPrompt = (await resolveDmJoinPrompt(botId)).trim();
+        if (joinPrompt) {
+          try {
+            await api.sendMessage(targetChatId, joinPrompt, {
+              link_preview_options: { is_disabled: true },
+            });
+            promptDelivered = true;
+          } catch {
+            /* 私聊不可达时静默（用户 /start 后会重发提示） */
+          }
+        }
+        console.log(
+          `Pending code_api DM verification exists: user ${user.id} chat ${chat.id} ` +
+            `session=${existingPending.token.slice(0, 8)}... — promptResent=${promptDelivered}`,
         );
-        promptDelivered = true;
       } else if (existingPending.method === "captcha") {
         const keyboard = new InlineKeyboard().webApp(
           runtime.verificationButtonText,
@@ -320,39 +353,48 @@ async function bootstrapDmVerification(
   );
 
   if (resolved.method === "code_api") {
-    const promptText = settings?.promptText ?? "🔐 请在下方输入框直接发送验证码完成验证";
+    // v3.0.3：申请到达后机器人在用户私聊发送入群提示（用户点击「申请加入群组」后
+    // 就地直接输码 —— 真实 APP 等价于仿真屏的「自动跳转机器人私聊」视图切换）。
+    // 文案 = bots.config.texts.dm_join_prompt（文案配置中心可自定义），置空 = 不发送。
     const targetChatId = user.userChatId ?? user.id;
-    try {
-      // chat_join_request 的 user_chat_id 只作为发送目标；身份与会话仍使用 from.id。
-      // 申请用户处于私聊会话，私聊消息不受群隐私模式限制，无需 force_reply。
-      // 用户直接发送文本，由 handleCodeInput 按 from.id 查找待验证会话。
-      await api.sendMessage(
-        targetChatId,
-        `${htmlEscape(promptText)}\n\n请直接在下方输入框发送验证码，无需回复本消息。`,
-        {
-          parse_mode: "HTML",
-          link_preview_options: { is_disabled: true },
-        },
+    const joinPrompt = (await resolveDmJoinPrompt(botId)).trim();
+    if (!joinPrompt) {
+      console.log(
+        `code_api verification session ready: user ${user.id} chat ${chat.id} ` +
+          `token=${verificationToken.slice(0, 8)}... — dm_join_prompt is empty, no DM sent`,
       );
-      console.log(`Code verification prompt sent to chat ${targetChatId} (user ${user.id}, ${requestType})`);
+      return { created: true, promptDelivered: false, method: "code_api" };
+    }
+    try {
+      await api.sendMessage(targetChatId, joinPrompt, {
+        link_preview_options: { is_disabled: true },
+      });
+      console.log(`Join-request DM prompt sent to chat ${targetChatId} (user ${user.id}, ${requestType})`);
       return { created: true, promptDelivered: true, method: "code_api" };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.toLowerCase().includes("chat not found") || message.toLowerCase().includes("forbidden")) {
         console.warn(
-          `Cannot send code prompt to chat ${targetChatId} (user ${user.id}, ${requestType}): chat not reachable; ` +
+          `Cannot send join-request prompt to chat ${targetChatId} (user ${user.id}, ${requestType}): chat not reachable; ` +
             "prompt will be resent when the user /starts the bot; session expires per timeout",
         );
         return { created: true, promptDelivered: false, method: "code_api" };
       }
-      console.error("Failed to send code verification prompt:", error);
+      console.error("Failed to send join-request DM prompt:", error);
       return { created: true, promptDelivered: false, method: "code_api" };
     }
   }
 
   // code_self：私聊发送自生成的入群验证码（直接输入，不要求回复提示消息）
+  // v3.0.3：提示文案 NULL = 未配置回落默认；空串 = 用户选择不发送
   if (useSelfCode && joinCode) {
-    const promptText = settings?.promptText || CODE_SELF_DEFAULT_PROMPT;
+    const promptText = settings?.promptText ?? CODE_SELF_DEFAULT_PROMPT;
+    if (!promptText.trim()) {
+      console.log(
+        `code_self prompt skipped (prompt_text empty = do-not-send): user ${user.id} chat ${chat.id}`,
+      );
+      return { created: true, promptDelivered: false, method: "code_self" };
+    }
     const targetChatId = user.userChatId ?? user.id;
     const delivery = await sendCodeSelfPrompt(api, targetChatId, {
       promptText,
@@ -425,7 +467,7 @@ export async function bootstrapJoinVerification(
 
   if (dmChannel) {
     return bootstrapDmVerification(
-      api, user, chat, requestType, runtime, settings, resolved, preloaded?.requestDate,
+      api, user, chat, requestType, runtime, settings, resolved, preloaded?.requestDate, botId,
     );
   }
   if (!settings) {

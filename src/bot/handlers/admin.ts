@@ -14,7 +14,7 @@ import { adminOnly } from "../filters";
 import { mainMenu } from "../menus";
 import { InlineKeyboard } from "grammy";
 import { htmlEscape } from "@/utils/html";
-import { DEFAULT_BOT_HELP_MARKDOWN_V2, DEFAULT_BOT_START_WELCOME_MARKDOWN_V2 } from "@/services/bot-messages";
+import { BOT_TEXT_DEFAULTS, DEFAULT_GROUP_PROMPT_TEXT } from "@/services/bot-messages";
 
 /**
  * /start —— 三段式入口（v1.1.3）：
@@ -50,7 +50,7 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
     // 一键部署保存的链接（editChatInviteLink 存活探测，死链自动重建并落库），
     // 保证买家拿到的永远与部署面板展示的是同一条有效链接。
     const superGroup = isSuperGroupChatId(chatId);
-    let inviteLink: string;
+    let inviteLink: string | null;
     try {
       const bots = await listBots();
       const botRow = bots.find((item) => item.enabled && item.token === ctx.api.token);
@@ -66,6 +66,10 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
     } catch (error) {
       console.error("cmdStart: acquire invite link failed:", error);
       await ctx.reply("⚠️ 生成入群链接失败，请稍后重试；若持续失败请联系管理员重新部署该群组。");
+      return;
+    }
+    if (!inviteLink) {
+      await ctx.reply("⚠️ 该群组还没有可用的入群链接（管理员未创建），请联系管理员在后台「邀请链接」面板创建后再试。");
       return;
     }
     const title = settings.chatTitle ?? "群组";
@@ -90,39 +94,48 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
       // v1.1.7 code_self：重发含验证码的完整提示（验证码随会话落库，重发同一码，
       // 与首次发送文案一致）；code_api 仍走原提示（验证码在用户手里/外部系统）
       if (pending.session.method === "code_self" && pending.session.expectedCode) {
+        // v3.0.3：提示文案置空 = 不发送（与 bootstrap 语义一致）
+        const selfPrompt = (pending.settings?.promptText ?? DEFAULT_GROUP_PROMPT_TEXT).trim();
+        if (!selfPrompt) return;
         const { sendCodeSelfPrompt } = await import("../verification-prompt");
         await sendCodeSelfPrompt(ctx.api, ctx.from.id, {
-          promptText: pending.settings?.promptText ?? "🔐 请在下方输入框直接发送验证码完成验证",
+          promptText: selfPrompt,
           code: pending.session.expectedCode,
           expiresAt: pending.session.expiresAt,
           contextLabel: "/start resend",
         });
         return;
       }
-      const promptText = pending.settings?.promptText ?? "🔐 请在下方输入框直接发送验证码完成验证";
+      const promptText = (pending.settings?.promptText ?? DEFAULT_GROUP_PROMPT_TEXT).trim();
       // /start 可能在群里输入，有 pending 会话时仍只向用户私聊发送提示。
       // 私聊不受群隐私模式限制，用户直接发送文本即可，无需 force_reply。
+      // v3.0.3：提示正文 = 群组「提示文案」整条发送（已合并输码引导），置空 = 不发送。
+      if (!promptText) return;
       await ctx.api.sendMessage(
         ctx.from.id,
-        `${htmlEscape(promptText)}\n\n请直接在下方输入框发送验证码，无需回复本消息。`,
+        promptText,
         { link_preview_options: { is_disabled: true } },
       );
       return;
     }
   }
 
-  // 可配置欢迎语优先于默认欢迎文案；按当前界面模式挂载对应键盘/菜单。
+  // v3.0.2 文案配置中心：/start 各分支文案全部走 bots.config.texts（管理端文本框
+  // 默认回填当前生效值）；文案值为空串 = 不发送该文本。旧 welcomeText 字段继续兼容
+  // 且优先于 texts.start_welcome（同一编辑框的存储位）。
+  const texts = ctx.botTexts ?? BOT_TEXT_DEFAULTS;
   const configuredWelcome = ctx.startWelcomeText?.trim();
-  if (configuredWelcome) {
-    const welcome = configuredWelcome
+  const welcomeTemplate = configuredWelcome || texts.start_welcome || "";
+  const markup =
+    ctx.interfaceKeyboardMode && ctx.customKeyboard
+      ? ctx.customKeyboard
+      : ctx.interfaceMenuEnabled === false
+        ? undefined
+        : ctx.botMenu ?? mainMenu;
+  if (welcomeTemplate.trim()) {
+    const welcome = welcomeTemplate
       .replaceAll("{{bot_name}}", ctx.me?.first_name ?? "TGuard")
       .replaceAll("{{bot_username}}", ctx.me?.username ? `@${ctx.me.username}` : "");
-    const markup =
-      ctx.interfaceKeyboardMode && ctx.customKeyboard
-        ? ctx.customKeyboard
-        : ctx.interfaceMenuEnabled === false
-          ? undefined
-          : ctx.botMenu ?? mainMenu;
     await ctx.reply(welcome, {
       ...(markup ? { reply_markup: markup } : {}),
       link_preview_options: { is_disabled: true },
@@ -130,39 +143,32 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
     return;
   }
 
-  // v2.3 界面模式互斥：键盘模式 = 欢迎语 + 自定义键盘（不发内嵌菜单）；
-  // 内嵌按钮面板关闭 = 纯文本欢迎（不发菜单）；否则 = 欢迎语 + 内嵌菜单
+  // 欢迎文案为空：内嵌菜单开启 → 只发菜单提示+菜单；键盘模式 → 只发键盘；全关 → 不发文本
   if (ctx.interfaceMenuEnabled === false) {
-    await ctx.reply(
-      "🤖 *TGuard 机器人*\n\n发送 /help 查看可用指令。",
-      { parse_mode: "MarkdownV2" },
-    );
+    const text = (texts.start_no_menu ?? "").trim();
+    if (text) await ctx.reply(text);
     return;
   }
   if (ctx.interfaceKeyboardMode && ctx.customKeyboard) {
-    await ctx.reply(
-      "🤖 *TGuard 机器人*\n\n👇 请使用下方自定义键盘按钮：",
-      { parse_mode: "MarkdownV2", reply_markup: ctx.customKeyboard },
-    );
+    const text = (texts.start_keyboard ?? "").trim();
+    if (text) await ctx.reply(text, { reply_markup: ctx.customKeyboard });
     return;
   }
-
-  await ctx.reply(
-    DEFAULT_BOT_START_WELCOME_MARKDOWN_V2,
-    // @grammyjs/menu 官方约束：Menu 实例只能发给安装它的 bot —— 菜单 bot 实例
-    // 优先发自己安装的菜单（ctx.botMenu），主 bot 无 botMenu 注入走全局 mainMenu
-    { parse_mode: "MarkdownV2", reply_markup: ctx.botMenu ?? mainMenu },
-  );
-  // v2.3：内嵌模式下不注入 ctx.customKeyboard（multi-runtime 已按界面模式互斥注入），
-  // 此分支仅作为主 bot（无界面模式标记）的旧语义兜底保留
-  if (ctx.customKeyboard && ctx.interfaceKeyboardMode === undefined) {
-    await ctx.reply("👇 请使用下方自定义键盘按钮：", { reply_markup: ctx.customKeyboard });
+  const menuHint = (texts.menu_hint ?? "").trim();
+  if (menuHint) {
+    await ctx.reply(menuHint, {
+      // @grammyjs/menu 官方约束：Menu 实例只能发给安装它的 bot —— 菜单 bot 实例
+      // 优先发自己安装的菜单（ctx.botMenu），主 bot 无 botMenu 注入走全局 mainMenu
+      reply_markup: ctx.botMenu ?? mainMenu,
+    });
   }
 }
 
 export async function cmdHelp(ctx: BotContext): Promise<void> {
-  await ctx.reply(DEFAULT_BOT_HELP_MARKDOWN_V2, {
-    parse_mode: "MarkdownV2",
+  // v3.0.2：/help 文案走配置中心（空串 = 不发送）
+  const text = (ctx.botTexts?.help_text ?? BOT_TEXT_DEFAULTS.help_text ?? "").trim();
+  if (!text) return;
+  await ctx.reply(text, {
     link_preview_options: { is_disabled: true },
   });
 }

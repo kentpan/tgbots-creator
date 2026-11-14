@@ -1,5 +1,6 @@
 import type { Api } from "grammy";
 import { htmlEscape } from "@/utils/html";
+import { DEFAULT_GROUP_PROMPT_TEXT } from "@/services/bot-messages";
 
 /**
  * code_self 验证方式（v1.1.7）的私聊验证码提示 —— 机器人自生成验证码，
@@ -13,8 +14,8 @@ import { htmlEscape } from "@/utils/html";
  * 不再要求回复提示消息，也不再依赖 force_reply/stateless-question。
  */
 
-/** code_self 方式的默认提示正文（group_settings.prompt_text 未配置时使用） */
-export const CODE_SELF_DEFAULT_PROMPT = "🔐 请在下方输入框直接发送验证码完成验证";
+/** code_self 方式的默认提示正文（group_settings.prompt_text 未配置时使用）——与群组「提示文案」默认值同源 */
+export const CODE_SELF_DEFAULT_PROMPT = DEFAULT_GROUP_PROMPT_TEXT;
 
 /**
  * 组装 code_self 提示消息（HTML）：

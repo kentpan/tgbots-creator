@@ -320,6 +320,7 @@ export async function handleVerificationChoice(
     username: from.username ?? null,
     code: choice,
     preloaded: { session, joinRequest, settings },
+    texts: ctx.botTexts,
   });
 
   switch (result.outcome) {

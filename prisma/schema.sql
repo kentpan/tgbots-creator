@@ -256,6 +256,7 @@ CREATE TABLE "invite_links" (
   "chat_id" BIGINT NOT NULL,
   "link" TEXT NOT NULL,
   "name" TEXT,
+  "remark" TEXT,
   "creates_join_request" BOOLEAN NOT NULL DEFAULT false,
   "is_revoked" BOOLEAN NOT NULL DEFAULT false,
   "source" TEXT NOT NULL DEFAULT 'api',

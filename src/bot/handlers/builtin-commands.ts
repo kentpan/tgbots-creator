@@ -6,6 +6,7 @@ import { cmdStart, cmdHelp, cmdStats, cmdApi } from "./admin";
 import { APP_VERSION } from "@/lib/app-version";
 import { getGlobalStats } from "@/database/operations";
 import { config } from "@/config/settings";
+import { BOT_TEXT_DEFAULTS } from "@/services/bot-messages";
 import type { MenuCommandRegistry, MenuCommandRunner } from "@/services/bot-menu";
 
 /**
@@ -87,9 +88,17 @@ function humanizeTelegramError(error: unknown): string {
 
 /** /menu — 打开主菜单 */
 export async function cmdMenu(ctx: BotContext): Promise<void> {
+  // v3.0.2 修复：「消息内嵌按钮」面板关闭（interfaceMenuEnabled=false）时不再发送
+  // 菜单提示+内嵌菜单（旧实现无条件发送 —— 用户关掉开关后仍收到带按钮消息的根因）。
+  // 文案走配置中心（bots.config.texts.menu_hint），空串 = 不发送。
+  if (ctx.interfaceMenuEnabled === false) {
+    return;
+  }
+  const text = ctx.botTexts?.menu_hint ?? BOT_TEXT_DEFAULTS.menu_hint;
+  if (!text.trim()) return;
   // @grammyjs/menu 官方约束：Menu 实例只能发给安装它的 bot —— 菜单 bot 实例
   // 优先发自己安装的菜单（ctx.botMenu），主 bot 无 botMenu 注入走全局 mainMenu
-  await ctx.reply("👇 请通过下方菜单按钮继续操作：", { reply_markup: ctx.botMenu ?? mainMenu });
+  await ctx.reply(text, { reply_markup: ctx.botMenu ?? mainMenu });
 }
 
 /** /about — 关于本机器人 */

@@ -187,11 +187,10 @@ export function TestingClient({
 
   // —— v2.1.11 统一部署（机器人级运行实例上线）——
   // 本页是全部机器人的唯一部署入口：TGAPI申请页「🚀 部署」已改为跳转本页。
-  // 实现复用 services/bot-deploy.ts 唯一实现（POST deployBotAndReport / GET probeBotDeployState），
-  // 与群组级「一键部署」（生成入群申请链接）互补；部署状态徽章真实探测，部署后自动同步。
+  // 实现复用 services/bot-deploy.ts 唯一实现（POST deployBotAndReport / GET probeBotDeployState）。
+  // v3.0.2：独立「上线」按钮已删除 —— deploySelectedBot 并入 handleDeployForGroup
+  //（每次单独/全量部署前自动上线/更新运行实例），probeBotDeploy 徽章保持真实状态。
   const [botDeployCheck, setBotDeployCheck] = useState<BotDeployCheck | null>(null);
-  const [deployingBot, setDeployingBot] = useState(false);
-  const [deployNote, setDeployNote] = useState<{ ok: boolean; text: string } | null>(null);
 
   const probeBotDeploy = useCallback(async (botId: string): Promise<void> => {
     try {
@@ -217,40 +216,6 @@ export function TestingClient({
     void probeBotDeploy(selectedBotId);
   }, [selectedBotId, probeBotDeploy]);
 
-  const deploySelectedBot = useCallback(async (): Promise<void> => {
-    if (!selectedBotId || deployingBot) return;
-    setDeployingBot(true);
-    setDeployNote(null);
-    try {
-      const response = await opsFetch("/api/admin/bots/testing/deploy-bot", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bot_id: selectedBotId }),
-      });
-      const payload = (await response.json()) as {
-        ok?: boolean;
-        state?: string;
-        message?: string;
-        error?: string;
-      };
-      if (payload.ok) {
-        setDeployNote({
-          ok: payload.state === "ok",
-          text: payload.message ?? "部署完成",
-        });
-      } else {
-        setDeployNote({ ok: false, text: payload.error ?? "部署失败" });
-      }
-    } catch (error) {
-      setDeployNote({
-        ok: false,
-        text: error instanceof Error ? error.message : "部署失败",
-      });
-    } finally {
-      setDeployingBot(false);
-      void probeBotDeploy(selectedBotId);
-    }
-  }, [selectedBotId, deployingBot, probeBotDeploy]);
   // v2.1.0：Edge 环境代理提醒 —— 进入仿真APP页面后，若当前为 edge 环境（线上部署）
   // 且代理开关开启时显示环境提示；不再要求用户关闭全局代理。
   const [edgeProxyWarning, setEdgeProxyWarning] = useState(false);
@@ -584,7 +549,7 @@ export function TestingClient({
   );
 
   const submitCode = useCallback(
-    async (text: string): Promise<{ ok: boolean; text: string; joined?: boolean }> => {
+    async (text: string): Promise<{ ok: boolean; text: string; joined?: boolean; event?: "joined" | "kicked" | "left" }> => {
       if (!session) {
         return { ok: false, text: "尚未加入群组：请先点击下方「申请加入群组」按钮" };
       }
@@ -625,7 +590,8 @@ export function TestingClient({
           setSession(null);
           setJoinPhase("idle");
           setSimView("group");
-          return { ok: true, text: `${payload.data.replyText}` };
+          // v3.0.3：被移出群组以服务消息胶囊展示（tg-desktop-chat 渲染）
+          return { ok: true, text: `${payload.data.replyText}`, event: "kicked" as const };
         }
         return { ok: true, text: `${payload.data.replyText}` };
       } catch (error) {
@@ -635,11 +601,15 @@ export function TestingClient({
     [session],
   );
 
-  // 一键部署（按群组）：Token → 已在群 → 管理员 → 邀请权限 → 生成入群申请链接并保存部署状态
+  // 一键部署（按群组）：Token → 已在群 → 管理员 → 邀请权限 → 复用/读取既有邀请链接并保存部署状态
   // 仿真屏列表项按钮入口；结果（stage/guide/链接）由仿真屏内浮层展示
+  // v3.0.2：① 部署前自动并入「运行实例上线」（原独立「上线」按钮已删除）；
+  //         ② 部署不再生成新邀请链接（服务端 createIfMissing=false，复用既有链接）；
+  //         ③ 单独部署统一 window.confirm 确认（全量部署在 deployToAllGroups 确认一次）。
   const handleDeployForGroup = useCallback(
     async (
       chatId: string,
+      options?: { skipConfirm?: boolean; chatTitle?: string },
     ): Promise<{
       ok: boolean;
       message: string;
@@ -652,8 +622,32 @@ export function TestingClient({
       migrated_from_chat_id?: string | null;
     } | null> => {
       if (!selectedBotId || deployingChatId) return null;
+      const target = realGroups.groups.find((group) => group.chatId === chatId);
+      const targetTitle = options?.chatTitle ?? target?.chatTitle ?? chatId;
+      if (!options?.skipConfirm) {
+        const botName = bots.find((bot) => bot.id === selectedBotId)?.name ?? selectedBotId;
+        const confirmed = window.confirm(
+          `单独部署确认\n\n` +
+            `将把机器人「${botName}」单独部署到群组「${targetTitle}」（chat_id=${chatId}）。\n` +
+            `部署内容：校验机器人状态与管理员权限 + 上线/更新运行实例 + 保存部署状态。\n` +
+            `部署不会生成新的邀请链接（优先复用该群已有链接；没有时请在「邀请链接」面板手动创建）。\n\n确认部署？`,
+        );
+        if (!confirmed) return null;
+      }
       setDeployingChatId(chatId);
       try {
+        // v3.0.2：运行实例上线并入部署（原「上线」按钮逻辑）——失败不阻断群组部署，
+        // 结果徽章（BotDeployBadge）会反映真实运行状态
+        try {
+          await opsFetch("/api/admin/bots/testing/deploy-bot", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ bot_id: selectedBotId }),
+          });
+        } catch {
+          console.warn("deploy-bot (runtime registration) failed; continuing group deploy");
+        }
+        void probeBotDeploy(selectedBotId);
         const response = await opsFetch("/api/admin/bots/testing/deploy", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -664,9 +658,11 @@ export function TestingClient({
           return { ok: false, message: payload.error ?? "部署校验失败" };
         }
         const stageMessages: Record<DeployResult["stage"], string> = {
-          deployed: payload.reused
-            ? "部署成功：复用已生成的有效邀请链接（未重复生成新链接）"
-            : "部署成功：入群申请链接已生成并保存为该群组的部署状态",
+          deployed: payload.invite_link
+            ? payload.reused
+              ? "部署成功：复用该群已有邀请链接（未生成新链接）"
+              : "部署成功：已使用该群既有邀请链接并保存部署状态"
+            : "部署成功（未生成新邀请链接）：请在该群「邀请链接」面板右上角创建邀请链接（可填备注区分渠道）",
           add_bot: "机器人还不在群里：请先把机器人拉进群（Telegram 限制：无法由 API 自拉）",
           promote_admin: "机器人已在群内但还不是管理员：请在群设置中添加为管理员",
           grant_permission: "机器人已是管理员但缺少「邀请用户 via 链接」权限：请开启后重新部署",
@@ -697,13 +693,14 @@ export function TestingClient({
         setDeployingChatId(null);
       }
     },
-    [selectedBotId, deployingChatId, selectedChatId, realGroups, router],
+    [selectedBotId, deployingChatId, selectedChatId, realGroups, router, bots, probeBotDeploy],
   );
 
   const simulatorConfig = selectedBot ? menuConfigs[selectedBot.id] : null;
   const botName = selectedBot?.name ?? "机器人";
 
   // v2.3 分体部署：主点击 = 部署当前机器人到其全部已登记群组（逐群真实部署，结果逐群回显）
+  // v3.0.2：全量部署统一 confirm 确认（写明是全量部署），逐群执行不再重复弹确认
   const [deployAllGroupsBusy, setDeployAllGroupsBusy] = useState(false);
   const deployToAllGroups = useCallback(async (): Promise<void> => {
     if (!selectedBotId || deployAllGroupsBusy) return;
@@ -712,20 +709,28 @@ export function TestingClient({
       alert("该机器人还没有已登记的群组：先把机器人拉进群，再点「同步真实群组」登记后部署。");
       return;
     }
+    const confirmed = window.confirm(
+      `全量部署确认\n\n` +
+        `将把机器人「${botName}」部署到全部 ${targets.length} 个已登记群组：\n` +
+        targets.map((group) => `· ${group.chatTitle || group.chatId}`).join("\n") +
+        `\n\n部署内容：逐群校验机器人状态与管理员权限 + 上线/更新运行实例 + 保存部署状态。\n` +
+        `部署不会生成新的邀请链接（优先复用各群已有链接）。\n\n确认全量部署？`,
+    );
+    if (!confirmed) return;
     setDeployAllGroupsBusy(true);
     try {
       let okCount = 0;
       for (const group of targets) {
-        const result = await handleDeployForGroup(group.chatId);
+        const result = await handleDeployForGroup(group.chatId, { skipConfirm: true, chatTitle: group.chatTitle });
         if (result?.ok && result.stage === "deployed") okCount += 1;
       }
-      alert(`部署完成：${okCount}/${targets.length} 个群组成功（详情见各群部署面板/徽章）`);
+      alert(`全量部署完成：${okCount}/${targets.length} 个群组成功（详情见各群部署面板/徽章）`);
       realGroups.reload();
       router.refresh();
     } finally {
       setDeployAllGroupsBusy(false);
     }
-  }, [selectedBotId, deployAllGroupsBusy, realGroups, handleDeployForGroup, router]);
+  }, [selectedBotId, deployAllGroupsBusy, realGroups, handleDeployForGroup, router, botName]);
 
   return (
     <div className="flex flex-col gap-4 lg:h-[calc(100vh-6.5rem)] lg:min-h-[680px]">
@@ -770,7 +775,7 @@ export function TestingClient({
         </div>
 
         <div className="flex flex-col gap-1">
-          <span className="text-xs font-medium text-muted-foreground">运行部署（上线/更新机器人服务）</span>
+          <span className="text-xs font-medium text-muted-foreground">运行部署（部署/更新机器人服务）</span>
           <div className="flex items-center gap-2">
             {botDeployCheck ? (
               <BotDeployBadge check={botDeployCheck} />
@@ -779,20 +784,8 @@ export function TestingClient({
                 状态探测中…
               </Badge>
             )}
-            {/* v2.3 分体部署按钮：主点击=部署当前机器人到其全部群组（逐群真实部署）；
-                ▾浮层=单群部署，已部署群组绿√；运行实例上线/更新保留为独立「上线」按钮 */}
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => void deploySelectedBot()}
-              disabled={!selectedBotId || deployingBot}
-              aria-label="上线/更新运行实例（注册 Webhook 或重启轮询）"
-              className="h-[30px] gap-1 px-2.5 text-[13px]"
-            >
-              {deployingBot ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Rocket className="h-3.5 w-3.5" />}
-              上线
-            </Button>
+            {/* v3.0.2：独立「上线」按钮已删除 —— 运行实例上线/更新并入每次部署流程
+                （单独部署/全量部署都会自动注册 Webhook 或确认轮询），徽章显示运行状态 */}
             <SplitDeployButton
               mainLabel="部署到所有群组"
               mainBusy={deployAllGroupsBusy}
@@ -807,7 +800,7 @@ export function TestingClient({
                 void handleDeployForGroup(chatId).then(() => realGroups.reload());
               }}
               onLoadItems={() => realGroups.reload()}
-              emptyHint="该机器人还没有已登记的群组：先把机器人拉进群并点「上线」"
+              emptyHint="该机器人还没有已登记的群组：先把机器人拉进群并点「同步真实群组」"
             />
           </div>
         </div>
@@ -858,14 +851,6 @@ export function TestingClient({
       {syncNote ? (
         <p className={`text-xs leading-relaxed ${syncNote.ok ? "text-green-700" : "text-red-600"}`}>
           {syncNote.ok ? "✓ " : "⚠ "}{syncNote.text}
-        </p>
-      ) : null}
-      {deployNote ? (
-        <p
-          className={`text-xs leading-relaxed ${deployNote.ok ? "text-green-700" : "text-red-600"}`}
-          role={deployNote.ok ? "status" : "alert"}
-        >
-          {deployNote.ok ? "✓ " : "⚠ "}{deployNote.text}
         </p>
       ) : null}
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ListTree } from "lucide-react";
+import { ChevronDown, ListTree } from "lucide-react";
 import { EditorMobileSwitch } from "@/components/admin/editor-mobile-switch";
 import {
   Dialog,
@@ -20,7 +20,7 @@ import { TgApiBotGroupsPanel } from "@/components/admin/tgapi-bot-groups-panel";
 import { useRealGroups } from "@/components/admin/use-real-groups";
 import { CustomKeyboardDesigner } from "@/components/admin/custom-keyboard-dialog";
 import { emptyKeyboardOptions } from "@/components/admin/custom-keyboard-editor";
-import type { CustomKeyboardConfig } from "@/services/custom-keyboard";
+import { parseCustomKeyboardConfig, type CustomKeyboardConfig } from "@/services/custom-keyboard";
 import { ConfigPanel } from "@/components/admin/config-panel";
 import { SubmitButton } from "@/components/admin/submit-button";
 import { TgApiGatePanel } from "@/components/admin/tgapi-gate-panel";
@@ -30,6 +30,7 @@ import {
   type CommandLibraryItem,
 } from "@/app/admin/bots/command-menu-dialog";
 import { saveBotFeatureConfigAction } from "./actions";
+import { BOT_TEXT_DEFS, DEFAULT_START_WELCOME_TEXT } from "@/services/bot-messages";
 import {
   DesignerBasicInfo,
   designerInputClass,
@@ -123,13 +124,37 @@ function readMenuDraft(bot?: DesignerBotInfo): BotMenuConfig {
 }
 
 function readWelcomeText(bot?: DesignerBotInfo): string {
-  if (!bot) return "";
+  // v3.0.2：文本框默认回填产品默认文案（用户要求所有文案默认可见可编辑）；
+  // 清空保存 = 删除 welcomeText 键，运行时回落 texts.start_welcome / 内置默认。
+  if (!bot) return DEFAULT_START_WELCOME_TEXT;
   try {
     const parsed = JSON.parse(bot.config) as { welcomeText?: unknown };
-    return typeof parsed.welcomeText === "string" ? parsed.welcomeText : "";
+    const value = parsed.welcomeText;
+    return typeof value === "string" && value.trim() ? value : DEFAULT_START_WELCOME_TEXT;
   } catch {
-    return "";
+    return DEFAULT_START_WELCOME_TEXT;
   }
+}
+
+/** v3.0.2 文案配置中心：读 bots.config.texts（key → 文案；缺失/坏数据回落默认值） */
+function readBotTexts(bot?: DesignerBotInfo): Record<string, string> {
+  let saved: Record<string, unknown> = {};
+  if (bot) {
+    try {
+      const parsed = JSON.parse(bot.config) as { texts?: unknown };
+      if (parsed.texts && typeof parsed.texts === "object" && !Array.isArray(parsed.texts)) {
+        saved = parsed.texts as Record<string, unknown>;
+      }
+    } catch {
+      /* 坏数据按未配置处理 */
+    }
+  }
+  const merged: Record<string, string> = {};
+  for (const def of BOT_TEXT_DEFS) {
+    const value = saved[def.key];
+    merged[def.key] = typeof value === "string" ? value : def.defaultValue;
+  }
+  return merged;
 }
 
 /** 通用机器人键盘保存在 bots.config.customKeyboard 顶层；兼容旧版 tgapi 子段。 */
@@ -176,6 +201,9 @@ export function FeatureConfigDialog({
   const [feature, setFeature] = useState<FeatureDraft>(() => readFeatureDraft(bot));
   const [menu, setMenu] = useState<BotMenuConfig>(() => readMenuDraft(bot));
   const [welcomeText, setWelcomeText] = useState(() => readWelcomeText(bot));
+  const [botTexts, setBotTexts] = useState<Record<string, string>>(() => readBotTexts(bot));
+  /** v3.0.3 默认文案区块默认收起（避免配置页被撑出数屏高度） */
+  const [textsOpen, setTextsOpen] = useState(false);
   const [kbPayload, setKbPayload] = useState<string>(() =>
     keyboardConfig ? JSON.stringify(keyboardConfig) : "",
   );
@@ -198,6 +226,7 @@ export function FeatureConfigDialog({
       setFeature(readFeatureDraft(bot));
       setMenu(readMenuDraft(bot));
       setWelcomeText(readWelcomeText(bot));
+      setBotTexts(readBotTexts(bot));
       setKbPayload(keyboardConfig ? JSON.stringify(keyboardConfig) : "");
       setPrivacyMode(profile.privacyMode);
       setSelectedCommandIds(profile.commandIds);
@@ -375,6 +404,7 @@ export function FeatureConfigDialog({
           <input type="hidden" name="gate_commands_required" value={feature.gateCommandsRequired ? "1" : "0"} />
           <input type="hidden" name="join_verify_enabled" value={feature.joinVerifyEnabled ? "1" : "0"} />
           <input type="hidden" name="welcome_text" value={welcomeText} />
+          <input type="hidden" name="texts_json" value={JSON.stringify(botTexts)} />
           <input type="hidden" name="gate_enabled" value={feature.gateEnabled ? "1" : "0"} />
 
           <div ref={editorScrollRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-6 sm:py-4">
@@ -426,6 +456,7 @@ export function FeatureConfigDialog({
                 <nav aria-label="功能配置快速导航" className="sticky top-0 z-20 -mx-1 flex gap-1 overflow-x-auto rounded-xl border bg-background/95 p-1 shadow-sm backdrop-blur">
                   {[
                     ["#welcome-config", "欢迎消息"],
+                    ["#texts-config", "默认文案"],
                     ["#join-verify-config", "加群验证"],
                     ["#gate-config", "门禁解锁"],
                     ["#interface-config", "菜单与键盘"],
@@ -461,6 +492,51 @@ export function FeatureConfigDialog({
                     <span>纯文本安全发送，不需要转义 Markdown 特殊字符。</span>
                     <span>{welcomeText.length}/3500</span>
                   </div>
+                </section>
+
+                {/* 📝 默认文案配置中心（v3.0.2）：机器人发送的所有默认消息文案都可编辑。
+                    v3.0.3：默认收起（区块过长曾把配置页撑出数屏高度），点击标题栏展开/收起。 */}
+                <section id="texts-config" className="scroll-mt-16 rounded-xl border bg-card">
+                  <button
+                    type="button"
+                    onClick={() => setTextsOpen((prev) => !prev)}
+                    aria-expanded={textsOpen}
+                    className="flex w-full cursor-pointer items-center justify-between gap-3 px-4 py-3 text-left"
+                  >
+                    <span className="min-w-0">
+                      <span className="block text-sm font-semibold">📝 机器人默认文案（全部可自定义）</span>
+                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                        内置指令与提示的默认文案都在这里编辑，文本框默认填入当前生效文案；清空保存 = 该条消息不发送。
+                      </span>
+                    </span>
+                    <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+                      {textsOpen ? "收起" : "展开"}
+                      <ChevronDown
+                        className={`h-4 w-4 transition-transform ${textsOpen ? "rotate-180" : ""}`}
+                        aria-hidden
+                      />
+                    </span>
+                  </button>
+                  {textsOpen ? (
+                    <div className="space-y-3 border-t px-4 py-3">
+                      {BOT_TEXT_DEFS.filter((def) => def.key !== "start_welcome").map((def) => (
+                        <label key={def.key} className="block">
+                          <span className="mb-1 block text-[13px] font-medium text-foreground">{def.label}</span>
+                          <span className="mb-1 block text-xs text-muted-foreground">{def.description}</span>
+                          <textarea
+                            value={botTexts[def.key] ?? ""}
+                            onChange={(event) =>
+                              setBotTexts((prev) => ({ ...prev, [def.key]: event.target.value }))
+                            }
+                            rows={def.key === "help_text" ? 8 : 3}
+                            maxLength={3500}
+                            className={`${designerInputClass()} min-h-16 resize-y font-mono text-sm leading-relaxed`}
+                            aria-label={def.label}
+                          />
+                        </label>
+                      ))}
+                    </div>
+                  ) : null}
                 </section>
 
                 {/* 🚪 加群验证 */}

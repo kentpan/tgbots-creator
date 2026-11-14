@@ -72,6 +72,8 @@ export interface SimInviteLinkEntry {
   chat_id: string;
   link: string;
   name: string | null;
+  /** v3.0.2 渠道备注（创建时填写，用于区分来源渠道） */
+  remark?: string | null;
   creates_join_request: boolean;
   is_revoked: boolean;
   source: string;

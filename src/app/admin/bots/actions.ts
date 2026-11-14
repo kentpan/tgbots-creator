@@ -808,6 +808,24 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
     else delete next.welcomeText;
   }
 
+  // v3.0.2 文案配置中心：bots.config.texts（key → 文案；空串 = 运行时不发送）
+  if (formData.has("texts_json")) {
+    let texts: Record<string, string> = {};
+    try {
+      const parsed = JSON.parse(String(formData.get("texts_json") ?? "{}")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+          if (typeof value === "string") texts[key] = value.replace(/\r\n?/g, "\n").slice(0, 3500);
+        }
+      }
+    } catch {
+      redirect(botPath({ error: "invalid-texts" }));
+    }
+    // 空对象 = 全部回落默认值，直接移除字段保持 config 精简
+    if (Object.keys(texts).length > 0) next.texts = texts;
+    else delete next.texts;
+  }
+
   // —— 隐私模式 + 指令勾选（与 saveTgApiBotAction / saveBotCommandMenuAction 同存储位） ——
   const privacyRaw = formData.get("privacyMode");
   if (privacyRaw !== null) next.privacyMode = privacyRaw === "1";

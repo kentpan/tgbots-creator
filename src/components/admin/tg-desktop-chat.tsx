@@ -268,7 +268,7 @@ export function TgDesktopChat({
   /** 外部注入的机器人消息（加群验证提示），由父组件控制生命周期 */
   promptMessage?: { id: number; text: string; hint?: string } | null;
   /** 用户发送文本消息的处理器（如提交验证码）；未提供时保持本地回显行为 */
-  onUserSend?: (text: string) => Promise<{ ok: boolean; text: string; joined?: boolean }>;
+  onUserSend?: (text: string) => Promise<{ ok: boolean; text: string; joined?: boolean; event?: "joined" | "kicked" | "left" }>;
   /** 加群仿真阶段：idle=尚未加入（底部显示「申请加入群组」按钮），awaiting_code/joined=显示输入框 */
   joinPhase?: "idle" | "awaiting_code" | "joined";
   /** 点击「申请加入群组」按钮时触发（父组件创建加群申请会话）；失败原因以红色服务消息展示 */
@@ -462,6 +462,21 @@ export function TgDesktopChat({
           content: { type: "text", text: "验证通过，你已加入群组", mediaUrl: "", items: [] },
         });
       }
+      // v3.0.3：入群/退群事件统一以服务消息胶囊展示（与真实 Telegram 服务消息一致）
+      if (result.ok && result.event === "kicked" && !isPrivate) {
+        appendStream("group", {
+          from: "system",
+          sender: "system",
+          content: { type: "text", text: "验证未通过，你已被移出群组", mediaUrl: "", items: [] },
+        });
+      }
+      if (result.ok && result.event === "left" && !isPrivate) {
+        appendStream("group", {
+          from: "system",
+          sender: "system",
+          content: { type: "text", text: "你已退出群组", mediaUrl: "", items: [] },
+        });
+      }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       patchStream(stream, loadingId, {
@@ -473,7 +488,7 @@ export function TgDesktopChat({
     }
   };
 
-  /** 点击「申请加入群组」：结果以服务消息胶囊展示（失败红色） */
+  /** 点击「申请加入群组」：结果以服务消息胶囊展示（失败红色）；成功也发服务胶囊（v3.0.3） */
   const handleJoinClick = async (): Promise<void> => {
     if (!onRequestJoin || requestingJoin) return;
     setRequestingJoin(true);
@@ -485,6 +500,12 @@ export function TgDesktopChat({
           sender: "system",
           content: { type: "text", text: `⚠️ ${result.message}`, mediaUrl: "", items: [] },
           tone: "error",
+        });
+      } else {
+        appendStream(stream, {
+          from: "system",
+          sender: "system",
+          content: { type: "text", text: "你已申请加入群组", mediaUrl: "", items: [] },
         });
       }
     } catch (error) {
@@ -721,6 +742,25 @@ export function TgDesktopChat({
                     : entry.first_name?.trim() ||
                       (entry.username ? `@${entry.username}` : `用户 ${entry.user_id ?? "?"}`);
                 const time = realMessageTime(entry.message_time);
+                // v3.0.3：服务消息（成员加入/离开群组等 Telegram 服务事件被当作普通
+                // 文本记录进台账）→ 渲染为居中半透明胶囊，与真实 Telegram 服务消息一致，
+                // 不再显示为带头像的普通白色气泡。
+                const serviceText = entry.text?.trim() ?? "";
+                const isServiceMessage =
+                  /^\s*—.*—\s*$/s.test(serviceText) ||
+                  (serviceText.length <= 40 && /(加入|离开|退出|移出)了?群组/.test(serviceText));
+                if (isServiceMessage) {
+                  return (
+                    <div key={entry.id} className="flex justify-center py-1">
+                      <span
+                        className="max-w-[86%] rounded-2xl bg-black/25 px-3.5 py-1.5 text-center text-xs leading-relaxed text-white backdrop-blur-sm"
+                        title={`${sender} · ${time}`}
+                      >
+                        {serviceText}
+                      </span>
+                    </div>
+                  );
+                }
                 return (
                   <div key={entry.id} className="flex items-end gap-2">
                     <div className="shrink-0" style={{ width: AVATAR_SIZE }}>

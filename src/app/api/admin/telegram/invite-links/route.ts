@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentAdmin, hasPermission, logOperation } from "@/lib/auth";
 import { headers } from "next/headers";
-import { getBot, listInviteLinks, deleteInviteLink, markInviteLinkRevoked, upsertInviteLink } from "@/database/operations";
+import { getBot, getGroupSettings, listInviteLinks, deleteInviteLink, markInviteLinkRevoked, updateInviteLinkRemark, upsertInviteLink } from "@/database/operations";
 import { botByToken, describeSyncError } from "@/services/telegram-sync";
 
 /**
@@ -14,6 +14,9 @@ import { botByToken, describeSyncError } from "@/services/telegram-sync";
  *
  * GET  ?chat_id=&bot_id= → 列出台账记录（纯数据库，不请求 Telegram）
  * POST { chat_id, bot_id, action }：
+ *   - action=create  → v3.0.2 调用 Telegram createChatInviteLink 真实创建新邀请链接
+ *                      （备注 remark 用于区分来源渠道；申请制形态跟随群组 requireApproval）
+ *                      并落库台账 —— 部署链路已不再自动建链，创建统一收敛到本入口
  *   - action=revoke  → 调用 Telegram revokeChatInviteLink 真正作废链接 + 台账标记已撤销
  *   - action=delete  → 仅删除台账记录（Telegram 侧不动，链接仍然有效时请先用 revoke）
  *   - action=add     → 手动登记链接（用户从 Telegram 客户端「邀请链接」列表粘贴历史链接，
@@ -56,6 +59,7 @@ export async function GET(request: Request): Promise<NextResponse> {
         chat_id: String(link.chatId),
         link: link.link,
         name: link.name,
+        remark: link.remark,
         creates_join_request: link.createsJoinRequest,
         is_revoked: link.isRevoked,
         source: link.source,
@@ -78,10 +82,12 @@ export async function POST(request: Request): Promise<NextResponse> {
   let payload: {
     chat_id?: string;
     bot_id?: string;
-    action?: "revoke" | "delete" | "add";
+    action?: "create" | "revoke" | "delete" | "add" | "update_remark";
     link_id?: string;
     link?: string;
     name?: string;
+    /** v3.0.2 渠道备注（create/add 时填写；update_remark 时编辑，用于区分来源渠道） */
+    remark?: string;
   };
   try {
     payload = (await request.json()) as typeof payload;
@@ -102,6 +108,49 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   const requestHeaders = await headers();
 
+  // —— v3.0.2 真实创建邀请链接（部署不再自动建链，创建统一收敛到本入口）——
+  if (action === "create") {
+    const bot = await getBot(botId);
+    if (!bot || !bot.token) {
+      return NextResponse.json({ ok: false, error: "机器人不存在或 Token 缺失" }, { status: 404 });
+    }
+    const remark = (payload.remark ?? "").trim();
+    try {
+      const api = botByToken(bot.token).api;
+      // 申请制形态跟随群组「新成员审核」开关；群组未登记时默认普通链接
+      const groupSettings = await getGroupSettings(chatId);
+      const requireApproval = groupSettings?.requireApproval ?? false;
+      const invite = await api.createChatInviteLink(Number(chatId), {
+        ...(requireApproval ? { creates_join_request: true } : {}),
+        ...(remark ? { name: remark } : {}),
+      });
+      await upsertInviteLink({
+        botId,
+        chatId,
+        link: invite.invite_link,
+        name: invite.name ?? (remark || "管理端创建"),
+        remark: remark || null,
+        createsJoinRequest: invite.creates_join_request === true,
+        source: "manual",
+      });
+      await logOperation(admin, {
+        action: "创建邀请链接",
+        target: `chat=${chatId} bot=${botId}`,
+        detail: `${invite.invite_link}${remark ? `（备注：${remark}）` : ""}`,
+        headers: requestHeaders,
+      });
+      return NextResponse.json({
+        ok: true,
+        data: { message: "邀请链接已创建并登记台账", link: invite.invite_link, remark: remark || null },
+      });
+    } catch (error) {
+      return NextResponse.json(
+        { ok: false, error: `创建邀请链接失败：${describeSyncError(error)}` },
+        { status: 502 },
+      );
+    }
+  }
+
   // —— 手动登记历史链接 ——
   if (action === "add") {
     const link = (payload.link ?? "").trim();
@@ -111,11 +160,13 @@ export async function POST(request: Request): Promise<NextResponse> {
         { status: 400 },
       );
     }
+    const remark = (payload.remark ?? "").trim();
     await upsertInviteLink({
       botId,
       chatId,
       link,
       name: (payload.name ?? "").trim() || "手动登记",
+      remark: remark || null,
       createsJoinRequest: true,
       source: "manual",
     });
@@ -136,6 +187,37 @@ export async function POST(request: Request): Promise<NextResponse> {
   const target = links.find((item) => String(item.id) === linkIdRaw);
   if (!target) {
     return NextResponse.json({ ok: false, error: "链接记录不存在（可能已被删除）" }, { status: 404 });
+  }
+
+  // —— v3.0.3 编辑备注（台账覆盖写入；Telegram 侧链接名称 best-effort 同步）——
+  if (action === "update_remark") {
+    const remark = (payload.remark ?? "").trim();
+    try {
+      const bot = await getBot(botId);
+      if (bot?.token) {
+        const api = botByToken(bot.token).api;
+        // 只对机器人自己创建的链接有效（Telegram 限制）；死链/非本 bot 创建的报错不影响台账
+        await api.editChatInviteLink(Number(chatId), target.link, {
+          ...(remark ? { name: remark } : {}),
+        });
+      }
+    } catch (error) {
+      console.warn(
+        `[invite-links] Telegram-side link rename skipped (chat=${chatId}, link=${target.link}):`,
+        error instanceof Error ? error.message : error,
+      );
+    }
+    const updated = await updateInviteLinkRemark(target.id, remark);
+    if (!updated) {
+      return NextResponse.json({ ok: false, error: "链接记录不存在（可能已被删除）" }, { status: 404 });
+    }
+    await logOperation(admin, {
+      action: "编辑邀请链接备注",
+      target: `chat=${chatId} bot=${botId}`,
+      detail: `${target.link} → ${remark || "（空）"}`,
+      headers: requestHeaders,
+    });
+    return NextResponse.json({ ok: true, data: { message: "备注已更新", remark: remark || null } });
   }
 
   // —— 撤销（Telegram 侧真正作废 + 台账标记）——

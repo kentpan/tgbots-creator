@@ -12,6 +12,8 @@ import {
   memoTtl,
 } from "@/database/bindings";
 
+import { LEGACY_GROUP_PROMPT_TEXT } from "@/services/bot-messages";
+
 // ---------------------------------------------------------------------------
 // v2.3.5 轻量自动迁移（D1 / SQLite 双端）：新增列在运行时自动补齐 ——
 // 每 isolate 仅执行一次（成功后缓存 Promise），已存在列 PRAGMA 探测后跳过。
@@ -29,6 +31,8 @@ export function ensureAppSchema(): Promise<void> {
       await ensureColumn("group_settings", "join_verify_method_id", "INTEGER");
       await ensureColumn("verification_sessions", "method_id", "INTEGER");
       await ensureColumn("verification_sessions", "max_attempts", "INTEGER");
+      // v3.0.2 邀请链接渠道备注（管理端创建/登记邀请链接时填写）
+      await ensureColumn("invite_links", "remark", "TEXT");
     })().catch((error: unknown) => {
       // 失败清空缓存：下次调用重试（例如首次部署 D1 偶发抖动）
       appSchemaReady = null;
@@ -216,9 +220,10 @@ export interface GroupSettingsRow {
   methodId: bigint | null;
   timeoutSeconds: number;
   maxAttempts: number;
-  promptText: string;
-  successText: string;
-  failureText: string;
+  /** v3.0.2：NULL = 未配置（运行时回落产品默认值）；空串 = 显式不发送 */
+  promptText: string | null;
+  successText: string | null;
+  failureText: string | null;
   enabled: boolean;
   /** 加群验证隐私模式：开启时验证码必须回复机器人的验证问题（stateless-question，兼容 Telegram 隐私模式）；关闭时任意文本消息均可触发校验 */
   privacyMode: boolean;
@@ -1161,9 +1166,16 @@ function mapGroupSettings(row: Record<string, unknown>): GroupSettingsRow {
     methodId: toBigIntOrNull(row.method_id),
     timeoutSeconds: toNumber(row.timeout_seconds ?? 300),
     maxAttempts: toNumber(row.max_attempts ?? 3),
-    promptText: (row.prompt_text as string) ?? "🔐 请回复本消息并输入验证码完成验证",
-    successText: (row.success_text as string) ?? "✅ 验证成功，欢迎加入！",
-    failureText: (row.failure_text as string) ?? "❌ 验证码错误，请重试。",
+    // v3.0.3：三段验证文案 NULL = 未配置（运行时回落产品默认值）；显式空串 =
+    // 用户选择「为空就不发送」（运行时判空跳过），不再回落默认值。
+    // 旧默认值「请回复本消息并输入验证码完成验证」归一为 NULL —— 老群组自动
+    // 升级为合并了输码引导的新默认文案（DEFAULT_GROUP_PROMPT_TEXT），用户无感。
+    promptText:
+      row.prompt_text === undefined || row.prompt_text === null || row.prompt_text === LEGACY_GROUP_PROMPT_TEXT
+        ? null
+        : String(row.prompt_text),
+    successText: row.success_text === undefined || row.success_text === null ? null : String(row.success_text),
+    failureText: row.failure_text === undefined || row.failure_text === null ? null : String(row.failure_text),
     enabled: toBoolean(row.enabled),
     privacyMode: row.privacy_mode === undefined ? true : toBoolean(row.privacy_mode),
     requireApproval: row.require_approval === undefined ? false : toBoolean(row.require_approval),
@@ -1644,9 +1656,10 @@ export async function upsertGroupSettings(
     methodId?: bigint | null;
     timeoutSeconds?: number;
     maxAttempts?: number;
-    promptText?: string;
-    successText?: string;
-    failureText?: string;
+    /** v3.0.2 三段验证文案：undefined = 不改动 / null = 清空（运行时不发送）/ 字符串 = 写入 */
+    promptText?: string | null;
+    successText?: string | null;
+    failureText?: string | null;
     enabled?: boolean;
     privacyMode?: boolean;
     /** v1.1.9 加群需要管理员审核；undefined = 不改动现有值 */
@@ -1678,6 +1691,10 @@ export async function upsertGroupSettings(
   let joinVerifyBotIdValue = input.joinVerifyBotId;
   let joinVerifyModeValue = input.joinVerifyMode;
   let joinVerifyMethodIdValue = input.joinVerifyMethodId;
+  // v3.0.2 三段验证文案 tri-state：undefined = 保留现值；null = 清空（不发送）
+  let promptTextValue = input.promptText;
+  let successTextValue = input.successText;
+  let failureTextValue = input.failureText;
   if (
     requireApprovalValue === undefined ||
     verificationChannelValue === undefined ||
@@ -1686,6 +1703,9 @@ export async function upsertGroupSettings(
     joinVerifyBotIdValue === undefined ||
     joinVerifyModeValue === undefined ||
     joinVerifyMethodIdValue === undefined ||
+    promptTextValue === undefined ||
+    successTextValue === undefined ||
+    failureTextValue === undefined ||
     input.chatType === undefined
   ) {
     const existing = await getGroupSettings(chatId);
@@ -1707,6 +1727,9 @@ export async function upsertGroupSettings(
     }
     if (joinVerifyModeValue === undefined) joinVerifyModeValue = existing?.joinVerifyMode ?? null;
     if (joinVerifyMethodIdValue === undefined) joinVerifyMethodIdValue = existing?.joinVerifyMethodId ?? null;
+    if (promptTextValue === undefined) promptTextValue = existing?.promptText ?? null;
+    if (successTextValue === undefined) successTextValue = existing?.successText ?? null;
+    if (failureTextValue === undefined) failureTextValue = existing?.failureText ?? null;
   }
   // chatType 独立读现值（existing 在上方 if 块作用域内，可能未查询）
   let chatTypeValue: string | null | undefined = input.chatType;
@@ -1725,9 +1748,9 @@ export async function upsertGroupSettings(
        method_id = excluded.method_id,
        timeout_seconds = COALESCE(excluded.timeout_seconds, group_settings.timeout_seconds),
        max_attempts = COALESCE(excluded.max_attempts, group_settings.max_attempts),
-       prompt_text = COALESCE(excluded.prompt_text, group_settings.prompt_text),
-       success_text = COALESCE(excluded.success_text, group_settings.success_text),
-       failure_text = COALESCE(excluded.failure_text, group_settings.failure_text),
+       prompt_text = excluded.prompt_text,
+       success_text = excluded.success_text,
+       failure_text = excluded.failure_text,
        enabled = COALESCE(excluded.enabled, group_settings.enabled),
        privacy_mode = COALESCE(excluded.privacy_mode, group_settings.privacy_mode),
        require_approval = excluded.require_approval,
@@ -1746,9 +1769,10 @@ export async function upsertGroupSettings(
       input.methodId === undefined || input.methodId === null ? null : Number(input.methodId),
       input.timeoutSeconds ?? 300,
       input.maxAttempts ?? 3,
-      input.promptText ?? "🔐 请回复本消息并输入验证码完成验证",
-      input.successText ?? "✅ 验证成功，欢迎加入！",
-      input.failureText ?? "❌ 验证码错误，请重试。",
+      // v3.0.2：tri-state 已在上方解析（undefined=现值 / null=清空 / 字符串=写入）
+      promptTextValue,
+      successTextValue,
+      failureTextValue,
       input.enabled === false ? 0 : 1,
       input.privacyMode === false ? 0 : 1,
       requireApprovalValue ? 1 : 0,
@@ -2650,6 +2674,8 @@ export interface InviteLinkRow {
   chatId: bigint;
   link: string;
   name: string | null;
+  /** v3.0.2 渠道备注：区分链接来源渠道（创建时填写，仅台账展示用） */
+  remark: string | null;
   createsJoinRequest: boolean;
   isRevoked: boolean;
   /** api=bot 运行时创建自动落库 / manual=管理后台手动登记 */
@@ -2665,6 +2691,7 @@ function mapInviteLink(row: Record<string, unknown>): InviteLinkRow {
     chatId: toBigInt(row.chat_id),
     link: (row.link as string) ?? "",
     name: (row.name as string) ?? null,
+    remark: (row.remark as string | null) ?? null,
     createsJoinRequest: Number(row.creates_join_request ?? 0) === 1,
     isRevoked: Number(row.is_revoked ?? 0) === 1,
     source: (row.source as string) ?? "api",
@@ -2683,17 +2710,20 @@ export async function upsertInviteLink(input: {
   chatId: bigint;
   link: string;
   name?: string | null;
+  /** v3.0.2 渠道备注（管理端创建/登记时填写，用于区分来源渠道） */
+  remark?: string | null;
   createsJoinRequest?: boolean;
   source?: string;
 }): Promise<void> {
   const now = dateText(new Date());
   await executeRun(
-    `INSERT INTO invite_links (bot_id, chat_id, link, name, creates_join_request, is_revoked, source, created_time, updated_time)
-     VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+    `INSERT INTO invite_links (bot_id, chat_id, link, name, remark, creates_join_request, is_revoked, source, created_time, updated_time)
+     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
      ON CONFLICT(link) DO UPDATE SET
        bot_id = COALESCE(excluded.bot_id, invite_links.bot_id),
        chat_id = excluded.chat_id,
        name = COALESCE(excluded.name, invite_links.name),
+       remark = COALESCE(excluded.remark, invite_links.remark),
        creates_join_request = excluded.creates_join_request,
        updated_time = excluded.updated_time`,
     [
@@ -2701,6 +2731,7 @@ export async function upsertInviteLink(input: {
       Number(input.chatId),
       input.link,
       input.name ?? null,
+      input.remark ?? null,
       input.createsJoinRequest ? 1 : 0,
       input.source ?? "api",
       now,
@@ -2746,6 +2777,15 @@ export async function markInviteLinkRevoked(id: bigint): Promise<boolean> {
 /** 删除本地台账记录（不影响 Telegram 侧；彻底清理用「撤销」） */
 export async function deleteInviteLink(id: bigint): Promise<boolean> {
   const result = await executeRun(`DELETE FROM invite_links WHERE id = ?`, [Number(id)]);
+  return result.changes > 0;
+}
+
+/** v3.0.3 更新台账链接备注（编辑备注；直接覆盖，允许置空） */
+export async function updateInviteLinkRemark(id: bigint, remark: string): Promise<boolean> {
+  const result = await executeRun(
+    `UPDATE invite_links SET remark = ?, updated_time = ? WHERE id = ?`,
+    [remark, dateText(new Date()), Number(id)],
+  );
   return result.changes > 0;
 }
 

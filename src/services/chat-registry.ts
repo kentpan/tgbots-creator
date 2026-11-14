@@ -5,6 +5,7 @@ import {
   upsertGroupBotAdmin,
   upsertGroupSettings,
 } from "@/database/operations";
+import { DEFAULT_GROUP_PROMPT_TEXT } from "@/services/bot-messages";
 
 /**
  * 进程内已登记聊天缓存：群消息高频到达时避免每条消息都打一次数据库。
@@ -80,7 +81,7 @@ export async function registerTelegramChat(input: {
       methodId: existing?.methodId ?? null,
       timeoutSeconds: existing?.timeoutSeconds ?? 300,
       maxAttempts: existing?.maxAttempts ?? 3,
-      promptText: existing?.promptText ?? "🔐 请回复本消息并输入验证码完成验证",
+      promptText: existing?.promptText ?? DEFAULT_GROUP_PROMPT_TEXT,
       successText: existing?.successText ?? "✅ 验证成功，欢迎加入！",
       failureText: existing?.failureText ?? "❌ 验证码错误，请重试。",
       enabled: existing?.enabled ?? true,

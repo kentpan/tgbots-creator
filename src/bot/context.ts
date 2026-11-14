@@ -21,4 +21,6 @@ export type BotContext = Context &
     interfaceMenuEnabled?: boolean;
     /** 管理后台可编辑的 /start 欢迎消息；空值时使用产品默认文案。 */
     startWelcomeText?: string;
+    /** v3.0.2 文案配置中心：bots.config.texts 与默认值合并后的运行时文案表（services/bot-messages.ts） */
+    botTexts?: Record<string, string>;
   };

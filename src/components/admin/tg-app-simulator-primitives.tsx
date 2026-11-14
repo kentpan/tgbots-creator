@@ -9,6 +9,13 @@ export const IOS_GREEN = "#34c759";
 export const IOS_GRAY_BG = "#efeff4";
 export const IOS_TEXT_SECONDARY = "#8e8e93";
 
+/** v3.0.3 群组三段验证文案的产品默认值（文本框回填源；清空保存 = 运行时不发送）。
+ *  提示文案与运行时默认（services/bot-messages.ts DEFAULT_GROUP_PROMPT_TEXT）同源 ——
+ *  已合并输码引导整段（图3 红框文案），群组信息文本框内可见、可编辑。 */
+export { DEFAULT_GROUP_PROMPT_TEXT } from "@/services/bot-messages";
+export const DEFAULT_GROUP_SUCCESS_TEXT = "✅ 验证成功，欢迎加入！";
+export const DEFAULT_GROUP_FAILURE_TEXT = "❌ 验证码错误，请重试。";
+
 const NAME_COLORS = ["#e17076", "#faa774", "#a695e7", "#7bc862", "#6ec9cb", "#65aadd", "#ee7aae"];
 
 function nameColor(name: string): string {

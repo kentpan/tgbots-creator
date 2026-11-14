@@ -8,6 +8,7 @@ import {
 } from "@/database/operations";
 import { generateJoinCode, generateVerificationToken } from "@/utils/crypto";
 import { parseCodeApiConfig, type CodeApiConfig } from "@/services/external-verify";
+import { DEFAULT_GROUP_PROMPT_TEXT } from "@/services/bot-messages";
 import { resolveJoinVerify } from "@/services/join-verify";
 
 /** 仿真屏使用的固定模拟用户（与仿真屏模板变量保持一致） */
@@ -225,10 +226,11 @@ export async function POST(request: Request): Promise<NextResponse> {
   // 不使用 force_reply；只有 captcha 才通过验证网页完成。此前把 code_api 误归入
   // captcha 分支，导致仿真屏提示网页验证，实际 submit-code 却走文本卡密校验。
   const configuredPrompt = settings?.promptText?.trim() ?? "";
-  // 数据库旧默认值曾使用 force_reply 文案；识别该历史默认值并迁移为直接输入提示。
+  // 数据库旧默认值（force_reply 文案）由 mapGroupSettings 归一为 NULL；此处兼容兜底，
+  // 统一迁移为合并了输码引导的产品默认提示（DEFAULT_GROUP_PROMPT_TEXT）。
   const directInputPrompt =
     !configuredPrompt || configuredPrompt === "🔐 请回复本消息并输入验证码完成验证"
-      ? "🔐 请在下方输入框直接发送验证码完成验证"
+      ? DEFAULT_GROUP_PROMPT_TEXT
       : configuredPrompt;
   const promptText =
     resolved.method === "code_self"

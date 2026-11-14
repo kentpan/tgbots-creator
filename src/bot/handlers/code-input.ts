@@ -225,6 +225,7 @@ export async function processCodeAnswer(
     preloaded: preloaded ?? undefined,
     eventApi: ctx.api,
     notificationChatId: replyChatId,
+    texts: ctx.botTexts,
     onNetworkRetry: async () => {
       await ctx.api.sendMessage(replyChatId, NETWORK_RETRY_NOTICE);
     },
@@ -256,16 +257,19 @@ export async function processCodeAnswer(
   }
 
   // 验证结果文案一律私聊发送（不用 ctx.reply，避免消息落到输码所在的群聊）。
+  // v3.0.2：replyText 为空串 = 群组成功/失败文案被用户显式置空 → 不发送任何回执。
   // v1.1.5：私聊发送失败（用户拉黑 bot / Telegram 侧瞬时错误）必须兜住并记录详细错误——
   // 通知层失败不允许中断后续「申请加群」按钮发送，也不允许让 webhook 处理以异常收场，
   // 否则用户看到的现象就是「输入验证码后无任何反应」（v1.1.4 同类反馈根因之一）。
-  try {
-    await ctx.api.sendMessage(replyChatId, result.replyText);
-  } catch (error) {
-    console.error(
-      `Failed to DM verification result to chat ${replyChatId} (user ${from.id}, outcome=${result.outcome}):`,
-      error,
-    );
+  if (result.replyText) {
+    try {
+      await ctx.api.sendMessage(replyChatId, result.replyText);
+    } catch (error) {
+      console.error(
+        `Failed to DM verification result to chat ${replyChatId} (user ${from.id}, outcome=${result.outcome}):`,
+        error,
+      );
+    }
   }
 
   // 验证失效：紧随失效文案发送「申请加群」按钮（入群申请链接），
@@ -418,6 +422,40 @@ async function handleCodeInputInternal(
           : `⚠️ 验证已通过，但恢复审批失败：${approval.error ?? "请联系管理员处理"}`,
       );
       return;
+    }
+    // v3.0.2 修复「输错 2 次后第 3 次无论对错都没反应」：会话因超时/尝试次数用尽
+    // 被 expire+reject 后，getPendingCodeContext 查不到 pending，旧逻辑静默 next()。
+    // 只要数据库里还有同用户的 code_api/code_self 验证痕迹，必须给出失效反馈，
+    // 绝不允许静默吞掉用户的第 N 次输入。
+    if (isCodeSession) {
+      const replyChatId = ctx.chat?.type === "private" ? ctx.chat.id : from.id;
+      const sessionExpired =
+        !latest.session.captchaCompleted &&
+        new Date(latest.session.expiresAt).getTime() <= Date.now();
+      let notice: string | null = null;
+      if (latest.joinRequest.status === "rejected") {
+        notice =
+          "❌ 本次验证已失效（验证码错误次数达到上限或被管理员拒绝），入群申请已被取消。\n\n" +
+          "请重新提交加群申请发起新的验证；如需帮助请联系群管理员。";
+      } else if (sessionExpired) {
+        notice =
+          "⏳ 本次验证会话已超时失效，验证码不再接受提交。\n\n" +
+          "请重新提交加群申请获取新的验证会话；如需帮助请联系群管理员。";
+      }
+      if (notice) {
+        console.log(
+          `[code-input] stale verification feedback: user=${from.id} ` +
+            `session=${latest.session.token.slice(0, 8)}... status=${latest.joinRequest.status}`,
+        );
+        try {
+          await ctx.api.sendMessage(replyChatId, notice, {
+            link_preview_options: { is_disabled: true },
+          });
+        } catch (notifyError) {
+          console.error(`[code-input] failed to deliver stale-session notice to ${replyChatId}:`, notifyError);
+        }
+        return;
+      }
     }
     await next();
     return;

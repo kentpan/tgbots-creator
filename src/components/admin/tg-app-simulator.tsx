@@ -74,6 +74,9 @@ import {
   IOS_GREEN,
   IOS_GRAY_BG,
   IOS_TEXT_SECONDARY,
+  DEFAULT_GROUP_PROMPT_TEXT,
+  DEFAULT_GROUP_SUCCESS_TEXT,
+  DEFAULT_GROUP_FAILURE_TEXT,
   methodLabel,
   OVERLAY_VARIANTS,
   readJson,
@@ -384,9 +387,11 @@ export function TgAppSimulator({
         ...prev,
         chat_title: settings?.chat_title ?? "",
         enabled: settings?.enabled ?? true,
-        prompt_text: settings?.prompt_text ?? "",
-        success_text: settings?.success_text ?? "",
-        failure_text: settings?.failure_text ?? "",
+        // v3.0.2：三段验证文案默认回填产品默认值（文本框永远可见完整文案）；
+        // 用户清空后保存 = 置空（运行时不发送该条消息）
+        prompt_text: settings?.prompt_text ?? DEFAULT_GROUP_PROMPT_TEXT,
+        success_text: settings?.success_text ?? DEFAULT_GROUP_SUCCESS_TEXT,
+        failure_text: settings?.failure_text ?? DEFAULT_GROUP_FAILURE_TEXT,
         require_approval: settings?.require_approval ?? false,
         join_verify_bot_id: settings?.join_verify_bot_id ?? "",
         join_verify_mode: settings?.join_verify_mode ?? "verify",
@@ -984,6 +989,140 @@ export function TgAppSimulator({
     if (inviteSheetOpen && activeChatId) void loadAllInviteLinks(activeChatId);
   }, [inviteSheetOpen, activeChatId, loadAllInviteLinks]);
 
+  // v3.0.2：右上角「创建邀请链接」—— 部署链路已不自动建链，创建统一收敛到此入口；
+  // 备注用于区分来源渠道（如：闲鱼店铺A / 朋友圈投放），随链接落库台账展示。
+  const [creatingInviteLink, setCreatingInviteLink] = useState(false);
+  const createInviteLink = useCallback(
+    async (): Promise<void> => {
+      if (!activeChatId || !selectedBotId || creatingInviteLink) return;
+      const remark = window.prompt("邀请链接备注（用于区分来源渠道，可留空）：", "");
+      if (remark === null) return; // 用户取消
+      setCreatingInviteLink(true);
+      try {
+        const response = await opsFetch("/api/admin/telegram/invite-links", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: activeChatId,
+            bot_id: selectedBotId,
+            action: "create",
+            remark: remark.trim(),
+          }),
+        });
+        const payload = await readJson<{ ok: boolean; error?: string; data?: { message?: string; link?: string } }>(response);
+        if (!payload) {
+          showFlash(false, `服务返回异常（HTTP ${response.status}）`);
+          return;
+        }
+        if (!payload.ok) {
+          showFlash(false, payload.error ?? "创建邀请链接失败");
+          return;
+        }
+        showFlash(true, `${payload.data?.message ?? "邀请链接已创建"}${payload.data?.link ? `：${payload.data.link}` : ""}`);
+        void loadAllInviteLinks(activeChatId);
+      } catch (error) {
+        showFlash(false, error instanceof Error ? error.message : "创建邀请链接失败");
+      } finally {
+        setCreatingInviteLink(false);
+      }
+    },
+    [activeChatId, selectedBotId, creatingInviteLink, showFlash, loadAllInviteLinks],
+  );
+
+  // v3.0.3：MTProto 导出引导 —— grammY(Bot API) 无导出/枚举邀请链接能力；群主侧
+  // 链接需用用户 API（api_id/api_hash，Telethon 等客户端）export_chat_invite 导出。
+  // 此处提供「手动获取」引导：检测开发者账号配置状态 → 展示可复制脚本 → 登记台账。
+  const [devAccountConfigured, setDevAccountConfigured] = useState<boolean | null>(null);
+  const [exportHelpOpen, setExportHelpOpen] = useState(false);
+  const [scriptCopied, setScriptCopied] = useState(false);
+  useEffect(() => {
+    if (!inviteSheetOpen) return;
+    void (async () => {
+      try {
+        const response = await opsFetch("/api/admin/developer-accounts/status", { cache: "no-store" });
+        const payload = await readJson<{ ok: boolean; data?: { configured?: boolean } }>(response);
+        setDevAccountConfigured(payload?.ok === true && payload.data?.configured === true);
+      } catch {
+        setDevAccountConfigured(false);
+      }
+    })();
+  }, [inviteSheetOpen]);
+
+  const exportScript = useMemo(() => {
+    const chatId = activeChatId || "-1001234567890";
+    return [
+      "from telethon import TelegramClient",
+      "",
+      'API_ID = 你的API_ID数字',
+      "API_HASH = '你的API_HASH字符串'",
+      "SESSION_NAME = '任意会话名称'",
+      `CHANNEL_ID = ${chatId}`,
+      "",
+      "async def main():",
+      "    async with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:",
+      "        try:",
+      "            invite_link = await client.export_invite_link(CHANNEL_ID)",
+      "            print(f'成功获取邀请链接: {invite_link}')",
+      "        except Exception as e:",
+      "            print(f'无法获取链接: {str(e)}，大概率是管理员未开放普通成员生成权限')",
+      "",
+      "if __name__ == '__main__':",
+      "    import asyncio",
+      "    asyncio.run(main())",
+    ].join("\n");
+  }, [activeChatId]);
+
+  const copyExportScript = useCallback((): void => {
+    void navigator.clipboard.writeText(exportScript).then(() => {
+      setScriptCopied(true);
+      window.setTimeout(() => setScriptCopied(false), 1500);
+    });
+  }, [exportScript]);
+
+  // v3.0.3：登记已有链接 —— Telegram Bot API 没有「列出历史邀请链接」的方法，
+  // 机器人被设为管理员前后在客户端手动创建的链接都无法自动枚举；粘贴登记进台账后
+  // 即可统一执行 复制/备注/撤销/删除（死链接撤销时 Telegram 返回已失效会自动标记）。
+  const registerInviteLink = useCallback(
+    async (): Promise<void> => {
+      if (!activeChatId || !selectedBotId) return;
+      const link = window.prompt(
+        "粘贴已有邀请链接（https://t.me/+xxxx 或 https://t.me/joinchat/xxxx 形式）：",
+        "",
+      );
+      if (link === null) return;
+      const trimmedLink = link.trim();
+      if (!trimmedLink) return;
+      const remark = window.prompt("备注（区分来源渠道，可留空）：", "") ?? "";
+      try {
+        const response = await opsFetch("/api/admin/telegram/invite-links", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: activeChatId,
+            bot_id: selectedBotId,
+            action: "add",
+            link: trimmedLink,
+            remark: remark.trim(),
+          }),
+        });
+        const payload = await readJson<{ ok: boolean; error?: string; data?: { message?: string } }>(response);
+        if (!payload) {
+          showFlash(false, `服务返回异常（HTTP ${response.status}）`);
+          return;
+        }
+        if (!payload.ok) {
+          showFlash(false, payload.error ?? "登记失败");
+          return;
+        }
+        showFlash(true, payload.data?.message ?? "链接已登记");
+        void loadAllInviteLinks(activeChatId);
+      } catch (error) {
+        showFlash(false, error instanceof Error ? error.message : "登记失败");
+      }
+    },
+    [activeChatId, selectedBotId, showFlash, loadAllInviteLinks],
+  );
+
   // 面板动作（撤销/删除）：bot_id 优先取台账记录的创建者，未登记时回退当前选中机器人
   const actOnInviteLink = useCallback(
     async (action: "revoke" | "delete", entry: SimInviteLinkEntry): Promise<void> => {
@@ -1013,6 +1152,45 @@ export function TgAppSimulator({
         await loadAllInviteLinks(activeChatId);
       } catch (error) {
         showFlash(false, error instanceof Error ? error.message : "操作失败");
+      } finally {
+        setSheetBusyId(null);
+      }
+    },
+    [activeChatId, sheetBusyId, selectedBotId, showFlash, loadAllInviteLinks],
+  );
+
+  // v3.0.3 编辑备注：台账覆盖写入；Telegram 侧链接名称 best-effort 同步（服务端处理）
+  const editInviteLinkRemark = useCallback(
+    async (entry: SimInviteLinkEntry): Promise<void> => {
+      if (!activeChatId || sheetBusyId) return;
+      const remark = window.prompt("编辑邀请链接备注（用于区分来源渠道；清空提交 = 移除备注）：", entry.remark ?? "");
+      if (remark === null) return;
+      setSheetBusyId(entry.id);
+      try {
+        const response = await opsFetch("/api/admin/telegram/invite-links", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: activeChatId,
+            bot_id: entry.bot_id ?? selectedBotId,
+            action: "update_remark",
+            link_id: entry.id,
+            remark: remark.trim(),
+          }),
+        });
+        const payload = await readJson<{ ok: boolean; error?: string; data?: { message?: string } }>(response);
+        if (!payload) {
+          showFlash(false, `服务返回异常（HTTP ${response.status}）`);
+          return;
+        }
+        if (!payload.ok) {
+          showFlash(false, payload.error ?? "备注更新失败");
+          return;
+        }
+        showFlash(true, payload.data?.message ?? "备注已更新");
+        await loadAllInviteLinks(activeChatId);
+      } catch (error) {
+        showFlash(false, error instanceof Error ? error.message : "备注更新失败");
       } finally {
         setSheetBusyId(null);
       }
@@ -1184,7 +1362,7 @@ export function TgAppSimulator({
             {/* 验证文案（与群组管理同源） */}
             <div className="space-y-2 rounded-xl bg-white px-4 py-3">
               <p className="text-[13px]" style={{ color: IOS_TEXT_SECONDARY }}>
-                验证文案（机器人私聊发送给申请者）
+                验证文案（机器人私聊发送给申请者；支持多行，清空保存 = 该条消息不发送）
               </p>
               {(
                 [
@@ -1200,8 +1378,9 @@ export function TgAppSimulator({
                     onChange={(event) =>
                       setForm((prev) => ({ ...prev, [field.key]: event.target.value }))
                     }
-                    rows={2}
-                    className="w-full resize-none rounded-lg bg-black/[0.04] px-3 py-2 text-[15px] leading-relaxed text-black outline-none"
+                    rows={5}
+                    placeholder={field.key === "prompt_text" ? DEFAULT_GROUP_PROMPT_TEXT : field.key === "success_text" ? DEFAULT_GROUP_SUCCESS_TEXT : DEFAULT_GROUP_FAILURE_TEXT}
+                    className="w-full resize-y rounded-lg bg-black/[0.04] px-3 py-2 text-[15px] leading-relaxed text-black outline-none"
                   />
                 </label>
               ))}
@@ -2668,9 +2847,91 @@ export function TgAppSimulator({
               <div className="mx-auto mt-3 h-1 w-10 shrink-0 rounded-full bg-black/15" aria-hidden />
               <div className="flex shrink-0 items-center justify-between px-4 py-3">
                 <span className="text-[17px] font-semibold text-black">邀请链接</span>
-                <span className="text-[13px]" style={{ color: IOS_TEXT_SECONDARY }}>
-                  {allInviteLinks.length} 条 · 按创建者管理员
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[13px]" style={{ color: IOS_TEXT_SECONDARY }}>
+                    {allInviteLinks.length} 条 · 按创建者管理员
+                  </span>
+                  {/* v3.0.3：右上角创建入口（部署不再自动建链）+ 历史链接登记入口 */}
+                  <button
+                    type="button"
+                    onClick={() => void registerInviteLink()}
+                    className="inline-flex cursor-pointer items-center gap-1 rounded-full bg-black/[0.06] px-3 py-1.5 text-[12px] font-medium text-black transition-transform active:scale-95"
+                    aria-label="登记已有邀请链接（粘贴后统一管理撤销/删除）"
+                  >
+                    登记已有链接
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void createInviteLink()}
+                    disabled={creatingInviteLink}
+                    className="inline-flex cursor-pointer items-center gap-1 rounded-full bg-[#3390ec] px-3 py-1.5 text-[12px] font-medium text-white transition-transform active:scale-95 disabled:opacity-50"
+                    aria-label="创建邀请链接（可填备注区分来源渠道）"
+                  >
+                    {creatingInviteLink ? <Loader2 className="h-3 w-3 animate-spin" /> : <UserRoundPlus className="h-3 w-3" />}
+                    创建邀请链接
+                  </button>
+                </div>
+              </div>
+              {/* v3.0.3 MTProto 导出引导：Bot API 无导出/枚举邀请链接能力 */}
+              <div className="shrink-0 border-b border-black/[0.06] px-4 py-2">
+                <div className="flex items-start justify-between gap-2">
+                  <p className="text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
+                    {devAccountConfigured === false ? (
+                      <>⚠️ Bot API（grammY）无法枚举/导出群主邀请链接。请先在「管理后台 → 开发者账号」配置 api_id / api_hash，再按脚本手动导出。</>
+                    ) : (
+                      <>Bot API（grammY）无法枚举/导出群主邀请链接；导出需用用户 API（MTProto）。点「手动获取」查看导出脚本。</>
+                    )}
+                  </p>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    {devAccountConfigured === false ? (
+                      <a
+                        href="/admin/developer-accounts"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex cursor-pointer items-center gap-1 rounded-full bg-[#ff9500]/15 px-3 py-1.5 text-[12px] font-medium text-[#b45309]"
+                      >
+                        请先配置开发者账号
+                      </a>
+                    ) : null}
+                    <button
+                      type="button"
+                      onClick={() => setExportHelpOpen((prev) => !prev)}
+                      className="inline-flex cursor-pointer items-center gap-1 rounded-full bg-[#3390ec]/10 px-3 py-1.5 text-[12px] font-medium text-[#3390ec] transition-transform active:scale-95"
+                      aria-label="手动获取群主邀请链接（Telethon 脚本引导）"
+                    >
+                      手动获取
+                    </button>
+                  </div>
+                </div>
+                {exportHelpOpen ? (
+                  <div className="mt-2 space-y-2 rounded-xl bg-black/[0.03] p-3">
+                    <p className="text-[12px] leading-relaxed text-black">
+                      步骤：① 前往 my.telegram.org 注册获取 <b>API ID / API Hash</b>（并录入「管理后台 → 开发者账号」）；
+                      ② 安装依赖 <code>pip install telethon</code>；③ 复制下方脚本（已代入当前群 chat_id）运行并完成手机验证码登录；
+                      ④ 复制脚本输出的链接 → 点「我已获取，去登记」粘贴进台账统一管理。
+                    </p>
+                    <pre className="max-h-44 overflow-auto rounded-lg bg-black/[0.06] p-2 font-mono text-[11px] leading-relaxed text-black">
+                      {exportScript}
+                    </pre>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={copyExportScript}
+                        className="inline-flex cursor-pointer items-center gap-1 rounded-full bg-black/[0.06] px-3 py-1.5 text-[12px] font-medium text-black transition-transform active:scale-95"
+                      >
+                        <Copy className="h-3 w-3" />
+                        {scriptCopied ? "已复制" : "复制脚本"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void registerInviteLink()}
+                        className="inline-flex cursor-pointer items-center gap-1 rounded-full bg-[#34c759]/15 px-3 py-1.5 text-[12px] font-medium text-[#248a3d] transition-transform active:scale-95"
+                      >
+                        我已获取，去登记
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
               <div className="flex-1 overflow-y-auto px-4 pb-6">
                 {allInviteLoading ? (
@@ -2679,8 +2940,9 @@ export function TgAppSimulator({
                   </div>
                 ) : inviteSheetGroups.length === 0 ? (
                   <div className="px-2 py-10 text-center text-[14px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
-                    暂无邀请链接记录：机器人在该群创建邀请链接后会自动登记；
-                    历史遗留链接可在「群组管理 → 邀请链接」弹窗手动登记后一并管理。
+                    暂无邀请链接记录。Telegram Bot API 无法枚举历史链接（机器人被设为管理员也不会自动生成链接）：
+                    点右上角「创建邀请链接」新建；或在 Telegram 客户端复制历史链接后点「登记已有链接」粘贴进来，
+                    即可统一 复制/备注/撤销/删除（含死链接）。
                   </div>
                 ) : (
                   <>
@@ -2709,7 +2971,7 @@ export function TgAppSimulator({
                                 {" · "}
                                 {entry.is_revoked ? "已撤销/失效" : entry.creates_join_request ? "有效 · 申请制" : "有效"}
                                 {entry.source === "deploy" ? " · 部署生成" : entry.source === "manual" ? " · 手动登记" : ""}
-                                {entry.name ? ` · ${entry.name}` : ""}
+                                {entry.remark ? ` · 备注：${entry.remark}` : entry.name ? ` · ${entry.name}` : ""}
                               </p>
                               <div className="mt-2 flex items-center gap-2">
                                 <button
@@ -2720,6 +2982,20 @@ export function TgAppSimulator({
                                 >
                                   <Copy className="h-3 w-3" />
                                   {copiedLinkId === entry.id ? "已复制" : "复制"}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void editInviteLinkRemark(entry)}
+                                  disabled={sheetBusyId === entry.id}
+                                  className="inline-flex cursor-pointer items-center gap-1 rounded-full bg-[#3390ec]/10 px-3 py-1.5 text-[12px] font-medium text-[#3390ec] transition-transform active:scale-95 disabled:opacity-50"
+                                  aria-label="编辑邀请链接备注（区分来源渠道）"
+                                >
+                                  {sheetBusyId === entry.id ? (
+                                    <Loader2 className="h-3 w-3 animate-spin" />
+                                  ) : (
+                                    <SquarePen className="h-3 w-3" />
+                                  )}
+                                  {entry.remark ? "改备注" : "备注"}
                                 </button>
                                 {!entry.is_revoked ? (
                                   <button

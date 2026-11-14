@@ -27,6 +27,7 @@ import {
   type CustomKeyboardConfig,
 } from "@/services/custom-keyboard";
 import { normalizeReplyContent, countMenuStats } from "@/services/menu-config";
+import { resolveBotTexts } from "@/services/bot-messages";
 import { parseBotFeatureConfig, resolveInterfaceMode, type BotFeatureConfig } from "@/services/bot-feature-config";
 import { CommandGroup } from "@grammyjs/commands";
 import { codeQuestion } from "./verification-question";
@@ -81,6 +82,8 @@ interface BotProfileConfig {
   tgapi?: TgApiBotConfig;
   /** 普通机器人 /start 欢迎消息（纯文本；空值使用内置默认消息）。 */
   welcomeText?: string;
+  /** v3.0.2 文案配置中心：key → 文案文本（services/bot-messages.ts BOT_TEXT_DEFS；空串 = 不发送） */
+  texts?: Record<string, string>;
   /** v2.2.0 自定义键盘（ReplyKeyboard）：通用机器人附加到 /start 欢迎消息；TGAPI 机器人由 tgapi.customKeyboard 承载（互斥切换见 services/custom-keyboard.ts） */
   customKeyboard?: unknown;
 }
@@ -448,6 +451,8 @@ async function registerBotCapabilities(
     ctx.interfaceMenuEnabled = menuEffective;
     // /start 欢迎消息由机器人管理「功能配置」维护；空值继续使用默认文案。
     ctx.startWelcomeText = typeof profile.welcomeText === "string" ? profile.welcomeText : undefined;
+    // v3.0.2 文案配置中心：bots.config.texts 与默认值合并注入（handler 统一取 ctx.botTexts）
+    ctx.botTexts = resolveBotTexts(profile.texts);
     await next();
   });
 

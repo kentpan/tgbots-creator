@@ -75,6 +75,14 @@ export function GroupDeployButton({
 
   const deployAll = useCallback(async (): Promise<void> => {
     if (mainBusy) return;
+    // v3.0.2：全量部署统一 confirm 确认（写明是「部署所有机器人到本群组」全量操作）
+    const listPreview = bots.length > 0 ? bots.map((bot) => `· ${bot.name}`).join("\n") : "（当前选中机器人）";
+    const confirmed = window.confirm(
+      `全量部署确认\n\n将把所有机器人部署到群组「${chatId}」：\n${listPreview}\n\n` +
+        `部署内容：逐个机器人校验状态与管理员权限 + 上线/更新运行实例 + 保存部署状态。\n` +
+        `部署不会生成新的邀请链接（优先复用已有链接）。\n\n确认全量部署？`,
+    );
+    if (!confirmed) return;
     setMainBusy(true);
     try {
       let list = bots;

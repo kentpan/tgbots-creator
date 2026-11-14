@@ -185,18 +185,20 @@ export async function PUT(request: Request): Promise<NextResponse> {
         ? (existing?.chatTitle ?? null)
         : String(payload.chat_title ?? "").trim() || null,
     enabled: payload.enabled ?? existing?.enabled ?? true,
+    // v3.0.2 三段验证文案 tri-state：未传 = 保留现值；空串 = 清空保存（运行时不发送，
+    // 语义为「置空=不发送」而非回落默认）；非空 = 写入（支持多行）。
     promptText:
       payload.prompt_text === undefined
         ? undefined
-        : String(payload.prompt_text ?? "").trim() || undefined,
+        : String(payload.prompt_text ?? "").trim(),
     successText:
       payload.success_text === undefined
         ? undefined
-        : String(payload.success_text ?? "").trim() || undefined,
+        : String(payload.success_text ?? "").trim(),
     failureText:
       payload.failure_text === undefined
         ? undefined
-        : String(payload.failure_text ?? "").trim() || undefined,
+        : String(payload.failure_text ?? "").trim(),
     // v2.3 新成员审核开关：未传时保留现值（undefined 语义 = 不改动）
     requireApproval: payload.require_approval ?? existing?.requireApproval,
     joinVerifyBotId: joinVerifyBotIdValue,

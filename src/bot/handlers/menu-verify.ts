@@ -6,6 +6,7 @@ import {
   verifyCodeExternally,
 } from "@/services/external-verify";
 import type { MenuVerifyConfig } from "@/services/menu-config";
+import { DEFAULT_GROUP_PROMPT_TEXT } from "@/services/bot-messages";
 import { htmlEscape } from "@/utils/html";
 
 /**
@@ -32,7 +33,7 @@ const MENU_VERIFY_MAX_ATTEMPTS = 3;
 const DEFAULT_INPUT_HINT_TEXT = "✍🏻 请在下方的输入框进行输入:";
 
 /** 其余默认文案（按钮配置留空时使用；与图2 外部API 验证文案同款语义） */
-const DEFAULT_PROMPT_TEXT = "🔐 请回复本消息并输入验证码完成验证";
+const DEFAULT_PROMPT_TEXT = DEFAULT_GROUP_PROMPT_TEXT;
 const DEFAULT_SUCCESS_TEXT = "✅ 验证成功！";
 const DEFAULT_FAIL_TEXT = "❌ 验证失败";
 

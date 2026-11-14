@@ -91,3 +91,8 @@ CREATE INDEX IF NOT EXISTS idx_bots_factory_updated ON bots_factory(updated_at D
 INSERT OR IGNORE INTO menus(id,parent_id,title,path,icon,sort_order,visible,permission_code,status,created_time,updated_time)
  SELECT 900000007,900000001,'机器人工厂','/admin/bots-factory','🏭',0,1,'model-config:view',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
  WHERE EXISTS (SELECT 1 FROM menus WHERE id=900000001);
+
+-- v3.0.2 追加（并入本文件）：邀请链接渠道备注列 —— 管理端创建/登记邀请链接时填写，
+-- 用于区分来源渠道。裸 ALTER 的幂等由部署工作流 scripts/d1-upgrade-filter.mjs 保证
+-- （远端列已存在时自动剔除），本地 SQLite 由 ensureAppSchema 列探测保证。
+ALTER TABLE invite_links ADD COLUMN remark TEXT;
