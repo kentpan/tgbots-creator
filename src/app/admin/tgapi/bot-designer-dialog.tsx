@@ -507,84 +507,86 @@ export function TgApiMenuKeyboardDialog({
                         「✏️ 设置Title / 📝 设置Description」预配置（未配置时使用下方默认值），
                         平台未预配置时随机选一。
                       </p>
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <div className="space-y-1">
-                      <label className="text-sm font-medium" htmlFor={`app-title-${suffix}`}>
-                        APP_TITLE（默认值）
-                      </label>
-                      <input
-                        id={`app-title-${suffix}`}
-                        name="app_title"
-                        defaultValue={cfg.appTitle}
-                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-sm font-medium" htmlFor={`app-short-name-${suffix}`}>
-                        APP_SHORT_NAME
-                      </label>
-                      <input
-                        id={`app-short-name-${suffix}`}
-                        name="app_short_name"
-                        defaultValue={cfg.appShortName}
-                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-sm font-medium" htmlFor={`app-url-${suffix}`}>
-                        APP_URL
-                      </label>
-                      <input
-                        id={`app-url-${suffix}`}
-                        name="app_url"
-                        defaultValue={cfg.appUrl}
-                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-sm font-medium" htmlFor={`footer-${suffix}`}>
-                        页脚署名（FTEXT）
-                      </label>
-                      <input
-                        id={`footer-${suffix}`}
-                        name="footer_text"
-                        defaultValue={cfg.footerText}
-                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                      />
-                    </div>
-                  </div>
-                  <div className="space-y-1">
-                    <label className="text-sm font-medium" htmlFor={`app-desc-${suffix}`}>
-                      APP_DESCRIPTION（默认值）
-                    </label>
-                    <textarea
-                      id={`app-desc-${suffix}`}
-                      name="app_description"
-                      rows={2}
-                      defaultValue={cfg.appDescription}
-                      className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <p className="text-sm font-medium">
-                      APP_PLATFORM（创建时随机选一，对应原 random.choice）
-                    </p>
-                    <div className="flex flex-wrap gap-3">
-                      {TGAPI_APP_PLATFORMS.map((platform) => (
-                        <label key={platform} className="inline-flex items-center gap-1.5 text-sm">
+                      <div className="grid gap-4 md:grid-cols-2">
+                        <div className="space-y-1">
+                          <label className="text-sm font-medium" htmlFor={`app-title-${suffix}`}>
+                            APP_TITLE（默认值）
+                          </label>
                           <input
-                            type="checkbox"
-                            name="app_platforms"
-                            value={platform}
-                            defaultChecked={selectedPlatforms.has(platform)}
-                            className="h-4 w-4"
+                            id={`app-title-${suffix}`}
+                            name="app_title"
+                            defaultValue={cfg.appTitle}
+                            className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                           />
-                          {TGAPI_PLATFORM_LABELS[platform] ?? platform}
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-sm font-medium" htmlFor={`app-short-name-${suffix}`}>
+                            APP_SHORT_NAME
+                          </label>
+                          <input
+                            id={`app-short-name-${suffix}`}
+                            name="app_short_name"
+                            defaultValue={cfg.appShortName}
+                            className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-sm font-medium" htmlFor={`app-url-${suffix}`}>
+                            APP_URL
+                          </label>
+                          <input
+                            id={`app-url-${suffix}`}
+                            name="app_url"
+                            defaultValue={cfg.appUrl}
+                            className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-sm font-medium" htmlFor={`footer-${suffix}`}>
+                            页脚署名（FTEXT）
+                          </label>
+                          <input
+                            id={`footer-${suffix}`}
+                            name="footer_text"
+                            defaultValue={cfg.footerText}
+                            className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                          />
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-sm font-medium" htmlFor={`app-desc-${suffix}`}>
+                          APP_DESCRIPTION（默认值）
                         </label>
-                      ))}
+                        <textarea
+                          id={`app-desc-${suffix}`}
+                          name="app_description"
+                          rows={2}
+                          defaultValue={cfg.appDescription}
+                          className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <p className="text-sm font-medium">
+                          APP_PLATFORM（创建时随机选一，对应原 random.choice）
+                        </p>
+                        <div className="flex flex-wrap gap-3">
+                          {TGAPI_APP_PLATFORMS.map((platform) => (
+                            <label key={platform} className="inline-flex items-center gap-1.5 text-sm">
+                              <input
+                                type="checkbox"
+                                name="app_platforms"
+                                value={platform}
+                                defaultChecked={selectedPlatforms.has(platform)}
+                                className="h-4 w-4"
+                              />
+                              {TGAPI_PLATFORM_LABELS[platform] ?? platform}
+                            </label>
+                          ))}
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                  )}
+                  ) : <></>
+                  }
                 </div>
 
                 {/* 🔐 解锁门禁全局配置（通用组件：unlock_mode 恒 captcha + verification_method_id 随表单提交） */}
