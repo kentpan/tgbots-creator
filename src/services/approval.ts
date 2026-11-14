@@ -250,11 +250,15 @@ async function resolveGroupJumpUrl(bot: Bot, chatId: bigint): Promise<string | n
   }
   try {
     const { acquireStableGroupInviteLink } = await import("./invite-link");
-    const binding = await getActiveBotForChat(chatId);
+    const [binding, settings] = await Promise.all([
+      getActiveBotForChat(chatId),
+      getGroupSettings(chatId),
+    ]);
     const acquired = await acquireStableGroupInviteLink({
       api: bot.api,
       chatId,
       superGroup: isSuperGroupChatId(chatId),
+      requireApproval: settings?.requireApproval ?? true,
       botId: binding?.botId ?? null,
     });
     return acquired.invite_link;
@@ -264,7 +268,12 @@ async function resolveGroupJumpUrl(bot: Bot, chatId: bigint): Promise<string | n
   }
 }
 
-async function sendWelcomeMessage(bot: Bot, chatId: bigint, userId: bigint): Promise<void> {
+async function sendWelcomeMessage(
+  bot: Bot,
+  chatId: bigint,
+  userId: bigint,
+  recipientChatId: number = Number(userId),
+): Promise<void> {
   try {
     const chatInfo = await bot.api.getChat(Number(chatId));
     const escapedTitle = escapeMarkdownV2(
@@ -273,7 +282,7 @@ async function sendWelcomeMessage(bot: Bot, chatId: bigint, userId: bigint): Pro
     // v2.1.5：附「🚀 前往群组」按钮 —— 验证通过后用户无需翻找群组，一键直达
     const jumpUrl = await resolveGroupJumpUrl(bot, chatId);
     await bot.api.sendMessage(
-      Number(userId),
+      recipientChatId,
       `🎉 *验证成功\\!*\n\n您已成功加入 *${escapedTitle}*，欢迎\\!`,
       {
         parse_mode: "MarkdownV2",
@@ -287,7 +296,11 @@ async function sendWelcomeMessage(bot: Bot, chatId: bigint, userId: bigint): Pro
   }
 }
 
-export async function autoApproveUser(verificationToken: string, eventApi?: Api): Promise<ApprovalResult> {
+export async function autoApproveUser(
+  verificationToken: string,
+  eventApi?: Api,
+  notificationChatId?: number,
+): Promise<ApprovalResult> {
   try {
     const joinRequest = await getJoinRequestByToken(verificationToken);
     if (!joinRequest) {
@@ -339,7 +352,14 @@ export async function autoApproveUser(verificationToken: string, eventApi?: Api)
     );
 
     if (joinRequest.requestType === "telegram") {
-      await sendWelcomeMessage(bot, joinRequest.chatId, joinRequest.userId);
+      // chat_join_request 的 user_chat_id 是首次私聊可达的会话地址；
+      // 验证输入所在的 ctx.chat.id 优先于 from.id，避免用户未 /start 时欢迎消息/跳转按钮 403。
+      await sendWelcomeMessage(
+        bot,
+        joinRequest.chatId,
+        joinRequest.userId,
+        notificationChatId ?? Number(joinRequest.userId),
+      );
     }
 
     return new ApprovalResult(true);

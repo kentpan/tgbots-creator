@@ -249,8 +249,8 @@ export function useDesignerSimChat({
           from: "bot",
           text:
             func === "settitle"
-              ? TGAPI_TEXTS_ZH.askAppTitle.replaceAll("{default}", cfg.appTitle)
-              : TGAPI_TEXTS_ZH.askAppDescription.replaceAll("{default}", cfg.appDescription),
+              ? texts.askAppTitle.replaceAll("{default}", cfg.appTitle)
+              : texts.askAppDescription.replaceAll("{default}", cfg.appDescription),
         });
       }
     },
@@ -307,7 +307,10 @@ export function useDesignerSimChat({
         return { ok: true, text: texts.afterRecvdCode };
       }
       if (flow.stage === "code") {
-        // 登录码 → 抓取/创建 APP → 结果（仿真演示值；真实端登录 my.telegram.org 真实抓取）
+        // 仿真只演示状态推进，不会向 my.telegram.org 发起真实登录或创建请求。
+        if (!/^\d{4,8}$/.test(input)) {
+          return { ok: false, text: simLang === "zh" ? "登录验证码格式不正确，请输入 4-8 位数字。" : "Invalid login code. Enter 4-8 digits." };
+        }
         flow.stage = "idle";
         window.setTimeout(() => {
           const created = { phone: flow.phone ?? "+8613800138000", ...SIM_DEMO_API };
@@ -335,7 +338,10 @@ export function useDesignerSimChat({
         }, 1200);
         return { ok: true, text: texts.beforeSuccLogin };
       }
-      return { ok: true, text: texts.start };
+      return {
+        ok: false,
+        text: simLang === "zh" ? "当前没有等待输入的步骤，请点击机器人菜单中的对应功能按钮。" : "No input is expected right now. Choose an action from the bot menu.",
+      };
     },
     [simLang, simRef, slotText, startSimCreate],
   );

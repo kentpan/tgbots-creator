@@ -223,6 +223,7 @@ export async function processCodeAnswer(
     code: codeText,
     preloaded: preloaded ?? undefined,
     eventApi: ctx.api,
+    notificationChatId: replyChatId,
     onNetworkRetry: async () => {
       await ctx.api.sendMessage(replyChatId, NETWORK_RETRY_NOTICE);
     },

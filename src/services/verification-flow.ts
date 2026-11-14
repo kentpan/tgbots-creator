@@ -78,6 +78,8 @@ export interface CodeCheckInput {
    * 不依赖群组绑定行与主 bot token（edge 部署主 bot 未配置时旧实现直接断裂）。
    */
   eventApi?: Api;
+  /** 用户实际输码所在的私聊 chat.id（chat_join_request 场景可能是 user_chat_id）；用于发送成功欢迎语与群组跳转按钮 */
+  notificationChatId?: number;
   /**
    * 验证接口网络错误、服务端即将发起重试时触发一次
    * （bot 路径传入私聊发送回调，立即私聊发送「网络波动，正在重试...」；仿真路径不传）。
@@ -304,7 +306,11 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
       console.warn(`Direct-join completion failed after code verification: ${completion.error}`);
     }
   } else {
-    const approval = await autoApproveUser(session.token, input.eventApi);
+    const approval = await autoApproveUser(
+      session.token,
+      input.eventApi,
+      input.notificationChatId,
+    );
     approved = approval.success;
     if (!approval.success) {
       approvalNote = approval.error ?? undefined;
@@ -314,7 +320,9 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
 
   return {
     outcome: "success",
-    replyText: settings?.successText ?? "✅ 验证成功，欢迎加入！",
+    replyText: approved
+      ? settings?.successText ?? "✅ 验证成功，欢迎加入！"
+      : `验证码正确，但自动批准入群失败：${approvalNote ?? "Telegram 审批未完成"}。请联系群管理员处理。`,
     approved,
     approvalNote,
   };

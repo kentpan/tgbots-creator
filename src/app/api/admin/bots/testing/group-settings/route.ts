@@ -44,7 +44,7 @@ export async function GET(request: Request): Promise<NextResponse> {
   const joinVerifyCandidates = bots
     .filter((bot) => {
       const feature = parseBotFeatureConfig(bot.config, false);
-      return feature.joinVerify.enabled && feature.joinVerify.methodId;
+      return bot.enabled && feature.joinVerify.enabled && feature.joinVerify.methodId;
     })
     .map((bot) => ({ id: String(bot.id), name: bot.name }));
 

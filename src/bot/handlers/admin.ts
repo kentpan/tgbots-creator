@@ -14,7 +14,7 @@ import { adminOnly } from "../filters";
 import { mainMenu } from "../menus";
 import { InlineKeyboard } from "grammy";
 import { htmlEscape } from "@/utils/html";
-import { codeQuestion } from "../verification-question";
+import { DEFAULT_BOT_HELP_MARKDOWN_V2, DEFAULT_BOT_START_WELCOME_MARKDOWN_V2 } from "@/services/bot-messages";
 
 /**
  * /start —— 三段式入口（v1.1.3）：
@@ -58,6 +58,7 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
         api: ctx.api,
         chatId,
         superGroup,
+        requireApproval: settings.requireApproval,
         botId: botRow?.id ?? null,
         meta: { chat_title: settings.chatTitle ?? null },
       });
@@ -91,25 +92,42 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
       if (pending.session.method === "code_self" && pending.session.expectedCode) {
         const { sendCodeSelfPrompt } = await import("../verification-prompt");
         await sendCodeSelfPrompt(ctx.api, ctx.from.id, {
-          promptText: pending.settings?.promptText ?? "🔐 请回复本消息并输入验证码完成验证",
+          promptText: pending.settings?.promptText ?? "🔐 请在下方输入框直接发送验证码完成验证",
           code: pending.session.expectedCode,
           expiresAt: pending.session.expiresAt,
           contextLabel: "/start resend",
         });
         return;
       }
-      const promptText = pending.settings?.promptText ?? "🔐 请回复本消息并输入验证码完成验证";
-      // 隐私红线（同 code-input.ts）：/start 可能在群里输入，有 pending 会话时
-      // 验证提示必须私聊发送；不用 ctx.reply（force_reply 提示会落到当前群聊），
-      // 发送失败由 grammY bot.catch 全局兜底并记录
-      await ctx.api.sendMessage(ctx.from.id, htmlEscape(promptText) + codeQuestion.messageSuffixHTML(), {
-        reply_markup: {
-          force_reply: true,
-          input_field_placeholder: "输入验证码",
-        },
-      });
+      const promptText = pending.settings?.promptText ?? "🔐 请在下方输入框直接发送验证码完成验证";
+      // /start 可能在群里输入，有 pending 会话时仍只向用户私聊发送提示。
+      // 私聊不受群隐私模式限制，用户直接发送文本即可，无需 force_reply。
+      await ctx.api.sendMessage(
+        ctx.from.id,
+        `${htmlEscape(promptText)}\n\n请直接在下方输入框发送验证码，无需回复本消息。`,
+        { link_preview_options: { is_disabled: true } },
+      );
       return;
     }
+  }
+
+  // 可配置欢迎语优先于默认欢迎文案；按当前界面模式挂载对应键盘/菜单。
+  const configuredWelcome = ctx.startWelcomeText?.trim();
+  if (configuredWelcome) {
+    const welcome = configuredWelcome
+      .replaceAll("{{bot_name}}", ctx.me?.first_name ?? "TGuard")
+      .replaceAll("{{bot_username}}", ctx.me?.username ? `@${ctx.me.username}` : "");
+    const markup =
+      ctx.interfaceKeyboardMode && ctx.customKeyboard
+        ? ctx.customKeyboard
+        : ctx.interfaceMenuEnabled === false
+          ? undefined
+          : ctx.botMenu ?? mainMenu;
+    await ctx.reply(welcome, {
+      ...(markup ? { reply_markup: markup } : {}),
+      link_preview_options: { is_disabled: true },
+    });
+    return;
   }
 
   // v2.3 界面模式互斥：键盘模式 = 欢迎语 + 自定义键盘（不发内嵌菜单）；
@@ -130,14 +148,7 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
   }
 
   await ctx.reply(
-    "🤖 *TGuard 群组验证机器人*\n\n" +
-      "🛡️ *自动验证新成员身份，防止机器人和恶意用户进入群组*\n\n" +
-      "*功能：*\n" +
-      "• 新成员申请加群时自动发送验证链接\n" +
-      "• 通过人机验证后自动批准加群\n" +
-      "• 支持多种验证码服务\\(hCaptcha、Cap\\.js、Turnstile\\)\n\n" +
-      "使用 `/help` 查看更多信息\n\n" +
-      "👇 也可以直接点击下方菜单按钮：",
+    DEFAULT_BOT_START_WELCOME_MARKDOWN_V2,
     // @grammyjs/menu 官方约束：Menu 实例只能发给安装它的 bot —— 菜单 bot 实例
     // 优先发自己安装的菜单（ctx.botMenu），主 bot 无 botMenu 注入走全局 mainMenu
     { parse_mode: "MarkdownV2", reply_markup: ctx.botMenu ?? mainMenu },
@@ -150,18 +161,10 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
 }
 
 export async function cmdHelp(ctx: BotContext): Promise<void> {
-  await ctx.reply(
-    "🤖 *TGuard 群组验证机器人*\n\n" +
-      "🛡️ *自动验证新成员身份，防止机器人和恶意用户进入群组*\n\n" +
-      "*使用说明：*\n" +
-      "如何使用请见 [README](https://github.com/SideCloudGroup/TGuard/blob/main/README.md)\n\n" +
-      "*技术支持：*\n" +
-      "由 [TGuard](https://github.com/SideCloudGroup/TGuard) 提供技术支持",
-    {
-      parse_mode: "MarkdownV2",
-      link_preview_options: { is_disabled: true },
-    },
-  );
+  await ctx.reply(DEFAULT_BOT_HELP_MARKDOWN_V2, {
+    parse_mode: "MarkdownV2",
+    link_preview_options: { is_disabled: true },
+  });
 }
 
 // v2.0.13：机器人消息内时间统一北京时间（服务器时区为 UTC，用户在国内）

@@ -13,6 +13,7 @@ import {
   Smile,
   UserRoundPlus,
 } from "lucide-react";
+import { IosStatusBar } from "@/components/admin/ios-status-bar";
 import {
   renderMenuTemplate,
   type BotMenuConfig,
@@ -514,8 +515,10 @@ export function TgDesktopChat({
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
+      {/* 移动端 iOS 状态栏；桌面端沿用 Telegram Desktop 仿真布局 */}
+      <IosStatusBar className="absolute inset-x-0 top-0 z-20 bg-white/85 lg:hidden" />
       {/* —— 顶部浮动标题条（截图2：白色圆角条 + 右侧搜索/更多胶囊） —— */}
-      <div className="absolute inset-x-0 top-0 z-10 px-4 pt-3 lg:px-6">
+      <div className="absolute inset-x-0 top-0 z-10 px-4 pt-8 lg:px-6 lg:pt-3">
         <div className="mx-auto flex w-full max-w-[980px] items-stretch gap-2">
           <div className="flex min-w-0 flex-1 items-center gap-3 rounded-2xl bg-white/95 py-2 pl-2.5 pr-4 shadow-[0_1px_8px_rgba(0,0,0,0.14)] backdrop-blur-sm">
             {onBackToList ? (
@@ -587,7 +590,9 @@ export function TgDesktopChat({
         ref={scrollRef}
         onScroll={handleScroll}
         className={`min-h-0 flex-1 overflow-y-auto px-4 pb-3 lg:px-6 ${
-          !isPrivate && pendingJoinCount > 0 && onOpenJoinRequests ? "pt-[122px]" : "pt-[74px]"
+          !isPrivate && pendingJoinCount > 0 && onOpenJoinRequests
+            ? "pt-[146px] lg:pt-[122px]"
+            : "pt-[98px] lg:pt-[74px]"
         }`}
       >
         <div className="mx-auto flex w-full max-w-[980px] flex-col gap-1.5">
@@ -865,7 +870,10 @@ export function TgDesktopChat({
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter") void sendText(input);
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void sendText(input);
+                  }
                 }}
                 placeholder={
                   joinPhase === "awaiting_code"
@@ -886,14 +894,16 @@ export function TgDesktopChat({
             <button
               type="button"
               onClick={() => void sendText(input)}
-              className={`flex h-10 w-10 shrink-0 cursor-pointer items-center justify-center rounded-full shadow-[0_1px_6px_rgba(0,0,0,0.16)] transition-colors ${
-                input.trim() || joinPhase === "awaiting_code"
+              disabled={!input.trim() || sending}
+              title={!input.trim() ? "输入消息后发送；语音录制暂不支持仿真" : sending ? "发送中" : "发送消息"}
+              className={`flex h-10 w-10 shrink-0 cursor-pointer items-center justify-center rounded-full shadow-[0_1px_6px_rgba(0,0,0,0.16)] transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${
+                input.trim() && !sending
                   ? "bg-[#3390ec] text-white hover:bg-[#2b7cc9]"
-                  : "bg-white text-[#9db1c0] hover:text-[#5e6e7e]"
+                  : "bg-white text-[#9db1c0]"
               }`}
-              aria-label={input.trim() || joinPhase === "awaiting_code" ? "发送" : "录音"}
+              aria-label="发送"
             >
-              {input.trim() || joinPhase === "awaiting_code" ? (
+              {input.trim() ? (
                 <SendHorizontal className="h-5 w-5" />
               ) : (
                 <Mic className="h-5 w-5" />

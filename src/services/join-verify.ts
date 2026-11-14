@@ -105,7 +105,7 @@ export async function listJoinVerifyCapableBotIds(): Promise<Set<string>> {
   const result = new Set<string>();
   for (const bot of bots) {
     const feature = parseBotFeatureConfig(bot.config, false);
-    if (feature.joinVerify.enabled && feature.joinVerify.methodId) {
+    if (bot.enabled && feature.joinVerify.enabled && feature.joinVerify.methodId) {
       result.add(String(bot.id));
     }
   }

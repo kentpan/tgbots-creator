@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { opsFetch } from "@/lib/remote-ops";
-import { SplitDeployButton } from "@/components/admin/split-deploy-button";
 import {
   Check,
   ChevronRight,
@@ -36,12 +35,49 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Switch } from "@/components/ui/switch";
 import {
   renderMenuTemplate,
-  type BotMenuConfig,
   type MenuTemplateVars,
 } from "@/services/menu-config";
 import { TgDesktopChat } from "@/components/admin/tg-desktop-chat";
 import { TgProxyPanel } from "@/components/admin/tg-proxy-panel";
-import { TgNewGroupPanel, type NewGroupBot } from "@/components/admin/tg-new-group-panel";
+import { TgNewGroupPanel } from "@/components/admin/tg-new-group-panel";
+import { IosStatusBar } from "@/components/admin/ios-status-bar";
+import { GroupDeployButton } from "@/components/admin/tg-app-simulator-group-deploy";
+import {
+  ADMIN_RIGHTS,
+  type AppSimGroup,
+  type BotCheckPlanNode,
+  type BotCheckResult,
+  type ChatStateSnapshot,
+  type GroupSettingsFormState,
+  type JoinVerifyCandidate,
+  type BotAdminEntry,
+  type JoinResolveResult,
+  type PendingJoinRequest,
+  type RealChatMessage,
+  type SimInviteLinkEntry,
+  type SimulatorScreen,
+  type TgAppSimulatorProps,
+} from "@/components/admin/tg-app-simulator-types";
+export type { AppSimGroup, JoinResolveResult, RealChatMessage } from "@/components/admin/tg-app-simulator-types";
+
+import {
+  DoodleWallpaper,
+  formatJoinRequestTime,
+  filterSimulatorGroups,
+  groupInviteLinksByCreator,
+  isInviteSearch,
+  sumSimulatorUnread,
+  GroupAvatar,
+  IosRowIcon,
+  ListTime,
+  IOS_BLUE,
+  IOS_GREEN,
+  IOS_GRAY_BG,
+  IOS_TEXT_SECONDARY,
+  methodLabel,
+  OVERLAY_VARIANTS,
+  readJson,
+} from "@/components/admin/tg-app-simulator-primitives";
 
 /**
  * Telegram 桌面客户端仿真外壳（机器人测试页仿真屏，v2.0.14）。
@@ -56,259 +92,6 @@ import { TgNewGroupPanel, type NewGroupBot } from "@/components/admin/tg-new-gro
  * （testing-client）持有，保证仿真屏与页面上方（会话徽章）状态一致。
  */
 
-const NAME_COLORS = ["#e17076", "#faa774", "#a695e7", "#7bc862", "#6ec9cb", "#65aadd", "#ee7aae"];
-const IOS_BLUE = "#3390ec";
-const IOS_GREEN = "#34c759";
-const IOS_GRAY_BG = "#efeff4";
-const IOS_TEXT_SECONDARY = "#8e8e93";
-
-function nameColor(name: string): string {
-  let hash = 0;
-  for (const char of name) hash = (hash * 31 + char.charCodeAt(0)) % 997;
-  return NAME_COLORS[hash % NAME_COLORS.length];
-}
-
-export interface AppSimGroup {
-  chatId: string;
-  chatTitle: string;
-  /** v2.3 聊天类型（group/supergroup/channel；未登记=空不显示徽标） */
-  chatType?: string | null;
-  enabled: boolean;
-  method: string;
-  methodId: string | null;
-  methodName: string | null;
-  timeoutSeconds: number;
-  maxAttempts: number;
-  /** 已通过一键部署生成申请制入群链接（group_bot_admins.deploy_mode === "join_request"） */
-  deployed: boolean;
-  /** 待处理加群申请数（join_requests.status=pending 真实统计） */
-  unread: number;
-  /** 群组配置更新时间（ISO）；列表时间列显示：当天 HH:mm，更早 M/D */
-  updatedTime: string;
-}
-
-export interface JoinResolveResult {
-  resolve_type: "deep_link" | "invite_link";
-  chat_id: string;
-  chat_title: string;
-  join_request_enabled: boolean;
-  invite_link?: string | null;
-  method: string | null;
-  method_name: string | null;
-  enabled: boolean;
-  bot_username?: string | null;
-  member_count?: number | null;
-}
-
-interface BotAdminEntry {
-  id: string;
-  bot_id: string;
-  bot_name: string | null;
-  bot_username: string | null;
-  rights: Record<string, boolean>;
-}
-
-/** v2.0.16 待处理加群申请（/api/admin/bots/testing/join-requests GET 返回项） */
-interface PendingJoinRequest {
-  id: string;
-  token: string;
-  user_id: string;
-  username: string | null;
-  first_name: string;
-  last_name: string | null;
-  request_time: string;
-  request_type: string;
-}
-
-/** 与 bots/actions.ts BOT_ADMIN_RIGHT_KEYS 一致（Telegram promoteChatMember 支持的 8 项） */
-const ADMIN_RIGHTS: { key: string; label: string; hint: string }[] = [
-  { key: "can_change_info", label: "修改群组信息", hint: "更改群名称、头像与描述" },
-  { key: "can_delete_messages", label: "删除消息", hint: "删除群内任意成员的消息" },
-  { key: "can_restrict_members", label: "封禁用户", hint: "封禁/解封群成员" },
-  { key: "can_invite_users", label: "添加成员", hint: "邀请用户与生成邀请链接（部署必需）" },
-  { key: "can_pin_messages", label: "置顶消息", hint: "置顶或取消置顶群消息" },
-  { key: "can_manage_video_chats", label: "管理视频聊天", hint: "发起与管理群视频会议" },
-  { key: "can_promote_members", label: "添加新管理员", hint: "提升其他成员为管理员" },
-  { key: "can_manage_chat", label: "管理聊天", hint: "默认管理员基础权限" },
-];
-
-/** 邀请链接台账条目（/api/admin/telegram/invite-links GET 返回项） */
-interface SimInviteLinkEntry {
-  id: string;
-  bot_id: string | null;
-  chat_id: string;
-  link: string;
-  name: string | null;
-  creates_join_request: boolean;
-  is_revoked: boolean;
-  source: string;
-  created_time: string;
-  updated_time: string;
-}
-
-/** 浮层动画（设置/权限/加群确认面板：右侧滑入） */
-const OVERLAY_VARIANTS = {
-  enter: { x: "100%" },
-  center: { x: "0%" },
-  exit: { x: "100%" },
-};
-
-/** 列表时间列：当天显示 HH:mm，更早显示 M/D（与真实 Telegram 会话列表一致） */
-function formatListTime(iso: string): string {
-  if (!iso) return "";
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "";
-  const now = new Date();
-  const pad = (value: number): string => String(value).padStart(2, "0");
-  if (date.toDateString() === now.toDateString()) {
-    return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
-  }
-  return `${date.getMonth() + 1}/${date.getDate()}`;
-}
-
-/**
- * 水合安全的列表时间列。
- *
- * formatListTime 依赖本地时区（getHours/getMinutes）：SSR 用服务器时区（UTC）
- * 渲染出的 HH:mm 与客户端（如 UTC+8）不一致，触发 "server rendered text didn't
- * match the client" hydration 错误。因此 mount 前与 SSR 保持一致渲染空字符串，
- * mount 后再写入本地时区时间，并每 30 秒刷新（保证跨天 M/D 判定持续正确）。
- */
-function ListTime({ iso, active }: { iso: string; active?: boolean }) {
-  const [value, setValue] = useState("");
-  useEffect(() => {
-    const update = (): void => setValue(formatListTime(iso));
-    update();
-    const timer = window.setInterval(update, 30000);
-    return () => window.clearInterval(timer);
-  }, [iso]);
-  return (
-    <span className={`shrink-0 text-[13px] ${active ? "text-white/85" : "text-[#8e8e93]"}`}>{value}</span>
-  );
-}
-
-function methodLabel(method: string | null): string {
-  if (method === "code_self") return "自动验证码";
-  if (method === "code_api") return "自定义验证码";
-  if (method === "captcha") return "人机验证码";
-  return "未配置验证";
-}
-
-/** 安全解析响应 JSON：空响应体 / 非 JSON（如 500 错误页）不再抛 "Unexpected end of JSON input" */
-async function readJson<T>(response: Response): Promise<T | null> {
-  try {
-    const text = await response.text();
-    if (!text.trim()) return null;
-    return JSON.parse(text) as T;
-  } catch {
-    return null;
-  }
-}
-
-function GroupAvatar({ title, size }: { title: string; size: number }) {
-  return (
-    <div
-      className="flex shrink-0 items-center justify-center rounded-full font-semibold text-white"
-      style={{ width: size, height: size, backgroundColor: nameColor(title), fontSize: size * 0.42 }}
-      aria-hidden
-    >
-      {title.slice(0, 1) || "?"}
-    </div>
-  );
-}
-
-function IosRowIcon({ bg, children }: { bg: string; children: React.ReactNode }) {
-  return (
-    <span
-      className="flex h-[29px] w-[29px] shrink-0 items-center justify-center rounded-[7px] text-white"
-      style={{ backgroundColor: bg }}
-      aria-hidden
-    >
-      {children}
-    </span>
-  );
-}
-
-/**
- * Telegram 桌面端绿色涂鸦壁纸（截图1/截图2 背景）：
- * 绿色渐变底 + 白色描边涂鸦图案（SVG pattern 内联渲染，避免 data-URI 编码问题）。
- */
-function DoodleWallpaper() {
-  return (
-    <div className="pointer-events-none absolute inset-0 overflow-hidden" style={{ backgroundColor: "#94bd8a" }} aria-hidden>
-      <div
-        className="absolute inset-0"
-        style={{ backgroundImage: "linear-gradient(160deg, #a9cb9a 0%, #8fb886 48%, #9dc191 100%)" }}
-      />
-      <svg className="absolute inset-0 h-full w-full" aria-hidden>
-        <defs>
-          <pattern id="tg-desktop-doodles" width="300" height="300" patternUnits="userSpaceOnUse">
-            <g
-              fill="none"
-              stroke="#ffffff"
-              strokeOpacity="0.32"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              {/* 爱心 */}
-              <path d="M38 64c-9-8.5-15-14-15-21.5C23 36 28 31 34.5 31c3.6 0 6.5 2.4 3.5 5.8C41 33.4 44 31 47.5 31 54 31 59 36 59 42.5 59 50 53 55.5 44 64l-6 5.4z" transform="scale(0.62) translate(8 -18)" />
-              {/* 五角星 */}
-              <path d="M156 20l5.4 11 12.1 1.7-8.8 8.5 2.1 12-10.8-5.7-10.8 5.7 2.1-12-8.8-8.5 12.1-1.7z" />
-              {/* 笑脸 */}
-              <circle cx="262" cy="52" r="13" />
-              <circle cx="257.5" cy="49" r="1.3" fill="#ffffff" stroke="none" />
-              <circle cx="266.5" cy="49" r="1.3" fill="#ffffff" stroke="none" />
-              <path d="M256.5 55c1.6 2.2 4 3.4 5.5 3.4s3.9-1.2 5.5-3.4" />
-              {/* 纸飞机 */}
-              <path d="M52 138l52-18-34 38-5.5-13.5z" />
-              <path d="M64.5 144.5L104 120" />
-              {/* 音符 */}
-              <path d="M204 158v-26l16-5v26" />
-              <circle cx="200" cy="158" r="4.6" />
-              <circle cx="216" cy="153" r="4.6" />
-              {/* 小房子 */}
-              <path d="M30 216l15-13 15 13" />
-              <path d="M35 212v18h20v-18" />
-              <path d="M42 230v-9h6v9" />
-              {/* 螺旋 */}
-              <path d="M148 246c0-5 4-9 9-9s9 4 9 9-4 9-9 9-13-4-13-11 6-15 15-15 16 7 16 17" />
-              {/* 气球 */}
-              <ellipse cx="258" cy="222" rx="11" ry="13" />
-              <path d="M258 235l-2.5 5h5z" />
-              <path d="M258 240c0 8-6 10-6 17" />
-              {/* 十字与圆点散布 */}
-              <path d="M112 62v10M107 67h10" />
-              <path d="M236 116v8M232 120h8" />
-              <circle cx="86" cy="196" r="2.2" fill="#ffffff" stroke="none" />
-              <circle cx="176" cy="96" r="2.2" fill="#ffffff" stroke="none" />
-              <circle cx="30" cy="150" r="2.2" fill="#ffffff" stroke="none" />
-              <circle cx="284" cy="160" r="2.2" fill="#ffffff" stroke="none" />
-              {/* 云朵 */}
-              <path d="M92 268c-5 0-8-3.4-8-7.6 0-4.2 3.4-7.4 7.6-7.4 1.2-4.6 5.4-7.6 10-7.2 4.4.4 8 3.6 8.8 7.8 3.8.4 6.6 3.4 6.6 7 0 4-3.2 7.4-7.6 7.4z" />
-            </g>
-          </pattern>
-        </defs>
-        <rect width="100%" height="100%" fill="url(#tg-desktop-doodles)" />
-      </svg>
-    </div>
-  );
-}
-
-type Screen = "chat" | "settings" | "admins" | "proxy" | "newgroup" | "apiconfig" | "botcheck" | "chattype";
-
-/** v2.1.2 真实群消息（chat_messages 台账，/api/admin/telegram/chat-messages 返回项） */
-export interface RealChatMessage {
-  id: string;
-  message_id: number | null;
-  user_id: string | null;
-  username: string | null;
-  first_name: string | null;
-  from_bot: boolean;
-  kind: string;
-  text: string | null;
-  message_time: string | null;
-}
 
 export function TgAppSimulator({
   config,
@@ -337,54 +120,9 @@ export function TgAppSimulator({
   realMessages,
   realMessagesState,
   onRefreshRealMessages,
-}: {
-  config: BotMenuConfig;
-  botName: string;
-  botUsername: string | null;
-  selectedBotId: string;
-  groups: AppSimGroup[];
-  activeChatId: string | null;
-  memberCount: string;
-  systemNote?: string;
-  templateVars?: Partial<MenuTemplateVars>;
-  promptMessage?: { id: number; text: string; hint?: string } | null;
-  onUserSend?: (text: string) => Promise<{ ok: boolean; text: string; joined?: boolean }>;
-  joinPhase?: "idle" | "awaiting_code" | "joined";
-  onRequestJoin?: () => Promise<{ ok: boolean; message: string }>;
-  view: "group" | "private";
-  onSelectGroup: (chatId: string) => void;
-  /** 移动端从聊天区返回列表（桌面端双栏常驻不需要） */
-  onBackToList?: () => void;
-  onSyncGroups: () => void;
-  syncing: boolean;
-  /** 一键部署：父组件调用 deploy API，返回校验结果（stage/guide 由部署面板展示） */
-  onDeployGroup: (chatId: string) => Promise<{
-    ok: boolean;
-    message: string;
-    stage?: string;
-    guide?: string[];
-    invite_link?: string | null;
-    chat_title?: string | null;
-    reused?: boolean;
-    chat_id?: string | null;
-    migrated_from_chat_id?: string | null;
-  } | null>;
-  deployingChatId: string | null;
-  /** 从列表/加群确认面板发起模拟加群申请（父组件创建验证会话并切换视图） */
-  onSimulateJoinForGroup: (chatId: string) => Promise<{ ok: boolean; message: string }>;
-  /** 群组设置保存成功后由父组件刷新列表数据（router.refresh + realGroups 重载） */
-  onSettingsSaved: () => void;
-  /** v2.0.15 新建群组流程的机器人列表（已有机器人，替代 APP「选择用户」） */
-  bots: NewGroupBot[];
-  /** v2.1.2 真实群消息（父组件按 bot 权限视角拉取的 chat_messages 台账） */
-  realMessages?: RealChatMessage[];
-  /** 真实消息加载状态（v2.1.3 起父组件只在展现时获取，无轮询） */
-  realMessagesState?: { loading: boolean; fetchedAt: string | null; error: string | null };
-  /** v2.1.3 手动刷新真实群消息（聊天区同步胶囊刷新按钮，绕过展现去重强制拉取） */
-  onRefreshRealMessages?: () => void | Promise<void>;
-}) {
+}: TgAppSimulatorProps) {
   // —— 浮层屏幕：chat=聊天区（默认初始界面），settings=群组设置，admins=机器人权限 ——
-  const [screen, setScreen] = useState<Screen>("chat");
+  const [screen, setScreen] = useState<SimulatorScreen>("chat");
 
   // —— 顶部 flash 提示（iOS 深色胶囊）——
   const [flash, setFlash] = useState<{ ok: boolean; text: string } | null>(null);
@@ -400,19 +138,9 @@ export function TgAppSimulator({
 
   // —— 会话列表搜索（普通文本过滤；加群链接 → 打开确认面板）——
   const [search, setSearch] = useState("");
-  const isJoinLink = /t\.me\/(\+|joinchat\/)/i.test(search) || /start=join_-?\d+/i.test(search);
-  const filteredGroups = useMemo(() => {
-    if (!search.trim() || isJoinLink) return groups;
-    const keyword = search.trim().toLowerCase();
-    return groups.filter(
-      (group) =>
-        group.chatTitle.toLowerCase().includes(keyword) || group.chatId.includes(keyword),
-    );
-  }, [groups, search, isJoinLink]);
-  const totalUnread = useMemo(
-    () => groups.reduce((sum, group) => sum + group.unread, 0),
-    [groups],
-  );
+  const isJoinLink = isInviteSearch(search);
+  const filteredGroups = useMemo(() => filterSimulatorGroups(groups, search), [groups, search]);
+  const totalUnread = useMemo(() => sumSimulatorUnread(groups), [groups]);
 
   const [resolving, setResolving] = useState(false);
   const [joinPanel, setJoinPanel] = useState<JoinResolveResult | null>(null);
@@ -540,19 +268,8 @@ export function TgAppSimulator({
     [activeChatId, joinActionToken, selectedBotId, showFlash, onSettingsSaved],
   );
 
-  /** 申请时间（北京时间 Asia/Shanghai）：客户端渲染（面板仅在点击后出现），无水合风险 */
-  const formatRequestTime = useCallback((iso: string): string => {
-    const date = new Date(iso);
-    if (Number.isNaN(date.getTime())) return "";
-    return new Intl.DateTimeFormat("zh-CN", {
-      timeZone: "Asia/Shanghai",
-      month: "numeric",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    }).format(date);
-  }, []);
+  /** 申请时间统一由 primitives 层格式化，固定 Asia/Shanghai。 */
+  const formatRequestTime = formatJoinRequestTime;
 
   /** 上滑面板唯一待处理申请（1 条时直接展示用户卡片 + 通过/拒绝两个按钮，与真实 APP 一致） */
   const singleJoinRequest = joinRequests.length === 1 ? joinRequests[0] : null;
@@ -602,8 +319,8 @@ export function TgAppSimulator({
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   // v2.3 自动审核机器人候选（bots.config.joinVerify.enabled 的机器人，服务端过滤）
-  const [joinVerifyCandidates, setJoinVerifyCandidates] = useState<{ id: string; name: string }[]>([]);
-  const [form, setForm] = useState({
+  const [joinVerifyCandidates, setJoinVerifyCandidates] = useState<JoinVerifyCandidate[]>([]);
+  const [form, setForm] = useState<GroupSettingsFormState>({
     chat_title: "",
     method: "code_self",
     method_id: "",
@@ -707,7 +424,7 @@ export function TgAppSimulator({
         showFlash(false, payload.error ?? "保存失败");
         return;
       }
-      showFlash(true, "群组配置已保存（新成员审核与自动审核机器人即时生效）");
+      showFlash(true, "群组配置已保存；若切换了新成员审核状态，请重新部署群组以更新已生成的邀请链接");
       onSettingsSaved();
       // iOS 群组信息语义：右上角 ✓ = 保存并返回上一页（聊天区）
       setScreen("chat");
@@ -724,20 +441,6 @@ export function TgAppSimulator({
   }, [screen, activeChatId, loadGroupSettings]);
 
   // —— v2.2.7 群组真实状态快照（展示时实时调用 getChat，绝不硬编码假数据） ——
-  interface ChatStateSnapshot {
-    id: string;
-    type: string;
-    title: string | null;
-    username: string | null;
-    active_usernames: string[];
-    is_forum: boolean;
-    has_visible_history: boolean;
-    has_available_reactions: boolean;
-    available_reactions_count: number | null;
-    max_reaction_count: number | null;
-    has_custom_appearance: boolean;
-    has_protected_content: boolean;
-  }
   const [chatState, setChatState] = useState<ChatStateSnapshot | null>(null);
   const [chatStateError, setChatStateError] = useState<string | null>(null);
   const [chatStateLoading, setChatStateLoading] = useState(false);
@@ -803,20 +506,6 @@ export function TgAppSimulator({
   };
 
   // —— v2.2.7 机器人关键节点真实检测（顺序逐节点真实执行，❌ 即停） ——
-  interface BotCheckPlanNode {
-    key: string;
-    label: string;
-    hint: string;
-  }
-  interface BotCheckResult {
-    key: string;
-    label: string;
-    ok: boolean;
-    ms: number;
-    detail: string;
-    error?: string;
-    suggestion?: string;
-  }
   const [checkPlan, setCheckPlan] = useState<BotCheckPlanNode[] | null>(null);
   const [checkResults, setCheckResults] = useState<BotCheckResult[]>([]);
   /** 当前正在真实检测的节点下标（-1 = 空闲） */
@@ -1328,20 +1017,10 @@ export function TgAppSimulator({
   }, []);
 
   // 按创建者管理员平铺（真实 APP 邀请链接页语义：同创建者的链接归组展示）
-  const inviteSheetGroups = useMemo(() => {
-    const byCreator = new Map<string, SimInviteLinkEntry[]>();
-    for (const entry of allInviteLinks) {
-      const key = entry.bot_id ?? "";
-      const list = byCreator.get(key) ?? [];
-      list.push(entry);
-      byCreator.set(key, list);
-    }
-    return [...byCreator.entries()].map(([key, items]) => ({
-      key,
-      label: key ? (bots.find((bot) => bot.id === key)?.name ?? `机器人 #${key}`) : "未登记创建者",
-      items,
-    }));
-  }, [allInviteLinks, bots]);
+  const inviteSheetGroups = useMemo(
+    () => groupInviteLinksByCreator(allInviteLinks, bots),
+    [allInviteLinks, bots],
+  );
 
   const activeGroup = useMemo(
     () => groups.find((group) => group.chatId === activeChatId) ?? null,
@@ -1424,7 +1103,7 @@ export function TgAppSimulator({
                 <span className="text-[17px] leading-snug text-black">
                   新成员审核
                   <span className="block text-[12px] leading-relaxed" style={{ color: IOS_TEXT_SECONDARY }}>
-                    开启后入群需要审核：部署生成的邀请链接变为「申请制」，申请由下方自动审核机器人自动验证，或人工审批
+                    开启后入群需要审核：私有超级群部署生成「申请制」链接，申请由下方自动审核机器人验证或人工审批；切换此开关后需重新部署群组更新旧链接。公开群还需在 Telegram 群设置中开启加入审核（Bot API 无法远程切换该开关）
                   </span>
                 </span>
                 <Switch
@@ -2538,9 +2217,10 @@ export function TgAppSimulator({
       <div className="flex h-full w-full">
         {/* —— 左侧：会话列表窗口卡（样式与旧版列表一致，图1） —— */}
         <div className="flex h-full w-full min-w-0 flex-col border-r border-black/10 bg-white lg:w-[360px] lg:shrink-0">
-          {/* macOS 红绿灯标题栏（截图1） */}
+          {/* 移动端使用 iOS 状态栏；桌面端保留 macOS 窗口标题栏 */}
+          <IosStatusBar className="lg:hidden" />
           <div className="relative flex items-center justify-center px-4 pt-3.5 pb-2.5">
-            <div className="absolute left-4 flex items-center gap-2" aria-hidden>
+            <div className="absolute left-4 hidden items-center gap-2 lg:flex" aria-hidden>
               <span className="h-3 w-3 rounded-full bg-[#ff5f57]" />
               <span className="h-3 w-3 rounded-full bg-[#febc2e]" />
               <span className="h-3 w-3 rounded-full bg-[#28c840]" />
@@ -3066,143 +2746,3 @@ export function TgAppSimulator({
   );
 }
 
-/**
- * v2.3 群组列表分体部署按钮（自包含子组件）：
- * - 主点击 = 部署该群全部机器人管理员（逐个真实调用 deploy API，逐个回显结果）；
- * - ▾浮层 = 该群机器人管理员列表（group-bots API 真实数据），单选部署，已部署绿√；
- * - 部署状态判定与列表徽章同一来源（group_bot_admins.rights 部署状态）。
- */
-function GroupDeployButton({
-  chatId,
-  fallbackDeployed,
-  fallbackBusy,
-  onDeployChat,
-  showFlash,
-}: {
-  chatId: string;
-  /** 当前选中机器人的部署状态（浮层未加载时的回退判定） */
-  fallbackDeployed: boolean;
-  fallbackBusy: boolean;
-  /** 父组件单机器人部署（当前选中机器人，含迁移刷新等副作用） */
-  onDeployChat: (chatId: string) => Promise<void>;
-  showFlash: (ok: boolean, text: string) => void;
-}) {
-  const [bots, setBots] = useState<{ id: string; name: string; deployed: boolean }[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [mainBusy, setMainBusy] = useState(false);
-  const [busyBotId, setBusyBotId] = useState<string | null>(null);
-
-  const loadBots = useCallback(async (): Promise<void> => {
-    try {
-      const response = await opsFetch(
-        `/api/admin/bots/testing/group-bots?chat_id=${encodeURIComponent(chatId)}`,
-        { cache: "no-store" },
-      );
-      const payload = (await response.json()) as {
-        ok: boolean;
-        error?: string;
-        data?: { items: { id: string; name: string; deployed: boolean }[] };
-      };
-      if (!payload.ok || !payload.data) {
-        showFlash(false, payload.error ?? "读取群组机器人列表失败");
-        return;
-      }
-      setBots(payload.data.items);
-      setLoaded(true);
-    } catch (error) {
-      showFlash(false, error instanceof Error ? error.message : "读取群组机器人列表失败");
-    }
-  }, [chatId, showFlash]);
-
-  const deployOne = useCallback(
-    async (botId: string, botName: string): Promise<boolean> => {
-      try {
-        const response = await opsFetch("/api/admin/bots/testing/deploy", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ bot_id: botId, chat_id: chatId }),
-        });
-        const payload = (await response.json()) as { ok: boolean; error?: string; stage?: string; reused?: boolean };
-        if (!payload.ok) {
-          showFlash(false, `${botName}：${payload.error ?? "部署校验失败"}`);
-          return false;
-        }
-        if (payload.stage === "deployed") {
-          showFlash(true, `${botName}：${payload.reused ? "复用已生成的有效邀请链接" : "入群申请链接已生成并保存"}`);
-          return true;
-        }
-        showFlash(false, `${botName}：部署校验未通过（${payload.stage ?? "未知阶段"}），请按部署面板指引操作`);
-        return false;
-      } catch (error) {
-        showFlash(false, `${botName}：${error instanceof Error ? error.message : "部署失败"}`);
-        return false;
-      }
-    },
-    [chatId, showFlash],
-  );
-
-  const deployAll = useCallback(async (): Promise<void> => {
-    if (mainBusy) return;
-    setMainBusy(true);
-    try {
-      let list = bots;
-      if (!loaded) {
-        try {
-          const response = await opsFetch(
-            `/api/admin/bots/testing/group-bots?chat_id=${encodeURIComponent(chatId)}`,
-            { cache: "no-store" },
-          );
-          const payload = (await response.json()) as {
-            ok: boolean;
-            data?: { items: { id: string; name: string; deployed: boolean }[] };
-          };
-          if (payload.ok && payload.data) {
-            list = payload.data.items;
-            setBots(list);
-            setLoaded(true);
-          }
-        } catch {
-          /* 加载失败时回退：部署当前选中机器人 */
-        }
-      }
-      if (list.length === 0) {
-        // 该群没有机器人管理员登记（如基础群未登记）：回退部署当前选中机器人
-        await onDeployChat(chatId);
-        return;
-      }
-      let okCount = 0;
-      for (const bot of list) {
-        setBusyBotId(bot.id);
-        if (await deployOne(bot.id, bot.name)) okCount += 1;
-      }
-      setBusyBotId(null);
-      showFlash(okCount === list.length, `部署完成：${okCount}/${list.length} 个机器人成功`);
-      await loadBots();
-    } finally {
-      setMainBusy(false);
-      setBusyBotId(null);
-    }
-  }, [bots, loaded, chatId, mainBusy, onDeployChat, deployOne, showFlash, loadBots]);
-
-  const allDeployed = loaded && bots.length > 0 ? bots.every((bot) => bot.deployed) : fallbackDeployed;
-
-  return (
-    <SplitDeployButton
-      mainLabel={allDeployed ? "重新部署所有机器人" : "一键部署所有机器人"}
-      mainBusy={mainBusy || fallbackBusy}
-      onMain={() => void deployAll()}
-      items={bots.map((bot) => ({ id: bot.id, label: bot.name, deployed: bot.deployed }))}
-      itemBusyId={busyBotId}
-      onSelectItem={(botId) => {
-        const bot = bots.find((entry) => entry.id === botId);
-        setBusyBotId(botId);
-        void deployOne(botId, bot?.name ?? `#${botId}`).then(() => {
-          setBusyBotId(null);
-          return loadBots();
-        });
-      }}
-      onLoadItems={() => void loadBots()}
-      emptyHint="该群还没有机器人管理员登记：先把机器人添加为群管理员并点部署"
-    />
-  );
-}

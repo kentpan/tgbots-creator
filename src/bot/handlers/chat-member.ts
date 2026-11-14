@@ -12,7 +12,6 @@ import { generateVerificationToken, generateJoinCode } from "@/utils/crypto";
 import { htmlEscape } from "@/utils/html";
 import { utcnow } from "@/utils/time";
 import { InlineKeyboard, type Api } from "grammy";
-import { codeQuestion } from "../verification-question";
 import { CODE_SELF_DEFAULT_PROMPT, sendCodeSelfPrompt } from "../verification-prompt";
 import { muteAndSendGroupPrompt } from "./group-verification";
 import { approveTelegramJoinRequest } from "@/services/approval";
@@ -207,13 +206,53 @@ async function bootstrapDmVerification(
   // 幂等守卫（v2.1.5）：同用户同群未完成会话 / 近 15 分钟已批准 → 不重复创建与发送
   const existingPending = await getPendingSessionForUserChat(BigInt(user.id), BigInt(chat.id));
   if (existingPending) {
+    // Telegram 可能重投 chat_join_request；若首轮建会话成功但提示消息发送失败，
+    // 旧逻辑会把“已有会话”误报为 promptDelivered=true 并永久跳过提示重发。
+    // 使用同一 session/token/code 重发，不新建 D1 行、不重置尝试次数或过期时间。
+    const targetChatId = user.userChatId ?? user.id;
+    let promptDelivered = false;
+    try {
+      if (existingPending.method === "code_self" && existingPending.expectedCode) {
+        const delivery = await sendCodeSelfPrompt(api, targetChatId, {
+          promptText: settings?.promptText || CODE_SELF_DEFAULT_PROMPT,
+          code: existingPending.expectedCode,
+          expiresAt: existingPending.expiresAt,
+          contextLabel: `${requestType} retry`,
+        });
+        promptDelivered = delivery.delivered;
+      } else if (existingPending.method === "code_api") {
+        const promptText = settings?.promptText ?? "🔐 请在下方输入框直接发送验证码完成验证";
+        await api.sendMessage(
+          targetChatId,
+          `${htmlEscape(promptText)}\n\n请直接在下方输入框发送验证码，无需回复本消息。`,
+          { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+        );
+        promptDelivered = true;
+      } else if (existingPending.method === "captcha") {
+        const keyboard = new InlineKeyboard().webApp(
+          runtime.verificationButtonText,
+          `${runtime.baseUrl}/verify?token=${existingPending.token}`,
+        );
+        await api.sendMessage(
+          targetChatId,
+          `欢迎加入群组${htmlEscape(chat.title ?? "群组")}！请点击下方链接完成人机验证`,
+          { parse_mode: "HTML", reply_markup: keyboard },
+        );
+        promptDelivered = true;
+      }
+    } catch (error) {
+      console.warn(
+        `[join-verify] duplicate request prompt resend failed: user=${user.id} chat=${chat.id} ` +
+          `target=${targetChatId} method=${existingPending.method}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     console.log(
       `Pending DM verification already exists: user ${user.id} chat ${chat.id} ` +
-        `session=${existingPending.token.slice(0, 8)}... — skip duplicate bootstrap`,
+        `session=${existingPending.token.slice(0, 8)}... — promptResent=${promptDelivered}`,
     );
     return {
       created: true,
-      promptDelivered: true,
+      promptDelivered,
       method: existingPending.method,
     };
   }
@@ -263,22 +302,18 @@ async function bootstrapDmVerification(
   }
 
   if (resolved.method === "code_api") {
-    const promptText = settings?.promptText ?? "🔐 请回复本消息并输入验证码完成验证";
+    const promptText = settings?.promptText ?? "🔐 请在下方输入框直接发送验证码完成验证";
     const targetChatId = user.userChatId ?? user.id;
     try {
-      // stateless-question：问题消息末尾附加用户不可见的后缀（HTML 模式需转义正文），
-      // 配合 force_reply 引导用户回复该消息——机器人无需关闭 Telegram 隐私模式
-      // 即可在用户回复时收到验证码
+      // chat_join_request 的 user_chat_id 只作为发送目标；身份与会话仍使用 from.id。
+      // 申请用户处于私聊会话，私聊消息不受群隐私模式限制，无需 force_reply。
+      // 用户直接发送文本，由 handleCodeInput 按 from.id 查找待验证会话。
       await api.sendMessage(
         targetChatId,
-        htmlEscape(promptText) + codeQuestion.messageSuffixHTML(),
+        `${htmlEscape(promptText)}\n\n请直接在下方输入框发送验证码，无需回复本消息。`,
         {
           parse_mode: "HTML",
           link_preview_options: { is_disabled: true },
-          reply_markup: {
-            force_reply: true,
-            input_field_placeholder: "输入验证码",
-          },
         },
       );
       console.log(`Code verification prompt sent to chat ${targetChatId} (user ${user.id}, ${requestType})`);
@@ -286,7 +321,6 @@ async function bootstrapDmVerification(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.toLowerCase().includes("chat not found") || message.toLowerCase().includes("forbidden")) {
-        // 私聊不可达：/start 时会重发验证提示；超时未验证按失效处理
         console.warn(
           `Cannot send code prompt to chat ${targetChatId} (user ${user.id}, ${requestType}): chat not reachable; ` +
             "prompt will be resent when the user /starts the bot; session expires per timeout",
@@ -298,7 +332,7 @@ async function bootstrapDmVerification(
     }
   }
 
-  // code_self：私聊发送自生成的入群验证码（含隐形后缀 + force_reply，与 code_api 同一输码通道）
+  // code_self：私聊发送自生成的入群验证码（直接输入，不要求回复提示消息）
   if (useSelfCode && joinCode) {
     const promptText = settings?.promptText || CODE_SELF_DEFAULT_PROMPT;
     const targetChatId = user.userChatId ?? user.id;
@@ -348,10 +382,15 @@ export async function bootstrapJoinVerification(
   chat: JoinVerificationChat,
   requestType: "telegram" | "direct",
   botId: bigint,
+  preloaded?: {
+    settings: Awaited<ReturnType<typeof loadGroupSettingsForChat>>;
+    resolved: ResolvedJoinVerify;
+  },
 ): Promise<BootstrapResult | null> {
   const runtime = await getRuntimeSettings(config);
-  const settings = await loadGroupSettingsForChat(BigInt(chat.id));
-  const resolved = await resolveJoinVerify(botId, settings);
+  // chat_join_request Composer 已加载并解析过配置时直接复用，避免重复 D1 读取。
+  const settings = preloaded ? preloaded.settings : await loadGroupSettingsForChat(BigInt(chat.id));
+  const resolved = preloaded?.resolved ?? (await resolveJoinVerify(botId, settings));
   if (!resolved) {
     return null;
   }

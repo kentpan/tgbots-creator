@@ -110,7 +110,8 @@ export function isDefinitiveInviteLinkDeath(error: unknown): boolean {
  *
  * @param input.api         grammY API 实例（botByToken(...).api 或 ctx.api）
  * @param input.chatId      目标群 chat_id（调用方负责先解析 migrate_to_chat_id）
- * @param input.superGroup  超级群/频道 → 申请制链接；基础群 → 普通链接
+ * @param input.superGroup  是否超级群/频道（基础群不能创建申请制链接）
+ * @param input.requireApproval 群组「新成员审核」开关；true=申请制链接，false=普通邀请链接
  * @param input.publicUsername v2.1.16：群组公开用户名（getChat.username，非空 = 公开群）——
  *   直接使用公开群自定义链接 https://t.me/<username>（群开启「加入审核」时点链接出
  *   「申请加入」→ chat_join_request 事件；绝不给公开群再生成 t.me/+hash 私密形态
@@ -122,6 +123,7 @@ export async function acquireStableGroupInviteLink(input: {
   api: Api;
   chatId: bigint;
   superGroup: boolean;
+  requireApproval?: boolean;
   publicUsername?: string | null;
   botId?: bigint | null;
   meta?: Record<string, unknown>;
@@ -129,6 +131,7 @@ export async function acquireStableGroupInviteLink(input: {
   const { api, chatId, superGroup } = input;
   const botId = input.botId ?? null;
   const publicUsername = input.publicUsername?.trim() ?? "";
+  const joinRequestMode = superGroup && (input.requireApproval ?? true);
   const deployedAt = new Date().toISOString();
 
   // 0) 公开群（v2.1.16）：自定义公开链接 t.me/<username>，无需机器人建链，
@@ -160,7 +163,7 @@ export async function acquireStableGroupInviteLink(input: {
   return acquireInviteLinkViaBot({
     api,
     chatId,
-    superGroup,
+    joinRequestMode,
     ...(botId !== null ? { botId } : {}),
     ...(input.meta ? { meta: input.meta } : {}),
   });
@@ -170,11 +173,11 @@ export async function acquireStableGroupInviteLink(input: {
 async function acquireInviteLinkViaBot(input: {
   api: Api;
   chatId: bigint;
-  superGroup: boolean;
+  joinRequestMode: boolean;
   botId?: bigint | null;
   meta?: Record<string, unknown>;
 }): Promise<AcquireInviteLinkResult> {
-  const { api, chatId, superGroup } = input;
+  const { api, chatId, joinRequestMode } = input;
   const botId = input.botId ?? null;
 
   // 部署状态行只读一次（复用探测与新建落库共用）
@@ -196,9 +199,9 @@ async function acquireInviteLinkViaBot(input: {
     try {
       const probe = await api.editChatInviteLink(Number(chatId), storedLink, {
         name: DEPLOY_LINK_NAME,
-        ...(superGroup ? { creates_join_request: true } : {}),
+        ...(joinRequestMode ? { creates_join_request: true } : {}),
       });
-      const joinRequestCompatible = superGroup
+      const joinRequestCompatible = joinRequestMode
         ? probe.creates_join_request === true
         : probe.creates_join_request !== true;
       if (probe.is_revoked !== true && joinRequestCompatible) {
@@ -227,9 +230,9 @@ async function acquireInviteLinkViaBot(input: {
     }
   }
 
-  // 2) 新建（v2.0.12 形态自适应：超级群申请制 / 基础群普通链接）
+  // 2) 新建（超级群按 requireApproval 选择申请制/普通链接；基础群始终普通链接）
   const invite = await api.createChatInviteLink(Number(chatId), {
-    ...(superGroup ? { creates_join_request: true } : {}),
+    ...(joinRequestMode ? { creates_join_request: true } : {}),
     name: DEPLOY_LINK_NAME,
   });
   const deployedAt = new Date().toISOString();
@@ -241,7 +244,7 @@ async function acquireInviteLinkViaBot(input: {
       invite_link: invite.invite_link,
       invite_link_name: invite.name ?? null,
       deployed_at: deployedAt,
-      deploy_mode: superGroup ? "join_request" : "direct",
+      deploy_mode: joinRequestMode ? "join_request" : "direct",
       ...(input.meta ?? {}),
     });
     await upsertGroupBotAdmin({ botId, chatId, rights, status: "active" });

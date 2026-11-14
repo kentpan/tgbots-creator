@@ -35,6 +35,8 @@ import {
 } from "@/services/tgapi-config";
 import { isTgApiGateConfigured, checkTgApiGateMethod } from "@/bot/tgapi-gate";
 import { parseCodeApiConfig } from "@/services/external-verify";
+import { parseBotFeatureConfig } from "@/services/bot-feature-config";
+import type { CustomKeyboardButton } from "@/services/custom-keyboard";
 
 /** 检测节点计划项（点击「机器人检测」时先行展示的全部关键节点） */
 export interface BotCheckNode {
@@ -144,6 +146,7 @@ interface WebhookInfoResult {
     last_error_message?: string;
     last_error_date?: number;
     pending_update_count?: number;
+    allowed_updates?: string[];
   };
 }
 
@@ -195,7 +198,19 @@ export async function runBotCheckNode(
       if (runtime.webhookUrl && url !== runtime.webhookUrl) {
         return { key, label, ok: false, ms, detail: "", error: `Webhook 指向 ${url}，与当前环境期望的 ${runtime.webhookUrl} 不一致（消息在推给别的地址）`, suggestion: "重新部署本机器人，把 Webhook 覆盖为当前环境的回调地址。" };
       }
-      return { key, label, ok: true, ms, detail: `已注册：${url}` };
+      const feature = parseBotFeatureConfig(bot.config, false);
+      if (feature.joinVerify.enabled && !(res.result?.allowed_updates ?? []).includes("chat_join_request")) {
+        return {
+          key,
+          label,
+          ok: false,
+          ms,
+          detail: `已注册：${url}`,
+          error: "Webhook 的 allowed_updates 未包含 chat_join_request；Telegram 不会把加群申请事件投递给看门狗机器人",
+          suggestion: "在仿真APP页对该机器人重新部署，重新 setWebhook 后再运行机器人检测。",
+        };
+      }
+      return { key, label, ok: true, ms, detail: `已注册：${url}${feature.joinVerify.enabled ? "；chat_join_request 订阅 ✓" : ""}` };
     } catch (error) {
       return { key, label, ok: false, ms: 0, detail: "", error: briefErrorText(error), suggestion: "getWebhookInfo 网络失败：检查网络/代理后重试。" };
     }
@@ -345,25 +360,35 @@ export async function runBotCheckNode(
   if (key === "keyboard") {
     const cfg: TgApiBotConfig = parseTgApiBotConfig(bot.config);
     const mode = tgApiInterfaceMode(cfg);
-    if (mode === "keyboard") {
+    const menuConfig = parseBotMenuConfig(bot.menuConfig);
+    const feature = parseBotFeatureConfig(bot.config, countMenuStats(menuConfig.root).buttons > 0);
+    const keyboardEnabled = feature.keyboard.enabled;
+    const menuEnabled = feature.menu.enabled;
+    if (!keyboardEnabled && !menuEnabled) {
+      return { key, label, ok: true, ms: 0, detail: "内嵌按钮与自定义键盘均已关闭；用户只能通过已单独启用的指令入口访问 TGAPI 流程" };
+    }
+    if (keyboardEnabled && mode === "keyboard") {
       const kb = cfg.customKeyboard;
       if (!kb) {
-        return { key, label, ok: false, ms: 0, detail: "", error: "生效模式为自定义键盘，但键盘配置为空（运行端将回落内嵌按钮模式，与配置意图不符）", suggestion: "在「菜单和键盘 → 自定义键盘」保存键盘配置，或把界面模式切回「消息内嵌按钮」。" };
+        return { key, label, ok: false, ms: 0, detail: "", error: "已开启自定义键盘，但键盘配置为空，无法显示可操作的主键盘", suggestion: "在「菜单和键盘 → 自定义键盘」保存至少一个文本按钮，或切回消息内嵌按钮模式。" };
       }
-      const rowCount = kb.root.rows.length;
-      const buttons = kb.root.rows.flatMap((row) => row.buttons);
+      const flatten = (rows: typeof kb.root.rows): CustomKeyboardButton[] =>
+        rows.flatMap((row) => row.buttons.flatMap((button) => [button, ...(button.submenu ? flatten(button.submenu.rows) : [])]));
+      const buttons = flatten(kb.root.rows);
       const createButton = buttons.find((item) => item.action?.type === "tgapi_func" && item.action.tgapi_func === "create");
       const myButton = buttons.find((item) => item.action?.type === "tgapi_func" && item.action.tgapi_func === "my");
       if (!createButton) {
-        return { key, label, ok: false, ms: 0, detail: "", error: `键盘 ${rowCount} 行 ${buttons.length} 个按钮，但没有绑定「创建API」动作的文本按钮——用户无法进入申请流程`, suggestion: "在「菜单和键盘 → 自定义键盘」把「🗝 创建 API」设为文本按钮并绑定 TGAPI 指令「创建API」（或点「恢复图1默认键盘」后保存）。" };
+        return { key, label, ok: false, ms: 0, detail: "", error: `键盘含 ${buttons.length} 个按钮，但没有绑定「创建API」动作的文本按钮——用户无法进入申请流程`, suggestion: "在「菜单和键盘 → 自定义键盘」把一个文本按钮绑定 TGAPI 指令「创建API」。" };
       }
       if (createButton.kind !== "text") {
-        return { key, label, ok: false, ms: 0, detail: "", error: `「${createButton.text}」按钮类型为 ${createButton.kind}：点击只会直接共享${createButton.kind === "request_contact" ? "联系人" : "数据"}，不会发送按钮文本，创建流程永远无法开始`, suggestion: "在「菜单和键盘 → 自定义键盘」把该按钮改为「文本」类型并绑定「创建API」指令（手机号授权键盘会在流程内自动出现）。" };
+        return { key, label, ok: false, ms: 0, detail: "", error: `「${createButton.text}」按钮类型为 ${createButton.kind}：点击不会发送按钮文本，创建流程无法开始`, suggestion: "把创建 API 按钮改为「文本」类型并绑定「创建API」指令。" };
       }
-      return { key, label, ok: true, ms: 0, detail: `自定义键盘模式：${rowCount} 行 ${buttons.length} 按钮；「${createButton.text}」→ 创建API ✓${myButton ? `；「${myButton.text}」→ 我的API ✓` : ""}` };
+      return { key, label, ok: true, ms: 0, detail: `自定义键盘模式：${kb.root.rows.length} 行 ${buttons.length} 个按钮（含子菜单）；「${createButton.text}」→ 创建API ✓${myButton ? `；「${myButton.text}」→ 我的API ✓` : ""}` };
     }
-    const menu = parseBotMenuConfig(bot.menuConfig);
-    const stats = countMenuStats(menu.root);
+    if (!menuEnabled) {
+      return { key, label, ok: false, ms: 0, detail: "", error: "自定义键盘已开启，但界面模式不是键盘；内嵌按钮也已关闭", suggestion: "将界面模式切换为「自定义键盘」，或启用「消息内嵌按钮」。" };
+    }
+    const stats = countMenuStats(menuConfig.root);
     return { key, label, ok: true, ms: 0, detail: `消息内嵌按钮模式：菜单 ${stats.buttons} 个按钮${stats.submenus > 0 ? `（含 ${stats.submenus} 个子菜单）` : ""}` };
   }
 

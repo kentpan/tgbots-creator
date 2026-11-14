@@ -294,7 +294,8 @@ async function tgapiMainFlow(
   const resolveAction = (
     text: string,
   ): { func: string; action?: MenuButtonAction } | null => {
-    const button = buttonByText.get(text);
+    // 当前主键盘优先；子菜单按钮通过完整键盘树回查，确保嵌套层级的动作也可执行。
+    const button = buttonByText.get(text) ?? findKeyboardButtonByText(keyboard, text)?.button;
     if (button?.action) {
       if (button.action.type === "tgapi_func") {
         return { func: button.action.tgapi_func ?? "start", action: button.action };
@@ -595,7 +596,9 @@ async function tgapiMainFlow(
     const chosenPlatform =
       prefPlatform && isValidTgApiPlatformValue(prefPlatform)
         ? prefPlatform
-        : platformPool[0];
+        : await conversation.external(
+            () => platformPool[Math.floor(Math.random() * platformPool.length)],
+          );
     const effectiveShortName = deriveTgApiShortName(appTitle, cfg.appShortName);
     console.log(
       `TGAPI bot #${botId} create flow start: user ${from.id} title="${appTitle}" ` +
@@ -620,6 +623,7 @@ async function tgapiMainFlow(
         const contactPhone = evt.msg?.contact?.phone_number ?? null;
         const text = evt.msg?.text?.trim() ?? "";
         if (text === cancelLabel) {
+          await sendMenu(evt);
           return "done";
         }
         const candidate = extractPhoneNumber(evt.msg?.text ?? "", evt.msg?.entities, contactPhone);
@@ -876,6 +880,14 @@ async function tgapiMainFlow(
 
       const action = resolved.action;
       switch (resolved.func) {
+        case "start": {
+          if (action?.tgapi_response) {
+            await replyTemplate(evt, action.tgapi_response, "");
+          } else {
+            await sendMenu(evt);
+          }
+          break;
+        }
         case "create": {
           if (action?.tgapi_response) {
             await replyTemplate(evt, action.tgapi_response, "");
@@ -936,6 +948,7 @@ async function tgapiMainFlow(
             }
             const pickText = (pick.msg?.text ?? "").trim().replace(/^✅\s*/, "");
             if (pickText === backLabel || pickText === "/setplatform") {
+              await sendMenu(pick);
               chosen = true;
               break;
             }

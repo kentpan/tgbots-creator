@@ -21,10 +21,17 @@ export function createJoinVerifyComposer(botId: bigint): Composer<BotContext> {
     if (!joinRequest) return;
     const user = joinRequest.from;
     const chat = joinRequest.chat;
-    console.log(`New join request: user ${user.id} (${user.username}) → chat ${chat.id} (bot #${botId})`);
-
+    console.log(
+      `[join-verify] update received bot=#${botId} chat=${chat.id} user=${user.id} ` +
+        `user_chat_id=${joinRequest.user_chat_id} username=${user.username ?? "-"}`,
+    );
     const settings = await loadGroupSettingsForChat(BigInt(chat.id));
     const role = resolveDesignatedBot(settings, botId);
+    console.log(
+      `[join-verify] routing chat=${chat.id} bot=#${botId} role=${role} ` +
+        `designated=${settings?.joinVerifyBotId === null || settings?.joinVerifyBotId === undefined ? "manual" : `#${String(settings.joinVerifyBotId)}`} ` +
+        `groupApproval=${settings?.requireApproval === true}`,
+    );
 
     if (role === "other") {
       // 指定了其他加群验证机器人：当前机器人忽略（竞态守卫）
@@ -36,6 +43,17 @@ export function createJoinVerifyComposer(botId: bigint): Composer<BotContext> {
     }
     if (role === "manual") {
       // 未指定加群验证机器人：只落库，人工在「加群申请」页审批
+      await recordJoinRequestOnly(ctx.api, user, chat, "telegram");
+      return;
+    }
+
+    // Bot API 的 ChatJoinRequest.user_chat_id 是首次私聊的合法发送目标，
+    // from.id 仍是用户身份 ID。该字段缺失时绝不退回 from.id 猜测私聊地址。
+    if (!Number.isSafeInteger(joinRequest.user_chat_id) || joinRequest.user_chat_id === 0) {
+      console.error(
+        `[join-verify] chat_join_request missing valid user_chat_id: user=${user.id} chat=${chat.id} bot=#${botId}; ` +
+          "recording for manual review instead of attempting an unreliable DM",
+      );
       await recordJoinRequestOnly(ctx.api, user, chat, "telegram");
       return;
     }
@@ -63,7 +81,10 @@ export function createJoinVerifyComposer(botId: bigint): Composer<BotContext> {
       userChatId: joinRequest.user_chat_id,
     };
 
-    const result = await bootstrapJoinVerification(ctx.api, userWithChat, chat, "telegram", botId);
+    const result = await bootstrapJoinVerification(ctx.api, userWithChat, chat, "telegram", botId, {
+      settings,
+      resolved,
+    });
     if (!result) {
       console.error(
         `[join-verify] bootstrap returned null unexpectedly for chat ${chat.id} (bot #${botId}) — recorded for manual review`,

@@ -800,6 +800,14 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
   const profile = parseBotProfile(existing.config);
   const next = profile as unknown as Record<string, unknown>;
 
+  // /start 欢迎文案（纯文本，保存在 bots.config JSON，不新增数据库列/D1 写入）。
+  if (formData.has("welcome_text")) {
+    const welcomeText = String(formData.get("welcome_text") ?? "").replace(/\r\n?/g, "\n");
+    if (welcomeText.length > 3500) redirect(botPath({ error: "welcome-too-long" }));
+    if (welcomeText.trim()) next.welcomeText = welcomeText;
+    else delete next.welcomeText;
+  }
+
   // —— 隐私模式 + 指令勾选（与 saveTgApiBotAction / saveBotCommandMenuAction 同存储位） ——
   const privacyRaw = formData.get("privacyMode");
   if (privacyRaw !== null) next.privacyMode = privacyRaw === "1";

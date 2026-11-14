@@ -216,6 +216,8 @@ export interface TgSimulatorProps {
   onNodeNavigate: (nodeId: string) => void;
   /** 顶部提示条文案（默认：菜单预览提示） */
   systemNote?: string;
+  /** 普通机器人 /start 欢迎文案预览；为空时沿用菜单配置正文。 */
+  startWelcomeText?: string;
   /** 覆盖菜单模板变量（如真实的 chat_id / user_id），供机器人测试页传入仿真群组上下文 */
   templateVars?: Partial<MenuTemplateVars>;
   /** 外部注入的机器人消息（如加群验证提示），由父组件控制生命周期 */
@@ -279,6 +281,7 @@ export const TgSimulator = forwardRef<TgSimulatorHandle, TgSimulatorProps>(funct
   nodeId,
   onNodeNavigate,
   systemNote,
+  startWelcomeText,
   templateVars,
   promptMessage,
   onUserSend,
@@ -771,7 +774,11 @@ export const TgSimulator = forwardRef<TgSimulatorHandle, TgSimulatorProps>(funct
               <p className="mb-0.5 text-sm font-semibold" style={{ color: nameColor(botName) }}>
                 {botName}
               </p>
-              {config.content.type === "text" ? (
+              {startWelcomeText?.trim() ? (
+                <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-[#0f0f0f]">
+                  {startWelcomeText}
+                </p>
+              ) : config.content.type === "text" ? (
                 <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-[#0f0f0f]">
                   {config.content.text}
                 </p>

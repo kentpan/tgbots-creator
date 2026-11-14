@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Check, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
+import { IOS_BLUE, IOS_GREEN, IOS_GRAY_BG, IOS_TEXT_SECONDARY } from "@/components/admin/tg-app-simulator-primitives";
 
 /**
  * 新建群组面板（v2.0.15，机器人测试页仿真屏「新建会话」按钮 → 左滑滑入）。
@@ -17,10 +18,6 @@ import { Check, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
  * 面板底部展示该机器人的待绑定条目（等待创建中），可手动删除。
  */
 
-const IOS_BLUE = "#3390ec";
-const IOS_GREEN = "#34c759";
-const IOS_GRAY_BG = "#efeff4";
-const IOS_TEXT_SECONDARY = "#8e8e93";
 
 const NAME_COLORS = ["#e17076", "#faa774", "#a695e7", "#7bc862", "#6ec9cb", "#65aadd", "#ee7aae"];
 

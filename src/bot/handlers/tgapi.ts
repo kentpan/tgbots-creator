@@ -5,6 +5,7 @@ import { StatelessQuestion } from "@grammyjs/stateless-question";
 import type { BotContext } from "../context";
 import { htmlEscape } from "@/utils/html";
 import {
+  getGroupSettings,
   getTgApiBotUser,
   getTgApiUnlock,
   listBotCommandsByIds,
@@ -104,6 +105,28 @@ const TGAPI_UNLOCK_CALLBACK = "tgapi:unlock";
  */
 const TGAPI_FUNC_CALLBACK_PREFIX = "tgapi_func:";
 
+/**
+ * TGAPI 申请机器人只负责自动批准自己的普通申请群，不得抢处理开启了新成员审核的群。
+ * 目标群若已指定自动审核机器人（例如 #2 看门狗）或启用了人工审核，TGAPI 必须忽略
+ * chat_join_request，避免与真正的加群验证机器人竞态并绕过验证码。
+ */
+async function shouldAutoApproveTgApiJoinRequest(
+  botId: bigint,
+  chatId: bigint,
+): Promise<boolean> {
+  const settings = await getGroupSettings(chatId);
+  if (!settings) return true;
+  if (settings.requireApproval || settings.joinVerifyBotId !== null) {
+    console.log(
+      `[TGAPI] join request ignored: chat ${chatId} has approval workflow ` +
+        `(requireApproval=${settings.requireApproval}, designatedBot=${settings.joinVerifyBotId === null ? "manual" : `#${String(settings.joinVerifyBotId)}`}); ` +
+        `TGAPI bot #${botId} will not bypass it`,
+    );
+    return false;
+  }
+  return true;
+}
+
 /** 申请人自定义 APP 名称/描述的长度上限（my.telegram.org 表单约束） */
 const APP_TITLE_MAX_LENGTH = 32;
 const APP_DESCRIPTION_MAX_LENGTH = 200;
@@ -150,6 +173,10 @@ export async function registerTgApiHandlers(
   options: TgApiHandlerOptions,
 ): Promise<() => Promise<void>> {
   const { menuConfig, registry } = options;
+  // TGAPI「菜单和键盘」弹窗的界面开关必须参与运行时判定：none=两者都不展示，
+  // inline=仅内嵌按钮，keyboard=仅自定义键盘。旧配置缺字段时维持兼容默认。
+  const menuEnabled = options.feature?.menu.enabled ?? true;
+  const keyboardEnabled = options.feature?.keyboard.enabled ?? Boolean(cfg.customKeyboard);
 
   /** 会话语言偏好优先，未设置按用户 language_code 自动识别（zh* → 中文） */
   function langOf(ctx: BotContext): TgApiLang {
@@ -197,13 +224,14 @@ export async function registerTgApiHandlers(
   // 旧数据无 interfaceMode 时 tgApiInterfaceMode 按原语义（customKeyboard 非空）推断。
   // 生效条件 = 键盘模式 && 键盘配置非空（空键盘回落内嵌按钮）。
   // ---------------------------------------------------------------------------
-  if (tgApiInterfaceMode(cfg) === "keyboard" && cfg.customKeyboard) {
+  if (keyboardEnabled && tgApiInterfaceMode(cfg) === "keyboard" && cfg.customKeyboard) {
     registerTgApiConversation(bot, { cfg, botId, keyboard: cfg.customKeyboard, registry, feature: options.feature });
     // 加群申请自动通过（与内嵌模式同一能力，对话模式下仍需生效）
     bot.on("chat_join_request", async (ctx) => {
       const joinRequest = ctx.chatJoinRequest;
       if (!joinRequest) return;
       const { from: requestUser, chat } = joinRequest;
+      if (!(await shouldAutoApproveTgApiJoinRequest(botId, BigInt(chat.id)))) return;
       const approval = await approveTelegramJoinRequest(BigInt(chat.id), BigInt(requestUser.id), ctx.api);
       console.log(
         `TGAPI bot #${botId} join request: user ${requestUser.id} ` +
@@ -367,15 +395,21 @@ export async function registerTgApiHandlers(
           );
         });
     }
-    let markup: InlineKeyboardMarkup;
-    if (countMenuStats(menuConfig.root).buttons > 0) {
+    let markup: InlineKeyboardMarkup | undefined;
+    if (!menuEnabled) {
+      // 管理员显式关闭内嵌按钮且未启用自定义键盘时，不能偷偷回落授权按钮。
+      markup = undefined;
+    } else if (countMenuStats(menuConfig.root).buttons > 0) {
       markup = await renderMenuMarkup(menuConfig, bot, registry);
     } else {
       markup = {
         inline_keyboard: [[{ text: "🔐 授权认证", callback_data: TGAPI_UNLOCK_CALLBACK }]],
       };
     }
-    const sent = await ctx.reply(texts.start, { parse_mode: "HTML", reply_markup: markup });
+    const sent = await ctx.reply(texts.start, {
+      parse_mode: "HTML",
+      ...(markup ? { reply_markup: markup } : {}),
+    });
     // 台账记录最新菜单消息 id（下一轮 /start 移除旧键盘 + 过期拦截共同依赖）
     await saveTgApiBotUser({
       botId,
@@ -642,6 +676,7 @@ export async function registerTgApiHandlers(
     const joinRequest = ctx.chatJoinRequest;
     if (!joinRequest) return;
     const { from: requestUser, chat } = joinRequest;
+    if (!(await shouldAutoApproveTgApiJoinRequest(botId, BigInt(chat.id)))) return;
     const approval = await approveTelegramJoinRequest(BigInt(chat.id), BigInt(requestUser.id), ctx.api);
     console.log(
       `TGAPI bot #${botId} join request: user ${requestUser.id} (${requestUser.username ?? "no username"}) ` +
@@ -786,10 +821,11 @@ export async function registerTgApiHandlers(
       const effectiveDescription = prefDesc || cfg.appDescription;
       const effectiveShortName = deriveTgApiShortName(effectiveTitle, cfg.appShortName);
       const prefPlatform = ctx.session.tgapiPlatform;
+      const platformPool = cfg.appPlatforms.length > 0 ? cfg.appPlatforms : [...TGAPI_APP_PLATFORMS];
       const effectivePlatform =
         prefPlatform && isValidTgApiPlatformValue(prefPlatform)
           ? prefPlatform
-          : cfg.appPlatforms[0];
+          : platformPool[Math.floor(Math.random() * platformPool.length)];
 
       // 原实现：抓取现有 APP → 无则按参数创建 → 再抓取（stars have failed us 兜底）
       let scraped: TgOrgScrapeResult | null = null;

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ListTree } from "lucide-react";
+import { EditorMobileSwitch } from "@/components/admin/editor-mobile-switch";
 import {
   Dialog,
   DialogContent,
@@ -122,6 +123,16 @@ function readMenuDraft(bot?: DesignerBotInfo): BotMenuConfig {
   return emptyMenuConfig();
 }
 
+function readWelcomeText(bot?: DesignerBotInfo): string {
+  if (!bot) return "";
+  try {
+    const parsed = JSON.parse(bot.config) as { welcomeText?: unknown };
+    return typeof parsed.welcomeText === "string" ? parsed.welcomeText : "";
+  } catch {
+    return "";
+  }
+}
+
 export function FeatureConfigDialog({
   bot,
   methods,
@@ -137,6 +148,8 @@ export function FeatureConfigDialog({
   triggerClassName?: string;
 }) {
   const [open, setOpen] = useState(false);
+  const [mobilePane, setMobilePane] = useState<"config" | "preview">("config");
+  const editorScrollRef = useRef<HTMLDivElement>(null);
   const cfg = useMemo(() => parseDesignerTgApiCfg(bot), [bot]);
   const profile = useMemo(() => parseDesignerProfile(bot), [bot]);
   const suffix = bot ? String(bot.id) : "new";
@@ -145,6 +158,7 @@ export function FeatureConfigDialog({
   // —— 配置状态（单一事实源；每次打开按最新已保存数据重置） ——
   const [feature, setFeature] = useState<FeatureDraft>(() => readFeatureDraft(bot));
   const [menu, setMenu] = useState<BotMenuConfig>(() => readMenuDraft(bot));
+  const [welcomeText, setWelcomeText] = useState(() => readWelcomeText(bot));
   const [kbPayload, setKbPayload] = useState<string>(() =>
     cfg.customKeyboard ? JSON.stringify(cfg.customKeyboard) : "",
   );
@@ -170,6 +184,7 @@ export function FeatureConfigDialog({
     if (open) {
       setFeature(readFeatureDraft(bot));
       setMenu(readMenuDraft(bot));
+      setWelcomeText(readWelcomeText(bot));
       setKbPayload(cfg.customKeyboard ? JSON.stringify(cfg.customKeyboard) : "");
       setPrivacyMode(profile.privacyMode);
       setSelectedCommandIds(profile.commandIds);
@@ -179,12 +194,10 @@ export function FeatureConfigDialog({
   const patch = (partial: Partial<FeatureDraft>): void =>
     setFeature((prev) => ({ ...prev, ...partial }));
 
-  // 键盘编辑器回调（CustomKeyboardDesigner 在 render 中回调 onConfigChange —— 延迟到微任务）
-  const handleKbConfigChange = (config: CustomKeyboardConfig): void => {
-    queueMicrotask(() => {
-      setKbPayload(config.root.rows.length === 0 ? "" : JSON.stringify(config));
-    });
-  };
+  // 子编辑器在 commit 后通过 effect 回传变更；宿主直接更新待保存载荷。
+  const handleKbConfigChange = useCallback((config: CustomKeyboardConfig): void => {
+    setKbPayload(config.root.rows.length === 0 ? "" : JSON.stringify(config));
+  }, []);
   const currentKb = useMemo<CustomKeyboardConfig>(() => {
     if (!kbPayload) return { options: emptyKeyboardOptions(), root: { rows: [] } };
     try {
@@ -248,7 +261,7 @@ export function FeatureConfigDialog({
       return;
     }
     if (action.type === "verify") {
-      simAppend("bot", "🔐 外部验证 API：真实端点击后要求回复验证码，调用绑定验证方式真实核验。");
+      simAppend("bot", "🔐 外部验证 API：真实端在输入框直接发送验证码，机器人调用绑定验证方式核验；无需回复提示消息。");
       return;
     }
     if (action.type === "switch_inline") {
@@ -348,15 +361,66 @@ export function FeatureConfigDialog({
           <input type="hidden" name="gate_keyboard_required" value={feature.gateKeyboardRequired ? "1" : "0"} />
           <input type="hidden" name="gate_commands_required" value={feature.gateCommandsRequired ? "1" : "0"} />
           <input type="hidden" name="join_verify_enabled" value={feature.joinVerifyEnabled ? "1" : "0"} />
+          <input type="hidden" name="welcome_text" value={welcomeText} />
           <input type="hidden" name="gate_enabled" value={feature.gateEnabled ? "1" : "0"} />
 
-          <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-4">
+          <div ref={editorScrollRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-6 sm:py-4">
+            <div className="mb-3 lg:hidden">
+              <EditorMobileSwitch
+                value={mobilePane}
+                onChange={(pane) => {
+                  setMobilePane(pane);
+                  editorScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+                }}
+              />
+            </div>
             <div className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[1fr_430px]">
               {/* —— 左侧配置区 —— */}
-              <div className="min-w-0 space-y-4">
+              <div className={`min-w-0 space-y-4 ${mobilePane === "config" ? "block" : "hidden"} lg:block`}>
                 <DesignerBasicInfo bot={bot} suffix={suffix} defaultName="机器人" />
 
+                <nav aria-label="功能配置快速导航" className="sticky top-0 z-20 -mx-1 flex gap-1 overflow-x-auto rounded-xl border bg-background/95 p-1 shadow-sm backdrop-blur">
+                  {[
+                    ["#welcome-config", "欢迎消息"],
+                    ["#join-verify-config", "加群验证"],
+                    ["#gate-config", "门禁解锁"],
+                    ["#interface-config", "菜单与键盘"],
+                    ["#groups-config", "真实群组"],
+                  ].map(([href, label]) => (
+                    <a
+                      key={href}
+                      href={href}
+                      className="shrink-0 rounded-lg px-3 py-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    >
+                      {label}
+                    </a>
+                  ))}
+                </nav>
+
+                <section id="welcome-config" className="scroll-mt-16 rounded-xl border bg-card p-4 space-y-3">
+                  <div>
+                    <h3 className="text-sm font-semibold">💬 /start 欢迎消息（可自定义）</h3>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      这里编辑用户首次打开机器人看到的整段介绍。留空使用 TGuard 默认文案；支持换行与变量 {"{{bot_name}}"}、{"{{bot_username}}"}。菜单按钮仍由下方菜单配置控制。
+                    </p>
+                  </div>
+                  <textarea
+                    value={welcomeText}
+                    onChange={(event) => setWelcomeText(event.target.value)}
+                    rows={8}
+                    maxLength={3500}
+                    placeholder="🤖 欢迎使用……\n\n🛡️ 功能介绍……\n\n使用 /help 查看更多信息"
+                    className={`${designerInputClass()} min-h-36 resize-y font-mono text-sm leading-relaxed`}
+                    aria-label="机器人 /start 欢迎消息"
+                  />
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>纯文本安全发送，不需要转义 Markdown 特殊字符。</span>
+                    <span>{welcomeText.length}/3500</span>
+                  </div>
+                </section>
+
                 {/* 🚪 加群验证 */}
+                <div id="join-verify-config" className="scroll-mt-16">
                 <ConfigPanel
                   title="🚪 自动响应加群申请（加群验证）"
                   description="开启后，被群组指定为「自动审核机器人」时自动验证加群申请：私聊发送验证消息，通过后静默放行，失败 3 次拒绝。还需在群组「群组信息 → 新成员审核」中选择本机器人。"
@@ -411,8 +475,10 @@ export function FeatureConfigDialog({
                     </div>
                   </div>
                 </ConfigPanel>
+                </div>
 
                 {/* 🔐 门禁解锁 */}
+                <div id="gate-config" className="scroll-mt-16">
                 <ConfigPanel
                   title="🔐 门禁解锁（会话级，全局共享）"
                   description="挂在内嵌按钮/自定义键盘按钮/指令上的前置验证：未解锁用户点击后先完成验证，解锁一次对该机器人所有门禁入口永久生效。"
@@ -429,9 +495,10 @@ export function FeatureConfigDialog({
                     }
                   />
                 </ConfigPanel>
+                </div>
 
                 {/* 🧩 功能开关 + 平铺配置模块 */}
-                <div className="space-y-3 rounded-xl border bg-card p-4">
+                <div id="interface-config" className="scroll-mt-16 space-y-3 rounded-xl border bg-card p-4">
                   <div>
                     <p className="text-sm font-semibold">🧩 功能开关（显式开启才生效）</p>
                     <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
@@ -587,7 +654,7 @@ export function FeatureConfigDialog({
                 </div>
 
                 {/* 🧭 真实群组 */}
-                <div className="rounded-xl border bg-card p-4">
+                <div id="groups-config" className="scroll-mt-16 rounded-xl border bg-card p-4">
                   <div className="flex items-center justify-between gap-3">
                     <p className="text-sm font-semibold">🧭 机器人所在真实群组</p>
                     <button
@@ -619,12 +686,13 @@ export function FeatureConfigDialog({
               </div>
 
               {/* —— 右侧仿真屏（固定容器，数据驱动）：配置 state → props 即时呈现 —— */}
-              <div className="min-w-0 lg:sticky lg:top-0 lg:self-start">
+              <div className={`min-w-0 lg:sticky lg:top-0 lg:self-start ${mobilePane === "preview" ? "block" : "hidden"} lg:block`}>
                 <div key={sim.resetKey}>
                   <TgSimulator
                     ref={simRef}
                     config={simulatorConfig}
                     botName={botDisplayName}
+                    startWelcomeText={welcomeText}
                     groupTitle={realGroupTitle}
                     memberCount={realGroups.groups.length > 0 ? "已部署的真实群组" : ""}
                     nodeId={simNodeId}

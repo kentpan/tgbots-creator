@@ -3,6 +3,7 @@
 import { useEffect, useCallback, useMemo, useRef, useState } from "react";
 import { TgapiProxyConfigSection } from "@/components/admin/tgapi-proxy-config-section";
 import { ListTree } from "lucide-react";
+import { EditorMobileSwitch } from "@/components/admin/editor-mobile-switch";
 import {
   Dialog,
   DialogContent,
@@ -105,12 +106,13 @@ export function TgApiMenuKeyboardDialog({
   triggerClassName?: string;
 }) {
   const [open, setOpen] = useState(false);
+  const [mobilePane, setMobilePane] = useState<"config" | "preview">("config");
+  const editorScrollRef = useRef<HTMLDivElement>(null);
   const cfg = useMemo(() => parseDesignerTgApiCfg(bot), [bot]);
   const profile = useMemo(() => parseDesignerProfile(bot), [bot]);
   const suffix = bot ? String(bot.id) : "new";
   const selectedPlatforms = useMemo(() => new Set(cfg.appPlatforms), [cfg.appPlatforms]);
   const botDisplayName = bot?.username ? `@${bot.username}` : bot?.name ?? "TGAPI申请机器人";
-  const activeMode = tgApiInterfaceMode(cfg);
 
   // —— 🧩 功能开关（与机器人管理「功能配置」弹窗同一模型）：互斥 check 可全关 +
   //     指令菜单独立勾选 + 各面板门禁解锁开关；每次打开按最新已保存数据重置 ——
@@ -126,9 +128,16 @@ export function TgApiMenuKeyboardDialog({
     if (!botInfo) {
       return { uiMode: "inline", commandsEnabled: false, gateMenuRequired: false, gateKeyboardRequired: false, gateCommandsRequired: false };
     }
-    const feature = parseBotFeatureConfig(botInfo.config, false);
+    const hasMenuConfig = countMenuStats(parseBotMenuConfig(botInfo.menuConfig).root).buttons > 0;
+    const feature = parseBotFeatureConfig(botInfo.config, hasMenuConfig);
+    const activeMode = tgApiInterfaceMode(parseDesignerTgApiCfg(botInfo));
     return {
-      uiMode: feature.keyboard.enabled ? "keyboard" : feature.menu.enabled ? "inline" : "none",
+      uiMode:
+        feature.keyboard.enabled && activeMode === "keyboard"
+          ? "keyboard"
+          : feature.menu.enabled
+            ? "inline"
+            : "none",
       commandsEnabled: feature.commands.enabled,
       gateMenuRequired: feature.gateMenuRequired === true,
       gateKeyboardRequired: feature.gateKeyboardRequired === true,
@@ -161,11 +170,8 @@ export function TgApiMenuKeyboardDialog({
     cfg.customKeyboard ? JSON.stringify(cfg.customKeyboard) : "",
   );
   const handleKbConfigChange = useCallback((config: CustomKeyboardConfig): void => {
-    // CustomKeyboardDesigner 在 render 中回调 onConfigChange（React 受控同步），
-    // 直接 setState 会触发「render 期间更新其他组件」告警 —— 延迟到微任务执行
-    queueMicrotask(() => {
-      setKbPayload(config.root.rows.length === 0 ? "" : JSON.stringify(config));
-    });
+    // 子编辑器在 commit 后通过 effect 回传变更，避免 render 阶段跨组件更新。
+    setKbPayload(config.root.rows.length === 0 ? "" : JSON.stringify(config));
   }, []);
   const currentKb = useMemo<CustomKeyboardConfig>(() => {
     if (!kbPayload) return { options: emptyKeyboardOptions(), root: { rows: [] } };
@@ -453,14 +459,37 @@ export function TgApiMenuKeyboardDialog({
           <input type="hidden" name="privacyMode" value={privacyMode ? "1" : "0"} />
           <input type="hidden" name="commandIds" value={JSON.stringify(selectedCommandIds)} />
 
-          <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-4">
+          <div ref={editorScrollRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-6 sm:py-4">
+            <div className="mb-3 lg:hidden">
+              <EditorMobileSwitch
+                value={mobilePane}
+                onChange={(pane) => {
+                  setMobilePane(pane);
+                  editorScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+                }}
+              />
+            </div>
             <div className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[1fr_430px]">
               {/* —— 左侧配置区 —— */}
-              <div className="min-w-0 space-y-4">
+              <div className={`min-w-0 space-y-4 ${mobilePane === "config" ? "block" : "hidden"} lg:block`}>
                 <DesignerBasicInfo bot={bot} suffix={suffix} defaultName="TGAPI申请机器人" />
 
+                <nav aria-label="TGAPI 菜单与键盘配置快速导航" className="sticky top-0 z-20 -mx-1 flex gap-1 overflow-x-auto rounded-xl border bg-background/95 p-1 shadow-sm backdrop-blur">
+                  {[
+                    ["#tgapi-groups-config", "真实群组"],
+                    ["#tgapi-app-config", "APP 参数"],
+                    ["#tgapi-gate-config", "解锁门禁"],
+                    ["#tgapi-text-config", "消息文案"],
+                    ["#tgapi-interface-config", "菜单与键盘"],
+                  ].map(([href, label]) => (
+                    <a key={href} href={href} className="shrink-0 rounded-lg px-3 py-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+                      {label}
+                    </a>
+                  ))}
+                </nav>
+
                 {/* 2️⃣ 真实群组 + 申请加群按钮 */}
-                <div className="rounded-xl border bg-card p-4">
+                <div id="tgapi-groups-config" className="scroll-mt-16 rounded-xl border bg-card p-4">
                   <div className="flex items-center justify-between gap-3">
                     <p className="text-sm font-semibold">2️⃣ 🧭 机器人所在真实群组</p>
                     <button
@@ -491,7 +520,7 @@ export function TgApiMenuKeyboardDialog({
                 <TgapiProxyConfigSection />
 
                 {/* 3️⃣ my.telegram.org APP 创建参数（可折叠, 默认收起） */}
-                <div className="rounded-lg border bg-muted/20">
+                <div id="tgapi-app-config" className="scroll-mt-16 rounded-lg border bg-muted/20">
                   <button
                     type="button"
                     onClick={() => setAppParamsOpen((v) => !v)}
@@ -590,14 +619,16 @@ export function TgApiMenuKeyboardDialog({
                 </div>
 
                 {/* 🔐 解锁门禁全局配置（通用组件：unlock_mode 恒 captcha + verification_method_id 随表单提交） */}
+                <div id="tgapi-gate-config" className="scroll-mt-16">
                 <TgApiGatePanel
                   idScope={`gate-${suffix}`}
                   methods={methods}
                   verificationMethodId={cfg.verificationMethodId}
                 />
+                </div>
 
                 {/* 4️⃣ 消息配置（中英双语；当前仿真语言文案实时同步仿真屏）可折叠, 默认收起 */}
-                <div className="rounded-lg border bg-muted/20">
+                <div id="tgapi-text-config" className="scroll-mt-16 rounded-lg border bg-muted/20">
                   <button
                     type="button"
                     onClick={() => setMsgConfigOpen((v) => !v)}
@@ -668,7 +699,7 @@ export function TgApiMenuKeyboardDialog({
 
                 {/* 🧩 功能开关（显式开启才生效）：消息内嵌按钮 ⇄ 自定义键盘互斥 + 指令菜单独立；
                     平铺配置模块 —— 与机器人管理「功能配置」弹窗同一模型（复用，无割裂模块） */}
-                <div className="space-y-3 rounded-xl border bg-card p-4">
+                <div id="tgapi-interface-config" className="scroll-mt-16 space-y-3 rounded-xl border bg-card p-4">
                   <div>
                     <p className="text-sm font-semibold">🧩 功能开关（显式开启才生效）</p>
                     <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
@@ -690,7 +721,7 @@ export function TgApiMenuKeyboardDialog({
                       />
                       <span className="min-w-0">
                         <span className="block font-medium">💬 消息内嵌按钮
-                          {activeMode === "inline" ? <span className="ml-1 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">生效中</span> : null}
+                          {uiMode === "inline" ? <span className="ml-1 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">生效中</span> : null}
                         </span>
                         <span className="block text-[11px] text-muted-foreground">初始消息底部 InlineKeyboard</span>
                       </span>
@@ -709,7 +740,7 @@ export function TgApiMenuKeyboardDialog({
                       />
                       <span className="min-w-0">
                         <span className="block font-medium">⌨️ 自定义键盘
-                          {activeMode === "keyboard" ? <span className="ml-1 rounded-full bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700">生效中</span> : null}
+                          {uiMode === "keyboard" ? <span className="ml-1 rounded-full bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700">生效中</span> : null}
                         </span>
                         <span className="block text-[11px] text-muted-foreground">ReplyKeyboard 对话流程{!bot ? "（先保存机器人）" : ""}</span>
                       </span>
@@ -846,7 +877,7 @@ export function TgApiMenuKeyboardDialog({
               </div>
 
               {/* —— 右侧仿真屏（固定容器，数据驱动）：配置 state → props 即时呈现 —— */}
-              <div className="min-w-0 lg:sticky lg:top-0 lg:self-start">
+              <div className={`min-w-0 lg:sticky lg:top-0 lg:self-start ${mobilePane === "preview" ? "block" : "hidden"} lg:block`}>
                 <div key={sim.resetKey}>
                   <TgSimulator
                     ref={simRef}
@@ -878,7 +909,7 @@ export function TgApiMenuKeyboardDialog({
                     {uiMode === "inline" ? `内嵌按钮 ${stats.buttons} 个 · ${stats.submenus} 个子菜单（初始消息随文案实时同步）` : "内嵌按钮未开启"}
                     {uiMode === "keyboard" ? "；自定义键盘面板在私聊输入框下方（⌨️ 展开）" : ""}
                     {uiMode === "none" ? "；界面模块全部关闭 → /start 纯文本欢迎" : ""}
-                    。仿真流程与真实机器人完全一致：申请加入群组 → 自动通过并跳转私聊 → 创建API（解锁门禁 → 手机号 → 登录码）→ /start 重发。
+                    。此处是交互预览：解锁验证码与 API 凭据使用明确标注的演示数据，不会真实登录 my.telegram.org；真实申请请使用「TGAPI申请」页面的申请向导。
                   </p>
                 </div>
               </div>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Keyboard as KeyboardIcon } from "lucide-react";
 import {
   Dialog,
@@ -140,14 +140,18 @@ export function CustomKeyboardDesigner({
   const [config, setConfigState] = useState<CustomKeyboardConfig>(
     () => initialConfig ?? { options: emptyKeyboardOptions(), root: { rows: [] } },
   );
-  // v2.2.6 嵌入模式：每次配置变更同步回调宿主（统一表单 hidden custom_keyboard 载荷）
+  // 状态更新器保持纯函数；配置同步通过 effect 在 commit 后通知宿主，避免
+  // 在 React state updater 中执行外部 setState（并发渲染下可能重复执行）。
+  const emittedConfigRef = useRef(JSON.stringify(config));
   const setConfig = (updater: (prev: CustomKeyboardConfig) => CustomKeyboardConfig): void => {
-    setConfigState((prev) => {
-      const next = updater(prev);
-      onConfigChange?.(next);
-      return next;
-    });
+    setConfigState(updater);
   };
+  useEffect(() => {
+    const serialized = JSON.stringify(config);
+    if (serialized === emittedConfigRef.current) return;
+    emittedConfigRef.current = serialized;
+    onConfigChange?.(config);
+  }, [config, onConfigChange]);
   const [selected, setSelected] = useState<string | null>(null);
 
   const mutate = (mutator: (draft: CustomKeyboardConfig) => void): void => {

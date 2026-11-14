@@ -7,10 +7,9 @@ import { getLatestVerificationContext } from "@/database/operations";
 /**
  * 加群验证的无状态问题（stateless-question）。
  *
- * Telegram 默认开启隐私模式（privacy mode），机器人无法收到群内的普通文本消息；
- * 但用户「回复」机器人消息的消息始终可达。本插件把验证问题消息附加一个
- * 用户不可见的后缀并发送（force_reply），用户回复该消息时机器人即可在
- * 不关闭隐私模式、不申请管理员以外的权限的情况下完成验证码校验。
+ * 兼容历史验证消息的无状态问题（legacy reply path）。当前申请制加群验证的主交互
+ * 是私聊输入框直接发送验证码，由 handleCodeInput 按 ctx.from.id 查找会话；不再
+ * 依赖 force_reply 或隐形后缀。此中间件只保留给仍在回复旧提示消息的用户。
  *
  * 问题的状态完全编码在消息后缀中（无状态），机器人重启不会丢失验证上下文；
  * 会话的尝试次数与过期时间仍由数据库 verification_sessions 管理。

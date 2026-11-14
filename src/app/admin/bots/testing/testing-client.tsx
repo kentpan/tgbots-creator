@@ -922,7 +922,7 @@ export function TestingClient({
                       hint:
                         isGroupChannelView(session.verificationChannel, session.chatId)
                           ? "群内验证消息（仿真：点击消息下方按钮/在输入框模拟输码）"
-                          : "请输入验证码后点击发送按钮（仿真 force_reply）",
+                          : "直接在输入框输入验证码并发送（无需回复验证消息）",
                     }
                   : null
               }

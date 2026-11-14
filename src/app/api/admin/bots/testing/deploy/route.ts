@@ -20,7 +20,7 @@ import { acquireStableGroupInviteLink, migratedChatIdFromError } from "@/service
  * 2. getChat          —— 群组真实存在且机器人可见
  * 3. getChatMember    —— 机器人是否已在群里 / 是否管理员 / 是否有「邀请用户」权限
  *                        （机器人 user id 直接取自 Token 前段，无需等待 getMe）
- * 4. createChatInviteLink(creates_join_request) —— 生成入群申请链接并保存（校验通过后串行执行）
+ * 4. createChatInviteLink —— 按群组「新成员审核」设置生成申请制/普通邀请链接并保存
  *
  * Telegram 官方限制：机器人无法通过 API 把自己拉进群、也无法自我提升为管理员，
  * 因此步骤「拉进群」「设为管理员」必须由群管理员在 Telegram 客户端手动完成；
@@ -203,13 +203,14 @@ export async function POST(request: Request): Promise<NextResponse> {
 
     // v2.0.12：Telegram 官方限制 creates_join_request 仅超级群/频道可用，
     // 基础群传该参数会直接报错 —— 按群组类型自动选择链接形态：
-    // 超级群/频道 → 申请制链接（点链接出「申请加入」按钮 → chat_join_request 事件）；
-    // 基础群 → 普通链接（点链接直接进群 → chat_member 事件触发补验证，私聊发码）
+    // 超级群/频道 + 新成员审核开启 → 申请制链接（chat_join_request）；
+    // 新成员审核关闭或基础群 → 普通链接（chat_member 直连补验证，私聊发码）
     //
     // v2.0.14：不再每次部署都无条件新建链接 —— 优先复用已保存的邀请链接
     // （editChatInviteLink 存活探测，is_revoked/报错视为死链才重建），并把部署
     // 状态合并写回 rights（不再整列覆盖，避免与机器人权限配置互踩）。
     let superGroup = isSuperGroupChatId(effectiveChatId);
+    let groupSettings = await getGroupSettings(effectiveChatId);
     let linkAcquired: Awaited<ReturnType<typeof acquireStableGroupInviteLink>>;
     try {
       linkAcquired = await withTelegramTimeout(
@@ -217,6 +218,7 @@ export async function POST(request: Request): Promise<NextResponse> {
           api,
           chatId: effectiveChatId,
           superGroup,
+          requireApproval: groupSettings?.requireApproval ?? false,
           publicUsername,
           botId: bot.id,
           meta: { bot_username: me.username ?? null, chat_title: chatTitle },
@@ -252,11 +254,13 @@ export async function POST(request: Request): Promise<NextResponse> {
         });
       }
       superGroup = isSuperGroupChatId(effectiveChatId);
+      groupSettings = await getGroupSettings(effectiveChatId);
       linkAcquired = await withTelegramTimeout(
         acquireStableGroupInviteLink({
           api,
           chatId: effectiveChatId,
           superGroup,
+          requireApproval: groupSettings?.requireApproval ?? false,
           publicUsername,
           botId: bot.id,
           meta: { bot_username: me.username ?? null, chat_title: chatTitle },

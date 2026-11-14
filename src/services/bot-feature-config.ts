@@ -124,7 +124,13 @@ export function parseBotFeatureConfig(configRaw: string, hasMenuConfig: boolean)
 
   const commandIds = parseCommandIds(root.commandIds);
   const customKeyboardRaw = asRecord(root.customKeyboard);
-  const keyboardHasData = Object.keys(customKeyboardRaw).length > 0;
+  // TGAPI 机器人历史版本把键盘保存在 bots.config.tgapi.customKeyboard；
+  // 通用机器人则保存在顶层 customKeyboard。缺少显式 keyboardEnabled 的旧数据
+  // 必须兼容两种存储位置，否则升级后 TGAPI 自定义键盘会被误判为关闭。
+  const tgapiRaw = asRecord(root.tgapi);
+  const tgapiKeyboardRaw = asRecord(tgapiRaw.customKeyboard);
+  const keyboardHasData =
+    Object.keys(customKeyboardRaw).length > 0 || Object.keys(tgapiKeyboardRaw).length > 0;
   const interfaceModeRaw = root.interfaceMode;
 
   return {

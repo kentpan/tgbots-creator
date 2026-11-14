@@ -221,14 +221,26 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   // 隐私红线：仿真动作一律只停留在仿真屏，绝不真实发送到群组 —— 不调用 Telegram API。
   const minutes = Math.max(1, Math.round(resolved.timeoutSeconds / 60));
+  // 仿真交互必须与真实私聊链路一致：code_self / code_api 均在输入框直接提交，
+  // 不使用 force_reply；只有 captcha 才通过验证网页完成。此前把 code_api 误归入
+  // captcha 分支，导致仿真屏提示网页验证，实际 submit-code 却走文本卡密校验。
+  const configuredPrompt = settings?.promptText?.trim() ?? "";
+  // 数据库旧默认值曾使用 force_reply 文案；识别该历史默认值并迁移为直接输入提示。
+  const directInputPrompt =
+    !configuredPrompt || configuredPrompt === "🔐 请回复本消息并输入验证码完成验证"
+      ? "🔐 请在下方输入框直接发送验证码完成验证"
+      : configuredPrompt;
   const promptText =
     resolved.method === "code_self"
-      ? `${settings?.promptText ?? "🔐 请回复本消息并输入验证码完成验证"}\n\n` +
+      ? `${directInputPrompt}\n\n` +
         `您的入群验证码：${joinCode}\n\n` +
-        `⏱ 验证码 ${minutes} 分钟内有效，请回复本消息并输入上述验证码完成验证，验证通过后将自动批准入群。请勿把验证码泄露给他人。`
-      : `👋 欢迎 @preview_user 加入「${settings?.chatTitle ?? "群组"}」！\n\n` +
-        `请在 ${minutes} 分钟内完成验证（外部验证码核验），验证通过后将自动批准入群。\n\n` +
-        "🔒 验证过程在验证页面完成，群里其他成员不可见。";
+        `⏱ 验证码 ${minutes} 分钟内有效，请直接在输入框发送上述验证码，无需回复本消息。验证通过后将自动批准入群。请勿把验证码泄露给他人。`
+      : resolved.method === "code_api"
+        ? `${directInputPrompt}\n\n` +
+          `⏱ 请在 ${minutes} 分钟内直接输入验证码并发送，系统将调用绑定的外部验证 API 核验；验证通过后将自动批准入群。无需回复本消息。`
+        : `👋 欢迎 @preview_user 加入「${settings?.chatTitle ?? "群组"}」！\n\n` +
+          `请在 ${minutes} 分钟内点击验证入口完成人机验证，验证通过后将自动批准入群。\n\n` +
+          "🔒 验证过程在验证页面完成，群里其他成员不可见。";
 
   return NextResponse.json({
     ok: true,

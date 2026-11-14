@@ -79,6 +79,8 @@ interface BotProfileConfig {
   aiSupport?: AiSupportConfig;
   /** TGAPI申请 机器人配置（v2.1.6）：启用后实例为纯私聊对话工具机器人（MyTelegramOrgRoBot 复刻） */
   tgapi?: TgApiBotConfig;
+  /** 普通机器人 /start 欢迎消息（纯文本；空值使用内置默认消息）。 */
+  welcomeText?: string;
   /** v2.2.0 自定义键盘（ReplyKeyboard）：通用机器人附加到 /start 欢迎消息；TGAPI 机器人由 tgapi.customKeyboard 承载（互斥切换见 services/custom-keyboard.ts） */
   customKeyboard?: unknown;
 }
@@ -441,6 +443,8 @@ async function registerBotCapabilities(
   bot.use(async (ctx, next) => {
     ctx.interfaceKeyboardMode = keyboardEffective;
     ctx.interfaceMenuEnabled = menuEffective;
+    // /start 欢迎消息由机器人管理「功能配置」维护；空值继续使用默认文案。
+    ctx.startWelcomeText = typeof profile.welcomeText === "string" ? profile.welcomeText : undefined;
     await next();
   });
 

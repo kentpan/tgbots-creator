@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ChevronLeft, Loader2, Lock, Pencil, Plus, Trash2 } from "lucide-react";
 import { motion } from "framer-motion";
 import { Switch } from "@/components/ui/switch";
+import { IOS_BLUE, IOS_GRAY_BG, IOS_TEXT_SECONDARY } from "@/components/admin/tg-app-simulator-primitives";
 
 /**
  * 代理偏好设置面板（v2.0.15，机器人测试页仿真屏盾牌按钮 → 右侧区域向左滑入）。
@@ -26,9 +27,6 @@ import { Switch } from "@/components/ui/switch";
  * 「线上 Edge 站代理」地址经 fetchEdgeProxyUrl 到线上站点自动生成（含自动生成的 Basic 凭据）。
  */
 
-const IOS_BLUE = "#3390ec";
-const IOS_GRAY_BG = "#efeff4";
-const IOS_TEXT_SECONDARY = "#8e8e93";
 
 interface ProxyEntry {
   id: string;

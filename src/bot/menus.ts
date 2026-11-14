@@ -3,21 +3,18 @@ import type { Context } from "grammy";
 import { getGlobalStats } from "@/database/operations";
 import { config } from "@/config/settings";
 import { isAdmin } from "./filters";
+import { DEFAULT_BOT_HELP_MARKDOWN_V2 } from "@/services/bot-messages";
 
 function formatPercent(rate: number): string {
   return `${rate.toFixed(1)}%`;
 }
 
 function sendHelp(ctx: Context): Promise<unknown> {
-  return ctx.editMessageText(
-    "🤖 *TGuard 群组验证机器人*\n\n" +
-      "🛡️ *自动验证新成员身份，防止机器人和恶意用户进入群组*\n\n" +
-      "*使用说明：*\n" +
-      "如何使用请见 [README](https://github.com/SideCloudGroup/TGuard/blob/main/README.md)\n\n" +
-      "*技术支持：*\n" +
-      "由 [TGuard](https://github.com/SideCloudGroup/TGuard) 提供技术支持",
-    { parse_mode: "MarkdownV2", link_preview_options: { is_disabled: true }, reply_markup: mainMenu },
-  );
+  return ctx.editMessageText(DEFAULT_BOT_HELP_MARKDOWN_V2, {
+    parse_mode: "MarkdownV2",
+    link_preview_options: { is_disabled: true },
+    reply_markup: mainMenu,
+  });
 }
 
 export function sendApiInfo(ctx: Context): Promise<unknown> {

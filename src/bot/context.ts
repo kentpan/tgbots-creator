@@ -19,4 +19,6 @@ export type BotContext = Context &
     interfaceKeyboardMode?: boolean;
     /** v2.3 内嵌按钮面板开关：false = cmdStart 不发内嵌菜单（面板全关时发纯文本） */
     interfaceMenuEnabled?: boolean;
+    /** 管理后台可编辑的 /start 欢迎消息；空值时使用产品默认文案。 */
+    startWelcomeText?: string;
   };

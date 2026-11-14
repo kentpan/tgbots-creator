@@ -114,7 +114,7 @@ export async function GET(request: Request): Promise<NextResponse> {
         resolve_type: "deep_link",
         chat_id: String(chatId),
         chat_title: settings.chatTitle ?? `群组 ${deepChatId}`,
-        join_request_enabled: true,
+        join_request_enabled: settings.requireApproval,
         method: settings.method,
         method_name:
           settings.method === "code_self"
