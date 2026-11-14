@@ -188,9 +188,19 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
   // v2.3 功能面板开关（🧩功能开关卡片随表单提交）：与 saveBotFeatureConfigAction
   // 同字段同存储位（bots.config 顶层）—— 部署后运行实例的面板门禁/界面开关据此生效。
   // 字段缺失 = 不触碰（兼容旧调用方）。
+  // 表单字段 snake_case → config camelCase 映射（与 parseBotFeatureConfig 读取键一致，
+  // 修复"保存后重新打开弹窗 checkbox 未回显"根因）。
+  const FEATURE_FLAG_MAP: Record<string, string> = {
+    menu_enabled: "menuEnabled",
+    keyboard_enabled: "keyboardEnabled",
+    commands_enabled: "commandsEnabled",
+    gate_menu_required: "gateMenuRequired",
+    gate_keyboard_required: "gateKeyboardRequired",
+    gate_commands_required: "gateCommandsRequired",
+  };
   const readFeatureFlag = (key: string): void => {
     const raw = formData.get(key);
-    if (raw !== null) (profile as unknown as Record<string, unknown>)[key] = raw === "1";
+    if (raw !== null) (profile as unknown as Record<string, unknown>)[FEATURE_FLAG_MAP[key] ?? key] = raw === "1";
   };
   readFeatureFlag("menu_enabled");
   readFeatureFlag("keyboard_enabled");

@@ -840,9 +840,19 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
   }
 
   // —— 功能面板开关（显式 boolean；表单缺字段不触碰） ——
+  // 表单字段 snake_case → config camelCase 映射（与 parseBotFeatureConfig 读取键一致，
+  // 修复"保存后重新打开弹窗 checkbox 未回显"根因）
+  const FEAT_FLAG_MAP: Record<string, string> = {
+    menu_enabled: "menuEnabled",
+    commands_enabled: "commandsEnabled",
+    keyboard_enabled: "keyboardEnabled",
+    gate_menu_required: "gateMenuRequired",
+    gate_keyboard_required: "gateKeyboardRequired",
+    gate_commands_required: "gateCommandsRequired",
+  };
   const readFlag = (key: string): void => {
     const raw = formData.get(key);
-    if (raw !== null) next[key] = raw === "1";
+    if (raw !== null) next[FEAT_FLAG_MAP[key] ?? key] = raw === "1";
   };
   readFlag("menu_enabled");
   readFlag("commands_enabled");
@@ -866,7 +876,7 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
   // —— 面板门禁开关（内嵌按钮/键盘/指令三面板各一） ——
   const readGateFlag = (key: string): void => {
     const raw = formData.get(key);
-    if (raw !== null) next[key] = raw === "1";
+    if (raw !== null) next[FEAT_FLAG_MAP[key] ?? key] = raw === "1";
   };
   readGateFlag("gate_menu_required");
   readGateFlag("gate_keyboard_required");

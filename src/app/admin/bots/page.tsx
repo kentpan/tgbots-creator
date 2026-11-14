@@ -11,6 +11,7 @@ import { getTelegramRuntimeSettings, resolveBotRuntime } from "@/services/bot-tr
 import { DeployStatusCell } from "@/components/admin/deploy-status-cell";
 import { isEdgeRuntime } from "@/lib/telegram/runtime-mode";
 import { parseBotProfile, parseBotPrivacyMode } from "@/bot/multi-runtime";
+import { parseTgApiBotConfig } from "@/services/tgapi-config";
 import { parseCustomKeyboardConfig } from "@/services/custom-keyboard";
 import { requirePermission } from "@/lib/auth";
 import { deleteBotAction, deployBotAction } from "./actions";
@@ -61,13 +62,15 @@ export default async function BotsPage({
 }) {
   await requirePermission("bots:view");
   const params = await searchParams;
-  const [bots, groups, builtinCommands, customCommands, verificationMethods] = await Promise.all([
+  const [allBots, groups, builtinCommands, customCommands, verificationMethods] = await Promise.all([
     listBots(),
     listGroupSettings(),
     listBotCommands({ type: "builtin", enabledOnly: true }),
     listBotCommands({ type: "custom", enabledOnly: true }),
     listVerificationMethods(),
   ]);
+  // TGAPI申请机器人不在机器人管理列表重复显示（TGAPI机器人由 /admin/tgapi 页管理）
+  const bots = allBots.filter((bot) => !parseTgApiBotConfig(bot.config).enabled);
   const commandLibrary = [...builtinCommands.rows, ...customCommands.rows].map((row) => ({
     id: String(row.id),
     name: row.name,

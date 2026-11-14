@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useCallback, useMemo, useRef, useState } from "react";
+import { TgapiProxyConfigSection } from "@/components/admin/tgapi-proxy-config-section";
 import { ListTree } from "lucide-react";
 import {
   Dialog,
@@ -140,6 +141,9 @@ export function TgApiMenuKeyboardDialog({
   const [gateMenuRequired, setGateMenuRequired] = useState(initialUi.gateMenuRequired);
   const [gateKeyboardRequired, setGateKeyboardRequired] = useState(initialUi.gateKeyboardRequired);
   const [gateCommandsRequired, setGateCommandsRequired] = useState(initialUi.gateCommandsRequired);
+  // 3️⃣ APP 创建参数 / 4️⃣ 消息配置 可折叠(默认收起, 参考 TGAPI代理模块)
+  const [appParamsOpen, setAppParamsOpen] = useState(false);
+  const [msgConfigOpen, setMsgConfigOpen] = useState(false);
   useEffect(() => {
     if (defaultOpen) setOpen(true);
     if (open) {
@@ -483,14 +487,26 @@ export function TgApiMenuKeyboardDialog({
                   </div>
                 </div>
 
-                {/* 3️⃣ my.telegram.org APP 创建参数 */}
-                <div className="rounded-lg border bg-muted/20 p-4 space-y-4">
-                  <p className="text-sm font-semibold">3️⃣ 📱 my.telegram.org APP 创建参数</p>
-                  <p className="text-xs text-muted-foreground">
-                    创建 API 直接手机号 → 登录码（不再对话中收集）；APP 名称/描述可用键盘
-                    「✏️ 设置Title / 📝 设置Description」预配置（未配置时使用下方默认值），
-                    平台未预配置时随机选一。
-                  </p>
+                {/* TGAPI代理模块(TGAPI申请机器人专用, 在 APP 创建参数前) */}
+                <TgapiProxyConfigSection />
+
+                {/* 3️⃣ my.telegram.org APP 创建参数（可折叠, 默认收起） */}
+                <div className="rounded-lg border bg-muted/20">
+                  <button
+                    type="button"
+                    onClick={() => setAppParamsOpen((v) => !v)}
+                    className="flex w-full items-center justify-between px-4 py-3 text-left"
+                  >
+                    <span className="text-sm font-semibold">3️⃣ 📱 my.telegram.org APP 创建参数</span>
+                    <span className="text-xs text-muted-foreground">{appParamsOpen ? "收起 ▲" : "展开 ▼"}</span>
+                  </button>
+                  {appParamsOpen ? (
+                    <div className="space-y-4 px-4 pb-4">
+                      <p className="text-xs text-muted-foreground">
+                        创建 API 直接手机号 → 登录码（不再对话中收集）；APP 名称/描述可用键盘
+                        「✏️ 设置Title / 📝 设置Description」预配置（未配置时使用下方默认值），
+                        平台未预配置时随机选一。
+                      </p>
                   <div className="grid gap-4 md:grid-cols-2">
                     <div className="space-y-1">
                       <label className="text-sm font-medium" htmlFor={`app-title-${suffix}`}>
@@ -568,6 +584,7 @@ export function TgApiMenuKeyboardDialog({
                       ))}
                     </div>
                   </div>
+                  )}
                 </div>
 
                 {/* 🔐 解锁门禁全局配置（通用组件：unlock_mode 恒 captcha + verification_method_id 随表单提交） */}
@@ -577,11 +594,18 @@ export function TgApiMenuKeyboardDialog({
                   verificationMethodId={cfg.verificationMethodId}
                 />
 
-                {/* 4️⃣ 消息配置（中英双语；当前仿真语言文案实时同步仿真屏） */}
-                <div className="rounded-lg border bg-muted/20 p-4 space-y-3">
-                  <p className="text-sm font-semibold">
-                    4️⃣ 💬 消息配置（中英文双语：按用户语言自动识别，「✅ 语言」按钮可手动切换）
-                  </p>
+                {/* 4️⃣ 消息配置（中英双语；当前仿真语言文案实时同步仿真屏）可折叠, 默认收起 */}
+                <div className="rounded-lg border bg-muted/20">
+                  <button
+                    type="button"
+                    onClick={() => setMsgConfigOpen((v) => !v)}
+                    className="flex w-full items-center justify-between px-4 py-3 text-left"
+                  >
+                    <span className="text-sm font-semibold">4️⃣ 💬 消息配置（中英文双语：按用户语言自动识别，「✅ 语言」按钮可手动切换）</span>
+                    <span className="text-xs text-muted-foreground">{msgConfigOpen ? "收起 ▲" : "展开 ▼"}</span>
+                  </button>
+                  {msgConfigOpen ? (
+                    <div className="space-y-3 px-4 pb-4">
                   <div className="space-y-1">
                     <label className="text-sm font-medium" htmlFor={`text-zh-start-${suffix}`}>
                       中文欢迎语（START_TEXT · 初始消息正文，右侧仿真屏实时预览）
@@ -636,6 +660,8 @@ export function TgApiMenuKeyboardDialog({
                       </div>
                     </div>
                   ))}
+                  </div>
+                  )}
                 </div>
 
                 {/* 🧩 功能开关（显式开启才生效）：消息内嵌按钮 ⇄ 自定义键盘互斥 + 指令菜单独立；
