@@ -238,6 +238,8 @@ export interface TgSimulatorProps {
   onOpenSettings?: () => void;
   /** v2.1.16 TGAPI 弹窗：私聊视图也渲染菜单消息+内嵌按钮键盘（机器人初始消息在私聊中） */
   showMenuInPrivate?: boolean;
+  /** 非 inline 生效模式隐藏消息下方 InlineKeyboard；默认 true 保持旧页面行为。 */
+  showInlineKeyboard?: boolean;
   /** v2.1.16 TGAPI 弹窗：语言切换按钮点击交给宿主（返回 true=已处理，不再显示内置提示） */
   onTgApiFunc?: (button: MenuButton) => void | Promise<void>;
   /** v2.1.16 TGAPI 弹窗：语言切换按钮点击交给宿主（返回 true=已处理，不再显示内置提示） */
@@ -292,6 +294,7 @@ export const TgSimulator = forwardRef<TgSimulatorHandle, TgSimulatorProps>(funct
   onBack,
   onOpenSettings,
   showMenuInPrivate = false,
+  showInlineKeyboard = true,
   onTgApiFunc,
   onLanguageToggle,
   replyKeyboard,
@@ -786,7 +789,9 @@ export const TgSimulator = forwardRef<TgSimulatorHandle, TgSimulatorProps>(funct
                 <MediaBlock content={config.content} />
               )}
             </div>
-            <MenuKeyboard node={currentNode} pressedId={pressed} onButtonClick={handleButtonClick} />
+            {showInlineKeyboard ? (
+              <MenuKeyboard node={currentNode} pressedId={pressed} onButtonClick={handleButtonClick} />
+            ) : null}
             <p className="mt-0.5 text-right text-sm text-white/95 [text-shadow:0_1px_2px_rgba(0,0,0,0.35)]">
               {clock}
             </p>

@@ -892,6 +892,7 @@ export function TgApiMenuKeyboardDialog({
                     onRequestJoin={sim.requestJoin}
                     onUserSend={sim.onUserSend}
                     showMenuInPrivate={sim.simView === "private" && uiMode === "inline"}
+                    showInlineKeyboard={uiMode === "inline"}
                     replyKeyboard={uiMode === "keyboard" ? currentKb : undefined}
                     onTgApiFunc={sim.onTgApiFunc}
                     onLanguageToggle={sim.onLanguageToggle}
@@ -916,16 +917,16 @@ export function TgApiMenuKeyboardDialog({
             </div>
           </div>
 
-          <div className="flex shrink-0 items-center justify-end gap-2 border-t bg-muted/30 px-6 py-3">
+          <div className="flex shrink-0 items-center justify-end gap-2 border-t bg-muted/30 px-4 py-2 sm:px-5">
             <button
               type="button"
               onClick={() => setOpen(false)}
-              className="inline-flex h-10 items-center rounded-md border px-4 text-sm font-medium hover:bg-accent"
+              className="inline-flex h-9 items-center rounded-md border px-3 text-sm font-medium hover:bg-accent"
             >
               取消
             </button>
             <SubmitButton
-              className="inline-flex h-10 items-center rounded-md bg-primary px-6 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+              className="inline-flex h-9 items-center rounded-md bg-primary px-5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
               pendingLabel="保存中…"
             >
               保存机器人

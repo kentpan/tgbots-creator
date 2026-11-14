@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ListTree } from "lucide-react";
 import { EditorMobileSwitch } from "@/components/admin/editor-mobile-switch";
 import {
