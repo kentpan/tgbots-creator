@@ -72,6 +72,7 @@ interface FeatureDraft {
   gateKeyboardRequired: boolean;
   gateCommandsRequired: boolean;
   joinVerifyEnabled: boolean;
+  joinVerifyMode: "verify" | "direct";
   gateEnabled: boolean;
 }
 
@@ -84,6 +85,7 @@ function readFeatureDraft(bot?: DesignerBotInfo): FeatureDraft {
       gateKeyboardRequired: false,
       gateCommandsRequired: false,
       joinVerifyEnabled: false,
+      joinVerifyMode: "verify",
       gateEnabled: false,
     };
   }
@@ -100,6 +102,7 @@ function readFeatureDraft(bot?: DesignerBotInfo): FeatureDraft {
     gateKeyboardRequired: feature.gateKeyboardRequired === true,
     gateCommandsRequired: feature.gateCommandsRequired === true,
     joinVerifyEnabled: feature.joinVerify.enabled,
+    joinVerifyMode: feature.joinVerify.mode,
     gateEnabled: feature.gate.enabled,
   };
 }
@@ -133,6 +136,23 @@ function readWelcomeText(bot?: DesignerBotInfo): string {
   }
 }
 
+/** 通用机器人键盘保存在 bots.config.customKeyboard 顶层；兼容旧版 tgapi 子段。 */
+function readCustomKeyboard(bot?: DesignerBotInfo): CustomKeyboardConfig | null {
+  if (!bot) return null;
+  try {
+    const parsed = JSON.parse(bot.config) as {
+      customKeyboard?: unknown;
+      tgapi?: { customKeyboard?: unknown };
+    };
+    return (
+      parseCustomKeyboardConfig(parsed.customKeyboard) ??
+      parseCustomKeyboardConfig(parsed.tgapi?.customKeyboard)
+    );
+  } catch {
+    return null;
+  }
+}
+
 export function FeatureConfigDialog({
   bot,
   methods,
@@ -151,6 +171,7 @@ export function FeatureConfigDialog({
   const [mobilePane, setMobilePane] = useState<"config" | "preview">("config");
   const editorScrollRef = useRef<HTMLDivElement>(null);
   const cfg = useMemo(() => parseDesignerTgApiCfg(bot), [bot]);
+  const keyboardConfig = useMemo(() => readCustomKeyboard(bot), [bot]);
   const profile = useMemo(() => parseDesignerProfile(bot), [bot]);
   const suffix = bot ? String(bot.id) : "new";
   const botDisplayName = bot?.username ? `@${bot.username}` : bot?.name ?? "机器人";
@@ -160,7 +181,7 @@ export function FeatureConfigDialog({
   const [menu, setMenu] = useState<BotMenuConfig>(() => readMenuDraft(bot));
   const [welcomeText, setWelcomeText] = useState(() => readWelcomeText(bot));
   const [kbPayload, setKbPayload] = useState<string>(() =>
-    cfg.customKeyboard ? JSON.stringify(cfg.customKeyboard) : "",
+    keyboardConfig ? JSON.stringify(keyboardConfig) : "",
   );
   const [privacyMode, setPrivacyMode] = useState(profile.privacyMode);
   const [selectedCommandIds, setSelectedCommandIds] = useState<number[]>(profile.commandIds);
@@ -185,11 +206,11 @@ export function FeatureConfigDialog({
       setFeature(readFeatureDraft(bot));
       setMenu(readMenuDraft(bot));
       setWelcomeText(readWelcomeText(bot));
-      setKbPayload(cfg.customKeyboard ? JSON.stringify(cfg.customKeyboard) : "");
+      setKbPayload(keyboardConfig ? JSON.stringify(keyboardConfig) : "");
       setPrivacyMode(profile.privacyMode);
       setSelectedCommandIds(profile.commandIds);
     }
-  }, [open, bot, cfg.customKeyboard, profile]);
+  }, [open, bot, keyboardConfig, profile]);
 
   const patch = (partial: Partial<FeatureDraft>): void =>
     setFeature((prev) => ({ ...prev, ...partial }));
@@ -361,6 +382,7 @@ export function FeatureConfigDialog({
           <input type="hidden" name="gate_keyboard_required" value={feature.gateKeyboardRequired ? "1" : "0"} />
           <input type="hidden" name="gate_commands_required" value={feature.gateCommandsRequired ? "1" : "0"} />
           <input type="hidden" name="join_verify_enabled" value={feature.joinVerifyEnabled ? "1" : "0"} />
+          <input type="hidden" name="join_verify_mode" value={feature.joinVerifyMode} />
           <input type="hidden" name="welcome_text" value={welcomeText} />
           <input type="hidden" name="gate_enabled" value={feature.gateEnabled ? "1" : "0"} />
 
@@ -378,6 +400,37 @@ export function FeatureConfigDialog({
               {/* —— 左侧配置区 —— */}
               <div className={`min-w-0 space-y-4 ${mobilePane === "config" ? "block" : "hidden"} lg:block`}>
                 <DesignerBasicInfo bot={bot} suffix={suffix} defaultName="机器人" />
+
+                {/* 🧭 真实群组 */}
+                <div id="groups-config" className="scroll-mt-16 rounded-xl border bg-card p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm font-semibold">🧭 机器人所在真实群组</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSimNodeId("root");
+                        sim.resetSimChat();
+                      }}
+                      className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md border border-primary/50 bg-primary/10 px-3 text-sm font-medium text-primary hover:bg-primary/20"
+                      title="右侧仿真屏恢复到申请加群的初始状态"
+                    >
+                      📲 申请加群
+                    </button>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    仿真屏群名为机器人已部署的真实群组（下方面板数据）；点「申请加群」恢复申请加群初始状态 ——
+                    点击「申请加入群组」后机器人自动通过（真实端 chat_join_request 自动审批）并跳转私聊。
+                  </p>
+                  <div className="mt-2">
+                    {bot ? (
+                      <TgApiBotGroupsPanel botId={String(bot.id)} />
+                    ) : (
+                      <p className="rounded-md border border-dashed bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        🧭 机器人所在真实群组：保存后再次打开本弹窗即可查看与同步（真实调用 Bot API 发现）。
+                      </p>
+                    )}
+                  </div>
+                </div>
 
                 <nav aria-label="功能配置快速导航" className="sticky top-0 z-20 -mx-1 flex gap-1 overflow-x-auto rounded-xl border bg-background/95 p-1 shadow-sm backdrop-blur">
                   {[
@@ -423,27 +476,37 @@ export function FeatureConfigDialog({
                 <div id="join-verify-config" className="scroll-mt-16">
                 <ConfigPanel
                   title="🚪 自动响应加群申请（加群验证）"
-                  description="开启后，被群组指定为「自动审核机器人」时自动验证加群申请：私聊发送验证消息，通过后静默放行，失败 3 次拒绝。还需在群组「群组信息 → 新成员审核」中选择本机器人。"
+                  description="开启后，被群组指定为「自动审核机器人」时处理申请。可选择验证码验证后通过，或直接通过申请。还需在群组设置中选择本机器人。"
                   checked={feature.joinVerifyEnabled}
                   onCheckedChange={(checked) => patch({ joinVerifyEnabled: checked })}
                 >
                   <div className="space-y-4">
-                    <TgApiUnlockMethodBinding
-                      initialMethods={methods}
-                      initialMethodId={
-                        joinVerifyMethodId && /^\d+$/.test(joinVerifyMethodId)
-                          ? Number(joinVerifyMethodId)
-                          : null
-                      }
-                      hiddenName="join_verify_method_id"
-                    />
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">申请处理方式</label>
+                      <select
+                        value={feature.joinVerifyMode}
+                        onChange={(event) => patch({ joinVerifyMode: event.target.value === "direct" ? "direct" : "verify" })}
+                        className={designerInputClass()}
+                        aria-label="加群申请处理方式"
+                      >
+                        <option value="verify">验证码验证后通过</option>
+                        <option value="direct">直接通过申请（不验证）</option>
+                      </select>
+                    </div>
+                    {feature.joinVerifyMode === "verify" ? <>
+                      <TgApiUnlockMethodBinding
+                        initialMethods={methods}
+                        initialMethodId={joinVerifyMethodId && /^\d+$/.test(joinVerifyMethodId) ? Number(joinVerifyMethodId) : null}
+                        hiddenName="join_verify_method_id"
+                      />
                     <p className="text-xs text-muted-foreground">
                       上方下拉选择验证方式（验证方式库全部方式），点击「配置外部验证 API」可直接编辑该方式的
                       API 地址 / apikey / 传参 / 响应解析（保存到验证方式库，同一数据源）。列表没有需要的方式？到
                       <a href="/admin/verification-methods" className="mx-1 text-primary underline">验证方式页</a>
                       新增（支持 验证码核验 API / 自动验证码 / 人机验证）。
                     </p>
-                    <div className="grid gap-3 md:grid-cols-2">
+                    </> : <p className="rounded-md border border-amber-300/50 bg-amber-50/50 p-3 text-xs text-muted-foreground">收到 Telegram 加群申请事件后立即调用 approveChatJoinRequest；普通邀请链接直接入群时不启动验证码流程。此模式不会检查卡密或人机验证。</p>}
+                    <div className={`grid gap-3 md:grid-cols-2 ${feature.joinVerifyMode === "direct" ? "hidden" : ""}`}>
                       <div className="space-y-1">
                         <label className="text-sm font-medium" htmlFor={`jv-timeout-${suffix}`}>
                           验证超时（秒，留空用默认）
@@ -608,7 +671,7 @@ export function FeatureConfigDialog({
                           key={`kb-${bot.id}`}
                           botId={String(bot.id)}
                           botName={botDisplayName}
-                          initialConfig={cfg.customKeyboard ?? null}
+                          initialConfig={keyboardConfig}
                           isTgApi={false}
                           embedded
                           builtinCommands={builtinCommands}
@@ -653,36 +716,7 @@ export function FeatureConfigDialog({
                   ) : null}
                 </div>
 
-                {/* 🧭 真实群组 */}
-                <div id="groups-config" className="scroll-mt-16 rounded-xl border bg-card p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="text-sm font-semibold">🧭 机器人所在真实群组</p>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setSimNodeId("root");
-                        sim.resetSimChat();
-                      }}
-                      className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md border border-primary/50 bg-primary/10 px-3 text-sm font-medium text-primary hover:bg-primary/20"
-                      title="右侧仿真屏恢复到申请加群的初始状态"
-                    >
-                      📲 申请加群
-                    </button>
-                  </div>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    仿真屏群名为机器人已部署的真实群组（下方面板数据）；点「申请加群」恢复申请加群初始状态 ——
-                    点击「申请加入群组」后机器人自动通过（真实端 chat_join_request 自动审批）并跳转私聊。
-                  </p>
-                  <div className="mt-2">
-                    {bot ? (
-                      <TgApiBotGroupsPanel botId={String(bot.id)} />
-                    ) : (
-                      <p className="rounded-md border border-dashed bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                        🧭 机器人所在真实群组：保存后再次打开本弹窗即可查看与同步（真实调用 Bot API 发现）。
-                      </p>
-                    )}
-                  </div>
-                </div>
+
               </div>
 
               {/* —— 右侧仿真屏（固定容器，数据驱动）：配置 state → props 即时呈现 —— */}

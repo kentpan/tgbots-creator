@@ -148,6 +148,8 @@ export interface CreateJoinRequestInput {
   lastName: string | null;
   verificationToken: string;
   requestType?: string;
+  /** Telegram chat_join_request.date；重复投递保持相同时间，真实重新申请时间更新。 */
+  requestTime?: Date;
 }
 
 export interface RoleRow {
@@ -391,7 +393,7 @@ export async function createJoinRequest(
         [
           input.verificationToken,
           requestType,
-          dateText(new Date()),
+          dateText(input.requestTime ?? new Date()),
           Number(existing.id),
         ],
       );
@@ -411,7 +413,7 @@ export async function createJoinRequest(
         input.lastName,
         input.verificationToken,
         RequestStatus.PENDING,
-        dateText(new Date()),
+        dateText(input.requestTime ?? new Date()),
         requestType,
       ],
     );
@@ -865,18 +867,25 @@ export async function setSessionPromptMessage(
 export async function getPendingSessionForUserChat(
   userId: bigint,
   chatId: bigint,
+  requestDate?: Date,
 ): Promise<VerificationSessionRow | null> {
   await ensureAppSchema();
   try {
     const row = await queryOne<Record<string, unknown>>(
-      `SELECT s.* FROM verification_sessions s
+      `SELECT s.*, j.request_time AS join_request_time FROM verification_sessions s
        JOIN join_requests j ON j.verification_token = s.token
        WHERE s.user_id = ? AND s.chat_id = ? AND s.captcha_completed = 0 AND s.expires_at > ?
          AND j.status = ?
        ORDER BY s.created_time DESC LIMIT 1`,
       [Number(userId), Number(chatId), dateText(new Date()), RequestStatus.PENDING],
     );
-    return row ? mapSession(row) : null;
+    if (!row) return null;
+    // Telegram 重投同一个 chat_join_request 时 date 不变，应复用原会话；
+    // 用户后来重新申请时 date 晚于旧会话创建时间，必须视为新申请并重置 attempts。
+    if (requestDate && new Date(String(row.join_request_time)).getTime() < requestDate.getTime()) {
+      return null;
+    }
+    return mapSession(row);
   } catch (error) {
     console.error("Error getting pending session for user/chat:", error);
     return null;
@@ -900,14 +909,20 @@ export async function wasRecentlyApprovedForUserChat(
   userId: bigint,
   chatId: bigint,
   windowSeconds = 900,
+  requestDate?: Date,
 ): Promise<boolean> {
   try {
     const cutoff = dateText(new Date(Date.now() - windowSeconds * 1000));
     const row = await queryOne<{ count: number }>(
       `SELECT COUNT(id) AS count FROM join_requests
        WHERE user_id = ? AND chat_id = ? AND status = ?
-         AND processed_time IS NOT NULL AND processed_time > ?`,
-      [Number(userId), Number(chatId), RequestStatus.APPROVED, cutoff],
+         AND processed_time IS NOT NULL AND processed_time > ?
+         AND (? IS NULL OR processed_time >= ?)`,
+      [
+        Number(userId), Number(chatId), RequestStatus.APPROVED, cutoff,
+        requestDate ? dateText(requestDate) : null,
+        requestDate ? dateText(requestDate) : null,
+      ],
     );
     return toNumber(row?.count ?? 0) > 0;
   } catch (error) {

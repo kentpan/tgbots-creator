@@ -32,6 +32,8 @@ export interface GateFeatureConfig {
 /** 加群验证面板（自动响应加群申请：方式单选 + 参数覆盖 + 文案默认值） */
 export interface JoinVerifyFeatureConfig {
   enabled: boolean;
+  /** verify=按绑定方式验证；direct=收到申请后直接审批/直连入群不验证 */
+  mode: "verify" | "direct";
   /** verification_methods.id（十进制字符串；未选择 = 配置不完整，运行时显式报「未配置验证方式」） */
   methodId: string | null;
   override?: VerificationParams;
@@ -97,6 +99,7 @@ function parseJoinVerify(raw: unknown, hasData: boolean): JoinVerifyFeatureConfi
   const methodIdRaw = typeof cfg.methodId === "string" && /^\d+$/.test(cfg.methodId) ? cfg.methodId : null;
   return {
     enabled: parseBoolean(cfg.enabled) ?? hasData,
+    mode: cfg.mode === "direct" ? "direct" : "verify",
     methodId: methodIdRaw,
     override: parseVerificationOverride(cfg.override),
   };

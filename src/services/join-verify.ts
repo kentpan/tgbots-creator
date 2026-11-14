@@ -2,13 +2,12 @@
  * 加群验证解析服务（机器人级验证方式配置的唯一解析口）：
  *
  * 数据来源（验证方式配置已从群级迁到机器人级）：
- *   bots.config.joinVerify = { enabled, methodId, override? }
+ *   bots.config.joinVerify = { enabled, mode, methodId?, override? }
  *   验证方式行 = verification_methods（type: code_api / code_self / captcha）
  *   生效参数 = 方式默认参数 ← bot 级 override（mergeVerificationParams）
  *
  * 渠道语义（源头规则，无配置项）：
- *   - 申请制入群（chat_join_request，被指定的加群验证机器人）：一律私聊验证
- *     （先验证后批准 —— 通过 approveChatJoinRequest 静默放行，失败 3 次 declineChatJoinRequest）；
+ *   - 申请制入群（chat_join_request，被指定的加群验证机器人）：按 mode 选择私聊验证或直接审批；
  *   - 直连入群（chat_member 补验证）：超级群 → 群内验证，基础群 → 私聊验证（auto 语义）；
  *   - 频道：物理不支持群内验证（订阅者不能发言），强制私聊验证。
  *
@@ -24,7 +23,7 @@ import {
 } from "@/services/verification-methods";
 import { parseCodeApiConfig } from "@/services/external-verify";
 
-export type JoinVerifyMethod = "code_api" | "code_self" | "captcha";
+export type JoinVerifyMethod = "code_api" | "code_self" | "captcha" | "direct";
 
 export interface ResolvedJoinVerify {
   method: JoinVerifyMethod;
@@ -48,9 +47,11 @@ export async function resolveJoinVerify(
     return null;
   }
   const feature = parseBotFeatureConfig(bot.config, false);
-  if (!feature.joinVerify.enabled || !feature.joinVerify.methodId) {
-    return null;
+  if (!feature.joinVerify.enabled) return null;
+  if (feature.joinVerify.mode === "direct") {
+    return { method: "direct", methodDbId: null, timeoutSeconds: 0, maxAttempts: 0 };
   }
+  if (!feature.joinVerify.methodId) return null;
   const method = await getVerificationMethod(BigInt(feature.joinVerify.methodId));
   if (!method || !method.enabled) {
     console.error(
@@ -105,7 +106,7 @@ export async function listJoinVerifyCapableBotIds(): Promise<Set<string>> {
   const result = new Set<string>();
   for (const bot of bots) {
     const feature = parseBotFeatureConfig(bot.config, false);
-    if (bot.enabled && feature.joinVerify.enabled && feature.joinVerify.methodId) {
+    if (bot.enabled && feature.joinVerify.enabled && (feature.joinVerify.mode === "direct" || feature.joinVerify.methodId)) {
       result.add(String(bot.id));
     }
   }

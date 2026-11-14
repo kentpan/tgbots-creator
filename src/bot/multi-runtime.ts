@@ -340,7 +340,10 @@ async function createMenuBot(row: BotRow, menuConfig: BotMenuConfig, mode: Effec
   if (plugins.throttler !== false) {
     bot.api.config.use(apiThrottler());
   }
-  const { middleware: sessionMiddleware } = await buildSessionMiddleware(plugins.sessionStorage);
+  const { middleware: sessionMiddleware } = await buildSessionMiddleware(
+    plugins.sessionStorage,
+    `bot:${row.id}`,
+  );
   bot.use(sessionMiddleware);
   // 真实群组自动登记（v1.1.1）：被拉进群/收到群事件即登记 chat_id / 群名，
   // 管理后台「同步真实群组」与机器人测试页才能看到机器人真实所在的群组
@@ -595,8 +598,8 @@ async function registerBotCapabilities(
   // 默认值，保证运行实例与管理后台读到同一份配置语义）。
   // v2.1.10：传入菜单配置与指令注册表 —— 按钮驱动新流程（欢迎+授权认证按钮→
   // 输码→成功+菜单键盘）+ 菜单「执行指令」按钮与自定义指令同源。
-  // 通用门禁解锁（Composer 模块）：TGAPI 机器人的自定义键盘按钮也支持「门禁解锁」
-  // 前置校验 —— 必须在 TGAPI 分支返回前注册（承接 tggate 挑战回复）
+  // 通用 tggate 仅服务菜单按钮的功能门禁（TGAPI 自定义键盘也可使用）；它与
+  // TGAPI 解锁 tgapi-unlock / tgapi_unlocks、看门狗加群 code-input 是三套独立状态。
   bot.use(createGateComposer(botId ?? BigInt(0)));
 
   if (profile.tgapi?.enabled) {

@@ -202,9 +202,15 @@ async function bootstrapDmVerification(
   runtime: RuntimeSettings,
   settings: Awaited<ReturnType<typeof getGroupSettings>>,
   resolved: ResolvedJoinVerify,
+  requestDate?: Date,
 ): Promise<BootstrapResult> {
-  // 幂等守卫（v2.1.5）：同用户同群未完成会话 / 近 15 分钟已批准 → 不重复创建与发送
-  const existingPending = await getPendingSessionForUserChat(BigInt(user.id), BigInt(chat.id));
+  // 同一 Telegram update 重投（date 相同）保持幂等；真实再次申请（date 更新）
+  // 必须创建新 token 和 attempts=0 的新会话，不能继承上次输错次数。
+  const existingPending = await getPendingSessionForUserChat(
+    BigInt(user.id),
+    BigInt(chat.id),
+    requestDate,
+  );
   if (existingPending) {
     // Telegram 可能重投 chat_join_request；若首轮建会话成功但提示消息发送失败，
     // 旧逻辑会把“已有会话”误报为 promptDelivered=true 并永久跳过提示重发。
@@ -256,7 +262,12 @@ async function bootstrapDmVerification(
       method: existingPending.method,
     };
   }
-  const recentlyApproved = await wasRecentlyApprovedForUserChat(BigInt(user.id), BigInt(chat.id));
+  const recentlyApproved = await wasRecentlyApprovedForUserChat(
+    BigInt(user.id),
+    BigInt(chat.id),
+    900,
+    requestDate,
+  );
   if (recentlyApproved) {
     console.log(
       `Join request recently approved: user ${user.id} chat ${chat.id} — skip duplicate DM bootstrap`,
@@ -274,6 +285,7 @@ async function bootstrapDmVerification(
     lastName: user.last_name ?? null,
     verificationToken,
     requestType,
+    requestTime: requestDate,
   });
 
   if (!dbJoinRequest) {
@@ -300,6 +312,11 @@ async function bootstrapDmVerification(
     console.error(`Failed to create verification session for user ${user.id} (${requestType})`);
     return { created: false, promptDelivered: false, method: "none" };
   }
+  console.log(
+    `[join-verify] fresh DM verification session initialized: user=${user.id} chat=${chat.id} ` +
+      `token=${verificationToken.slice(0, 8)}... attempts=${verificationSession.attempts} ` +
+      `method=${verificationSession.method}`,
+  );
 
   if (resolved.method === "code_api") {
     const promptText = settings?.promptText ?? "🔐 请在下方输入框直接发送验证码完成验证";
@@ -385,6 +402,7 @@ export async function bootstrapJoinVerification(
   preloaded?: {
     settings: Awaited<ReturnType<typeof loadGroupSettingsForChat>>;
     resolved: ResolvedJoinVerify;
+    requestDate?: Date;
   },
 ): Promise<BootstrapResult | null> {
   const runtime = await getRuntimeSettings(config);
@@ -405,7 +423,9 @@ export async function bootstrapJoinVerification(
     settings === null;
 
   if (dmChannel) {
-    return bootstrapDmVerification(api, user, chat, requestType, runtime, settings, resolved);
+    return bootstrapDmVerification(
+      api, user, chat, requestType, runtime, settings, resolved, preloaded?.requestDate,
+    );
   }
   if (!settings) {
     return null;
@@ -479,6 +499,11 @@ export async function handleChatMemberUpdate(ctx: BotContext, botId: bigint): Pr
 
   // 直连入群验证方式 = 收到事件的机器人的加群验证配置；
   // 未配置/面板关闭 → 只落库记录（手动审核），不拦截不验证
+  const directResolved = await resolveJoinVerify(botId, await loadGroupSettingsForChat(BigInt(chat.id)));
+  if (directResolved?.method === "direct") {
+    console.log(`[join-verify] direct mode: user=${user.id} joined chat=${chat.id}; no verification required`);
+    return;
+  }
   const result = await bootstrapJoinVerification(ctx.api, user, chat, "direct", botId);
   if (!result) {
     console.log(

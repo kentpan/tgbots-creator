@@ -843,7 +843,8 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
       if (!parsedKeyboard) redirect(botPath({ error: "invalid-keyboard" }));
       next.customKeyboard = parsedKeyboard;
     } else {
-      delete next.customKeyboard;
+      // 统一功能配置弹窗始终提交 hidden 字段；编辑器尚未回传载荷时可能为空。
+      // 空载荷不代表管理员明确清空键盘，保留既有配置，避免只保存开关却丢失键盘树。
     }
   }
 
@@ -869,6 +870,7 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
   // —— 加群验证（bots.config.joinVerify）：方式单选 + 超时/次数覆盖 ——
   if (formData.has("join_verify_enabled")) {
     const methodIdRaw = String(formData.get("join_verify_method_id") ?? "").trim();
+    const joinVerifyMode = String(formData.get("join_verify_mode") ?? "verify") === "direct" ? "direct" : "verify";
     const timeoutRaw = Number(formData.get("join_verify_timeout") ?? "");
     const attemptsRaw = Number(formData.get("join_verify_attempts") ?? "");
     const override: Record<string, number> = {};
@@ -876,7 +878,8 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
     if (Number.isFinite(attemptsRaw) && attemptsRaw >= 1) override.max_attempts = Math.floor(attemptsRaw);
     next.joinVerify = {
       enabled: formData.get("join_verify_enabled") === "1",
-      methodId: methodIdRaw && /^\d+$/.test(methodIdRaw) ? methodIdRaw : null,
+      mode: joinVerifyMode,
+      methodId: joinVerifyMode === "verify" && methodIdRaw && /^\d+$/.test(methodIdRaw) ? methodIdRaw : null,
       ...(Object.keys(override).length > 0 ? { override } : {}),
     };
   }
@@ -903,7 +906,10 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
   const menuConfigRaw = String(formData.get("menu_config") ?? "").trim();
   let menuConfigJson: string | null = null;
   let menuTextValue: string | null = null;
-  if (menuConfigRaw) {
+  // 只有明确启用「消息内嵌按钮」时才写入菜单载荷。
+  // 功能配置弹窗在键盘模式/关闭菜单模式下也会提交 hidden menu_config；
+  // 此时载荷可能只是未挂载编辑器的空初始状态，不能覆盖数据库中已有菜单。
+  if (formData.get("menu_enabled") === "1" && menuConfigRaw) {
     try {
       const parsed = parseBotMenuConfig(menuConfigRaw);
       menuConfigJson = JSON.stringify({ content: parsed.content, root: parsed.root });

@@ -2,6 +2,9 @@ import { Composer } from "grammy";
 import type { BotContext } from "../context";
 import { recordJoinRequestOnly, bootstrapJoinVerification, type JoinVerificationUser } from "../handlers/chat-member";
 import { loadGroupSettingsForChat, resolveDesignatedBot, resolveJoinVerify } from "@/services/join-verify";
+import { createJoinRequest, wasRecentlyApprovedForUserChat } from "@/database/operations";
+import { generateVerificationToken } from "@/utils/crypto";
+import { autoApproveUser } from "@/services/approval";
 
 /**
  * 加群验证 Composer（grammy Composer 模块化，机器人实例按 botId 装配）：
@@ -58,7 +61,7 @@ export function createJoinVerifyComposer(botId: bigint): Composer<BotContext> {
       return;
     }
 
-    // 当前机器人是指定的加群验证机器人：解析配置并自动验证
+    // 当前机器人是指定的加群验证机器人：解析配置并自动验证/直接通过
     const resolved = await resolveJoinVerify(botId, settings);
     if (!resolved) {
       // 配置不完整（面板关闭/方式不可用）：显式记录并回落手动审核，绝不静默、绝不假验证
@@ -67,6 +70,38 @@ export function createJoinVerifyComposer(botId: bigint): Composer<BotContext> {
           "incomplete (panel off / method missing or disabled) — falling back to manual review",
       );
       await recordJoinRequestOnly(ctx.api, user, chat, "telegram");
+      return;
+    }
+
+    // 直接通过模式：不创建验证码会话，先记录申请，再调用 Telegram 审批 API。
+    if (resolved.method === "direct") {
+      const requestDate = new Date(joinRequest.date * 1000);
+      if (await wasRecentlyApprovedForUserChat(BigInt(user.id), BigInt(chat.id), 900, requestDate)) {
+        console.log(`[join-verify] duplicate already-approved direct request ignored: chat=${chat.id} user=${user.id}`);
+        return;
+      }
+      const token = generateVerificationToken();
+      const recorded = await createJoinRequest({
+        userId: BigInt(user.id),
+        chatId: BigInt(chat.id),
+        username: user.username ?? null,
+        firstName: user.first_name ?? "",
+        lastName: user.last_name ?? null,
+        verificationToken: token,
+        requestType: "telegram",
+        requestTime: requestDate,
+      });
+      if (!recorded) {
+        console.error(`[join-verify] direct approval could not record request: chat=${chat.id} user=${user.id}`);
+        return;
+      }
+      const approval = await autoApproveUser(token, ctx.api, joinRequest.user_chat_id);
+      if (!approval.success) {
+        console.error(`[join-verify] direct approval failed: chat=${chat.id} user=${user.id} reason=${approval.error}`);
+        try { await ctx.api.sendMessage(joinRequest.user_chat_id, `暂时无法自动通过你的加群申请：${approval.error ?? "请联系管理员"}`); } catch { /* best effort */ }
+      } else {
+        console.log(`[join-verify] direct approval succeeded: chat=${chat.id} user=${user.id}`);
+      }
       return;
     }
 
@@ -84,6 +119,7 @@ export function createJoinVerifyComposer(botId: bigint): Composer<BotContext> {
     const result = await bootstrapJoinVerification(ctx.api, userWithChat, chat, "telegram", botId, {
       settings,
       resolved,
+      requestDate: new Date(joinRequest.date * 1000),
     });
     if (!result) {
       console.error(

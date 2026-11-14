@@ -3,13 +3,14 @@ import type { BotContext } from "../context";
 import {
   getGroupSettings,
   getPendingCodeContext,
+  getLatestVerificationContext,
   resolveVerificationChannel,
 } from "@/database/operations";
 import {
   evaluateSubmittedCode,
   type CodeCheckResult,
 } from "@/services/verification-flow";
-import { kickUnverifiedMember } from "@/services/approval";
+import { autoApproveUser, kickUnverifiedMember } from "@/services/approval";
 import { isGroupReplyInputMode } from "./group-verification";
 
 /** 网络波动、服务端即将重试时立即私聊发送给用户的提示文案 */
@@ -359,7 +360,7 @@ export async function processCodeAnswer(
  * 现改为：群聊消息先查群设置（300s KV 缓存 + 进程内 memo，命中时不打 D1），
  * 群内验证模式直接跳过会话查询；仅私聊模式（dm）群组/私聊消息才查会话。
  */
-export async function handleCodeInput(
+async function handleCodeInputInternal(
   ctx: BotContext,
   next: () => Promise<void>,
 ): Promise<void> {
@@ -391,6 +392,33 @@ export async function handleCodeInput(
 
   const pending = await getPendingCodeContext(BigInt(from.id));
   if (!pending) {
+    // 恢复成功校验后、Telegram 审批前发生中断的窗口：
+    // completeVerification 会先持久化 captcha_completed=1，再调用 approveChatJoinRequest。
+    // 若 webhook/Worker 在两步之间被终止，下一条正确验证码消息将查不到 pending 会话，
+    // 旧逻辑会静默 next()。只有数据库明确证明“验证已成功且申请仍 pending”时才恢复审批，
+    // 不重新调用外部卡密 API，也不为未完成验证的会话放行。
+    const latest = await getLatestVerificationContext(BigInt(from.id));
+    const isCodeSession =
+      latest?.session.method === "code_api" || latest?.session.method === "code_self";
+    if (isCodeSession && latest.session.captchaCompleted && latest.joinRequest.status === "pending") {
+      const replyChatId = ctx.chat?.type === "private" ? ctx.chat.id : from.id;
+      console.warn(
+        `[code-input] resuming interrupted approval: user=${from.id} ` +
+          `session=${latest.session.token.slice(0, 8)}... chat=${latest.joinRequest.chatId}`,
+      );
+      const approval = await autoApproveUser(
+        latest.session.token,
+        ctx.api,
+        replyChatId,
+      );
+      await ctx.api.sendMessage(
+        replyChatId,
+        approval.success
+          ? "✅ 验证已完成，入群申请已恢复审批。"
+          : `⚠️ 验证已通过，但恢复审批失败：${approval.error ?? "请联系管理员处理"}`,
+      );
+      return;
+    }
     await next();
     return;
   }
@@ -410,5 +438,59 @@ export async function handleCodeInput(
     }
   }
 
-  await processCodeAnswer(ctx, text, pending);
+  try {
+    await processCodeAnswer(ctx, text, pending);
+  } catch (error) {
+    // 外部验证 API / 数据库 / Telegram 审批链路的未预期异常不能静默吞掉。
+    // 用户已经提交验证码时，必须收到可重试的反馈；日志保留完整上下文供排障。
+    console.error(
+      `[code-input] verification processing failed: user=${from.id} chat=${ctx.chat?.id ?? "unknown"} ` +
+        `session=${pending.session.token.slice(0, 8)}... method=${pending.session.method}`,
+      error,
+    );
+    const replyChatId = ctx.chat?.type === "private" ? ctx.chat.id : from.id;
+    try {
+      await ctx.api.sendMessage(
+        replyChatId,
+        "⚠️ 验证服务暂时异常，本次没有确认验证结果。请稍后重新发送验证码；如果持续出现，请联系管理员。",
+      );
+    } catch (notifyError) {
+      console.error(`[code-input] failed to notify user ${from.id} after verification error:`, notifyError);
+    }
+  }
+}
+
+
+/**
+ * 最外层兜底：覆盖待验证会话查询、群组设置读取及验证执行的所有未预期异常。
+ * Telegram webhook 不应因单条用户验证码消息异常而失败并让用户看到“无响应”。
+ */
+export async function handleCodeInput(
+  ctx: BotContext,
+  next: () => Promise<void>,
+): Promise<void> {
+  try {
+    await handleCodeInputInternal(ctx, next);
+  } catch (error) {
+    const from = ctx.from;
+    const message = ctx.message;
+    console.error(
+      `[code-input] unhandled middleware failure: user=${from?.id ?? "unknown"} ` +
+        `chat=${ctx.chat?.id ?? "unknown"} message=${message?.message_id ?? "unknown"}`,
+      error,
+    );
+    if (from && !from.is_bot && message?.text && !message.text.startsWith("/")) {
+      const replyChatId = ctx.chat?.type === "private" ? ctx.chat.id : from.id;
+      try {
+        await ctx.api.sendMessage(
+          replyChatId,
+          "⚠️ 验证服务暂时异常，本次没有确认验证结果。请稍后重新发送验证码；如果持续出现，请联系管理员。",
+        );
+      } catch (notifyError) {
+        console.error(`[code-input] fallback notification failed for user ${from.id}:`, notifyError);
+      }
+      return;
+    }
+    await next();
+  }
 }

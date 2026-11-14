@@ -786,17 +786,26 @@ export type BotSessionContext = BotContext;
  * backend=memory 或解析失败时不安装自定义 storage（grammY 默认内存）。
  * 注意 grammY session 泛型顺序：<SessionData, Context>。
  */
-export async function buildSessionMiddleware(single?: string) {
+export async function buildSessionMiddleware(single?: string, namespace?: string) {
   const resolution = await resolveSessionStorage(single);
-  if (!resolution.adapter) {
-    return { middleware: session<BotSessionData, BotContext>({ initial: () => ({}) }), resolution };
-  }
+  const sessionOptions = {
+    initial: () => ({}),
+    // 多机器人共用 D1/Redis/R2 时，默认 chat.id 会导致不同 Bot 的同一用户共享 session。
+    // namespace 由 createMenuBot 注入 bot:<id>；主机器人不传 namespace，保留旧 key 兼容性。
+    ...(namespace
+      ? {
+          getSessionKey: (ctx: BotContext) => {
+            const key = ctx.chat?.id ?? ctx.from?.id;
+            return key === undefined ? undefined : `${namespace}:${key}`;
+          },
+        }
+      : {}),
+    ...(resolution.adapter
+      ? { storage: resolution.adapter as unknown as StorageAdapter<BotSessionData> }
+      : {}),
+  };
   return {
-    middleware: session<BotSessionData, BotContext>({
-      initial: () => ({}),
-      // 内部 JSON 序列化往返，结构与 grammY StorageAdapter<BotSessionData> 等价
-      storage: resolution.adapter as unknown as StorageAdapter<BotSessionData>,
-    }),
+    middleware: session<BotSessionData, BotContext>(sessionOptions),
     resolution,
   };
 }

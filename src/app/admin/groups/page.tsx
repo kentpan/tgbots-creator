@@ -152,7 +152,7 @@ function GroupFormDialog({
       <SwitchField
         name="require_approval"
         label="新成员审核（审批制入群）"
-        description="开启后部署生成的邀请链接变为「申请制」：用户申请加入时，由下方自动审核机器人自动验证（私聊验证，通过后静默放行、失败 3 次拒绝），或在「加群申请」页人工审批。"
+        description="开启后，本系统为支持申请制的超级群生成 creates_join_request 邀请链接。申请事件由下方指定机器人按其模式处理（验证码验证或直接通过），未指定机器人则由管理员人工审批。该开关不改变 Telegram 外部普通邀请链接或公开用户名入口本身的类型。"
         defaultChecked={group ? group.requireApproval : false}
         id={`require-approval-${group?.chatId ?? "new"}`}
       />
@@ -174,7 +174,7 @@ function GroupFormDialog({
           ))}
         </select>
         <p className="text-xs text-muted-foreground">
-          列表只显示已开启「自动响应加群申请」的机器人；机器人未出现？到
+          列表显示已启用「自动响应加群申请」且已选择验证码验证或直接通过模式的机器人；机器人未出现？到
           <a href="/admin/bots" className="mx-1 text-primary underline">机器人管理 → 功能配置</a>
           开启「自动响应加群申请」并选择验证方式，然后点「部署」更新运行实例。
         </p>
@@ -206,7 +206,7 @@ export default async function GroupsPage({
   const joinVerifyCandidates = bots
     .filter((bot: BotRow) => {
       const feature = parseBotFeatureConfig(bot.config, false);
-      return feature.joinVerify.enabled && feature.joinVerify.methodId;
+      return feature.joinVerify.enabled && (feature.joinVerify.mode === "direct" || feature.joinVerify.methodId);
     })
     .map((bot: BotRow) => ({ id: String(bot.id), name: bot.name }));
 
