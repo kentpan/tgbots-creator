@@ -638,12 +638,15 @@ jobs:
             echo "::error::prisma/schema.sql 不存在(D1 schema 建表唯一真源), 无法保证发布后数据就绪。"
             exit 1
           fi
-          # 归一为幂等 DDL: ① 建表/建索引语句追加 IF NOT EXISTS ② 剥离 PRAGMA/
-          # BEGIN/COMMIT(D1 execute 逐语句执行, 事务包裹无意义且部分语句不受支持)
+          # 归一为幂等 DDL: ① 建表/建索引语句追加 IF NOT EXISTS(已带则不重复 ——
+          # schema.sql 的 v3.0.0+ 增量段本身已用 IF NOT EXISTS, 无条件插入会生成
+          # "CREATE TABLE IF NOT EXISTS IF NOT EXISTS" 语法错误炸掉部署)
+          # ② 剥离 PRAGMA/BEGIN/COMMIT(D1 execute 逐语句执行, 事务包裹无意义且
+          # 部分语句不受支持)
           sed -E \
-            -e 's/^CREATE TABLE /CREATE TABLE IF NOT EXISTS /' \
-            -e 's/^CREATE UNIQUE INDEX /CREATE UNIQUE INDEX IF NOT EXISTS /' \
-            -e 's/^CREATE INDEX /CREATE INDEX IF NOT EXISTS /' \
+            -e 's/^CREATE TABLE (IF NOT EXISTS )?/CREATE TABLE IF NOT EXISTS /' \
+            -e 's/^CREATE UNIQUE INDEX (IF NOT EXISTS )?/CREATE UNIQUE INDEX IF NOT EXISTS /' \
+            -e 's/^CREATE INDEX (IF NOT EXISTS )?/CREATE INDEX IF NOT EXISTS /' \
             -e '/^(PRAGMA|BEGIN|COMMIT)/d' \
             prisma/schema.sql > /tmp/tguard-d1-schema.sql
           echo "归一后 schema 语句数: $(grep -c 'CREATE ' /tmp/tguard-d1-schema.sql)"

@@ -62,12 +62,14 @@ function colInfo(def) {
 }
 
 function ifNotExists(sql) {
+  // (IF NOT EXISTS )? 可选拍获: 语句已带 IF NOT EXISTS 时原样保留, 防止双插
+  // ("CREATE TABLE IF NOT EXISTS IF NOT EXISTS ..." 是 CI 实录过的语法错误)
   return sql
-    .replace(/^CREATE\s+UNIQUE\s+INDEX\s+/i, 'CREATE UNIQUE INDEX IF NOT EXISTS ')
-    .replace(/^CREATE\s+INDEX\s+/i, 'CREATE INDEX IF NOT EXISTS ')
-    .replace(/^CREATE\s+TRIGGER\s+/i, 'CREATE TRIGGER IF NOT EXISTS ')
-    .replace(/^CREATE\s+VIEW\s+/i, 'CREATE VIEW IF NOT EXISTS ')
-    .replace(/^CREATE\s+TABLE\s+/i, 'CREATE TABLE IF NOT EXISTS ')
+    .replace(/^CREATE\s+UNIQUE\s+INDEX\s+(IF\s+NOT\s+EXISTS\s+)?/i, 'CREATE UNIQUE INDEX IF NOT EXISTS ')
+    .replace(/^CREATE\s+INDEX\s+(IF\s+NOT\s+EXISTS\s+)?/i, 'CREATE INDEX IF NOT EXISTS ')
+    .replace(/^CREATE\s+TRIGGER\s+(IF\s+NOT\s+EXISTS\s+)?/i, 'CREATE TRIGGER IF NOT EXISTS ')
+    .replace(/^CREATE\s+VIEW\s+(IF\s+NOT\s+EXISTS\s+)?/i, 'CREATE VIEW IF NOT EXISTS ')
+    .replace(/^CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?/i, 'CREATE TABLE IF NOT EXISTS ')
 }
 
 // 远端对象索引: 表名 → 列名集合; 其余对象名集合

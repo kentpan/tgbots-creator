@@ -42,12 +42,14 @@ function colInfo(def) {
 }
 
 function ifNotExists(sql) {
+  // (IF NOT EXISTS )? 可选拍获: sqlite_master.sql 可能保留原始 IF NOT EXISTS 文本,
+  // 无条件插入会双插成 "IF NOT EXISTS IF NOT EXISTS" 语法错误
   return sql
-    .replace(/^CREATE\s+UNIQUE\s+INDEX\s+/i, 'CREATE UNIQUE INDEX IF NOT EXISTS ')
-    .replace(/^CREATE\s+INDEX\s+/i, 'CREATE INDEX IF NOT EXISTS ')
-    .replace(/^CREATE\s+TRIGGER\s+/i, 'CREATE TRIGGER IF NOT EXISTS ')
-    .replace(/^CREATE\s+VIEW\s+/i, 'CREATE VIEW IF NOT EXISTS ')
-    .replace(/^CREATE\s+TABLE\s+/i, 'CREATE TABLE IF NOT EXISTS ')
+    .replace(/^CREATE\s+UNIQUE\s+INDEX\s+(IF\s+NOT\s+EXISTS\s+)?/i, 'CREATE UNIQUE INDEX IF NOT EXISTS ')
+    .replace(/^CREATE\s+INDEX\s+(IF\s+NOT\s+EXISTS\s+)?/i, 'CREATE INDEX IF NOT EXISTS ')
+    .replace(/^CREATE\s+TRIGGER\s+(IF\s+NOT\s+EXISTS\s+)?/i, 'CREATE TRIGGER IF NOT EXISTS ')
+    .replace(/^CREATE\s+VIEW\s+(IF\s+NOT\s+EXISTS\s+)?/i, 'CREATE VIEW IF NOT EXISTS ')
+    .replace(/^CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?/i, 'CREATE TABLE IF NOT EXISTS ')
 }
 
 const local = load(localPath)
