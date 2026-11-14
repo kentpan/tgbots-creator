@@ -4,8 +4,11 @@
 # 数据库迁移固定规则（所有后续版本必须遵守）：SQLite/D1 schema 有新增、修改或删除时，
 # 必须新增 prisma/sql-upgrade-v<package.json.version>.sql；文件名版本必须与 package.json
 # 一致。迁移只写增量 SQL，兼容 SQLite/D1，数据迁移必须先复制/校验再清理旧结构。工作流
-# 固定检测该精确文件：存在则应用线上 D1，不存在则跳过；Node SQLite 升级也必须执行同版
-# 脚本。无 schema 变化不创建空文件。详细规范见 prisma/README.md。
+# 固定检测该精确文件：存在则经 scripts/d1-upgrade-filter.mjs 幂等过滤后应用到线上 D1
+# (CREATE 归一 IF NOT EXISTS / 远端已存在的列跳过 ADD COLUMN —— SQLite 无 ADD COLUMN
+# IF NOT EXISTS, 盲目整文件执行在重跑/运行时已补列场景必报 duplicate column), 全部
+# 就位则零写入；不存在则跳过。Node SQLite 升级也必须执行同版脚本。无 schema 变化不
+# 创建空文件。详细规范见 prisma/README.md。
 #
 # 来源: 生产环境验证过的通用工作流(upload/next-deploy.zip, gem-td 同源 v9.x,
 # npm + Pages/Workers 双部署类型版), 按 TGuard 项目实际情况做如下适配:
@@ -674,17 +677,32 @@ jobs:
       - name: Apply versioned SQL upgrade (prisma/sql-upgrade-v{version}.sql, if present)
         # 版本化 SQL 增量: 每次打包若 sqlite/D1 schema 有新增/修改/删除,
         # 固定新增 prisma/sql-upgrade-v{本次打包版本号}.sql; 此步骤检测是否存在该文件,
-        # 有则经 wrangler d1 execute 应用到线上 D1, 无则跳过。
+        # 有则应用到线上 D1, 无则跳过。
+        # 幂等执行(2026-11-14 事故修复): SQLite 无 ADD COLUMN IF NOT EXISTS, 裸
+        # ALTER 在"列已被运行时 ensureAppSchema 补齐 / 上次部署已应用"的库上重复
+        # 执行必报 duplicate column name 炸掉部署。执行前先拉远端 sqlite_master,
+        # 经 scripts/d1-upgrade-filter.mjs 过滤: CREATE 归一 IF NOT EXISTS、远端
+        # 已存在的列剔除 ADD COLUMN、剥离 PRAGMA/事务包裹 —— 只执行真实增量,
+        # 全部就位则零写入。重跑安全, 不再依赖"工作流只执行一次"的假设。
         if: env.PROXY_PASSTHROUGH != 'true' && env.D1_NAME != '' && env.D1_ID != ''
         run: |
           PKG_VERSION=$(node -p "require('./package.json').version")
           SQL_FILE="prisma/sql-upgrade-v${PKG_VERSION}.sql"
-          if [ -f "$SQL_FILE" ]; then
-            echo "检测到版本化 SQL 增量: $SQL_FILE → 应用到 D1"
-            npx wrangler d1 execute "$D1_NAME" --remote -y --file="$SQL_FILE"
-            echo "✅ 版本化 SQL 增量已应用: $SQL_FILE"
-          else
+          if [ ! -f "$SQL_FILE" ]; then
             echo "未检测到 prisma/sql-upgrade-v${PKG_VERSION}.sql → 跳过版本化 SQL 增量"
+            exit 0
+          fi
+          echo "检测到版本化 SQL 增量: $SQL_FILE → 幂等应用到 D1"
+          INV_Q="SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name != '_sync_meta'"
+          npx wrangler d1 execute "$D1_NAME" --remote --json --command "$INV_Q" > /tmp/d1-upgrade-remote-inv.json
+          node scripts/d1-upgrade-filter.mjs "$SQL_FILE" /tmp/d1-upgrade-remote-inv.json /tmp/sql-upgrade-final.sql
+          if [ -s /tmp/sql-upgrade-final.sql ]; then
+            echo "待执行增量语句:"
+            cat /tmp/sql-upgrade-final.sql
+            npx wrangler d1 execute "$D1_NAME" --remote -y --file=/tmp/sql-upgrade-final.sql
+            echo "✅ 版本化 SQL 增量已应用(幂等过滤后): $SQL_FILE"
+          else
+            echo "✓ 版本化 SQL 增量内容远端已全部就位 → 零写入"
           fi
 
       - name: Migrate D1 schema (additive, data-preserving)

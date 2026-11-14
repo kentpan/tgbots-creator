@@ -11,13 +11,20 @@
 2. **无结构变化不创建空文件。** 仅业务代码、配置 JSON 或查询逻辑变化，不属于 schema 迁移。
 3. **迁移文件只写增量。** 不得用全量 dump 覆盖线上数据。新增对象优先使用
    `IF NOT EXISTS`；数据更新使用明确的 `WHERE` 条件；迁移可能重跑时必须幂等。
+   注：SQLite 无 `ADD COLUMN IF NOT EXISTS`，裸 `ALTER TABLE ... ADD COLUMN` 无法在
+   SQL 文件内自幂等 —— D1 侧的幂等由部署工作流保证（见规则 6），本地 SQLite 侧由
+   应用层 `ensureAppSchema` 列探测保证，迁移文件本身照写裸 ALTER 即可。
 4. **SQLite 与 D1 兼容。** 迁移 SQL 应使用两端共同支持的 SQLite SQL 子集。若某项操作两端
    不兼容，必须拆分并在工作流/本地迁移器中明确区分执行，不得静默跳过。
 5. **破坏性变更先迁数据。** 删除/重命名列或表前，先新增目标结构、复制并校验数据、更新
    读写代码，确认回滚/备份策略后再清理旧结构。禁止直接删除仍有业务数据的字段。
 6. **部署固定检测。** `.github/workflows/pages-deploy.yml` 根据 `package.json.version` 检测
-   `prisma/sql-upgrade-v<版本号>.sql`：存在则应用到线上 D1；不存在则跳过。迁移执行失败必须
-   使部署失败，不得继续发布半迁移版本。
+   `prisma/sql-upgrade-v<版本号>.sql`：存在则先拉取线上 D1 `sqlite_master`，经
+   `scripts/d1-upgrade-filter.mjs` 幂等过滤（CREATE 归一 `IF NOT EXISTS`、远端已存在的
+   列剔除 `ADD COLUMN`、剥离 `PRAGMA`/事务包裹）后只执行真实增量；全部就位则零写入。
+   不存在则跳过。迁移执行失败必须使部署失败，不得继续发布半迁移版本。重跑安全：
+   线上列可能已被运行时 `ensureAppSchema` 或上次部署提前补齐，工作流不得假设
+   "迁移只执行一次"。
 7. **本地 SQLite 同步执行。** 发布/升级到 Node SQLite 实例时，必须在应用新代码前应用同一
    版本迁移脚本；不得只更新 D1 而遗漏本地 SQLite。执行后核对 `sqlite_master` 和关键数据行数。
 8. **发版记录。** 每次 schema 变更在本文件追加版本、变更摘要、数据迁移说明和验证结果；
@@ -49,3 +56,4 @@
 - 数据迁移：两列新增时保持 NULL；历史群组在显式保存群组策略前继续兼容读取旧机器人级策略。关闭「新成员审核」不会清空这两列。
 - 迁移文件：`prisma/sql-upgrade-v2.3.5.sql`，SQLite 与 D1 共用。
 - 验证：本地 SQLite 副本执行迁移、重复执行预期报 duplicate column（工作流只执行一次）；应用层运行时 `ensureAppSchema` 使用列探测确保幂等补齐。
+- 事故修正（2026-11-14）：上条"工作流只执行一次"的假设不成立 —— 线上 `join_verify_mode` 已被运行时 `ensureAppSchema` 补齐，CI 重跑时整文件盲目执行报 `duplicate column name: join_verify_mode` 部署失败。修复：部署工作流改为先拉远端 `sqlite_master`，经 `scripts/d1-upgrade-filter.mjs` 幂等过滤后只执行真实增量（列已存在则剔除对应 ADD COLUMN），重复执行安全；迁移文件本身不变。
