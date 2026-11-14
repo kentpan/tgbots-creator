@@ -51,6 +51,19 @@ export async function GET(request: Request): Promise<NextResponse> {
     })
     .map((bot) => ({ id: String(bot.id), name: bot.name }));
 
+  // v2.3.5 生效策略（与 services/join-verify.ts 运行时解析同语义）：
+  // 群组私有列非 NULL 取群组值；NULL（历史群组未显式保存策略）回退该群绑定
+  // 机器人的 bot 级 joinVerify 配置；未绑定机器人或机器人不存在则保持 NULL。
+  const effectiveJoinVerifyMode: "verify" | "direct" | null = settings?.joinVerifyMode ?? null;
+  let effectiveJoinVerifyMethodId: bigint | null = settings?.joinVerifyMethodId ?? null;
+  if (effectiveJoinVerifyMode === null && settings?.joinVerifyBotId != null) {
+    const boundBot = await getBot(settings.joinVerifyBotId);
+    const feature = boundBot ? parseBotFeatureConfig(boundBot.config, false) : null;
+    if (feature?.joinVerify.enabled && feature.joinVerify.methodId) {
+      effectiveJoinVerifyMethodId = BigInt(feature.joinVerify.methodId);
+    }
+  }
+
   return NextResponse.json({
     ok: true,
     data: {

@@ -57,3 +57,16 @@
 - 迁移文件：`prisma/sql-upgrade-v2.3.5.sql`，SQLite 与 D1 共用。
 - 验证：本地 SQLite 副本执行迁移、重复执行预期报 duplicate column（工作流只执行一次）；应用层运行时 `ensureAppSchema` 使用列探测确保幂等补齐。
 - 事故修正（2026-11-14）：上条"工作流只执行一次"的假设不成立 —— 线上 `join_verify_mode` 已被运行时 `ensureAppSchema` 补齐，CI 重跑时整文件盲目执行报 `duplicate column name: join_verify_mode` 部署失败。修复：部署工作流改为先拉远端 `sqlite_master`，经 `scripts/d1-upgrade-filter.mjs` 幂等过滤后只执行真实增量（列已存在则剔除对应 ADD COLUMN），重复执行安全；迁移文件本身不变。
+
+## v3.0.0
+
+- Schema：新增独立通用机器人模型配置模块五表 `model_event_entries` / `model_triggers` / `model_workflows` / `model_permissions` / `model_execution_logs` 及 7 个配套索引；`schema.sql` 同步追加。
+- 数据迁移：保留高位 ID（900000001/900000002）插入 `permissions` 两条 `model-config:*` 权限、`menus` 六条菜单，并按 `bots:view` / `bots:manage` 现有授权复制 `role_permissions`；全部为守卫式 `INSERT OR IGNORE` + `WHERE EXISTS`，无既有数据改动。
+- 迁移文件：`prisma/sql-upgrade-v3.0.0.sql`（**2026-11-14 已并入 v3.0.1 并删除**，见下）。
+
+## v3.0.1
+
+- Schema：新增机器人工厂独立装配配置表 `bots_factory` 及索引 `idx_bots_factory_updated`；`schema.sql` 同步追加。
+- 数据迁移：`menus` 新增"机器人工厂"菜单（id=900000007，父级为 v3.0.0 的"模型配置" 900000001）；守卫式插入，父菜单缺失时跳过。
+- 迁移文件合并（2026-11-14）：`package.json` 版本为 3.0.1，工作流固定只检测 `sql-upgrade-v3.0.1.sql`；v3.0.1 菜单插入依赖 v3.0.0 创建的父菜单，若线上 D1 从未成功应用 v3.0.0 会静默丢数据。故将 v3.0.0 全部内容并入 `sql-upgrade-v3.0.1.sql`（一个文件从任意 ≥v2.3.5 旧库无损升到 3.0.1），并删除 `sql-upgrade-v3.0.0.sql`。合并文件整文件幂等：`CREATE` 全部 `IF NOT EXISTS`、种子全部守卫式 `INSERT OR IGNORE`，重跑不产生重复行。
+- 验证：干净库（`schema.sql` 基线）应用两次 → 表/索引全部就位、无重复、`PRAGMA integrity_check` ok；带 `bots:view`/`bots:manage` 基线种子的库应用 → `model-config:*` 权限 2 条、菜单 7 条、角色授权映射 2 条，第四次复跑行数不变；六张新表列集合与 `schema.sql` 目标结构逐列一致。另发现并修复本地 `prisma/bot-groups.db` schema 损坏（主库文件与 WAL 时间戳不匹配致 `malformed database schema`），经 `.recover` 重建后应用本迁移，integrity ok。

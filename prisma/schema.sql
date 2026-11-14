@@ -355,3 +355,23 @@ CREATE UNIQUE INDEX "verification_methods_name_key" ON "verification_methods"("n
 CREATE UNIQUE INDEX "verification_sessions_token_key" ON "verification_sessions"("token");
 CREATE UNIQUE INDEX "verify_codes_code_key" ON "verify_codes"("code");
 COMMIT;
+
+
+-- v3.0.0 通用机器人模型配置（与 v3.0.0 增量迁移一致）
+CREATE TABLE IF NOT EXISTS model_event_entries (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER, name TEXT NOT NULL, source_type TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'private', chat_id TEXT, config_json TEXT NOT NULL DEFAULT '{}', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS model_triggers (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER, event_entry_id INTEGER, name TEXT NOT NULL, trigger_type TEXT NOT NULL, match_json TEXT NOT NULL DEFAULT '{}', workflow_id INTEGER, permission_ids_json TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS model_workflows (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER, name TEXT NOT NULL, description TEXT, nodes_json TEXT NOT NULL DEFAULT '[]', entry_node_id TEXT, permission_ids_json TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS model_permissions (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER, name TEXT NOT NULL, permission_type TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'private', config_json TEXT NOT NULL DEFAULT '{}', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS model_execution_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER, event_entry_id INTEGER, trigger_id INTEGER, workflow_id INTEGER, scope TEXT NOT NULL DEFAULT 'private', chat_id TEXT, user_id TEXT, status TEXT NOT NULL, current_node_id TEXT, input_json TEXT NOT NULL DEFAULT '{}', output_json TEXT NOT NULL DEFAULT '{}', error_text TEXT, duration_ms INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_model_events_bot ON model_event_entries(bot_id, enabled);
+CREATE INDEX IF NOT EXISTS idx_model_triggers_event ON model_triggers(event_entry_id, enabled);
+CREATE INDEX IF NOT EXISTS idx_model_triggers_type ON model_triggers(trigger_type, enabled);
+CREATE INDEX IF NOT EXISTS idx_model_workflows_bot ON model_workflows(bot_id, enabled);
+CREATE INDEX IF NOT EXISTS idx_model_permissions_bot ON model_permissions(bot_id, enabled);
+CREATE INDEX IF NOT EXISTS idx_model_logs_created ON model_execution_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_model_logs_workflow ON model_execution_logs(workflow_id, created_at DESC);
+
+
+-- v3.0.1 机器人工厂独立装配配置
+CREATE TABLE IF NOT EXISTS bots_factory (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',bot_id INTEGER,config_json TEXT NOT NULL DEFAULT '{}',status TEXT NOT NULL DEFAULT 'draft',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_bots_factory_updated ON bots_factory(updated_at DESC,id DESC);
