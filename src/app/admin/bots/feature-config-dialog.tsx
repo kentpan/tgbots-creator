@@ -771,6 +771,7 @@ export function FeatureConfigDialog({
                     ref={simRef}
                     config={simulatorConfig}
                     botName={botDisplayName}
+                    botUsername={bot?.username ?? ""}
                     startWelcomeText={welcomeText}
                     groupTitle={realGroupTitle}
                     memberCount={realGroups.groups.length > 0 ? "已部署的真实群组" : ""}

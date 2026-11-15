@@ -13,7 +13,7 @@ import { htmlEscape } from "@/utils/html";
 import { utcnow } from "@/utils/time";
 import { InlineKeyboard, type Api } from "grammy";
 import { CODE_SELF_DEFAULT_PROMPT, sendCodeSelfPrompt } from "../verification-prompt";
-import { BOT_TEXT_DEFAULTS } from "@/services/bot-messages";
+import { BOT_TEXT_DEFAULTS, renderBotTextVars, type BotTextVars } from "@/services/bot-messages";
 import { muteAndSendGroupPrompt } from "./group-verification";
 import { approveTelegramJoinRequest } from "@/services/approval";
 import { registerTelegramChat } from "@/services/chat-registry";
@@ -196,22 +196,26 @@ async function bootstrapGroupVerification(
  * 失败 3 次 → declineChatJoinRequest（评估管道 verification-flow 已实现）。
  * stars 方式：发送星星发票（payload=join_verify:<token>），支付成功事件放行。
  */
-/** v3.0.3：读取 bots.config.texts.dm_join_prompt（申请入群私聊提示）；缺失回落默认，置空 = 不发送 */
-async function resolveDmJoinPrompt(botId?: bigint | null): Promise<string> {
+/** v3.0.3：读取 bots.config.texts.dm_join_prompt（申请入群私聊提示）+ 变量取值；
+ * 缺失回落默认，置空 = 不发送。变量来自 bots 表（name/username）。 */
+async function resolveDmJoinPrompt(botId?: bigint | null): Promise<{ text: string; vars: BotTextVars }> {
+  let text = BOT_TEXT_DEFAULTS.dm_join_prompt;
+  let vars: BotTextVars = {};
   try {
     if (botId) {
       const { getBot } = await import("@/database/operations");
       const botRow = await getBot(botId);
       if (botRow) {
+        vars = { botName: botRow.name, botUsername: botRow.username ?? null };
         const parsed = JSON.parse(botRow.config || "{}") as { texts?: Record<string, unknown> };
         const value = parsed.texts?.dm_join_prompt;
-        if (typeof value === "string") return value;
+        if (typeof value === "string") text = value;
       }
     }
   } catch {
     /* 配置读取失败回落默认文案 */
   }
-  return BOT_TEXT_DEFAULTS.dm_join_prompt;
+  return { text: renderBotTextVars(text, vars), vars };
 }
 
 async function bootstrapDmVerification(
@@ -253,7 +257,7 @@ async function bootstrapDmVerification(
         }
       } else if (existingPending.method === "code_api") {
         // v3.0.3：重投的 chat_join_request 同样发送入群私聊提示（文案可配置、置空不发）
-        const joinPrompt = (await resolveDmJoinPrompt(botId)).trim();
+        const joinPrompt = (await resolveDmJoinPrompt(botId)).text.trim();
         if (joinPrompt) {
           try {
             await api.sendMessage(targetChatId, joinPrompt, {
@@ -357,7 +361,7 @@ async function bootstrapDmVerification(
     // 就地直接输码 —— 真实 APP 等价于仿真屏的「自动跳转机器人私聊」视图切换）。
     // 文案 = bots.config.texts.dm_join_prompt（文案配置中心可自定义），置空 = 不发送。
     const targetChatId = user.userChatId ?? user.id;
-    const joinPrompt = (await resolveDmJoinPrompt(botId)).trim();
+    const joinPrompt = (await resolveDmJoinPrompt(botId)).text.trim();
     if (!joinPrompt) {
       console.log(
         `code_api verification session ready: user ${user.id} chat ${chat.id} ` +

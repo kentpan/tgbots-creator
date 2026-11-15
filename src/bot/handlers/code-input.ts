@@ -226,6 +226,11 @@ export async function processCodeAnswer(
     eventApi: ctx.api,
     notificationChatId: replyChatId,
     texts: ctx.botTexts,
+    textVars: {
+      botName: ctx.me?.first_name ?? null,
+      botUsername: ctx.me?.username ?? null,
+      chatTitle: ctx.chat && "title" in ctx.chat ? (ctx.chat.title ?? null) : null,
+    },
     onNetworkRetry: async () => {
       await ctx.api.sendMessage(replyChatId, NETWORK_RETRY_NOTICE);
     },

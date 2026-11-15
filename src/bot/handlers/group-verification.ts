@@ -321,6 +321,11 @@ export async function handleVerificationChoice(
     code: choice,
     preloaded: { session, joinRequest, settings },
     texts: ctx.botTexts,
+    textVars: {
+      botName: ctx.me?.first_name ?? null,
+      botUsername: ctx.me?.username ?? null,
+      chatTitle: ctx.chat?.title ?? null,
+    },
   });
 
   switch (result.outcome) {

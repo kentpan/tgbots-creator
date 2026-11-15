@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentAdmin, hasPermission } from "@/lib/auth";
 import {
+  approveJoinRequest,
   createJoinRequest,
   createVerificationSession,
   getVerificationMethod,
@@ -162,6 +163,41 @@ export async function POST(request: Request): Promise<NextResponse> {
       { ok: false, error: "仿真屏暂不支持「人机验证（WebApp）」交互仿真：该方式依赖真实验证网页，请在真实 Telegram 中验证" },
       { status: 400 },
     );
+  }
+
+  // v3.0.3 修复：直接通过申请模式（mode=direct）与真实 chat_join_request 链路
+  // （composers/join-verify.ts direct 分支）同语义 —— 不创建验证会话、不发验证提示、
+  // 不切私聊，记录申请后立即落库批准，仿真屏直接进入群组。
+  // 旧实现给 direct 也建会话+返回提示文案，导致"申请后先绕进机器人私聊点按钮"的绕弯路。
+  if (resolved.method === "direct") {
+    const token = generateVerificationToken();
+    const directRequest = await createJoinRequest({
+      userId: SIMULATED_USER_ID,
+      chatId,
+      username: "preview_user",
+      firstName: "预览",
+      lastName: "用户",
+      verificationToken: token,
+      requestType: "simulator",
+    });
+    if (!directRequest) {
+      return NextResponse.json({ ok: false, error: "创建模拟加群申请失败" }, { status: 500 });
+    }
+    const approved = await approveJoinRequest(token);
+    if (!approved) {
+      return NextResponse.json({ ok: false, error: "自动批准加群申请失败（落库）" }, { status: 500 });
+    }
+    console.log(`Simulator direct-mode join approved: user ${SIMULATED_USER_ID} -> chat ${chatId}`);
+    return NextResponse.json({
+      ok: true,
+      data: {
+        approved: true,
+        mode: "direct",
+        chat_id: String(chatId),
+        chat_title: settings?.chatTitle,
+        success_text: settings?.successText ?? "✅ 已加入群组",
+      },
+    });
   }
 
   // 弹窗携带 api_config：更新机器人绑定的方式库配置（仅 code_api 方式且已绑定）

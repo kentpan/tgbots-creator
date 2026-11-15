@@ -11,6 +11,7 @@ import {
 } from "@/database/operations";
 import { escapeMarkdownV2 } from "@/utils/markdown";
 import { htmlEscape, userMentionHTML } from "@/utils/html";
+import { BOT_TEXT_DEFAULTS, renderBotTextVars, type BotTextVars } from "./bot-messages";
 
 const TELEGRAM_ERRORS: Record<string, string> = {
   user_not_found: "用户不存在",
@@ -268,6 +269,45 @@ async function resolveGroupJumpUrl(bot: Bot, chatId: bigint): Promise<string | n
   }
 }
 
+/** v3.0.3 文案变量/配置取值：群标题 + 受理机器人名称/用户名 + bots.config.texts（审批链路低频事件，点查成本可忽略） */
+async function loadApprovalTextContext(chatId: bigint): Promise<{
+  vars: BotTextVars;
+  texts: Record<string, string>;
+}> {
+  const vars: BotTextVars = {};
+  let texts: Record<string, string> = {};
+  try {
+    const settings = await getGroupSettings(chatId);
+    vars.chatTitle = settings?.chatTitle ?? null;
+  } catch {
+    /* 群标题缺失 = {{chat_title}} 保留占位 */
+  }
+  try {
+    const binding = await getActiveBotForChat(chatId);
+    if (binding?.botId) {
+      const { getBot } = await import("@/database/operations");
+      const botRow = await getBot(binding.botId);
+      if (botRow) {
+        vars.botName = botRow.name;
+        vars.botUsername = botRow.username ?? null;
+        try {
+          const parsed = JSON.parse(botRow.config || "{}") as { texts?: Record<string, unknown> };
+          if (parsed.texts && typeof parsed.texts === "object" && !Array.isArray(parsed.texts)) {
+            for (const [key, value] of Object.entries(parsed.texts as Record<string, unknown>)) {
+              if (typeof value === "string") texts[key] = value;
+            }
+          }
+        } catch {
+          /* 坏配置按未配置处理 */
+        }
+      }
+    }
+  } catch {
+    /* 机器人信息缺失 = {{bot_name}}/{{bot_username}} 保留占位 */
+  }
+  return { vars, texts };
+}
+
 async function sendWelcomeMessage(
   bot: Bot,
   chatId: bigint,
@@ -275,17 +315,26 @@ async function sendWelcomeMessage(
   recipientChatId: number = Number(userId),
 ): Promise<void> {
   try {
+    // v3.0.3：祝贺文案走文案配置中心（bots.config.texts.dm_join_success），支持
+    // {{bot_name}}/{{bot_username}}/{{chat_title}} 变量；置空 = 不发送（按钮随之不发）。
+    const { vars, texts } = await loadApprovalTextContext(chatId);
     const chatInfo = await bot.api.getChat(Number(chatId));
-    const escapedTitle = escapeMarkdownV2(
-      "title" in chatInfo && chatInfo.title ? chatInfo.title : "群组",
-    );
+    if (vars.chatTitle === undefined) {
+      vars.chatTitle = "title" in chatInfo && chatInfo.title ? chatInfo.title : null;
+    } else if ("title" in chatInfo && chatInfo.title) {
+      vars.chatTitle = chatInfo.title;
+    }
+    const text = renderBotTextVars(
+      texts.dm_join_success ?? BOT_TEXT_DEFAULTS.dm_join_success ?? "",
+      vars,
+    ).trim();
+    if (!text) return;
     // v2.1.5：附「🚀 前往群组」按钮 —— 验证通过后用户无需翻找群组，一键直达
     const jumpUrl = await resolveGroupJumpUrl(bot, chatId);
     await bot.api.sendMessage(
       recipientChatId,
-      `🎉 *验证成功\\!*\n\n您已成功加入 *${escapedTitle}*，欢迎\\!`,
+      text,
       {
-        parse_mode: "MarkdownV2",
         ...(jumpUrl
           ? { reply_markup: new InlineKeyboard().url("🚀 前往群组", jumpUrl) }
           : {}),
@@ -584,6 +633,10 @@ export async function sendGroupWelcome(
 ): Promise<boolean> {
   try {
     const bot = await resolveBotForChat("sendGroupWelcome", chatId, userId, eventApi);
+    // v3.0.3：成功文案支持变量插值（{{bot_name}}/{{bot_username}}/{{chat_title}}）
+    const { vars } = await loadApprovalTextContext(chatId);
+    const rendered = renderBotTextVars(successText, vars);
+    if (!rendered.trim()) return false;
     const mention = userMentionHTML({
       id: Number(userId),
       username,
@@ -593,7 +646,7 @@ export async function sendGroupWelcome(
     return await sendGroupNoticeHTML(
       bot,
       chatId,
-      `${mention} ${htmlEscape(successText)}`,
+      `${mention} ${htmlEscape(rendered)}`,
     );
   } catch (error) {
     console.warn(`Failed to send group welcome to user ${userId} (chat ${chatId}):`, error);

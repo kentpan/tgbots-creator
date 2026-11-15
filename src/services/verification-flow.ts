@@ -15,7 +15,7 @@ import {
   type VerificationSessionRow,
 } from "@/database/operations";
 import { parseCodeApiConfig, verifyCodeExternally } from "./external-verify";
-import { BOT_TEXT_DEFAULTS } from "./bot-messages";
+import { BOT_TEXT_DEFAULTS, renderBotTextVars, type BotTextVars } from "./bot-messages";
 import type { Api } from "grammy";
 import {
   autoApproveUser,
@@ -88,6 +88,8 @@ export interface CodeCheckInput {
   onNetworkRetry?: () => void | Promise<void>;
   /** v3.0.3 文案配置中心：bot 路径传入 ctx.botTexts（bots.config.texts），次数用尽等提示按配置回复；不传走默认值 */
   texts?: Record<string, string>;
+  /** v3.0.3 文案变量（{{bot_name}}/{{bot_username}}）：bot 路径从 ctx.me 取值传入 */
+  textVars?: BotTextVars;
 }
 
 /**
@@ -251,7 +253,7 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
         outcome: "failed_expired",
         // v3.0.3：次数用尽回复走文案配置中心 texts.attempts_exhausted（默认
         // 「超出验证次数, 请重新申请加入群组」）；置空 = 不发送（空串调用方跳过）。
-        replyText: composeAttemptsExhaustedReply(input.texts, stayedInGroup),
+        replyText: composeAttemptsExhaustedReply(input.texts, stayedInGroup, input.textVars ?? {}),
         reason: verdict.reason,
         remaining: 0,
         reapplyChatId: joinRequest.chatId !== 0n ? joinRequest.chatId.toString() : null,
@@ -262,10 +264,13 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
     }
     return {
       outcome: "failed_retry",
-      // v3.0.2：失败文案显式置空 = 不发送（replyText 空串，调用方判空跳过）
-      replyText: composeFailureReply(
-        settings?.failureText,
-        `错误原因：${verdict.reason}\n剩余尝试次数：${remaining}`,
+      // v3.0.2/3.0.3：失败文案显式置空 = 不发送（replyText 空串，调用方判空跳过）；支持变量插值
+      replyText: renderBotTextVars(
+        composeFailureReply(
+          settings?.failureText,
+          `错误原因：${verdict.reason}\n剩余尝试次数：${remaining}`,
+        ),
+        input.textVars ?? {},
       ),
       reason: verdict.reason,
       remaining,
@@ -327,9 +332,9 @@ export async function evaluateSubmittedCode(input: CodeCheckInput): Promise<Code
 
   return {
     outcome: "success",
-    // v3.0.2：成功文案显式置空 = 不发送（replyText 空串，调用方判空跳过）
+    // v3.0.2/3.0.3：成功文案显式置空 = 不发送（replyText 空串，调用方判空跳过）；支持变量插值
     replyText: approved
-      ? composeSuccessReply(settings?.successText)
+      ? renderBotTextVars(composeSuccessReply(settings?.successText), input.textVars ?? {})
       : `验证码正确，但自动批准入群失败：${approvalNote ?? "Telegram 审批未完成"}。请联系群管理员处理。`,
     approved,
     approvalNote,
@@ -350,13 +355,17 @@ function composeSuccessReply(base: string | null | undefined): string {
 
 /**
  * 次数用尽提示组装（v3.0.3）：走文案配置中心 texts.attempts_exhausted
- * （默认「超出验证次数, 请重新申请加入群组」）；置空 = 不发送（返回空串）。
+ * （默认「超出验证次数, 请重新申请加入群组」）；支持变量插值；置空 = 不发送（返回空串）。
  */
 function composeAttemptsExhaustedReply(
   texts: Record<string, string> | undefined,
   stayedInGroup: boolean,
+  vars: BotTextVars = {},
 ): string {
-  const text = (texts?.attempts_exhausted ?? BOT_TEXT_DEFAULTS.attempts_exhausted ?? "").trim();
+  const text = renderBotTextVars(
+    (texts?.attempts_exhausted ?? BOT_TEXT_DEFAULTS.attempts_exhausted ?? "").trim(),
+    vars,
+  );
   if (!text) return "";
   return stayedInGroup ? `${text}（你仍保留在群组中）` : text;
 }

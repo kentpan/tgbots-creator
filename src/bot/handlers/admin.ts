@@ -14,7 +14,7 @@ import { adminOnly } from "../filters";
 import { mainMenu } from "../menus";
 import { InlineKeyboard } from "grammy";
 import { htmlEscape } from "@/utils/html";
-import { BOT_TEXT_DEFAULTS, DEFAULT_GROUP_PROMPT_TEXT } from "@/services/bot-messages";
+import { BOT_TEXT_DEFAULTS, DEFAULT_GROUP_PROMPT_TEXT, renderBotTextVars } from "@/services/bot-messages";
 
 /**
  * /start —— 三段式入口（v1.1.3）：
@@ -123,9 +123,15 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
   // v3.0.2 文案配置中心：/start 各分支文案全部走 bots.config.texts（管理端文本框
   // 默认回填当前生效值）；文案值为空串 = 不发送该文本。旧 welcomeText 字段继续兼容
   // 且优先于 texts.start_welcome（同一编辑框的存储位）。
+  // v3.0.3：所有文案发送前统一做变量插值（{{bot_name}}/{{bot_username}}/{{chat_title}}）。
   const texts = ctx.botTexts ?? BOT_TEXT_DEFAULTS;
+  const textVars = {
+    botName: ctx.me?.first_name ?? null,
+    botUsername: ctx.me?.username ?? null,
+    chatTitle: ctx.chat && "title" in ctx.chat ? (ctx.chat.title ?? null) : null,
+  };
   const configuredWelcome = ctx.startWelcomeText?.trim();
-  const welcomeTemplate = configuredWelcome || texts.start_welcome || "";
+  const welcomeTemplate = renderBotTextVars(configuredWelcome || texts.start_welcome || "", textVars);
   const markup =
     ctx.interfaceKeyboardMode && ctx.customKeyboard
       ? ctx.customKeyboard
@@ -133,10 +139,7 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
         ? undefined
         : ctx.botMenu ?? mainMenu;
   if (welcomeTemplate.trim()) {
-    const welcome = welcomeTemplate
-      .replaceAll("{{bot_name}}", ctx.me?.first_name ?? "TGuard")
-      .replaceAll("{{bot_username}}", ctx.me?.username ? `@${ctx.me.username}` : "");
-    await ctx.reply(welcome, {
+    await ctx.reply(welcomeTemplate, {
       ...(markup ? { reply_markup: markup } : {}),
       link_preview_options: { is_disabled: true },
     });
@@ -145,16 +148,16 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
 
   // 欢迎文案为空：内嵌菜单开启 → 只发菜单提示+菜单；键盘模式 → 只发键盘；全关 → 不发文本
   if (ctx.interfaceMenuEnabled === false) {
-    const text = (texts.start_no_menu ?? "").trim();
+    const text = renderBotTextVars(texts.start_no_menu ?? "", textVars).trim();
     if (text) await ctx.reply(text);
     return;
   }
   if (ctx.interfaceKeyboardMode && ctx.customKeyboard) {
-    const text = (texts.start_keyboard ?? "").trim();
+    const text = renderBotTextVars(texts.start_keyboard ?? "", textVars).trim();
     if (text) await ctx.reply(text, { reply_markup: ctx.customKeyboard });
     return;
   }
-  const menuHint = (texts.menu_hint ?? "").trim();
+  const menuHint = renderBotTextVars(texts.menu_hint ?? "", textVars).trim();
   if (menuHint) {
     await ctx.reply(menuHint, {
       // @grammyjs/menu 官方约束：Menu 实例只能发给安装它的 bot —— 菜单 bot 实例
@@ -165,8 +168,12 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
 }
 
 export async function cmdHelp(ctx: BotContext): Promise<void> {
-  // v3.0.2：/help 文案走配置中心（空串 = 不发送）
-  const text = (ctx.botTexts?.help_text ?? BOT_TEXT_DEFAULTS.help_text ?? "").trim();
+  // v3.0.2：/help 文案走配置中心（空串 = 不发送）；v3.0.3 支持变量插值
+  const text = renderBotTextVars(ctx.botTexts?.help_text ?? BOT_TEXT_DEFAULTS.help_text ?? "", {
+    botName: ctx.me?.first_name ?? null,
+    botUsername: ctx.me?.username ?? null,
+    chatTitle: ctx.chat && "title" in ctx.chat ? (ctx.chat.title ?? null) : null,
+  }).trim();
   if (!text) return;
   await ctx.reply(text, {
     link_preview_options: { is_disabled: true },

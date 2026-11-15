@@ -432,13 +432,22 @@ export function TestingClient({
         const payload = (await response.json()) as {
           ok: boolean;
           error?: string;
-          data?: Record<string, string>;
+          data?: Record<string, string> & { approved?: boolean; mode?: string };
         };
         if (!payload.ok || !payload.data) {
           setSession(null);
           setJoinPhase("idle");
           setSimView("group");
           return { ok: false, message: payload.error ?? "申请加入失败" };
+        }
+        // v3.0.3 直接通过申请模式（mode=direct）：不建验证会话、不切私聊 ——
+        // 与真实 chat_join_request 链路一致，申请即批准，直接进入群组。
+        if (payload.data.approved === true && payload.data.mode === "direct") {
+          setSession(null);
+          setJoinPhase("joined");
+          setSimView("group");
+          setSelectedChatId(chatId);
+          return { ok: true, message: "已直接通过，欢迎加入群组！" };
         }
         setSession({
           token: payload.data.token,
@@ -578,6 +587,9 @@ export function TestingClient({
           return { ok: false, text: payload.error ?? "提交失败" };
         }
         if (payload.data.outcome === "success") {
+          // v3.0.3：验证成功清空会话 —— 移除验证提示气泡与输码输入状态，
+          // 进群后回到普通聊天状态（旧实现 session 残留导致提示消息一直挂着）
+          setSession(null);
           setJoinPhase("joined");
           // 与真实 APP 一致：验证成功后回到群组（私聊验证对话保留在私聊流中）
           setSimView("group");

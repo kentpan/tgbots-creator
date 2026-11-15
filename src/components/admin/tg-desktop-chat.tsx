@@ -505,7 +505,7 @@ export function TgDesktopChat({
         appendStream(stream, {
           from: "system",
           sender: "system",
-          content: { type: "text", text: "你已申请加入群组", mediaUrl: "", items: [] },
+          content: { type: "text", text: result.message || "你已申请加入群组", mediaUrl: "", items: [] },
         });
       }
     } catch (error) {

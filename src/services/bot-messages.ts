@@ -69,7 +69,7 @@ export const BOT_TEXT_DEFS: BotTextDef[] = [
     label: "/start 欢迎消息（用户首次打开机器人时回复）",
     defaultValue: DEFAULT_START_WELCOME_TEXT,
     description:
-      "场景：用户在 Telegram 打开与机器人的私聊、发送 /start（或点「启动」按钮）时的第一段回复。支持换行与变量 {{bot_name}}、{{bot_username}}；置空 = /start 不发欢迎文本（内嵌菜单开启时仍会发菜单提示）。",
+      "场景：用户在 Telegram 打开与机器人的私聊、发送 /start（或点「启动」按钮）时的第一段回复。支持换行与变量 {{bot_name}}、{{bot_username}}、{{chat_title}}；置空 = /start 不发欢迎文本（内嵌菜单开启时仍会发菜单提示）。",
   },
   {
     key: "start_no_menu",
@@ -104,14 +104,21 @@ export const BOT_TEXT_DEFS: BotTextDef[] = [
     label: "入群申请私聊提示（用户点击「申请加入群组」后机器人私聊发送）",
     defaultValue: "✅ 已收到你的入群申请，请直接在此发送验证码完成验证。",
     description:
-      "场景：用户通过邀请链接/深链提交加群申请（chat_join_request）后，机器人在与该用户的私聊中发送的引导语 —— 用户就地直接发送验证码即可完成验证（外部卡密验证）。置空 = 申请后机器人不主动发任何私聊消息。",
+      "场景：用户通过邀请链接/深链提交加群申请（chat_join_request）后，机器人在与该用户的私聊中发送的引导语 —— 用户就地直接发送验证码即可完成验证（外部卡密验证）。支持变量 {{bot_name}}、{{bot_username}}、{{chat_title}}。置空 = 申请后机器人不主动发任何私聊消息。",
   },
   {
     key: "attempts_exhausted",
     label: "验证次数用尽提示（私聊输码错误次数超上限时）",
     defaultValue: "超出验证次数, 请重新申请加入群组",
     description:
-      "场景：用户私聊输码连续错误达到最大尝试次数（群组设置 max_attempts，默认 3 次），验证会话失效后机器人发送的最终提示。置空 = 次数用尽时机器人不回复。",
+      "场景：用户私聊输码连续错误达到最大尝试次数（群组设置 max_attempts，默认 3 次），验证会话失效后机器人发送的最终提示。支持变量 {{bot_name}}、{{bot_username}}。置空 = 次数用尽时机器人不回复。",
+  },
+  {
+    key: "dm_join_success",
+    label: "审批通过私聊祝贺（加群申请被批准后机器人私聊发送）",
+    defaultValue: "🎉 验证成功！您已成功加入 {{chat_title}}，欢迎！",
+    description:
+      "场景：加群申请被机器人自动批准（approveChatJoinRequest 成功）后，机器人在私聊发送的祝贺消息，附带「前往群组」跳转按钮。支持变量 {{bot_name}}、{{bot_username}}、{{chat_title}}。置空 = 不发送祝贺消息（按钮也随之不发送）。",
   },
 ];
 
@@ -119,6 +126,38 @@ export const BOT_TEXT_DEFS: BotTextDef[] = [
 export const BOT_TEXT_DEFAULTS: Record<string, string> = Object.fromEntries(
   BOT_TEXT_DEFS.map((def) => [def.key, def.defaultValue]),
 );
+
+/** 文案变量取值（v3.0.3：所有默认文案统一支持 {{bot_name}} / {{bot_username}} / {{chat_title}}） */
+export interface BotTextVars {
+  /** 机器人名称（运行时 = Telegram 侧 first_name；仿真屏 = 机器人配置名） */
+  botName?: string | null;
+  /** 机器人用户名（不含 @；空 = {{bot_username}} 替换为空串） */
+  botUsername?: string | null;
+  /** 当前群组名称（私聊场景为空） */
+  chatTitle?: string | null;
+}
+
+/**
+ * 文案变量插值（所有默认文案发送前统一调用）：
+ *   {{bot_name}}      → 机器人名称（vars.botName 未提供 = 保留占位不替换；
+ *                        提供但为空 = TGuard）
+ *   {{bot_username}}  → @用户名（未提供 = 保留占位；提供但为空 = 替换为空串）
+ *   {{chat_title}}    → 当前群组名称（未提供 = 保留占位；提供但为空 = 替换为空串）
+ */
+export function renderBotTextVars(text: string, vars: BotTextVars = {}): string {
+  if (!text) return text;
+  let out = text;
+  if (vars.botName !== undefined) {
+    out = out.replaceAll("{{bot_name}}", vars.botName?.trim() || "TGuard");
+  }
+  if (vars.botUsername !== undefined) {
+    out = out.replaceAll("{{bot_username}}", vars.botUsername?.trim() ? `@${vars.botUsername.trim()}` : "");
+  }
+  if (vars.chatTitle !== undefined) {
+    out = out.replaceAll("{{chat_title}}", vars.chatTitle?.trim() ?? "");
+  }
+  return out;
+}
 
 /**
  * 合并 bots.config.texts 与默认值 → 运行时文案表。

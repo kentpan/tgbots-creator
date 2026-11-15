@@ -27,7 +27,7 @@ import {
   type CustomKeyboardConfig,
 } from "@/services/custom-keyboard";
 import { normalizeReplyContent, countMenuStats } from "@/services/menu-config";
-import { resolveBotTexts } from "@/services/bot-messages";
+import { renderBotTextVars, resolveBotTexts, type BotTextVars } from "@/services/bot-messages";
 import { parseBotFeatureConfig, resolveInterfaceMode, type BotFeatureConfig } from "@/services/bot-feature-config";
 import { CommandGroup } from "@grammyjs/commands";
 import { codeQuestion } from "./verification-question";
@@ -97,6 +97,27 @@ export interface BotPluginsConfig {
 
 export function parseBotPrivacyMode(profile: BotProfileConfig): boolean {
   return profile.privacyMode !== false;
+}
+
+/**
+ * v3.0.3 菜单消息正文机器人变量预渲染：
+ * 菜单 content（text/caption/items[].caption）支持 {{bot_name}}/{{bot_username}}，
+ * 在菜单安装前按机器人信息一次性替换（运行时各发送点零成本）。
+ */
+function renderMenuConfigBotVars(config: BotMenuConfig, vars: BotTextVars): BotMenuConfig {
+  const render = (value: string | undefined): string | undefined =>
+    value === undefined ? undefined : renderBotTextVars(value, vars);
+  const content = config.content;
+  const renderedContent = {
+    ...content,
+    text: render(content.text) ?? "",
+    items: Array.isArray(content.items)
+      ? content.items.map((item) =>
+          item.caption === undefined ? item : { ...item, caption: render(item.caption) ?? "" },
+        )
+      : content.items,
+  };
+  return { ...config, content: renderedContent };
 }
 
 interface MenuBotInstance {
@@ -381,7 +402,13 @@ async function createMenuBot(row: BotRow, menuConfig: BotMenuConfig, mode: Effec
   const menuCommands = createMenuCommandRegistry();
   // v2.3 内嵌按钮面板门禁开关：面板开启时全部功能型按钮点击先解锁（导航/原生按钮除外）
   const menuFeature = parseBotFeatureConfig(row.config, false);
-  const instanceMenu = installBotMenu(bot, menuConfig, menuCommands, {
+  // v3.0.3：菜单消息正文支持 {{bot_name}}/{{bot_username}} 变量 —— 安装菜单前按
+  // 机器人信息一次性预渲染（菜单正文为静态配置，运行时逐条替换纯属浪费）。
+  const renderedMenuConfig = renderMenuConfigBotVars(menuConfig, {
+    botName: row.name,
+    botUsername: row.username ?? null,
+  });
+  const instanceMenu = installBotMenu(bot, renderedMenuConfig, menuCommands, {
     botId: row.id,
     panelRequired: menuFeature.gateMenuRequired === true,
   });
