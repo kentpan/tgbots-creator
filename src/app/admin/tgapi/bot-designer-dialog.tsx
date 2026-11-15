@@ -545,12 +545,12 @@ export function TgApiMenuKeyboardDialog({
                       <p className="text-xs text-muted-foreground">
                         创建 API 直接手机号 → 登录码（不再对话中收集）；APP 名称/描述可用键盘
                         「✏️ 设置Title / 📝 设置Description」预配置（未配置时使用下方默认值），
-                        平台未预配置时随机选一。
+                        平台从下方勾选的候选项中选择：多选 = 每次随机选一个；单选 = 固定使用该平台；全部取消时自动恢复全部候选项。
                       </p>
                       <div className="grid gap-4 md:grid-cols-2">
                         <div className="space-y-1">
                           <label className="text-sm font-medium" htmlFor={`app-title-${suffix}`}>
-                            APP_TITLE（默认值）
+                            应用名称（APP_TITLE：my.telegram.org 上显示的应用名称）
                           </label>
                           <input
                             id={`app-title-${suffix}`}
@@ -561,7 +561,7 @@ export function TgApiMenuKeyboardDialog({
                         </div>
                         <div className="space-y-1">
                           <label className="text-sm font-medium" htmlFor={`app-short-name-${suffix}`}>
-                            APP_SHORT_NAME
+                            短名称（APP_SHORT_NAME：应用短标识，字母开头、5–32 位字母数字）
                           </label>
                           <input
                             id={`app-short-name-${suffix}`}
@@ -572,7 +572,7 @@ export function TgApiMenuKeyboardDialog({
                         </div>
                         <div className="space-y-1">
                           <label className="text-sm font-medium" htmlFor={`app-url-${suffix}`}>
-                            APP_URL
+                            应用网址（APP_URL：应用官网或介绍页，可用 HTTPS）
                           </label>
                           <input
                             id={`app-url-${suffix}`}
@@ -583,7 +583,7 @@ export function TgApiMenuKeyboardDialog({
                         </div>
                         <div className="space-y-1">
                           <label className="text-sm font-medium" htmlFor={`footer-${suffix}`}>
-                            页脚署名（FTEXT）
+                            结果页附加文本（FTEXT：显示在 API 凭据结果末尾，可留空）
                           </label>
                           <input
                             id={`footer-${suffix}`}
@@ -595,7 +595,7 @@ export function TgApiMenuKeyboardDialog({
                       </div>
                       <div className="space-y-1">
                         <label className="text-sm font-medium" htmlFor={`app-desc-${suffix}`}>
-                          APP_DESCRIPTION（默认值）
+                          应用描述（APP_DESCRIPTION：my.telegram.org 上的应用说明）
                         </label>
                         <textarea
                           id={`app-desc-${suffix}`}
@@ -607,7 +607,7 @@ export function TgApiMenuKeyboardDialog({
                       </div>
                       <div className="space-y-2">
                         <p className="text-sm font-medium">
-                          APP_PLATFORM（创建时随机选一，对应原 random.choice）
+                          平台候选项（APP_PLATFORM：勾选多个时随机选一个；只勾一个则固定使用它）
                         </p>
                         <div className="flex flex-wrap gap-3">
                           {TGAPI_APP_PLATFORMS.map((platform) => (
@@ -620,6 +620,7 @@ export function TgApiMenuKeyboardDialog({
                                 className="h-4 w-4"
                               />
                               {TGAPI_PLATFORM_LABELS[platform] ?? platform}
+                              <span className="text-xs text-muted-foreground">({platform})</span>
                             </label>
                           ))}
                         </div>

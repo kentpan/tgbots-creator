@@ -536,13 +536,14 @@ export function renderTgApiTextTemplate(text: string, defaultValue: string): str
 }
 
 /**
- * 由申请人自定义的 APP 名称派生 my.telegram.org 必填的 short name：
- * 仅保留小写字母数字；不足 5 位或以数字开头时回落管理端默认 shortname
- *（my.telegram.org 对 shortname 要求：字母开头、5-32 位）。
+ * 生成 my.telegram.org 的 APP_SHORT_NAME：优先采用管理员明确配置的短名称；
+ * 配置不符合“字母开头、5–32 位字母数字”时，才从 APP_TITLE 派生兜底值。
  */
-export function deriveTgApiShortName(appTitle: string, fallback: string): string {
+export function deriveTgApiShortName(appTitle: string, configuredShortName: string): string {
+  const configured = configuredShortName.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (/^[a-z][a-z0-9]{4,31}$/.test(configured)) return configured;
   const slug = appTitle.toLowerCase().replace(/[^a-z0-9]+/g, "");
   const normalized = /^[a-z]/.test(slug) ? slug : `app${slug}`;
-  if (normalized.length < 5) return fallback;
+  if (normalized.length < 5) return "usetgapibot";
   return normalized.slice(0, 32);
 }

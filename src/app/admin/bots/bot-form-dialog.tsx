@@ -550,11 +550,12 @@ export function BotFormDialog({
 
       {/* 菜单按钮 setChatMenuButton */}
       <div className="rounded-lg border bg-muted/30 p-3">
-        <p className="text-sm font-medium">菜单按钮 setChatMenuButton（对应 BotFather「Menu Button / Configure Mini App」）</p>
+        <p className="text-sm font-medium">菜单按钮 setChatMenuButton（设置机器人聊天输入框旁的菜单入口）</p>
+        <p className="mt-1 text-xs text-muted-foreground">本项目通过 setChatMenuButton 设置全局默认按钮（不是逐个群组单独设置）。私聊中可显示命令菜单或 Mini App；群组中是否显示及其表现由 Telegram 客户端决定，群内命令列表还取决于命令作用范围。若要确保群内有业务入口，建议同时配置消息内嵌按钮或回复键盘。</p>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
           <div className="space-y-1">
             <label className={labelClass} htmlFor={`bot-menubtn-type-${idSuffix}`}>
-              按钮类型
+              按钮类型（MENU_BUTTON_TYPE：选择菜单按钮打开的内容）
             </label>
             <select
               id={`bot-menubtn-type-${idSuffix}`}
@@ -569,11 +570,14 @@ export function BotFormDialog({
               ))}
             </select>
           </div>
+          <p className="text-xs text-muted-foreground md:col-span-2">
+            默认：恢复 Telegram 标准菜单行为（通常打开命令列表）；命令列表：明确指定打开机器人命令列表；Mini App：打开下方填写的 HTTPS 网页应用。三种配置都会设置机器人全局默认菜单按钮，不支持在此处按单个群组分别设置。
+          </p>
           {menuButton.type === "web_app" ? (
             <>
               <div className="space-y-1">
                 <label className={labelClass} htmlFor={`bot-menubtn-text-${idSuffix}`}>
-                  按钮文字
+                  按钮文字（MENU_BUTTON_TEXT：显示在菜单按钮上的名称）
                 </label>
                 <input
                   id={`bot-menubtn-text-${idSuffix}`}
@@ -585,7 +589,7 @@ export function BotFormDialog({
               </div>
               <div className="space-y-1 md:col-span-2">
                 <label className={labelClass} htmlFor={`bot-menubtn-url-${idSuffix}`}>
-                  Mini App 地址（必须 HTTPS）
+                  Mini App 地址（MENU_BUTTON_URL：点击后打开的 HTTPS 网页应用）
                 </label>
                 <input
                   id={`bot-menubtn-url-${idSuffix}`}

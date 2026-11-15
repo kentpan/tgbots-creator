@@ -57,7 +57,36 @@ export async function getTgapiProxyConfig(): Promise<TgapiProxyConfig> {
 
 export async function isTgapiProxyEnabled(): Promise<boolean> {
   const cfg = await getTgapiProxyConfig();
-  return cfg.enabled && !!cfg.proxyUrl;
+  // 只反映管理员开关状态。启用但配置不完整时必须报错，不能悄悄回退直连。
+  return cfg.enabled;
+}
+
+/** 保存配置与发起请求前共用的校验。 */
+export function validateTgapiProxyConfig(cfg: TgapiProxyConfig): string | null {
+  if (!cfg.enabled) return null;
+  if (!cfg.proxyUrl) return "已启用 TGAPI 代理，但代理地址为空";
+  try {
+    const parsed = new URL(cfg.proxyUrl);
+    const localHttp = parsed.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+    if (parsed.protocol !== "https:" && !localHttp) {
+      return "公网 TGAPI 代理必须使用 HTTPS（仅 localhost 可使用 HTTP）";
+    }
+    if (parsed.username || parsed.password) {
+      return "代理鉴权信息请填写在鉴权字段中，不要嵌入代理 URL";
+    }
+    if (parsed.search || parsed.hash) {
+      return "代理根地址不能包含查询参数或 URL fragment";
+    }
+  } catch {
+    return "代理地址格式无效，请填写完整 URL（含 https://）";
+  }
+  if (cfg.authType === "bearer" && !cfg.bearerKey.trim()) {
+    return "代理鉴权方式为 Bearer，但 APIKEY 为空";
+  }
+  if (cfg.authType === "basic" && (!cfg.basicUser.trim() || !cfg.basicPass)) {
+    return "代理鉴权方式为 Basic，用户名和密码都必须填写";
+  }
+  return null;
 }
 
 /** 构造鉴权头 */
@@ -79,6 +108,8 @@ interface ProxyCookies {
 
 /** 统一代理请求: POST JSON, 返回解析后的 JSON(失败抛 Error) */
 async function proxyPost<T = unknown>(cfg: TgapiProxyConfig, path: string, body: unknown, startedAt: number): Promise<T> {
+  const configError = validateTgapiProxyConfig(cfg);
+  if (configError) throw new Error(`TGAPI代理配置无效：${configError}`);
   const url = `${cfg.proxyUrl}${path}`;
   const requestPayload = JSON.stringify(body);
   let statusCode: number | null = null;
@@ -109,7 +140,8 @@ async function proxyPost<T = unknown>(cfg: TgapiProxyConfig, path: string, body:
 /** step 1: send-code → {randomHash, cookies} */
 export async function proxySendCode(phone: string): Promise<{ randomHash: string; cookies: ProxyCookies }> {
   const cfg = await getTgapiProxyConfig();
-  if (!cfg.enabled || !cfg.proxyUrl) throw new Error("TGAPI代理未启用");
+  const configError = validateTgapiProxyConfig(cfg);
+  if (configError) throw new Error(`TGAPI代理配置无效：${configError}`);
   const startedAt = Date.now();
   interface SendCodeResp { random_hash?: string; cookies?: ProxyCookies; error?: string }
   const data = await proxyPost<SendCodeResp>(cfg, "/api/send-code", { phone }, startedAt);
@@ -122,7 +154,8 @@ export async function proxySendCode(phone: string): Promise<{ randomHash: string
 /** step 2: verify-code → {ok, stelToken, cookies} */
 export async function proxyVerifyCode(phone: string, randomHash: string, code: string, cookies: ProxyCookies): Promise<{ ok: boolean; stelToken: string; cookies: ProxyCookies; error: string }> {
   const cfg = await getTgapiProxyConfig();
-  if (!cfg.enabled || !cfg.proxyUrl) throw new Error("TGAPI代理未启用");
+  const configError = validateTgapiProxyConfig(cfg);
+  if (configError) throw new Error(`TGAPI代理配置无效：${configError}`);
   const startedAt = Date.now();
   interface VerifyResp { ok?: boolean; stel_token?: string; cookies?: ProxyCookies; error?: string }
   const data = await proxyPost<VerifyResp>(cfg, "/api/verify-code", { phone, random_hash: randomHash, code, cookies }, startedAt);
@@ -138,7 +171,8 @@ export async function proxyGetApp(stelToken: string, cookies: ProxyCookies): Pro
   appExists: boolean; appId: string; apiHash: string; appHash: string; cookies: ProxyCookies;
 }> {
   const cfg = await getTgapiProxyConfig();
-  if (!cfg.enabled || !cfg.proxyUrl) throw new Error("TGAPI代理未启用");
+  const configError = validateTgapiProxyConfig(cfg);
+  if (configError) throw new Error(`TGAPI代理配置无效：${configError}`);
   const startedAt = Date.now();
   interface GetAppResp { app_exists?: boolean; api_id?: string | number; api_hash?: string; form_hash?: string; cookies?: ProxyCookies; error?: string }
   const data = await proxyPost<GetAppResp>(cfg, "/api/get-app", { stel_token: stelToken, cookies }, startedAt);
@@ -157,7 +191,8 @@ export async function proxyCreateApp(input: {
   appPlatform: string; appUrl: string; appDescription: string;
 }): Promise<{ appId: string; apiHash: string; cookies: ProxyCookies }> {
   const cfg = await getTgapiProxyConfig();
-  if (!cfg.enabled || !cfg.proxyUrl) throw new Error("TGAPI代理未启用");
+  const configError = validateTgapiProxyConfig(cfg);
+  if (configError) throw new Error(`TGAPI代理配置无效：${configError}`);
   const startedAt = Date.now();
   interface CreateResp { api_id?: string | number; api_hash?: string; cookies?: ProxyCookies; error?: string }
   const data = await proxyPost<CreateResp>(cfg, "/api/create-app", {

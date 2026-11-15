@@ -47,9 +47,14 @@ export function parseDesignerTgApiCfg(bot?: DesignerBotInfo): TgApiBotConfig {
           : TGAPI_DEFAULT_APP.appShortName,
       appUrl:
         typeof tgapi.appUrl === "string" && tgapi.appUrl ? tgapi.appUrl : TGAPI_DEFAULT_APP.appUrl,
-      appPlatforms: Array.isArray(tgapi.appPlatforms)
-        ? (tgapi.appPlatforms as string[])
-        : [...TGAPI_DEFAULT_APP.appPlatforms],
+      appPlatforms: (() => {
+        const saved = Array.isArray(tgapi.appPlatforms)
+          ? (tgapi.appPlatforms as string[]).filter((value) =>
+              TGAPI_DEFAULT_APP.appPlatforms.includes(value),
+            )
+          : [];
+        return saved.length > 0 ? saved : [...TGAPI_DEFAULT_APP.appPlatforms];
+      })(),
       appDescription:
         typeof tgapi.appDescription === "string" && tgapi.appDescription
           ? tgapi.appDescription

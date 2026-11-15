@@ -34,13 +34,14 @@ import {
   type TgApiBotConfig,
   type TgApiLang,
 } from "@/services/tgapi-config";
+import type { TgOrgScrapeResult } from "@/services/my-telegram-org";
 import {
-  createNewTgApp,
-  loginStepGetStelCookie,
-  requestTgCodeGetRandomHash,
-  scrapeTgExistingApp,
-  type TgOrgScrapeResult,
-} from "@/services/my-telegram-org";
+  createTgApiApp,
+  getTgApiApp,
+  sendTgApiLoginCode,
+  verifyTgApiLoginCode,
+  type TgApiFlowTransport,
+} from "@/services/tgapi-apply-transport";
 import {
   briefError,
   buildAppResultHTML,
@@ -653,6 +654,7 @@ async function tgapiMainFlow(
       return "done";
     }
     const randomHash = sentCode.hash;
+    const applyTransport = sentCode.transport;
     await ctx.reply(texts().afterRecvdCode, {
       parse_mode: "HTML",
       reply_markup: { keyboard: [[]], remove_keyboard: true },
@@ -676,7 +678,7 @@ async function tgapiMainFlow(
         console.log(
           `TGAPI bot #${botId} conversation login code message: user ${from.id} ` +
             `forwarded=${evt.message?.forward_origin ? "yes" : "no"} ` +
-            `has_text=${Boolean(rawText)} extracted=${extracted ?? "null"}`,
+            `has_text=${Boolean(rawText)} extracted=${extracted ? "yes" : "no"}`,
         );
         if (!extracted) {
           await evt.reply(texts().invalidCode, { parse_mode: "HTML" });
@@ -698,51 +700,50 @@ async function tgapiMainFlow(
     };
 
     const login = await conversation.external(() =>
-      loginStepGetStelCookieSafe(phone, randomHash, providedCode),
+      loginStepGetStelCookieSafe(phone, randomHash, providedCode, applyTransport),
     );
     if (!login.ok) {
-      // 登录被拒：进度消息编辑为原因 + 单条收尾消息（fail 模板优先）随主键盘重新显示
-      await editProgress(login.error, false);
+      // 登录被拒：只编辑进度消息，避免“错误详情 + 失败模板”重复发送两条相同错误。
+      const failRaw = slotText(templates?.fail, lang);
+      const failureText = renderMenuTemplate(failRaw || texts().loginRejected, {
+        ...varsFromContext(codeEvt),
+        error: login.error,
+      });
+      await editProgress(failureText, Boolean(failRaw));
       console.log(
         `TGAPI bot #${botId} conversation login rejected: user ${from.id} reason=${login.error.slice(0, 120)}`,
-      );
-      const failRaw = slotText(templates?.fail, lang);
-      await codeEvt.reply(
-        renderMenuTemplate(failRaw || texts().loginRejected, {
-          ...varsFromContext(codeEvt),
-          error: login.error,
-        }),
-        { reply_markup: mainMarkup },
       );
       return "done";
     }
 
     // 抓取现有 APP → 无则按确定参数创建 → 再抓取（与内嵌模式同一管道）
-    let scraped = await conversation.external(() => scrapeTgExistingAppSafe(login.cookie));
+    const fetched = await conversation.external(() => getTgApiExistingAppSafe(login.cookie, login.transport));
+    let scraped = fetched?.result ?? null;
+    let activeTransport = fetched?.transport ?? login.transport;
     const existingAppHash = scraped && !scraped.ok ? scraped.appHash : "";
     if (existingAppHash) {
       const created = await conversation.external(() =>
-        createNewTgAppSafe(login.cookie, existingAppHash, {
+        createTgApiAppSafe({
+          stelToken: login.cookie,
+          tgAppHash: existingAppHash,
           appTitle,
           appShortName: effectiveShortName,
           appUrl: cfg.appUrl,
           appPlatform: chosenPlatform,
           appDescription,
-        }),
+        }, activeTransport),
       );
       if (!created.ok) {
-        await editProgress(created.error, false);
         const failRaw = slotText(templates?.fail, lang);
-        await codeEvt.reply(
-          renderMenuTemplate(failRaw || texts().erredPage, {
-            ...varsFromContext(codeEvt),
-            error: created.error,
-          }),
-          { reply_markup: mainMarkup },
-        );
+        const failureText = renderMenuTemplate(failRaw || texts().erredPage, {
+          ...varsFromContext(codeEvt),
+          error: created.error,
+        });
+        await editProgress(failureText, Boolean(failRaw));
         return "done";
       }
-      scraped = await conversation.external(() => scrapeTgExistingAppSafe(login.cookie));
+      scraped = created.result;
+      activeTransport = created.transport;
     }
 
     if (scraped?.ok && scraped.info) {
@@ -778,12 +779,13 @@ async function tgapiMainFlow(
         `TGAPI bot #${botId} conversation app credentials delivered: user ${from.id} app_id=${info.appId}`,
       );
     } else {
-      await editProgress(texts().erredPage, false);
+      // 抓取/创建失败只更新进度消息一次，避免再次发送相同失败提示。
       const failRaw = slotText(templates?.fail, lang);
-      await codeEvt.reply(
-        renderMenuTemplate(failRaw || texts().erredPage, varsFromContext(codeEvt)),
-        { reply_markup: mainMarkup },
-      );
+      const failureText = renderMenuTemplate(failRaw || texts().erredPage, {
+        ...varsFromContext(codeEvt),
+        error: "my.telegram.org APP 抓取/创建失败",
+      });
+      await editProgress(failureText, Boolean(failRaw));
     }
     return "done";
   };
@@ -1068,12 +1070,12 @@ async function tgapiMainFlow(
 
 async function requestTgCodeGetRandomHashSafe(
   phone: string,
-): Promise<{ ok: true; hash: string } | { ok: false; error: string }> {
+): Promise<{ ok: true; hash: string; transport: TgApiFlowTransport } | { ok: false; error: string }> {
   try {
-    return { ok: true, hash: await requestTgCodeGetRandomHash(phone) };
+    const started = await sendTgApiLoginCode(phone);
+    return { ok: true, hash: started.randomHash, transport: started.transport };
   } catch (error) {
-    // v2.2.5：详细状态透传（风控 24h / 手机号无效 / 网络错误等用户可读原因），不再泛化为「请求失败」
-    console.error(`TGAPI conversation send_password failed:`, error);
+    console.error("TGAPI conversation send_password failed:", error);
     return { ok: false, error: briefError(error) };
   }
 }
@@ -1082,43 +1084,53 @@ async function loginStepGetStelCookieSafe(
   phone: string,
   randomHash: string,
   code: string,
-): Promise<{ ok: true; cookie: string } | { ok: false; error: string }> {
+  transport: TgApiFlowTransport,
+): Promise<
+  | { ok: true; cookie: string; transport: TgApiFlowTransport }
+  | { ok: false; error: string; transport: TgApiFlowTransport }
+> {
   try {
-    return await loginStepGetStelCookie(phone, randomHash, code);
+    const result = await verifyTgApiLoginCode(phone, randomHash, code, transport);
+    if (!result.ok) return { ok: false, error: result.error, transport: result.transport };
+    return { ok: true, cookie: result.cookie, transport: result.transport };
   } catch (error) {
-    console.error(
-      `TGAPI conversation /auth/login failed: phone=${phone.slice(0, 6)}**** random_hash=${randomHash}:`,
-      error,
-    );
-    return { ok: false, error: briefError(error) };
+    console.error(`TGAPI conversation /auth/login failed: phone=${phone.slice(0, 6)}****:`, error);
+    return { ok: false, error: briefError(error), transport };
   }
 }
 
-async function scrapeTgExistingAppSafe(cookie: string): Promise<TgOrgScrapeResult | null> {
+async function getTgApiExistingAppSafe(
+  cookie: string,
+  transport: TgApiFlowTransport,
+): Promise<{ result: TgOrgScrapeResult; transport: TgApiFlowTransport } | null> {
   try {
-    return await scrapeTgExistingApp(cookie);
+    return await getTgApiApp(cookie, transport);
   } catch (error) {
-    console.error(`TGAPI conversation /apps scrape failed:`, error);
+    console.error("TGAPI conversation /apps scrape failed:", error);
     return null;
   }
 }
 
-async function createNewTgAppSafe(
-  stelToken: string,
-  tgAppHash: string,
-  params: {
+async function createTgApiAppSafe(
+  input: {
+    stelToken: string;
+    tgAppHash: string;
     appTitle: string;
     appShortName: string;
     appUrl: string;
     appPlatform: string;
     appDescription: string;
   },
-): Promise<{ ok: true } | { ok: false; error: string }> {
+  transport: TgApiFlowTransport,
+): Promise<
+  | { ok: true; result: TgOrgScrapeResult; transport: TgApiFlowTransport }
+  | { ok: false; error: string }
+> {
   try {
-    await createNewTgApp({ stelToken, tgAppHash, ...params });
-    return { ok: true };
+    const created = await createTgApiApp(input, transport);
+    return { ok: true, result: created.result, transport: created.transport };
   } catch (error) {
-    console.error(`TGAPI conversation /apps/create failed: title="${params.appTitle}":`, error);
+    console.error(`TGAPI conversation /apps/create failed: title="${input.appTitle}":`, error);
     return { ok: false, error: briefError(error) };
   }
 }

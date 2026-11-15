@@ -27,6 +27,15 @@ import { TGAPI_PLATFORM_LABELS, TGAPI_PLATFORM_VALUES } from "@/services/menu-co
  */
 
 /** /api/admin/tgapi/apply 的响应结构 */
+interface TgapiProxyConfig {
+  enabled: boolean;
+  proxyUrl: string;
+  authType: "bearer" | "basic";
+  bearerKey: string;
+  basicUser: string;
+  basicPass: string;
+}
+
 interface ApplyResponse {
   ok: boolean;
   error?: string;
@@ -171,8 +180,8 @@ export function TgApiApplyWizard({
 
   // TGAPI代理配置(可折叠面板)
   const [proxyOpen, setProxyOpen] = useState(false);
-  const [proxyCfg, setProxyCfg] = useState({
-    enabled: false, proxyUrl: "", authType: "bearer" as "bearer" | "basic",
+  const [proxyCfg, setProxyCfg] = useState<TgapiProxyConfig>({
+    enabled: false, proxyUrl: "", authType: "bearer",
     bearerKey: "", basicUser: "", basicPass: "",
   });
   const [proxySaving, setProxySaving] = useState(false);
@@ -223,8 +232,16 @@ export function TgApiApplyWizard({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(proxyCfg),
       });
-      const d = (await res.json().catch(() => null)) as { ok?: boolean; message?: string; error?: string } | null;
-      if (d?.ok) { setProxyMsg(d.message ?? "已保存"); }
+      const d = (await res.json().catch(() => null)) as {
+        ok?: boolean;
+        message?: string;
+        error?: string;
+        data?: { config?: TgapiProxyConfig };
+      } | null;
+      if (d?.ok) {
+        if (d.data?.config) setProxyCfg(d.data.config);
+        setProxyMsg(d.message ?? "已保存，服务器已重新读取配置");
+      }
       else { setProxyMsg(d?.error ?? `保存失败(HTTP ${res.status})`); }
     } catch (e) {
       setProxyMsg("保存失败: " + (e instanceof Error ? e.message : String(e)));
@@ -363,7 +380,7 @@ export function TgApiApplyWizard({
             {proxyOpen ? (
               <div className="space-y-3 border-t border-slate-200 px-3 py-3">
                 <p className="text-xs text-muted-foreground">
-                  将 my.telegram.org 申请四步调用经 tgapi-proxy-toolkit 代理转发(代理端用其上游 PROXIES 访问 my.telegram.org)。仅需配置代理地址 + 鉴权。
+                  将 my.telegram.org 四步申请请求转发到 tgapi-proxy-toolkit，再由代理端访问 my.telegram.org。必须填写兼容接口服务的 HTTPS 根地址（需实现 /api/send-code、/api/verify-code、/api/get-app、/api/create-app）；普通 HTTP/SOCKS 代理 IP:端口不能直接使用。代理端会接触手机号、登录码和登录会话，只能配置自己控制且可信的服务。
                 </p>
                 <label className="flex items-center gap-2 text-sm">
                   <input

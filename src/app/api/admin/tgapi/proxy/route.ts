@@ -8,12 +8,12 @@
 import { NextResponse } from "next/server";
 import { getCurrentAdmin, hasPermission } from "@/lib/auth";
 import { setAppSetting } from "@/database/operations";
-import { getTgapiProxyConfig } from "@/services/tgapi-proxy";
+import { getTgapiProxyConfig, validateTgapiProxyConfig } from "@/services/tgapi-proxy";
 
 export async function GET(): Promise<NextResponse> {
   const admin = await getCurrentAdmin();
   if (!admin) return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });
-  if (!hasPermission(admin, "settings:view")) {
+  if (!hasPermission(admin, "settings:view") && !hasPermission(admin, "tgapi:view")) {
     return NextResponse.json({ ok: false, error: "无权限" }, { status: 403 });
   }
   const config = await getTgapiProxyConfig();
@@ -32,7 +32,7 @@ interface ProxySavePayload {
 export async function POST(req: Request): Promise<NextResponse> {
   const admin = await getCurrentAdmin();
   if (!admin) return NextResponse.json({ ok: false, error: "未登录" }, { status: 401 });
-  if (!hasPermission(admin, "settings:manage")) {
+  if (!hasPermission(admin, "settings:manage") && !hasPermission(admin, "tgapi:manage")) {
     return NextResponse.json({ ok: false, error: "无权限" }, { status: 403 });
   }
   let body: ProxySavePayload = {};
@@ -44,6 +44,18 @@ export async function POST(req: Request): Promise<NextResponse> {
   const enabled = body.enabled ? "1" : "0";
   const proxyUrl = String(body.proxyUrl ?? "").trim().replace(/\/+$/, "");
   const authType = body.authType === "basic" ? "basic" : "bearer";
+  const candidate = {
+    enabled: enabled === "1",
+    proxyUrl,
+    authType,
+    bearerKey: String(body.bearerKey ?? ""),
+    basicUser: String(body.basicUser ?? ""),
+    basicPass: String(body.basicPass ?? ""),
+  } as const;
+  const validationError = validateTgapiProxyConfig(candidate);
+  if (validationError) {
+    return NextResponse.json({ ok: false, error: validationError }, { status: 400 });
+  }
   await setAppSetting("tgapi_proxy_enabled", enabled);
   await setAppSetting("tgapi_proxy_url", proxyUrl);
   await setAppSetting("tgapi_proxy_auth_type", authType);

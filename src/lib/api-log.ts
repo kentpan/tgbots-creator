@@ -93,6 +93,33 @@ export function ensureApiLogsTable(): Promise<void> {
   return globalForApiLog.tguardApiLogsTableReady;
 }
 
+/** TGAPI 日志可能包含 Telegram 登录码、会话 Cookie 和 API HASH；落库前统一脱敏。 */
+function redactTgapiLogPayload(text: string | null | undefined): string | null | undefined {
+  if (text === null || text === undefined) return text;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    const redact = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(redact);
+      if (!value || typeof value !== "object") return value;
+      const output: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+        if (/(phone|password|passcode|^code$|login.?code|random.?hash|api.?hash|form.?hash|hash|cookie|stel.?token|authorization|bearer.?key|basic.?pass)/i.test(key)) {
+          output[key] = "[REDACTED]";
+        } else {
+          output[key] = redact(item);
+        }
+      }
+      return output;
+    };
+    return JSON.stringify(redact(parsed));
+  } catch {
+    return text
+      .replace(/(<span\b[^>]*\bclass\s*=\s*["'][^"']*\binput-xlarge\b[^"']*["'][^>]*>)[\s\S]*?(<\/span\s*>)/gi, "$1[REDACTED]$2")
+      .replace(/(stel_token\s*=)[^;\s"'<>]+/gi, "$1[REDACTED]")
+      .replace(/(login code:\s*)[a-zA-Z0-9]+/gi, "$1[REDACTED]");
+  }
+}
+
 /** 截断超长原文并标注省略 */
 function truncatePayload(text: string | null | undefined): string | null {
   if (text === null || text === undefined) return null;
@@ -125,9 +152,9 @@ async function insertApiLog(input: ApiLogInput): Promise<void> {
       input.method ?? "",
       input.ok ? 1 : 0,
       input.statusCode ?? null,
-      truncatePayload(input.requestPayload),
-      truncatePayload(input.responseBody),
-      input.error ? input.error.slice(0, 2000) : null,
+      truncatePayload(input.category === "tgapi" ? redactTgapiLogPayload(input.requestPayload) : input.requestPayload),
+      truncatePayload(input.category === "tgapi" ? redactTgapiLogPayload(input.responseBody) : input.responseBody),
+      input.error ? (input.category === "tgapi" ? redactTgapiLogPayload(input.error) ?? input.error : input.error).slice(0, 2000) : null,
       typeof input.durationMs === "number" ? Math.round(input.durationMs) : null,
     ],
   );

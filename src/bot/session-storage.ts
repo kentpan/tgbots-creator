@@ -732,6 +732,8 @@ export interface BotSessionData {
     state: "phone" | "code" | "prefTitle" | "prefDesc";
     phone?: string;
     randomHash?: string;
+    /** 申请开始时选定的传输通道；代理 cookies 在输入验证码前必须留在服务端会话内。 */
+    transport?: import("@/services/tgapi-apply-transport").TgApiFlowTransport;
     /**
      * 按钮级结果消息模板（v2.1.16）：点击「创建API」按钮时从按钮 action 带入，
      * 登录码流程结束时渲染（success=创建成功消息 {{phone}}/{{api_id}}/{{api_hash}}，

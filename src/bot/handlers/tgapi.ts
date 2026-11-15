@@ -35,13 +35,13 @@ import {
   type TgApiBotConfig,
   type TgApiLang,
 } from "@/services/tgapi-config";
+import type { TgOrgScrapeResult } from "@/services/my-telegram-org";
 import {
-  createNewTgApp,
-  loginStepGetStelCookie,
-  requestTgCodeGetRandomHash,
-  scrapeTgExistingApp,
-  type TgOrgScrapeResult,
-} from "@/services/my-telegram-org";
+  createTgApiApp,
+  getTgApiApp,
+  sendTgApiLoginCode,
+  verifyTgApiLoginCode,
+} from "@/services/tgapi-apply-transport";
 import {
   briefError,
   buildAppResultHTML,
@@ -705,23 +705,6 @@ export async function registerTgApiHandlers(
     await sendTgApiStartMessage(ctx, lang);
   }
 
-  /**
-   * 指令失败消息槽位（v2.1.16）：创建流程失败时追加发送按钮配置的 tgapi_fail 模板
-   *（{{error}} 变量 = 具体错误摘要；模板随点击按钮存入会话 pendingFail；未配置则不追加）。
-   */
-  async function sendFailTemplateMessage(ctx: BotContext, lang: TgApiLang, error: string): Promise<void> {
-    const failTemplate = ctx.session.tgapi?.pendingFail;
-    if (!failTemplate) return;
-    const primary = (lang === "zh" ? failTemplate.zh : failTemplate.en).trim();
-    const failRaw = primary || (lang === "zh" ? failTemplate.en : failTemplate.zh).trim();
-    if (!failRaw) return;
-    await ctx.reply(
-      renderMenuTemplate(failRaw, {
-        ...varsFromContext(ctx),
-        error,
-      }),
-    );
-  }
 
   /** INPUT_PHONE_NUMBER 状态：受理手机号/联系人，请求发送登录码 */
   async function handlePhoneInput(
@@ -750,8 +733,14 @@ export async function registerTgApiHandlers(
       return;
     }
     try {
-      const randomHash = await requestTgCodeGetRandomHash(phone);
-      ctx.session.tgapi = { ...ctx.session.tgapi, state: "code", phone, randomHash };
+      const sent = await sendTgApiLoginCode(phone);
+      ctx.session.tgapi = {
+        ...ctx.session.tgapi,
+        state: "code",
+        phone,
+        randomHash: sent.randomHash,
+        transport: sent.transport,
+      };
       await ctx.reply(texts.afterRecvdCode, { parse_mode: "HTML" });
       console.log(
         `TGAPI bot #${botId} login code requested: user ${from.id} phone=${phone.slice(0, 6)}****`,
@@ -801,11 +790,16 @@ export async function registerTgApiHandlers(
     }
 
     try {
-      const login = await loginStepGetStelCookie(flow.phone, flow.randomHash, providedCode);
+      const login = await verifyTgApiLoginCode(
+        flow.phone,
+        flow.randomHash,
+        providedCode,
+        flow.transport ?? { mode: "direct" },
+      );
       if (!login.ok) {
         // 原实现：把 my.telegram.org 的错误原文原样 edit 给用户，会话结束
+        // 进度消息已显示唯一失败结果，不再额外发送同内容的失败模板。
         await editProgress(login.error || texts.erredPage, false);
-        await sendFailTemplateMessage(ctx, lang, login.error || "my.telegram.org 登录被拒绝");
         ctx.session.tgapi = undefined;
         console.log(
           `TGAPI bot #${botId} my.telegram.org login rejected: user ${from.id} reason=${login.error.slice(0, 120)}`,
@@ -831,13 +825,14 @@ export async function registerTgApiHandlers(
       let scraped: TgOrgScrapeResult | null = null;
       let createError = "";
       try {
-        scraped = await scrapeTgExistingApp(login.cookie);
+        const fetched = await getTgApiApp(login.cookie, login.transport);
+        scraped = fetched.result;
       } catch (error) {
         console.error(`TGAPI bot #${botId} first /apps scrape failed: user ${from.id}:`, error);
       }
       if (scraped && !scraped.ok && scraped.appHash) {
         try {
-          await createNewTgApp({
+          const created = await createTgApiApp({
             stelToken: login.cookie,
             tgAppHash: scraped.appHash,
             appTitle: effectiveTitle,
@@ -845,20 +840,16 @@ export async function registerTgApiHandlers(
             appUrl: cfg.appUrl,
             appPlatform: effectivePlatform,
             appDescription: effectiveDescription,
-          });
+          }, login.transport);
+          scraped = created.result;
           console.log(
             `TGAPI bot #${botId} app created: user ${from.id} title="${effectiveTitle}" ` +
-              `shortname=${effectiveShortName} platform=${effectivePlatform}`,
+              `shortname=${effectiveShortName} platform=${effectivePlatform} transport=${created.transport.mode}`,
           );
         } catch (error) {
           createError = briefError(error);
           console.error(`TGAPI bot #${botId} /apps/create failed: user ${from.id}:`, error);
-        }
-        try {
-          scraped = await scrapeTgExistingApp(login.cookie);
-        } catch (error) {
           scraped = null;
-          console.error(`TGAPI bot #${botId} second /apps scrape failed: user ${from.id}:`, error);
         }
       }
 
@@ -897,12 +888,8 @@ export async function registerTgApiHandlers(
           `TGAPI bot #${botId} app credentials delivered: user ${from.id} app_id=${scraped.info.appId}`,
         );
       } else {
-        await editProgress(texts.erredPage, false);
-        await sendFailTemplateMessage(
-          ctx,
-          lang,
-          createError || "APP 抓取/创建失败（my.telegram.org 页面不可用）",
-        );
+        const failReason = createError || "APP 抓取/创建失败（my.telegram.org 页面不可用）";
+        await editProgress(`${texts.erredPage}\n\n${failReason}`, false);
       }
     } catch (error) {
       console.error(`TGAPI bot #${botId} login/scrape pipeline failed: user ${from.id}:`, error);
@@ -911,7 +898,6 @@ export async function registerTgApiHandlers(
         `${sys.pipelineFail(brief)}\n\n${texts.erredPage}`,
         false,
       );
-      await sendFailTemplateMessage(ctx, lang, brief);
     }
     // 原实现：ConversationHandler.END（无论成败，登录码状态一律终结；
     // 解锁状态不受影响 —— 同一用户后续再次申请无需再次解锁）

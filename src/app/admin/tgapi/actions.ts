@@ -101,7 +101,10 @@ function buildTgApiConfig(formData: FormData, previousTgapi?: Record<string, unk
     appTitle: String(formData.get("app_title") ?? "").trim() || "usetgapibot",
     appShortName: String(formData.get("app_short_name") ?? "").trim() || "usetgapibot",
     appUrl: String(formData.get("app_url") ?? "").trim() || "https://www.telegram.org",
-    appPlatforms: parsePlatforms(formData),
+    // 未勾选任何平台时恢复“全部候选平台”，运行时从候选项中随机选一个提交。
+    appPlatforms: parsePlatforms(formData).length > 0
+      ? parsePlatforms(formData)
+      : [...TGAPI_APP_PLATFORMS],
     appDescription:
       String(formData.get("app_description") ?? "").trim() || "My Telegram App",
     // footer 留空 = 结果消息不附加任何署名
