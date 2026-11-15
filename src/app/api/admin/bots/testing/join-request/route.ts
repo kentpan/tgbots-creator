@@ -225,7 +225,7 @@ export async function POST(request: Request): Promise<NextResponse> {
   const token = generateVerificationToken();
   const useSelfCode = resolved.method === "code_self";
   const joinCode = useSelfCode ? generateJoinCode() : null;
-  const expiresAt = new Date(Date.now() + resolved.timeoutSeconds * 1000);
+  const expiresAt = new Date(Date.now() + resolved.sessionTimeoutSeconds * 1000);
 
   const joinRequest = await createJoinRequest({
     userId: SIMULATED_USER_ID,
@@ -257,7 +257,7 @@ export async function POST(request: Request): Promise<NextResponse> {
   console.log(`Simulator join request created: user ${SIMULATED_USER_ID} -> chat ${chatId} (bot #${botId}, method=${resolved.method})`);
 
   // 隐私红线：仿真动作一律只停留在仿真屏，绝不真实发送到群组 —— 不调用 Telegram API。
-  const minutes = Math.max(1, Math.round(resolved.timeoutSeconds / 60));
+  const minutes = Math.max(1, Math.round(resolved.sessionTimeoutSeconds / 60));
   // 仿真交互必须与真实私聊链路一致：code_self / code_api 均在输入框直接提交，
   // 不使用 force_reply；只有 captcha 才通过验证网页完成。此前把 code_api 误归入
   // captcha 分支，导致仿真屏提示网页验证，实际 submit-code 却走文本卡密校验。
@@ -291,7 +291,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       prompt_text: promptText,
       success_text: settings?.successText,
       failure_text: settings?.failureText,
-      timeout_seconds: resolved.timeoutSeconds,
+      timeout_seconds: resolved.sessionTimeoutSeconds,
       max_attempts: resolved.maxAttempts,
       expires_at: expiresAt.toISOString(),
       method_id: resolved.methodDbId !== null ? String(resolved.methodDbId) : "",

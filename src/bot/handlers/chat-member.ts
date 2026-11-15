@@ -164,7 +164,7 @@ async function bootstrapGroupVerification(
     token: verificationToken,
     userId: BigInt(user.id),
     chatId: BigInt(chat.id),
-    expiresAt: new Date(utcnow().getTime() + resolved.timeoutSeconds * 1000),
+    expiresAt: new Date(utcnow().getTime() + resolved.sessionTimeoutSeconds * 1000),
     method: resolved.method,
     expectedCode: joinCode,
     methodId: resolved.methodDbId,
@@ -334,7 +334,7 @@ async function bootstrapDmVerification(
   const useSelfCode = resolved.method === "code_self";
   const joinCode = useSelfCode ? generateJoinCode() : null;
 
-  const expiresAt = new Date(utcnow().getTime() + resolved.timeoutSeconds * 1000);
+  const expiresAt = new Date(utcnow().getTime() + resolved.sessionTimeoutSeconds * 1000);
   const verificationSession = await createVerificationSession({
     token: verificationToken,
     userId: BigInt(user.id),

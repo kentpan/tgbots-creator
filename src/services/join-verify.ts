@@ -30,7 +30,15 @@ export interface ResolvedJoinVerify {
   method: JoinVerifyMethod;
   /** 方式库行 id（会话锁定到会话记录） */
   methodDbId: bigint | null;
+  /**
+   * v3.0.3 修复（2026-11-15 计数事故）：code_api 的 config.timeout_seconds 是
+   * 「外部 API 单次请求超时」（5-60 秒），曾被误当作验证会话有效期写入 expires_at
+   * —— 用户输到第 3 次时会话早已过期，表现为「第 3 次不管对错都提示会话超时失效」。
+   * 会话有效期一律使用 sessionTimeoutSeconds；timeoutSeconds 仅保留兼容展示。
+   */
   timeoutSeconds: number;
+  /** 验证会话有效期（秒）：expires_at = 创建时刻 + sessionTimeoutSeconds（下限 60） */
+  sessionTimeoutSeconds: number;
   maxAttempts: number;
 }
 
@@ -50,7 +58,7 @@ export async function resolveJoinVerify(
   const feature = parseBotFeatureConfig(bot.config, false);
   if (!feature.joinVerify.enabled) return null;
   if (settings?.joinVerifyMode === "direct" || ((!settings || settings.joinVerifyMode === null) && feature.joinVerify.mode === "direct")) {
-    return { method: "direct", methodDbId: null, timeoutSeconds: 0, maxAttempts: 0 };
+    return { method: "direct", methodDbId: null, timeoutSeconds: 0, sessionTimeoutSeconds: 0, maxAttempts: 0 };
   }
   // v2.3.5 群组绑定方式优先；仅对尚未显式设置群组策略的历史群组回退旧机器人级 methodId。
   const methodId = settings?.joinVerifyMethodId ?? ((!settings || settings.joinVerifyMode === null) && feature.joinVerify.methodId ? BigInt(feature.joinVerify.methodId) : null);
@@ -68,6 +76,10 @@ export async function resolveJoinVerify(
     feature.joinVerify.override,
   );
 
+  // v3.0.3：会话有效期下限 60 秒 —— 保护用户至少有一次完整的输码机会；
+  // code_api 的 config.timeout_seconds（外部 API 请求超时，5-60 秒）绝不当会话时长。
+  const sessionTimeoutSeconds = Math.min(Math.max(params.session_timeout_seconds ?? 300, 60), 86400);
+
   switch (method.type) {
     case "code_api": {
       const apiConfig = parseCodeApiConfig(method.config);
@@ -75,12 +87,13 @@ export async function resolveJoinVerify(
         console.error(`[join-verify] bot #${botId} method ${method.id} has invalid code API config`);
         return null;
       }
-      return { method: "code_api", methodDbId: method.id, timeoutSeconds: params.timeout_seconds, maxAttempts: params.max_attempts };
+      // timeoutSeconds = 外部 API 请求超时（仅兼容展示）；会话有效期用 sessionTimeoutSeconds
+      return { method: "code_api", methodDbId: method.id, timeoutSeconds: params.timeout_seconds, sessionTimeoutSeconds, maxAttempts: params.max_attempts };
     }
     case "code_self":
-      return { method: "code_self", methodDbId: method.id, timeoutSeconds: params.timeout_seconds, maxAttempts: params.max_attempts };
+      return { method: "code_self", methodDbId: method.id, timeoutSeconds: params.timeout_seconds, sessionTimeoutSeconds, maxAttempts: params.max_attempts };
     case "captcha":
-      return { method: "captcha", methodDbId: method.id, timeoutSeconds: params.timeout_seconds, maxAttempts: params.max_attempts };
+      return { method: "captcha", methodDbId: method.id, timeoutSeconds: params.timeout_seconds, sessionTimeoutSeconds, maxAttempts: params.max_attempts };
     default:
       console.error(`[join-verify] bot #${botId} method ${method.id} has unsupported type ${method.type}`);
       return null;

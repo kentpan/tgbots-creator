@@ -18,8 +18,15 @@ export type VerificationMethodType = "code_api" | "code_self" | "captcha";
 
 /** 验证方式携带的可调参数（两种类型通用；全部可选，缺省用内置默认） */
 export interface VerificationParams {
-  /** 验证超时（秒）：超时未通过按失败处理；默认 300 */
+  /**
+   * code_self/captcha：验证会话有效期（秒）。
+   * ⚠️ code_api 类型的 config.timeout_seconds 是「外部 API 单次请求超时」（5-60 秒），
+   * 与会话有效期无关 —— code_api 的会话有效期固定默认 300 秒（见 join-verify.ts），
+   * 避免"输到第 3 次会话已超时"的计数事故（2026-11-15）。
+   */
   timeout_seconds?: number;
+  /** 验证会话有效期独立键（秒）：默认 300，下限 60；优先于 timeout_seconds（code_self/captcha） */
+  session_timeout_seconds?: number;
   /** 最大尝试次数：达到后按最终失败处理（踢出/拒绝）；默认 3 */
   max_attempts?: number;
   /** 提示文案默认值（发送给用户的验证提示） */
@@ -65,6 +72,7 @@ export function parseVerificationParams(raw: string | null | undefined): Verific
   const cfg = parsed as Record<string, unknown>;
   return {
     timeout_seconds: readOptionalInt(cfg.timeout_seconds, 1),
+    session_timeout_seconds: readOptionalInt(cfg.session_timeout_seconds, 60),
     max_attempts: readOptionalInt(cfg.max_attempts, 1),
     prompt_text: readOptionalText(cfg.prompt_text),
     success_text: readOptionalText(cfg.success_text),
@@ -78,6 +86,7 @@ export function parseVerificationOverride(raw: unknown): VerificationParams {
   const cfg = raw as Record<string, unknown>;
   return {
     timeout_seconds: readOptionalInt(cfg.timeout_seconds, 1),
+    session_timeout_seconds: readOptionalInt(cfg.session_timeout_seconds, 60),
     max_attempts: readOptionalInt(cfg.max_attempts, 1),
     prompt_text: readOptionalText(cfg.prompt_text),
     success_text: readOptionalText(cfg.success_text),
@@ -98,7 +107,7 @@ export function mergeVerificationParams(
     if (fromOverride !== undefined) return fromOverride;
     const fromMethod = methodParams[key];
     if (fromMethod !== undefined) return fromMethod;
-    return key === "timeout_seconds"
+    return key === "timeout_seconds" || key === "session_timeout_seconds"
       ? VERIFICATION_PARAM_DEFAULTS.timeout_seconds
       : key === "max_attempts"
         ? VERIFICATION_PARAM_DEFAULTS.max_attempts
@@ -106,6 +115,7 @@ export function mergeVerificationParams(
   };
   return {
     timeout_seconds: pick("timeout_seconds") as number,
+    session_timeout_seconds: pick("session_timeout_seconds") as number,
     max_attempts: pick("max_attempts") as number,
     prompt_text: pick("prompt_text") as string,
     success_text: pick("success_text") as string,
