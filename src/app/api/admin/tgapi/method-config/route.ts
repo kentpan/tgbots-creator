@@ -50,7 +50,7 @@ function buildMethodConfig(input: MethodApiConfigInput): { config: CodeApiConfig
   const apiKey = String(input.api_key ?? "").trim();
   const codeField = (String(input.code_field ?? "").trim() || "code").replace(/"/g, "");
   if (!isValidHttpUrl(url)) return { config: null, error: "验证 API 地址不合法（需 http/https 开头）" };
-  if (!apiKey) return { config: null, error: "请填写 Bearer API Key" };
+  if (!apiKey) return { config: null, error: "请填写 API Key（Bearer）或 user:pass（Basic）" };
   const httpMethod = String(input.http_method ?? "POST").toUpperCase() === "GET" ? "GET" : "POST";
   const successStatus = Number(input.success_status);
   const timeoutSeconds = Number(input.timeout_seconds);

@@ -273,7 +273,7 @@ export function TgApiUnlockMethodBinding({
           <span className="block truncate text-xs text-muted-foreground">
             {selected
               ? `${selected.name}（方法 #${selected.id}）· 点击修改`
-              : "验证 API 地址 / Bearer apikey / 传参 / 响应解析 / 超时 · 未绑定时保存自动创建"}
+              : "验证 API 地址 / apikey 或 user:pass / 传参 / 响应解析 / 超时 · 未绑定时保存自动创建"}
           </span>
         </span>
         <ChevronRight className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${editorOpen ? "rotate-90" : ""}`} />
@@ -349,13 +349,13 @@ export function TgApiUnlockMethodBinding({
               </div>
               <div className="space-y-1">
                 <label className={labelClass} htmlFor="tgapi-api-key">
-                  Bearer API Key *
+                  API Key（Bearer）/ user:pass（Basic）*
                 </label>
                 <input
                   id="tgapi-api-key"
                   value={apiForm.api_key}
                   onChange={(event) => updateField({ api_key: event.target.value })}
-                  placeholder="sk-xxxx / xyk_xxxx"
+                  placeholder="sk-xxxx / xyk_xxxx / user:pass"
                   className={`${inputClass} font-mono`}
                   autoComplete="off"
                 />
@@ -469,7 +469,7 @@ export function TgApiUnlockMethodBinding({
                 </button>
               </div>
               <p className="text-xs text-muted-foreground">
-                请求自动携带 <span className="font-mono">Authorization: Bearer api_key</span>；
+                请求自动携带 Authorization 头：填 API Key 时为 <span className="font-mono">Bearer api_key</span>；填 user:pass（含冒号）时为 <span className="font-mono">Basic</span> 认证；
                 判定规则：HTTP 状态等于判定状态码且响应 JSON 中判定字段等于判定值。保存后绑定关系随本表单一并提交。
               </p>
             </>

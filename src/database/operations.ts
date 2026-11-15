@@ -264,8 +264,15 @@ export interface GroupSettingsRow {
    *   其他管理员机器人即使开启了加群验证也忽略 —— 杜绝多机器人竞态。
    */
   joinVerifyBotId: bigint | null;
-  /** 群组私有审核策略：verify=按群组绑定验证方式；direct=直接审批 */
-  joinVerifyMode: "verify" | "direct" | null;
+  /**
+   * 群组私有申请处理方式（v3.0.3 拆分）:
+   * - "group" = 群内验证（申请先批准进群，群内验证网页输码）；
+   * - "dm" = 私聊验证（验证提示私聊发送，私聊输码通过后批准）；
+   * - "direct" = 直接通过申请；
+   * - "verify" = v2.3.5 历史值（拆分前「验证码验证后通过」，运行时按渠道旧语义）；
+   * - null = 未显式保存，回退机器人级默认。
+   */
+  joinVerifyMode: "verify" | "direct" | "group" | "dm" | null;
   /** 群组私有验证方式库 ID */
   joinVerifyMethodId: bigint | null;
   /** v2.3 聊天类型（group/supergroup/channel，运行时事件登记；旧数据/未登记为 NULL=未知） */
@@ -1192,7 +1199,16 @@ function mapGroupSettings(row: Record<string, unknown>): GroupSettingsRow {
     replyCodeInGroup: row.reply_code_in_group === undefined ? false : toBoolean(row.reply_code_in_group),
     // v2.3 加群验证机器人指定：列缺失/空 → null（手动审核）
     joinVerifyBotId: row.join_verify_bot_id === undefined || row.join_verify_bot_id === null || row.join_verify_bot_id === "" ? null : toBigIntOrNull(row.join_verify_bot_id),
-    joinVerifyMode: row.join_verify_mode === "direct" ? "direct" : row.join_verify_mode === "verify" ? "verify" : null,
+    joinVerifyMode:
+      row.join_verify_mode === "direct"
+        ? "direct"
+        : row.join_verify_mode === "verify"
+          ? "verify"
+          : row.join_verify_mode === "group"
+            ? "group"
+            : row.join_verify_mode === "dm"
+              ? "dm"
+              : null,
     joinVerifyMethodId: row.join_verify_method_id === undefined || row.join_verify_method_id === null || row.join_verify_method_id === "" ? null : toBigIntOrNull(row.join_verify_method_id),
     // v2.3.5 群组策略列：NULL 表示历史群组尚未显式选择，兼容旧机器人默认值；
     // 聊天类型：运行时事件登记（group/supergroup/channel）；未登记 = NULL
@@ -1672,8 +1688,8 @@ export async function upsertGroupSettings(
     replyCodeInGroup?: boolean;
     /** v2.3 加群验证机器人指定（null=手动审核）；undefined = 不改动现有值 */
     joinVerifyBotId?: bigint | null;
-    /** 群组私有审核方式；undefined = 保留 */
-    joinVerifyMode?: "verify" | "direct" | null;
+    /** 群组私有申请处理方式（verify=历史值/group=群内验证/dm=私聊验证/direct=直接通过）；undefined = 保留 */
+    joinVerifyMode?: "verify" | "direct" | "group" | "dm" | null;
     /** 群组私有验证方式库 ID；undefined = 保留，null = 清除 */
     joinVerifyMethodId?: bigint | null;
     /** v2.3 聊天类型（group/supergroup/channel）；undefined = 不改动现有值 */
@@ -1785,7 +1801,15 @@ export async function upsertGroupSettings(
       kickDirectJoinsValue ? 1 : 0,
       replyCodeInGroupValue ? 1 : 0,
       joinVerifyBotIdValue === null || joinVerifyBotIdValue === undefined ? null : Number(joinVerifyBotIdValue),
-      joinVerifyModeValue === "direct" ? "direct" : joinVerifyModeValue === "verify" ? "verify" : null,
+      joinVerifyModeValue === "direct"
+        ? "direct"
+        : joinVerifyModeValue === "verify"
+          ? "verify"
+          : joinVerifyModeValue === "group"
+            ? "group"
+            : joinVerifyModeValue === "dm"
+              ? "dm"
+              : null,
       joinVerifyMethodIdValue === null || joinVerifyMethodIdValue === undefined ? null : Number(joinVerifyMethodIdValue),
       chatTypeValue,
       dateText(new Date()),

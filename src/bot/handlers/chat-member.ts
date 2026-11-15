@@ -21,6 +21,7 @@ import {
   loadGroupSettingsForChat,
   resolveJoinVerify,
   resolveDesignatedBot,
+  resolveJoinVerifyChannel,
   type ResolvedJoinVerify,
 } from "@/services/join-verify";
 import { chatCapabilities, chatKindFromChatType } from "@/services/chat-type";
@@ -114,15 +115,15 @@ export async function recordJoinRequestOnly(
 }
 
 /**
- * 群内验证 bootstrap（直连入群 + 超级群 auto 渠道）：用户已物理在群内，
- * 创建会话 → 禁言 → 群内验证消息；通过解禁 / 失败超时踢出。
+ * 群内验证 bootstrap（直连入群 + 超级群显式/自动渠道）：用户已物理在群内（或申请制
+ * 已先批准进群），创建会话 → 禁言 → 群内验证消息；通过解禁 / 失败超时踢出。
  * 验证方式来自群组绑定，超时/尝试次数使用机器人级默认覆盖。
  */
 async function bootstrapGroupVerification(
   api: Api,
   user: JoinVerificationUser,
   chat: JoinVerificationChat,
-  requestType: "direct",
+  requestType: "telegram" | "direct",
   runtime: RuntimeSettings,
   settings: NonNullable<Awaited<ReturnType<typeof getGroupSettings>>>,
   resolved: ResolvedJoinVerify,
@@ -437,7 +438,7 @@ async function bootstrapDmVerification(
 
 /**
  * 加群验证统一 bootstrap（唯一入口）：
- * 解析机器人级加群验证配置 → 按渠道分派（申请制/频道=私聊；直连超级群=群内）。
+ * 解析机器人级加群验证配置 → 按渠道分派（渠道判定与验证网页 /api/v1/verify 同一实现）。
  * 返回 null = 配置不完整（调用方按手动审核处理）。
  */
 export async function bootstrapJoinVerification(
@@ -460,14 +461,14 @@ export async function bootstrapJoinVerification(
     return null;
   }
 
-  // 渠道判定（源头规则）：频道不支持群内验证 → 私聊；申请制 → 私聊（先验证后批准）；
-  // 直连 → 超级群群内验证 / 基础群私聊（auto 语义）
+  // 渠道判定（v3.0.3 源头规则，与验证网页同一实现 resolveJoinVerifyChannel）：
+  // 显式群组策略（group/dm）直接决定渠道；历史 verify/NULL 维持旧行为
+  // （申请制→私聊；直连→群型 auto 语义）。
+  // 物理约束：基础群/频道不能群内验证（订阅者不能发言/无禁言）→ 强制私聊。
   const kind = chatKindFromChatType(chat.type);
   const capabilities = chatCapabilities(kind);
-  const dmChannel =
-    requestType === "telegram" ||
-    !capabilities.inGroupVerification ||
-    settings === null;
+  const resolvedChannel = resolveJoinVerifyChannel(settings, BigInt(chat.id), requestType);
+  const dmChannel = resolvedChannel === "dm" || !capabilities.inGroupVerification;
 
   if (dmChannel) {
     return bootstrapDmVerification(
@@ -476,6 +477,21 @@ export async function bootstrapJoinVerification(
   }
   if (!settings) {
     return null;
+  }
+  // v3.0.3 群内验证 + 申请制（chat_join_request）：先批准 Telegram 侧申请让用户进群
+  // （v2.2.5 同语义），join_requests.status 保持 pending 直到群内验证通过；
+  // 批准失败回落私聊验证（先验证后批准）。直连入群无需批准（人已在群内）。
+  if (requestType === "telegram") {
+    const approval = await approveTelegramJoinRequest(BigInt(chat.id), BigInt(user.id), api);
+    if (!approval.success) {
+      console.warn(
+        `Group-channel join request approval failed (chat ${chat.id}, user ${user.id}): ` +
+          `${approval.error ?? "unknown"} — falling back to DM verification`,
+      );
+      return bootstrapDmVerification(
+        api, user, chat, requestType, runtime, settings, resolved, preloaded?.requestDate, botId,
+      );
+    }
   }
   return bootstrapGroupVerification(api, user, chat, requestType, runtime, settings, resolved);
 }

@@ -42,7 +42,9 @@ export async function GET(request: Request): Promise<NextResponse> {
   // v2.3 自动审核机器人候选：bots.config.joinVerify.enabled 的机器人（Q4：只有开启了
   // 自动响应加群申请的机器人才进入下拉；群未指定时默认手动审核）
   const bots = await listBots();
-  const verificationMethods = (await listVerificationMethods()).filter((method) => method.enabled).map((method) => ({ id: String(method.id), name: method.name, type: method.type }));
+  // v3.0.3：验证方式库全部方法（含停用）—— 绑定验证方法下拉与「解锁门禁配置」同一规则，
+  // enabled 标记随行返回供下拉显示（启用/停用）。
+  const verificationMethods = (await listVerificationMethods()).map((method) => ({ id: String(method.id), name: method.name, type: method.type, enabled: method.enabled }));
   const { parseBotFeatureConfig } = await import("@/services/bot-feature-config");
   const joinVerifyCandidates = bots
     .filter((bot) => {
@@ -54,7 +56,9 @@ export async function GET(request: Request): Promise<NextResponse> {
   // v2.3.5 生效策略（与 services/join-verify.ts 运行时解析同语义）：
   // 群组私有列非 NULL 取群组值；NULL（历史群组未显式保存策略）回退该群绑定
   // 机器人的 bot 级 joinVerify 配置；未绑定机器人或机器人不存在则保持 NULL。
-  const effectiveJoinVerifyMode: "verify" | "direct" | null = settings?.joinVerifyMode ?? null;
+  // v3.0.3：join_verify_mode 拆分后含 group/dm 显式渠道值，历史值 verify/null 原样返回
+  // （前端按 chat_type 映射显示，与 resolveJoinVerifyChannel 历史语义一致）。
+  const effectiveJoinVerifyMode: "verify" | "direct" | "group" | "dm" | null = settings?.joinVerifyMode ?? null;
   let effectiveJoinVerifyMethodId: bigint | null = settings?.joinVerifyMethodId ?? null;
   if (effectiveJoinVerifyMode === null && settings?.joinVerifyBotId != null) {
     const boundBot = await getBot(settings.joinVerifyBotId);
@@ -84,6 +88,7 @@ export async function GET(request: Request): Promise<NextResponse> {
             kick_direct_joins: settings.kickDirectJoins,
             reply_code_in_group: settings.replyCodeInGroup,
             require_approval: settings.requireApproval,
+            chat_type: settings.chatType,
             join_verify_bot_id:
               settings.joinVerifyBotId === null ? null : String(settings.joinVerifyBotId),
             join_verify_mode: effectiveJoinVerifyMode,
@@ -128,7 +133,8 @@ export async function PUT(request: Request): Promise<NextResponse> {
     require_approval?: boolean;
     /** v2.3 自动审核机器人（null=手动审核） */
     join_verify_bot_id?: string | number | null;
-    join_verify_mode?: "verify" | "direct";
+    /** v3.0.3 拆分：group=群内验证 / dm=私聊验证 / direct=直接通过；verify=历史值兼容 */
+    join_verify_mode?: "verify" | "direct" | "group" | "dm";
     join_verify_method_id?: string | number | null;
   };
   try {
@@ -158,7 +164,14 @@ export async function PUT(request: Request): Promise<NextResponse> {
     }
   }
 
-  const joinVerifyMode = payload.join_verify_mode === "direct" ? "direct" : "verify";
+  // v3.0.3 申请处理方式拆分：group/dm/direct 显式值；未传 = 不改动（保留现值）；
+  // 未知/历史值回落 verify（旧语义）
+  const joinVerifyMode: "verify" | "direct" | "group" | "dm" | undefined =
+    payload.join_verify_mode === undefined
+      ? undefined
+      : payload.join_verify_mode === "direct" || payload.join_verify_mode === "group" || payload.join_verify_mode === "dm"
+        ? payload.join_verify_mode
+        : "verify";
   let joinVerifyMethodId: bigint | null | undefined;
   if (payload.join_verify_method_id !== undefined) {
     const raw = payload.join_verify_method_id === null ? "" : String(payload.join_verify_method_id).trim();
@@ -172,9 +185,16 @@ export async function PUT(request: Request): Promise<NextResponse> {
 
   const effectiveRequireApproval = payload.require_approval ?? existing?.requireApproval ?? false;
   const effectiveBotId = joinVerifyBotIdValue === undefined ? (existing?.joinVerifyBotId ?? null) : joinVerifyBotIdValue;
-  const effectiveMode = payload.join_verify_mode ?? existing?.joinVerifyMode ?? "verify";
+  const effectiveMode = joinVerifyMode ?? existing?.joinVerifyMode ?? "verify";
   const effectiveMethodId = joinVerifyMethodId === undefined ? (existing?.joinVerifyMethodId ?? null) : joinVerifyMethodId;
-  if (effectiveRequireApproval && effectiveBotId !== null && effectiveMode === "verify" && effectiveMethodId === null && payload.join_verify_mode !== undefined) {
+  // v3.0.3：group/dm 与历史 verify 同为验证模式（direct 除外），必须绑定验证方式
+  if (
+    effectiveRequireApproval &&
+    effectiveBotId !== null &&
+    effectiveMode !== "direct" &&
+    effectiveMethodId === null &&
+    payload.join_verify_mode !== undefined
+  ) {
     return NextResponse.json({ ok: false, error: "该群选择了验证码验证，请先绑定一种验证方式；如需免验证请选择「直接通过申请」" }, { status: 400 });
   }
 
@@ -202,7 +222,7 @@ export async function PUT(request: Request): Promise<NextResponse> {
     // v2.3 新成员审核开关：未传时保留现值（undefined 语义 = 不改动）
     requireApproval: payload.require_approval ?? existing?.requireApproval,
     joinVerifyBotId: joinVerifyBotIdValue,
-    joinVerifyMode: payload.join_verify_mode === undefined ? existing?.joinVerifyMode : joinVerifyMode,
+    joinVerifyMode: joinVerifyMode ?? existing?.joinVerifyMode,
     joinVerifyMethodId,
   });
 

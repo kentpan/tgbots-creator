@@ -174,13 +174,32 @@ function readJsonPath(source: unknown, path: string): unknown {
   return current;
 }
 
+/**
+ * v3.0.3 验证接口凭据双认证（配置与验证逻辑严格一致的唯一实现点）：
+ * - api_key 不含冒号（默认）：Authorization: Bearer <api_key>；
+ * - api_key 为 user:pass 形式（含冒号）：Authorization: Basic base64("user:pass")，
+ *   兼容 HTTP Basic 认证的验证接口；
+ * base64 编码优先 btoa（Node/Edge 通用），不可用时回退 Buffer（Node）。
+ */
+function buildAuthorizationHeader(apiKey: string): string {
+  if (!apiKey.includes(":")) return `Bearer ${apiKey}`;
+  const credentials = `${apiKey}`;
+  let encoded: string;
+  if (typeof btoa === "function") {
+    encoded = btoa(credentials);
+  } else {
+    encoded = Buffer.from(credentials, "utf-8").toString("base64");
+  }
+  return `Basic ${encoded}`;
+}
+
 export async function verifyCodeExternally(
   config: CodeApiConfig,
   input: ExternalVerifyInput,
   hooks?: ExternalVerifyHooks,
 ): Promise<ExternalVerifyResult> {
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${config.api_key}`,
+    Authorization: buildAuthorizationHeader(config.api_key),
   };
 
   let url = config.url;

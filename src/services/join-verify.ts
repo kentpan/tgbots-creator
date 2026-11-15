@@ -16,7 +16,7 @@
  * 表单预填文案保存在群组列；超时/次数由机器人级 override 覆盖验证方式默认值。
  */
 
-import { getBot, getGroupSettings, getVerificationMethod, type GroupSettingsRow } from "@/database/operations";
+import { getBot, getGroupSettings, getVerificationMethod, resolveVerificationChannel, type GroupSettingsRow } from "@/database/operations";
 import { parseBotFeatureConfig } from "@/services/bot-feature-config";
 import {
   mergeVerificationParams,
@@ -98,6 +98,31 @@ export async function resolveJoinVerify(
       console.error(`[join-verify] bot #${botId} method ${method.id} has unsupported type ${method.type}`);
       return null;
   }
+}
+
+/**
+ * v3.0.3 加群验证渠道统一判定（运行时 bootstrap 与验证网页 /api/v1/verify 共用同一实现）。
+ *
+ * 源头规则（配置与验证逻辑必须相匹配）:
+ * - join_verify_mode 显式值优先："group" = 群内验证 / "dm" = 私聊验证
+ *   （仿真屏「申请处理方式」拆分后的两个验证选项，配置直接决定渠道）；
+ * - 历史值 "verify" / null（未拆分前的「验证码验证后通过」/ 未保存）：
+ *   申请制（chat_join_request）→ 私聊验证（先验证后批准）；
+ *   直连入群 → verification_channel 列三态语义（auto：超级群→群内 / 基础群→私聊）。
+ *
+ * Telegram 物理约束（基础群无禁言/申请审批、频道订阅者不能发言 → 不能群内验证）
+ * 由调用方在 bootstrap 处用 chatCapabilities 强制回落 dm，本函数不做群型判断。
+ */
+export function resolveJoinVerifyChannel(
+  settings: GroupSettingsRow | null,
+  chatId: bigint | number | string | null | undefined,
+  requestType: "telegram" | "direct",
+): "group" | "dm" {
+  const mode = settings?.joinVerifyMode ?? null;
+  if (mode === "group") return "group";
+  if (mode === "dm") return "dm";
+  if (requestType === "telegram") return "dm";
+  return resolveVerificationChannel(settings, chatId);
 }
 
 /**

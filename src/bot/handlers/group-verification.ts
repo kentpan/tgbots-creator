@@ -8,10 +8,10 @@ import {
   getVerificationSession,
   isSessionExpired,
   setSessionPromptMessage,
-  resolveVerificationChannel,
   type GroupSettingsRow,
   type VerificationSessionRow,
 } from "@/database/operations";
+import { resolveJoinVerifyChannel } from "@/services/join-verify";
 import { generateJoinCode } from "@/utils/crypto";
 import { htmlEscape, userMentionHTML } from "@/utils/html";
 import { muteUnverifiedMember } from "@/services/approval";
@@ -308,7 +308,8 @@ export async function handleVerificationChoice(
   const settings = await getGroupSettings(session.chatId);
   // v2.0.12 三态：auto 按群 chat_id 判定（同一群判定结果恒定，与 bootstrap 一致）；
   // 显式配置被切换时旧会话失效要求重新申请
-  if (resolveVerificationChannel(settings, session.chatId) !== "group") {
+  // v3.0.3：改用与 bootstrap/验证网页同一实现（显式申请处理方式 group/dm 优先）
+  if (resolveJoinVerifyChannel(settings, session.chatId, "direct") !== "group") {
     await ctx.answerCallbackQuery({ text: "验证渠道已切换，请重新申请加群" });
     return;
   }

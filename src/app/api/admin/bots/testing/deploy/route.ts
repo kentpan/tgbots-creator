@@ -6,8 +6,8 @@ import {
   getGroupBotAdminByBotAndChat,
   getGroupSettings,
   isSuperGroupChatId,
-  resolveVerificationChannel,
 } from "@/database/operations";
+import { resolveJoinVerifyChannel } from "@/services/join-verify";
 import { botByToken, describeSyncError, withTelegramTimeout } from "@/services/telegram-sync";
 import { parseGroupDeployState } from "@/services/group-deploy";
 import { acquireStableGroupInviteLink, migratedChatIdFromError } from "@/services/invite-link";
@@ -288,10 +288,12 @@ export async function POST(request: Request): Promise<NextResponse> {
     // v2.1.1：部署指引与实际验证渠道严格一致 —— 不再硬编码「私聊发码」文案（
     // 旧文案与 v2.0.12 群内验证渠道矛盾，用户按文案预期「输码后进群」却观察到
     // 「先进群后验证」，被误判为功能损坏）。按群当前渠道设置生成本群真实流程说明。
+    // v3.0.3：改用与运行时/验证网页同一实现 resolveJoinVerifyChannel（邀请链接 =
+    // 申请制入群，requestType=telegram）；显式申请处理方式（group/dm）直接决定渠道。
     let verificationChannel: "group" | "dm" = isSuperGroupChatId(effectiveChatId) ? "group" : "dm";
     try {
       const settings = await getGroupSettings(effectiveChatId);
-      verificationChannel = resolveVerificationChannel(settings, effectiveChatId);
+      verificationChannel = resolveJoinVerifyChannel(settings, effectiveChatId, "telegram");
     } catch {
       /* 设置读取失败时按群型默认值展示 */
     }
@@ -319,7 +321,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       ? verificationChannel === "group"
         ? [
             "部署完成！把入群申请链接发给买家（或配置到闲鱼自动发货）",
-            "本群当前验证渠道为「群内验证」（验证渠道=自动 + 超级群，或在群组信息中显式选择）：",
+            "本群当前申请处理方式为「群内验证」（在仿真APP → 群组信息 → 自动审核机器人 → 申请处理方式中配置）：",
             "买家点链接 → 申请入群 → 机器人自动批准进群并禁言 → 群内点击「验证」按钮在验证页面输入验证码完成验证 → 自动解禁畅聊",
             "验证码在验证页面输入，群里其他成员不可见（隐私红线）",
             "⚠️ 只能分享本系统生成的「入群申请链接」（需机器人审批）！",
@@ -329,7 +331,7 @@ export async function POST(request: Request): Promise<NextResponse> {
           ]
         : [
             "部署完成！把入群申请链接发给买家（或配置到闲鱼自动发货）",
-            "本群当前验证渠道为「私聊验证」（在群组信息 → 验证渠道中配置）：",
+            "本群当前申请处理方式为「私聊验证」（在仿真APP → 群组信息 → 自动审核机器人 → 申请处理方式中配置）：",
             "买家点链接 → 申请入群 → 机器人私聊发送验证提示 → 输入验证码通过后自动进群",
             "验证码仅机器人与买家私聊可见，不会出现在群里（隐私模式）",
             "⚠️ 私聊验证要求买家先启动机器人（t.me/<机器人用户名>?start=join_<群组chat_id>），否则机器人无法私聊发码",

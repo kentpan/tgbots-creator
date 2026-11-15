@@ -10,7 +10,7 @@ import {
 import { generateJoinCode, generateVerificationToken } from "@/utils/crypto";
 import { parseCodeApiConfig, type CodeApiConfig } from "@/services/external-verify";
 import { DEFAULT_GROUP_PROMPT_TEXT } from "@/services/bot-messages";
-import { resolveJoinVerify } from "@/services/join-verify";
+import { resolveJoinVerify, resolveJoinVerifyChannel } from "@/services/join-verify";
 
 /** 仿真屏使用的固定模拟用户（与仿真屏模板变量保持一致） */
 export const SIMULATED_USER_ID = 777000n;
@@ -297,7 +297,8 @@ export async function POST(request: Request): Promise<NextResponse> {
       method_id: resolved.methodDbId !== null ? String(resolved.methodDbId) : "",
       method_name: method?.name ?? (useSelfCode ? "自动验证码（输入验证码加群）" : "外部API核验"),
       expected_code: joinCode,
-      verification_channel: settings?.verificationChannel ?? "auto",
+      // v3.0.3：与真实运行时同一渠道判定（显式 group/dm 优先，历史值按申请制→私聊）
+      verification_channel: resolveJoinVerifyChannel(settings, chatId, "telegram"),
     },
   });
 }

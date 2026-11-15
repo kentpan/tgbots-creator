@@ -100,7 +100,8 @@ export interface GroupSettingsFormState {
   reply_code_in_group: boolean;
   require_approval: boolean;
   join_verify_bot_id: string;
-  join_verify_mode: "verify" | "direct";
+  /** v3.0.3 申请处理方式拆分：group=群内验证 / dm=私聊验证 / direct=直接通过；verify=历史值（加载时按群型映射） */
+  join_verify_mode: "verify" | "direct" | "group" | "dm";
   join_verify_method_id: string;
 }
 

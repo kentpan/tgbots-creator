@@ -10,6 +10,7 @@ import {
   isSessionExpired,
 } from "@/database/operations";
 import { autoApproveUser, completeGroupVerification } from "@/services/approval";
+import { resolveJoinVerifyChannel } from "@/services/join-verify";
 import { evaluateSubmittedCode } from "@/services/verification-flow";
 import { getClientIp } from "@/utils/client-info";
 import { validateInitData } from "@/utils/telegram";
@@ -63,12 +64,18 @@ export async function POST(request: NextRequest) {
     const isApiRequest =
       session.chatId === 0n || (joinRequest !== null && joinRequest.requestType === "api");
 
-    // v2.0.5 群内验证：URL 按钮在群内以浏览器打开（无 Telegram WebApp initData），
+    // v2.0.5 群内验证：URL 按钮在群内以应用内浏览器打开（无 Telegram WebApp initData），
     // 持有 token 本身即身份凭据（链接仅出现在目标用户参与的群内，且 32 位随机不可猜测）；
     // code_api 还需在页面输入有效卡密，captcha 为纯人机验证 —— 代打风险与群验证 bot 通行做法一致。
+    //
+    // v3.0.3 根因修复（图1「用户身份验证失败」）：渠道判定改用与运行时 bootstrap
+    // 同一实现 resolveJoinVerifyChannel。旧实现硬比较 verificationChannel === "group"，
+    // 而运行时 bootstrap 发群内验证提示时并不看该列（历史群组该列为默认 "auto"）——
+    // 两边判定不一致导致群内验证网页必然 403。显式群组策略（join_verify_mode=group/dm）
+    // 优先，历史 verify/NULL 回落 verification_channel 三态语义。
+    const groupSettings = session.chatId !== 0n ? await getGroupSettings(session.chatId) : null;
     const groupChannel =
-      session.chatId !== 0n &&
-      (await getGroupSettings(session.chatId))?.verificationChannel === "group";
+      groupSettings !== null && resolveJoinVerifyChannel(groupSettings, session.chatId, "direct") === "group";
 
     const telegramUser = await validateInitData(
       typeof body.init_data === "string" ? body.init_data : "",

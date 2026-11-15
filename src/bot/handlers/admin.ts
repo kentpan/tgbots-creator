@@ -4,9 +4,9 @@ import {
   getGroupSettings,
   getPendingCodeContext,
   listBots,
-  resolveVerificationChannel,
   isSuperGroupChatId,
 } from "@/database/operations";
+import { resolveJoinVerifyChannel } from "@/services/join-verify";
 import { acquireStableGroupInviteLink } from "@/services/invite-link";
 import { formatBeijingDateTime } from "@/utils/datetime";
 import { config } from "@/config/settings";
@@ -75,8 +75,9 @@ export async function cmdStart(ctx: BotContext): Promise<void> {
     const title = settings.chatTitle ?? "群组";
     // v2.0.12 三态验证渠道文案：群内模式（超级群 auto/显式 group）申请后自动进群、群内按钮验证；
     // 私聊模式保持 v1.1.3 文案（私聊提示、群内零消息）；基础群提示直连入群补验证
+    // v3.0.3：与运行时 bootstrap 同一实现（申请链接 = 申请制入群，requestType=telegram）
     const flowLines =
-      resolveVerificationChannel(settings, chatId) === "group"
+      resolveJoinVerifyChannel(settings, chatId, "telegram") === "group"
         ? "• 提交申请后将自动批准进群，并在群内完成验证\n" +
           "• 在群内点击验证按钮即可（输入内容其他成员不可见）"
         : "• 验证提示将由本机器人私聊发送（群里看不到）\n" +

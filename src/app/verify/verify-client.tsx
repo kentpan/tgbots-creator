@@ -60,11 +60,15 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl,
     [showMessage],
   );
 
-  const submitVerification = useCallback(async () => {
+  /**
+   * v3.0.3：提交后返回是否成功 —— 失败时网页输码通道需清空验证码输入框
+   * （用户反馈：输错验证码后旧代码保留错误码，需要手动删除重输）。
+   */
+  const submitVerification = useCallback(async (): Promise<boolean> => {
     if (!captchaResponseRef.current) {
       showError("请先完成人机验证");
       hapticError();
-      return;
+      return false;
     }
 
     showSuccess("🔄 验证中，请稍候...");
@@ -118,9 +122,9 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl,
             });
           }
         }, 500);
-      } else {
-        throw new Error(result.detail || result.message || "验证失败");
+        return true;
       }
+      throw new Error(result.detail || result.message || "验证失败");
     } catch (error) {
       showError(error instanceof Error ? error.message : "网络错误，请重试");
       hapticError();
@@ -136,6 +140,7 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl,
         }
       }
       captchaResponseRef.current = null;
+      return false;
     }
   }, [apiBaseUrl, captchaConfig.provider, showError, showSuccess, token]);
 
@@ -299,7 +304,9 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl,
     }
     setCodeSubmitting(true);
     captchaResponseRef.current = code;
-    await submitVerification();
+    const ok = await submitVerification();
+    // v3.0.3：验证失败（验证码错误/会话失效等）清空验证码输入框，用户直接重输
+    if (!ok) setCodeInput("");
     setCodeSubmitting(false);
   }, [codeInput, codeSubmitting, showError, submitVerification]);
 

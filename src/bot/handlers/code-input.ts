@@ -4,8 +4,8 @@ import {
   getGroupSettings,
   getPendingCodeContext,
   getLatestVerificationContext,
-  resolveVerificationChannel,
 } from "@/database/operations";
+import { resolveJoinVerifyChannel } from "@/services/join-verify";
 import {
   evaluateSubmittedCode,
   type CodeCheckResult,
@@ -202,8 +202,9 @@ export async function processCodeAnswer(
   let groupReplyMode = false;
   if (ctx.chat && ctx.chat.type !== "private") {
     const chatSettings = await getGroupSettings(BigInt(ctx.chat.id));
+    // v3.0.3：与 bootstrap/验证网页同一渠道实现（显式申请处理方式 group/dm 优先）
     const groupChannel =
-      resolveVerificationChannel(chatSettings, ctx.chat.id) === "group";
+      resolveJoinVerifyChannel(chatSettings, ctx.chat.id, "direct") === "group";
     groupReplyMode = groupChannel && chatSettings?.replyCodeInGroup === true;
     if (groupChannel && !groupReplyMode) {
       console.log(
@@ -391,7 +392,7 @@ async function handleCodeInputInternal(
   if (ctx.chat && ctx.chat.type !== "private") {
     const chatSettings = await getGroupSettings(BigInt(ctx.chat.id));
     if (
-      resolveVerificationChannel(chatSettings, ctx.chat.id) === "group" &&
+      resolveJoinVerifyChannel(chatSettings, ctx.chat.id, "direct") === "group" &&
       chatSettings?.replyCodeInGroup !== true
     ) {
       await next();
