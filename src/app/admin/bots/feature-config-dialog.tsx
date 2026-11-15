@@ -209,6 +209,13 @@ export function FeatureConfigDialog({
   );
   const [privacyMode, setPrivacyMode] = useState(profile.privacyMode);
   const [selectedCommandIds, setSelectedCommandIds] = useState<number[]>(profile.commandIds);
+  /** v3.0.4 指令菜单面板「验证交互方式」开关（通用组件，随功能配置保存） */
+  const [commandPrivateReply, setCommandPrivateReply] = useState(
+    () => parseBotFeatureConfig(bot?.config ?? "{}", false).commandInteraction.privateReply,
+  );
+  const [commandLockUser, setCommandLockUser] = useState(
+    () => parseBotFeatureConfig(bot?.config ?? "{}", false).commandInteraction.lockUser,
+  );
   const featureGate = useMemo<GateFeatureConfig>(() => {
     if (!bot) return { enabled: false, verificationMethodId: null };
     return parseBotFeatureConfig(bot.config, false).gate;
@@ -230,6 +237,9 @@ export function FeatureConfigDialog({
       setKbPayload(keyboardConfig ? JSON.stringify(keyboardConfig) : "");
       setPrivacyMode(profile.privacyMode);
       setSelectedCommandIds(profile.commandIds);
+      const featureInteraction = parseBotFeatureConfig(bot?.config ?? "{}", false).commandInteraction;
+      setCommandPrivateReply(featureInteraction.privateReply);
+      setCommandLockUser(featureInteraction.lockUser);
     }
   }, [open, bot, keyboardConfig, profile]);
 
@@ -403,6 +413,8 @@ export function FeatureConfigDialog({
           <input type="hidden" name="gate_keyboard_required" value={feature.gateKeyboardRequired ? "1" : "0"} />
           <input type="hidden" name="gate_commands_required" value={feature.gateCommandsRequired ? "1" : "0"} />
           <input type="hidden" name="join_verify_enabled" value={feature.joinVerifyEnabled ? "1" : "0"} />
+          <input type="hidden" name="command_private_reply" value={commandPrivateReply ? "1" : "0"} />
+          <input type="hidden" name="command_lock_user" value={commandLockUser ? "1" : "0"} />
           <input type="hidden" name="welcome_text" value={welcomeText} />
           <input type="hidden" name="texts_json" value={JSON.stringify(botTexts)} />
           <input type="hidden" name="gate_enabled" value={feature.gateEnabled ? "1" : "0"} />
@@ -550,6 +562,14 @@ export function FeatureConfigDialog({
                   <div className="space-y-4">
                     <p className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
                       这里仅开启/关闭该机器人的自动响应能力。具体群组选择本机器人后，再在「仿真APP → 群组信息」中分别设置申请处理方式与绑定验证方式；不同群组可以使用不同策略。
+                    </p>
+                    {/* v3.0.4 群内验证提示自定义：使用「消息内嵌按钮」中配置的消息与按钮 */}
+                    <p className="rounded-md border border-primary/30 bg-primary/5 p-3 text-xs leading-relaxed text-foreground/80">
+                      💡 <b>群内验证提示自定义</b>：在下方「菜单与键盘 → 消息内嵌按钮」中配置的消息与按钮，
+                      将作为<b>群内验证提示</b>自动发送（替代默认欢迎文案）。要求按钮中至少包含一个
+                      「外部验证 API」按钮：开启按钮的<b>💬 使用私聊回复</b>后，点击按钮机器人私聊发提示、
+                      用户在私聊输入验证码；开启<b>🔒 锁定用户回复</b>后仅点击者本人的验证有效。
+                      未配置时使用默认验证提示。
                     </p>
                     <div className="grid gap-3 md:grid-cols-2">
                       <div className="space-y-1">
@@ -749,6 +769,10 @@ export function FeatureConfigDialog({
                       <CommandMenuConfigFields
                         privacyMode={privacyMode}
                         onPrivacyModeChange={setPrivacyMode}
+                        privateReply={commandPrivateReply}
+                        lockUser={commandLockUser}
+                        onPrivateReplyChange={setCommandPrivateReply}
+                        onLockUserChange={setCommandLockUser}
                         selected={selectedCommandIds}
                         onToggle={(id) =>
                           setSelectedCommandIds((prev) =>

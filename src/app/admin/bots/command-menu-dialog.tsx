@@ -26,6 +26,9 @@ export function CommandMenuDialog({
     name: string;
     privacyMode: boolean;
     selectedCommandIds: number[];
+    /** v3.0.4 验证交互方式开关（随 bots.config.commandInteraction 持久化） */
+    privateReply?: boolean;
+    lockUser?: boolean;
   };
   library: CommandLibraryItem[];
   trigger: React.ReactNode;
@@ -33,6 +36,8 @@ export function CommandMenuDialog({
 }) {
   const [privacyMode, setPrivacyMode] = useState(bot.privacyMode);
   const [selected, setSelected] = useState<number[]>(bot.selectedCommandIds);
+  const [privateReply, setPrivateReply] = useState(bot.privateReply ?? false);
+  const [lockUser, setLockUser] = useState(bot.lockUser ?? false);
 
   const toggle = (id: number) => {
     setSelected((prev) =>
@@ -52,10 +57,16 @@ export function CommandMenuDialog({
       <input type="hidden" name="id" value={bot.id} />
       <input type="hidden" name="privacyMode" value={privacyMode ? "1" : "0"} />
       <input type="hidden" name="commandIds" value={JSON.stringify(selected)} />
+      <input type="hidden" name="command_private_reply" value={privateReply ? "1" : "0"} />
+      <input type="hidden" name="command_lock_user" value={lockUser ? "1" : "0"} />
 
       <CommandMenuConfigFields
         privacyMode={privacyMode}
         onPrivacyModeChange={setPrivacyMode}
+        privateReply={privateReply}
+        lockUser={lockUser}
+        onPrivateReplyChange={setPrivateReply}
+        onLockUserChange={setLockUser}
         selected={selected}
         onToggle={toggle}
         library={library}

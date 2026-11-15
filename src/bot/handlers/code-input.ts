@@ -180,6 +180,7 @@ export async function processCodeAnswer(
   ctx: BotContext,
   codeText: string,
   preloaded?: Awaited<ReturnType<typeof getPendingCodeContext>>,
+  options?: { viaQuestion?: boolean },
 ): Promise<CodeCheckResult | null> {
   const from = ctx.from;
   if (!from || from.is_bot || !codeText.trim()) {
@@ -206,7 +207,10 @@ export async function processCodeAnswer(
     const groupChannel =
       resolveJoinVerifyChannel(chatSettings, ctx.chat.id, "direct") === "group";
     groupReplyMode = groupChannel && chatSettings?.replyCodeInGroup === true;
-    if (groupChannel && !groupReplyMode) {
+    // v3.0.4：viaQuestion（回复机器人验证提示消息，stateless-question 路径）不再拦截 ——
+    // 回复验证提示是用户的显式动作（加群验证自定义按钮的「群内直接回复验证码」流程
+    // 依赖此通道）；宽松模式下的任意明文文本仍然拦截（验证码不落群聊）。
+    if (groupChannel && !groupReplyMode && options?.viaQuestion !== true) {
       console.log(
         `Blocked plain-text code input in group ${ctx.chat.id} (verification_channel=group): ` +
           `user ${from.id} must use the in-group button/web page`,

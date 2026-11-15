@@ -3,8 +3,10 @@ import type { BotContext } from "../context";
 import { codeQuestion } from "../verification-question";
 import { CODE_SELF_DEFAULT_PROMPT } from "../verification-prompt";
 import {
+  getBot,
   getGroupSettings,
   getJoinRequestByToken,
+  getPendingSessionForUserChat,
   getVerificationSession,
   isSessionExpired,
   setSessionPromptMessage,
@@ -12,6 +14,8 @@ import {
   type VerificationSessionRow,
 } from "@/database/operations";
 import { resolveJoinVerifyChannel } from "@/services/join-verify";
+import { parseBotMenuConfig, type MenuMessageContent } from "@/services/menu-config";
+import { sendMenuMessage } from "@/services/bot-menu";
 import { generateJoinCode } from "@/utils/crypto";
 import { htmlEscape, userMentionHTML } from "@/utils/html";
 import { muteUnverifiedMember } from "@/services/approval";
@@ -172,6 +176,128 @@ export interface GroupPromptOutcome {
 }
 
 /**
+ * v3.0.4 群内验证提示自定义（消息内嵌按钮 → 自动发送）：
+ * 管理端在「功能配置 → 消息内嵌按钮」配置的消息内容 + 按钮布局，作为群内验证
+ * 提示自动发送（替代默认欢迎文案）。按钮中至少一个「外部验证 API」按钮，
+ * 点击回调走 jv: 前缀（handleJoinPromptButton）。
+ */
+export interface JoinPromptCustomization {
+  content: MenuMessageContent;
+  keyboard: InlineKeyboard;
+}
+
+/**
+ * v3.0.4 加群验证提示按钮回调（jv:<botId>:<row>:<col>）：
+ * - 防代验：仅存在本群待验证会话的成员可点击（其他成员点击无副作用）；
+ * - verify.private_reply 开启 → 验证提示发到点击者私聊，在私聊回复验证码
+ *   （复用 codeQuestion（tgcode）→ processCodeAnswer → evaluateSubmittedCode
+ *   现有统一管道，按用户维度定位会话，天然只验证本人的任务）；
+ * - 关闭 → 群内 force-reply 提示，直接在群里回复验证码。
+ * 验证通过/失败/超时全部复用现有管道（解禁/删提示/欢迎/踢出），解禁由
+ * 收到本回调的机器人（ctx.api）执行 —— 即时生效，无需等待禁言到期。
+ */
+export const JOIN_PROMPT_CALLBACK_PREFIX = "jv:";
+
+export function isJoinPromptCallbackData(data: string): boolean {
+  return data.startsWith(JOIN_PROMPT_CALLBACK_PREFIX) && data.split(":").length === 4;
+}
+
+export async function handleJoinPromptButton(
+  ctx: BotContext,
+  next?: () => Promise<void>,
+): Promise<void> {
+  const data = ctx.callbackQuery?.data ?? "";
+  if (!isJoinPromptCallbackData(data)) {
+    await next?.();
+    return;
+  }
+  const from = ctx.from;
+  const chat = ctx.chat;
+  if (!from || from.is_bot || !chat) {
+    await ctx.answerCallbackQuery({ text: "验证数据异常" });
+    return;
+  }
+  const [, botIdRaw, rowRaw, colRaw] = data.split(":");
+  if (!/^\d+$/.test(botIdRaw) || !/^\d+$/.test(rowRaw) || !/^\d+$/.test(colRaw)) {
+    await ctx.answerCallbackQuery({ text: "验证数据异常" });
+    return;
+  }
+
+  // 防代验：仅本群存在待验证会话的用户可点击（会话按 user+chat 绑定，天然锁定用户）
+  const session = await getPendingSessionForUserChat(BigInt(from.id), BigInt(chat.id));
+  if (!session) {
+    await ctx.answerCallbackQuery({
+      text: "这不是你的验证任务：请先申请加入群组，再点击按钮完成验证",
+      show_alert: true,
+    });
+    return;
+  }
+  if (session.method === "captcha") {
+    await ctx.answerCallbackQuery({
+      text: "该验证为人机验证，请点击「开始验证」在验证网页完成",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const botRow = await getBot(BigInt(botIdRaw));
+  const config = parseBotMenuConfig(botRow?.menuConfig ?? null);
+  const button = config.root.rows[Number(rowRaw)]?.buttons[Number(colRaw)];
+  const verify = button?.action.type === "verify" ? button.action.verify : undefined;
+  if (!verify || !verify.method_id) {
+    await ctx.answerCallbackQuery({ text: "验证按钮配置异常，请联系管理员检查消息内嵌按钮配置" });
+    return;
+  }
+
+  const inputHint = verify.input_hint_text?.trim() || "✍🏻 请在下方的输入框进行输入:";
+  const promptText = verify.prompt_text?.trim() || CODE_SELF_DEFAULT_PROMPT;
+  const codeLine =
+    session.method === "code_self" && session.expectedCode
+      ? `\n\n您的入群验证码：<b>${htmlEscape(session.expectedCode)}</b>`
+      : "";
+
+  if (verify.private_reply === true) {
+    // 使用私聊回复：验证提示发到点击者私聊，用户在私聊对话中回复验证码。
+    // 会话按 user id 定位（getPendingCodeContext），其他成员回复各自会话互不影响。
+    const dmText =
+      `${htmlEscape(inputHint)}\n\n${htmlEscape(promptText)}${codeLine}\n\n` +
+      "🔒 私聊对话中回复验证码完成验证，群内其他成员不可见。" +
+      codeQuestion.messageSuffixHTML();
+    try {
+      await ctx.api.sendMessage(from.id, dmText, {
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+        reply_markup: { force_reply: true, input_field_placeholder: "输入验证码" },
+      });
+      await ctx.answerCallbackQuery({ text: "已发送到你的私聊，请在私聊中回复验证码" });
+      console.log(
+        `Join prompt button (private reply): user ${from.id} chat ${chat.id} session=${session.token.slice(0, 8)}...`,
+      );
+    } catch (error) {
+      console.warn(
+        `Join prompt private DM failed: user ${from.id} chat ${chat.id} — ${error instanceof Error ? error.message : error}`,
+      );
+      await ctx.answerCallbackQuery({
+        text: "无法私聊你：请先私聊本机器人发送任意一句话（如 /start），再回来点击按钮",
+        show_alert: true,
+      });
+    }
+    return;
+  }
+
+  // 群内直接回复验证码：force-reply 提示（回执/清理走 reply-input 既有语义）
+  const groupText =
+    `${htmlEscape(promptText)}${codeLine}\n\n` +
+    "⏱ 输入框已定位到回复本消息，直接输入验证码发送即可。" +
+    codeQuestion.messageSuffixHTML();
+  await codeQuestion.replyWithHTML(ctx, groupText);
+  await ctx.answerCallbackQuery({ text: "请在输入框回复验证码完成验证" });
+  console.log(
+    `Join prompt button (group reply): user ${from.id} chat ${chat.id} session=${session.token.slice(0, 8)}...`,
+  );
+}
+
+/**
  * 群内验证 bootstrap 的发送阶段：禁言 + 群内验证消息（按方式组装按钮）。
  *
  * v2.1.5 群内回复输码模式（reply_code_in_group=true 且 code_self/code_api）：
@@ -190,6 +316,7 @@ export async function muteAndSendGroupPrompt(
   settings: GroupSettingsRow | null,
   webAppBaseUrl: string,
   verifyButtonText: string,
+  custom?: JoinPromptCustomization,
 ): Promise<GroupPromptOutcome> {
   // v2.1.5 群内回复输码模式：不禁言（禁言成员无法在群内发言/回复输码）
   const replyInputMode = isGroupReplyInputMode(settings, session.method);
@@ -202,6 +329,27 @@ export async function muteAndSendGroupPrompt(
     console.log(
       `Group reply-input mode enabled: user ${user.id} chat ${chat.id} method=${session.method} — skip mute (member must be able to reply)`,
     );
+  }
+
+  // v3.0.4 自定义提示（消息内嵌按钮配置）：优先于默认文案/按钮 —— 内容与按钮布局
+  // 完全按管理端配置发送（sendMenuMessage 支持 文本/图片/视频/相册），按钮回调
+  // jv: 前缀由 handleJoinPromptButton 处理。发送失败回落默认提示（best effort）。
+  if (custom) {
+    try {
+      const sent = await sendMenuMessage(api, chat.id, custom.content, {
+        replyMarkup: custom.keyboard,
+      });
+      await setSessionPromptMessage(session.token, sent.messageId);
+      console.log(
+        `Custom group verification prompt sent: user ${user.id} chat ${chat.id} method=${session.method} message=${sent.messageId}`,
+      );
+      return { sent: true, messageId: sent.messageId };
+    } catch (error) {
+      console.error(
+        `Failed to send custom group verification prompt to chat ${chat.id} — falling back to default:`,
+        error,
+      );
+    }
   }
 
   // 2. 组装键盘/提示形态：回复输码 → force_reply 提示（无按钮）；

@@ -4,6 +4,7 @@ import { getRuntimeSettings, type RuntimeSettings } from "@/config/runtime-setti
 import {
   createJoinRequest,
   createVerificationSession,
+  getBot,
   getGroupSettings,
   getPendingSessionForUserChat,
   wasRecentlyApprovedForUserChat,
@@ -14,7 +15,8 @@ import { utcnow } from "@/utils/time";
 import { InlineKeyboard, type Api } from "grammy";
 import { CODE_SELF_DEFAULT_PROMPT, sendCodeSelfPrompt } from "../verification-prompt";
 import { BOT_TEXT_DEFAULTS, renderBotTextVars, type BotTextVars } from "@/services/bot-messages";
-import { muteAndSendGroupPrompt } from "./group-verification";
+import { JOIN_PROMPT_CALLBACK_PREFIX, muteAndSendGroupPrompt, type JoinPromptCustomization } from "./group-verification";
+import { parseBotMenuConfig, renderMenuTemplate } from "@/services/menu-config";
 import { approveTelegramJoinRequest } from "@/services/approval";
 import { registerTelegramChat } from "@/services/chat-registry";
 import {
@@ -127,6 +129,7 @@ async function bootstrapGroupVerification(
   runtime: RuntimeSettings,
   settings: NonNullable<Awaited<ReturnType<typeof getGroupSettings>>>,
   resolved: ResolvedJoinVerify,
+  botId?: bigint | null,
 ): Promise<BootstrapResult> {
   // 幂等守卫：同一用户同群已有未完成会话（抖动/重复投递）不重复创建会话、不重复发群内消息
   const existing = await getPendingSessionForUserChat(BigInt(user.id), BigInt(chat.id));
@@ -194,6 +197,11 @@ async function bootstrapGroupVerification(
     return { created: false, promptDelivered: false, method: "none" };
   }
 
+  // v3.0.4 群内验证提示自定义：管理端「消息内嵌按钮」配置的消息 + 按钮布局
+  // 作为群内验证提示自动发送（要求按钮中含至少一个「外部验证 API」按钮，
+  // 回调 jv: 前缀由 handleJoinPromptButton 处理）；未配置/构建失败回落默认提示。
+  const customPrompt = await buildJoinPromptCustomization(botId, user, chat);
+
   // 禁言 + 群内验证消息（输入内容其他成员不可见：网页按钮 / 4 选 1 callback）
   const outcome = await muteAndSendGroupPrompt(
     api,
@@ -203,9 +211,86 @@ async function bootstrapGroupVerification(
     settings,
     runtime.baseUrl,
     runtime.verificationButtonText,
+    customPrompt,
   );
 
   return { created: true, promptDelivered: outcome.sent, method: resolved.method };
+}
+
+/**
+ * v3.0.4 构建群内验证自定义提示（消息内嵌按钮配置 → 提示内容 + jv 按钮键盘）：
+ * - 内容支持 文本/图片/视频/相册（sendMenuMessage 同源能力），{{user_id}} 等变量渲染；
+ * - 按钮仅保留两类：verify（→ jv:<botId>:<row>:<col> 回调）与合法 url；
+ * - 内容为空或无 verify 按钮时返回 undefined（调用方回落默认提示）。
+ */
+async function buildJoinPromptCustomization(
+  botId: bigint | null | undefined,
+  user: JoinVerificationUser,
+  chat: JoinVerificationChat,
+): Promise<JoinPromptCustomization | undefined> {
+  if (!botId) return undefined;
+  try {
+    const botRow = await getBot(botId);
+    if (!botRow) return undefined;
+    const parsed = parseBotMenuConfig(botRow.menuConfig ?? null);
+    const hasText = parsed.content.type !== "text" || parsed.content.text.trim().length > 0;
+    if (!hasText) return undefined;
+
+    const vars = {
+      user_id: String(user.id),
+      username: user.username ?? "",
+      first_name: user.first_name ?? "",
+      last_name: user.last_name ?? "",
+      chat_id: String(chat.id),
+      chat_title: chat.title ?? "",
+    };
+    const keyboard = new InlineKeyboard();
+    let verifyCount = 0;
+    let firstRow = true;
+    parsed.root.rows.forEach((row) => {
+      const rowButtons: Array<{ text: string; kind: "verify" | "url"; payload: string }> = [];
+      row.buttons.forEach((button, colIndex) => {
+        if (button.action.type === "verify" && button.action.verify?.method_id) {
+          rowButtons.push({
+            text: button.text,
+            kind: "verify",
+            payload: `${JOIN_PROMPT_CALLBACK_PREFIX}${botId}:${parsed.root.rows.indexOf(row)}:${colIndex}`,
+          });
+        } else if (button.action.type === "url" && /^https?:\/\//i.test(button.action.url ?? "")) {
+          rowButtons.push({ text: button.text, kind: "url", payload: button.action.url ?? "" });
+        }
+      });
+      if (rowButtons.length === 0) return;
+      if (!firstRow) keyboard.row();
+      firstRow = false;
+      for (const entry of rowButtons) {
+        if (entry.kind === "verify") {
+          verifyCount += 1;
+          keyboard.text(entry.text, entry.payload);
+        } else {
+          keyboard.url(entry.text, entry.payload);
+        }
+      }
+    });
+    if (verifyCount === 0) {
+      console.log(
+        `Join prompt customization skipped (no verify button in menu config): bot ${botId} chat ${chat.id}`,
+      );
+      return undefined;
+    }
+    const content = {
+      ...parsed.content,
+      text: renderMenuTemplate(parsed.content.text, vars),
+      items: parsed.content.items.map((item) => ({ ...item, caption: item.caption ? renderMenuTemplate(item.caption, vars) : item.caption })),
+    };
+    return { content, keyboard };
+  } catch (error) {
+    console.warn(
+      `Failed to build join prompt customization (bot ${botId} chat ${chat.id}) — falling back to default prompt:`,
+      error instanceof Error ? error.message : error,
+    );
+    return undefined;
+  }
 }
 
 /**
@@ -511,7 +596,7 @@ export async function bootstrapJoinVerification(
       );
     }
   }
-  return bootstrapGroupVerification(api, user, chat, requestType, runtime, settings, resolved);
+  return bootstrapGroupVerification(api, user, chat, requestType, runtime, settings, resolved, botId);
 }
 
 /**

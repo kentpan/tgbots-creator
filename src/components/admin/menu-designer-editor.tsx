@@ -14,6 +14,7 @@ import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import { MediaUploadButton } from "@/components/admin/media-upload-button";
 import { SelfContainedTabs } from "@/components/admin/self-contained-tabs";
 import { TgApiUnlockMethodBinding } from "@/components/admin/tgapi-unlock-api-config";
+import { InteractionModeSwitches } from "@/components/admin/interaction-mode-switches";
 import {
   countMenuStats,
   isHttpUrl,
@@ -887,6 +888,21 @@ function SelectedButtonPanel({ state }: { state: DesignerState }) {
             超时在上方「配置外部验证 API」中编辑并保存到「验证方式」库（同一数据源）；
             点击按钮后在输入框回复验证码真实核验。
           </p>
+          {/* v3.0.4 通用验证交互开关（与自定义键盘/指令菜单面板同一组件） */}
+          <InteractionModeSwitches
+            privateReply={action.verify?.private_reply === true}
+            lockUser={action.verify?.lock_user === true}
+            onPrivateReplyChange={(value) =>
+              update((draft) => {
+                if (draft.action.verify) draft.action.verify.private_reply = value;
+              })
+            }
+            onLockUserChange={(value) =>
+              update((draft) => {
+                if (draft.action.verify) draft.action.verify.lock_user = value;
+              })
+            }
+          />
           <div className="space-y-1">
             <label className="block text-sm font-medium">输入提示文案（点击按钮后先发送的提示）</label>
             <textarea

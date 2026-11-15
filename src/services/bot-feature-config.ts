@@ -58,6 +58,12 @@ export interface BotFeatureConfig {
   gate: GateFeatureConfig;
   /** 加群验证面板 */
   joinVerify: JoinVerifyFeatureConfig;
+  /**
+   * v3.0.4 指令菜单面板「验证交互方式」开关（与消息内嵌按钮/自定义键盘面板的
+   * 通用组件同款）：指令本身不直接触发验证码核验，此配置作为面板级持久化，
+   * 供指令触发的验证类交互（如自定义指令内嵌验证流程）读取。
+   */
+  commandInteraction: { privateReply: boolean; lockUser: boolean };
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -150,6 +156,10 @@ export function parseBotFeatureConfig(configRaw: string, hasMenuConfig: boolean)
       interfaceModeRaw === "inline" || interfaceModeRaw === "keyboard" ? interfaceModeRaw : undefined,
     gate: parseGate(root.gate, false),
     joinVerify: parseJoinVerify(root.joinVerify, false),
+    commandInteraction: {
+      privateReply: asRecord(root.commandInteraction).privateReply === true,
+      lockUser: asRecord(root.commandInteraction).lockUser === true,
+    },
   };
 }
 

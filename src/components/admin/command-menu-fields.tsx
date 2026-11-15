@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Check, ChevronsUpDown, FolderTree } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
+import { InteractionModeSwitches } from "@/components/admin/interaction-mode-switches";
 
 export interface CommandLibraryItem {
   id: string;
@@ -27,12 +28,21 @@ export interface CommandLibraryItem {
 export function CommandMenuConfigFields({
   privacyMode,
   onPrivacyModeChange,
+  privateReply,
+  lockUser,
+  onPrivateReplyChange,
+  onLockUserChange,
   selected,
   onToggle,
   library,
 }: {
   privacyMode: boolean;
   onPrivacyModeChange: (value: boolean) => void;
+  /** v3.0.4 指令菜单面板「验证交互方式」（通用开关组件，随功能配置保存） */
+  privateReply: boolean;
+  lockUser: boolean;
+  onPrivateReplyChange: (value: boolean) => void;
+  onLockUserChange: (value: boolean) => void;
   selected: number[];
   onToggle: (id: number) => void;
   library: CommandLibraryItem[];
@@ -64,6 +74,15 @@ export function CommandMenuConfigFields({
         </div>
         <Switch checked={privacyMode} onCheckedChange={onPrivacyModeChange} aria-label="隐私模式" />
       </div>
+
+      {/* v3.0.4 验证交互方式开关（与消息内嵌按钮/自定义键盘面板同一通用组件；
+          随功能配置保存到 bots.config.commandInteraction，供指令触发的验证类交互读取） */}
+      <InteractionModeSwitches
+        privateReply={privateReply}
+        lockUser={lockUser}
+        onPrivateReplyChange={onPrivateReplyChange}
+        onLockUserChange={onLockUserChange}
+      />
 
       {/* 指令选择浮层（双 Tab 多选） */}
       <div className="space-y-1">

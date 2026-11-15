@@ -24,6 +24,7 @@ import {
 } from "@/services/custom-keyboard";
 import { ACTION_OPTIONS } from "@/components/admin/menu-designer-editor";
 import { TgApiUnlockMethodBinding } from "@/components/admin/tgapi-unlock-api-config";
+import { InteractionModeSwitches } from "@/components/admin/interaction-mode-switches";
 import type { VerificationMethodOption } from "@/components/admin/menu-designer-editor";
 import {
   isValidTgApiPlatformValue,
@@ -598,6 +599,21 @@ function SelectedKeyboardButtonPanel({ state }: { state: KeyboardDesignerState }
               className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
             />
           </div>
+          {/* v3.0.4 通用验证交互开关（与消息内嵌按钮/指令菜单面板同一组件） */}
+          <InteractionModeSwitches
+            privateReply={action.verify?.private_reply === true}
+            lockUser={action.verify?.lock_user === true}
+            onPrivateReplyChange={(value) =>
+              update((draft) => {
+                if (draft.action?.verify) draft.action.verify.private_reply = value;
+              })
+            }
+            onLockUserChange={(value) =>
+              update((draft) => {
+                if (draft.action?.verify) draft.action.verify.lock_user = value;
+              })
+            }
+          />
         </div>
       ) : null}
 

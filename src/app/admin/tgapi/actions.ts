@@ -185,6 +185,23 @@ export async function saveTgApiBotAction(formData: FormData): Promise<void> {
     profile.commandIds = commandIds;
     savedCommandCount = commandIds.length;
   }
+  // v3.0.4 指令菜单面板「验证交互方式」（bots.config.commandInteraction）：
+  // 与 saveBotFeatureConfigAction 同存储位；字段缺失 = 不触碰（兼容旧调用方）。
+  if (formData.has("command_private_reply") || formData.has("command_lock_user")) {
+    const previousInteraction =
+      profile.commandInteraction && typeof profile.commandInteraction === "object"
+        ? (profile.commandInteraction as Record<string, unknown>)
+        : {};
+    profile.commandInteraction = {
+      ...previousInteraction,
+      ...(formData.has("command_private_reply")
+        ? { privateReply: formData.get("command_private_reply") === "1" }
+        : {}),
+      ...(formData.has("command_lock_user")
+        ? { lockUser: formData.get("command_lock_user") === "1" }
+        : {}),
+    };
+  }
   // v2.3 功能面板开关（🧩功能开关卡片随表单提交）：与 saveBotFeatureConfigAction
   // 同字段同存储位（bots.config 顶层）—— 部署后运行实例的面板门禁/界面开关据此生效。
   // 字段缺失 = 不触碰（兼容旧调用方）。

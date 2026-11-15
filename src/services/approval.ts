@@ -721,12 +721,28 @@ export async function completeGroupVerification(
       return new ApprovalResult(true);
     }
 
-    const bot = await resolveBotForChat(
-      "completeGroupVerification",
-      joinRequest.chatId,
-      joinRequest.userId,
-      eventApi,
-    );
+    // v3.0.4 解禁兜底：bot 解析失败（绑定缺失 + 主 bot token 缺失）时旧实现直接抛出
+    // —— 落库已批准但解禁/删提示/欢迎全部跳过，用户表现为「验证通过后还要等禁言
+    // 到期（好几分钟）才解锁」。现在解析失败降级尝试主 bot，仍失败才中断后续步骤。
+    let bot: Bot;
+    try {
+      bot = await resolveBotForChat(
+        "completeGroupVerification",
+        joinRequest.chatId,
+        joinRequest.userId,
+        eventApi,
+      );
+    } catch (resolveError) {
+      console.warn(
+        `completeGroupVerification: bot resolution failed (chat ${joinRequest.chatId}) — falling back to main bot: ` +
+          `${resolveError instanceof Error ? resolveError.message : resolveError}`,
+      );
+      bot = getBot({
+        scenario: "completeGroupVerification-fallback",
+        chatId: joinRequest.chatId,
+        userId: joinRequest.userId,
+      });
+    }
 
     // Telegram 侧入群兜底：极少数场景（bootstrap 审批失败回落私聊验证的群渠道会话）
     // 用户尚未真正进群 —— 验证通过后在此补一次 approveChatJoinRequest

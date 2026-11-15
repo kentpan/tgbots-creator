@@ -182,15 +182,24 @@ export function TgApiMenuKeyboardDialog({
     }
   }, [kbPayload]);
 
-  // —— 指令菜单配置（隐私模式 + 指令勾选） ——
+  // —— 指令菜单配置（隐私模式 + 指令勾选 + v3.0.4 验证交互方式开关） ——
   const [privacyMode, setPrivacyMode] = useState(profile.privacyMode);
   const [selectedCommandIds, setSelectedCommandIds] = useState<number[]>(profile.commandIds);
+  const [commandPrivateReply, setCommandPrivateReply] = useState(
+    parseBotFeatureConfig(bot?.config ?? "{}", false).commandInteraction.privateReply,
+  );
+  const [commandLockUser, setCommandLockUser] = useState(
+    parseBotFeatureConfig(bot?.config ?? "{}", false).commandInteraction.lockUser,
+  );
   useEffect(() => {
     if (open) {
       setPrivacyMode(profile.privacyMode);
       setSelectedCommandIds(profile.commandIds);
+      const interaction = parseBotFeatureConfig(bot?.config ?? "{}", false).commandInteraction;
+      setCommandPrivateReply(interaction.privateReply);
+      setCommandLockUser(interaction.lockUser);
     }
-  }, [open, profile]);
+  }, [open, profile, bot]);
 
   // —— 内嵌按钮配置状态（按钮树 + 双语欢迎语；配置 → 仿真屏实时呈现） ——
   const [zhStart, setZhStart] = useState(cfg.texts?.zh?.start?.trim() || TGAPI_TEXTS_ZH.start);
@@ -458,6 +467,8 @@ export function TgApiMenuKeyboardDialog({
           <input type="hidden" name="custom_keyboard" value={kbPayload} />
           <input type="hidden" name="privacyMode" value={privacyMode ? "1" : "0"} />
           <input type="hidden" name="commandIds" value={JSON.stringify(selectedCommandIds)} />
+          <input type="hidden" name="command_private_reply" value={commandPrivateReply ? "1" : "0"} />
+          <input type="hidden" name="command_lock_user" value={commandLockUser ? "1" : "0"} />
 
           <div ref={editorScrollRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-6 sm:py-4">
             <div className="mb-3 lg:hidden">
@@ -862,6 +873,10 @@ export function TgApiMenuKeyboardDialog({
                         <CommandMenuConfigFields
                           privacyMode={privacyMode}
                           onPrivacyModeChange={setPrivacyMode}
+                          privateReply={commandPrivateReply}
+                          lockUser={commandLockUser}
+                          onPrivateReplyChange={setCommandPrivateReply}
+                          onLockUserChange={setCommandLockUser}
                           selected={selectedCommandIds}
                           onToggle={(id) =>
                             setSelectedCommandIds((prev) =>

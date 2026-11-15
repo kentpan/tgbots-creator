@@ -694,6 +694,11 @@ export async function saveBotCommandMenuAction(formData: FormData): Promise<void
   const profile = parseBotProfile(existing.config);
   profile.privacyMode = privacyMode;
   profile.commandIds = commandIds;
+  // v3.0.4 指令菜单面板「验证交互方式」开关（bots.config.commandInteraction）
+  profile.commandInteraction = {
+    privateReply: formData.get("command_private_reply") === "1",
+    lockUser: formData.get("command_lock_user") === "1",
+  };
   await updateBotRecord(existing.id, { config: JSON.stringify(profile) });
 
   const sync = await syncBotCommandsToTelegram(existing.id);
@@ -923,10 +928,12 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
   const menuConfigRaw = String(formData.get("menu_config") ?? "").trim();
   let menuConfigJson: string | null = null;
   let menuTextValue: string | null = null;
-  // 只有明确启用「消息内嵌按钮」时才写入菜单载荷。
-  // 功能配置弹窗在键盘模式/关闭菜单模式下也会提交 hidden menu_config；
-  // 此时载荷可能只是未挂载编辑器的空初始状态，不能覆盖数据库中已有菜单。
-  if (formData.get("menu_enabled") === "1" && menuConfigRaw) {
+  // v3.0.4：写入条件放宽为「菜单开启 或 加群验证开启」—— 加群验证开启时，
+  // 这里配置的消息+按钮将作为群内验证提示自动发送（替代默认欢迎文案），
+  // 管理员可能只开加群验证而不开菜单面板，此时也必须保存菜单载荷。
+  // 关闭菜单模式下提交的 hidden menu_config 是打开弹窗时从数据库读入的初始值
+  // （未被编辑器修改），写回等价于无操作，不会覆盖其他管理端的并发修改窗口之外的配置。
+  if ((formData.get("menu_enabled") === "1" || formData.get("join_verify_enabled") === "1") && menuConfigRaw) {
     try {
       const parsed = parseBotMenuConfig(menuConfigRaw);
       menuConfigJson = JSON.stringify({ content: parsed.content, root: parsed.root });
@@ -934,6 +941,23 @@ export async function saveBotFeatureConfigAction(formData: FormData): Promise<vo
     } catch {
       redirect(botPath({ error: "invalid-menu" }));
     }
+  }
+
+  // —— v3.0.4 指令菜单面板「验证交互方式」（bots.config.commandInteraction） ——
+  if (formData.has("command_private_reply") || formData.has("command_lock_user")) {
+    const previousInteraction =
+      next.commandInteraction && typeof next.commandInteraction === "object"
+        ? (next.commandInteraction as Record<string, unknown>)
+        : {};
+    next.commandInteraction = {
+      ...previousInteraction,
+      ...(formData.has("command_private_reply")
+        ? { privateReply: formData.get("command_private_reply") === "1" }
+        : {}),
+      ...(formData.has("command_lock_user")
+        ? { lockUser: formData.get("command_lock_user") === "1" }
+        : {}),
+    };
   }
 
   await updateBotRecord(BigInt(idRaw), {

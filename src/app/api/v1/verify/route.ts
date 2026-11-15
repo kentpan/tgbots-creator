@@ -84,25 +84,26 @@ export async function POST(request: NextRequest) {
 
     let identityOk: boolean;
     let claimedUserId: number | null;
+    // v3.0.4 用户识别强制（修复「其他成员可打开他人验证页代为验证」）：
+    // 群内渠道不再豁免 —— 所有非 API 会话都必须携带与目标用户一致的 Telegram
+    // initData（通过消息内嵌按钮在 Telegram 内打开时必然携带；复制链接到外部
+    // 浏览器等无身份场景一律 403）。
     if (telegramUser) {
       claimedUserId = telegramUser.id;
       identityOk = claimedUserId === Number(session.userId);
-    } else if (groupChannel) {
-      claimedUserId = null;
-      identityOk = true;
-    } else if (!isApiRequest) {
-      claimedUserId = null;
-      identityOk = false;
-    } else {
+    } else if (isApiRequest) {
       claimedUserId = typeof body.user_id === "number" ? body.user_id : null;
       identityOk = claimedUserId === null || claimedUserId === Number(session.userId);
+    } else {
+      claimedUserId = null;
+      identityOk = false;
     }
 
     if (!identityOk) {
       console.warn(
         `User identity check failed for token ${token.slice(0, 8)}...: expected ${session.userId}, got ${claimedUserId}`,
       );
-      return httpError(403, "用户身份验证失败");
+      return httpError(403, "用户身份验证失败：请在 Telegram 中通过验证按钮打开本页面");
     }
 
     const clientIp = getClientIp(request);

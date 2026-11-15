@@ -42,7 +42,7 @@ import { handleChatMemberUpdate } from "./handlers/chat-member";
 import { startMenuVerifyFlow } from "@/bot/handlers/menu-verify";
 import { createJoinVerifyComposer } from "./composers/join-verify";
 import { createGateComposer, ensureGateUnlocked } from "./composers/gate";
-import { handleVerificationChoice } from "./handlers/group-verification";
+import { handleJoinPromptButton, handleVerificationChoice } from "./handlers/group-verification";
 import { handleCodeInput } from "./handlers/code-input";
 import { menuVerifyQuestion } from "./handlers/menu-verify";
 import type { BotContext } from "./context";
@@ -67,6 +67,8 @@ interface BotProfileConfig {
   transportMode?: "inherit" | "polling" | "webhook";
   /** 机器人指令菜单：「⌨️ 指令菜单」弹窗勾选的指令库 id 列表（指令注册唯一来源；未勾选 = 不注册任何指令） */
   commandIds?: number[];
+  /** v3.0.4 指令菜单面板「验证交互方式」开关（与消息内嵌按钮/自定义键盘面板同源语义） */
+  commandInteraction?: { privateReply?: boolean; lockUser?: boolean };
   /** 菜单按钮 setChatMenuButton（真实 API 配置） */
   menuButton?: { type: "default" | "commands" | "web_app"; text?: string; url?: string };
   /** 默认管理员权限 setMyDefaultAdministratorRights（真实 API 配置；group=群组，channel=频道） */
@@ -662,6 +664,10 @@ async function registerBotCapabilities(
 
   // 群内验证 4 选 1 点选回调（v2.0.5）：非本模块 callback 原样放行后续中间件（菜单等）
   bot.on("callback_query:data", handleVerificationChoice);
+
+  // v3.0.4 加群验证提示按钮回调（jv: 前缀，自定义消息内嵌按钮 → 私聊/群内回复验证码）：
+  // 非 jv 回调原样放行后续中间件（官方菜单插件等）
+  bot.on("callback_query:data", handleJoinPromptButton);
 
   // 加群验证：无状态问题（回复验证问题消息，隐私模式兼容）
   bot.use(codeQuestion.middleware());

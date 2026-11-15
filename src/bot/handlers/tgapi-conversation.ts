@@ -110,6 +110,7 @@ function parseBotFeatureConfigFallback(): BotFeatureConfig {
     keyboard: { enabled: false },
     gate: { enabled: false, verificationMethodId: null },
     joinVerify: { enabled: false, mode: "verify", methodId: null, override: {} },
+    commandInteraction: { privateReply: false, lockUser: false },
     interfaceMode: "inline",
   } as BotFeatureConfig;
 }

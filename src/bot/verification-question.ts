@@ -48,7 +48,11 @@ async function replyWithGroupAutoCleanup(
 export const codeQuestion = new StatelessQuestion<BotContext>(
   VERIFICATION_QUESTION_ID,
   async (ctx) => {
-    const result = await processCodeAnswer(ctx, ctx.message?.text ?? "");
+    // v3.0.4 viaQuestion：回复验证提示（显式动作）在群内放行 —— 加群验证自定义
+    // 按钮的「群内直接回复验证码」流程依赖此通道（宽松明文输入仍被拦截）
+    const result = await processCodeAnswer(ctx, ctx.message?.text ?? "", undefined, {
+      viaQuestion: true,
+    });
 
     // v1.1.4：回复的是本 bot 的验证提示消息，但已没有待验证会话——
     // 绝不静默吞掉，按最近一次会话状态给出明确反馈：

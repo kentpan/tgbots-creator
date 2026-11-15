@@ -776,6 +776,10 @@ export interface BotSessionData {
     successText: string;
     failText: string;
     attempts: number;
+    /** v3.0.4 锁定用户回复：发起者 user id（仅发起者回复有效，防代验） */
+    initiatorId?: number;
+    /** v3.0.4 锁定用户回复开关（随按钮配置透传） */
+    lockUser?: boolean;
   };
 }
 

@@ -283,6 +283,17 @@ export interface MenuVerifyConfig {
   success_text?: string;
   /** 失败文案（留空用默认） */
   fail_text?: string;
+  /**
+   * v3.0.4 使用私聊回复：开启后点击按钮（群内）时机器人改在私聊发送验证提示，
+   * 用户在私聊对话中回复验证码完成验证（私聊内容群友不可见）；关闭则在当前
+   * 会话（群内 force-reply）直接回复验证码。
+   */
+  private_reply?: boolean;
+  /**
+   * v3.0.4 锁定用户回复：开启后只有点击按钮发起验证的用户回复才有效，
+   * 其他成员的回复不消耗次数、不产生任何验证结果（防代验）。
+   */
+  lock_user?: boolean;
 }
 
 export interface MenuButtonAction {
@@ -562,6 +573,9 @@ function parseVerify(raw: unknown): MenuVerifyConfig | undefined {
     prompt_text: text(verify.prompt_text),
     success_text: text(verify.success_text),
     fail_text: text(verify.fail_text),
+    // v3.0.4 私聊回复 / 锁定用户回复开关（默认关闭）
+    private_reply: verify.private_reply === true,
+    lock_user: verify.lock_user === true,
   };
 }
 
