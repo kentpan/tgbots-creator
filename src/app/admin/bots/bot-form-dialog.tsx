@@ -186,10 +186,13 @@ export function BotFormDialog({
   bot,
   trigger,
   triggerClassName,
+  redirectTo,
 }: {
   bot?: BotFormData;
   trigger: React.ReactNode;
   triggerClassName?: string;
+  /** v3.0.4 保存后的回跳路径（站内 /admin 前缀；TGAPI 申请页列表编辑用，缺省回落 /admin/bots） */
+  redirectTo?: string;
 }) {
   const profile = bot ? readProfile(bot.config) : {};
   const commandsText = (profile.commands ?? [])
@@ -367,6 +370,7 @@ export function BotFormDialog({
     >
       <input type="hidden" name="id" value={bot?.id ?? ""} />
       <input type="hidden" name="enabled" value={enabled ? "1" : "0"} />
+      {redirectTo ? <input type="hidden" name="redirect_to" value={redirectTo} /> : null}
       <input type="hidden" name="plugins_json" value={pluginsJson} />
       <input type="hidden" name="aiSupport_json" value={aiSupportJson} />
       <input type="hidden" name="menuButton_json" value={menuButtonJson} />

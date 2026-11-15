@@ -110,6 +110,7 @@ export default async function TgApiPage({
       bots={tgapiBots.map((bot) => ({
         id: String(bot.id),
         name: bot.name,
+        token: bot.token,
         username: bot.username,
         enabled: bot.enabled,
         config: bot.config,

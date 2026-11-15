@@ -1584,7 +1584,7 @@ export function TgAppSimulator({
               正在同步到 Telegram…
             </span>
           ) : (
-            "保存更改"
+            "同步权限"
           )}
         </button>
       </div>

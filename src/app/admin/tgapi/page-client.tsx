@@ -7,6 +7,7 @@ import { parseTgApiBotConfig } from "@/services/tgapi-config";
 import type { BotDeployCheck } from "@/services/bot-deploy";
 import type { CommandLibraryItem } from "@/app/admin/bots/command-menu-dialog";
 import { TgApiMenuKeyboardDialog } from "./bot-designer-dialog";
+import { BotFormDialog } from "@/app/admin/bots/bot-form-dialog";
 import { SubmitButton } from "@/components/admin/submit-button";
 import { ConfirmDialog } from "@/components/admin/confirm-dialog";
 import {
@@ -73,6 +74,8 @@ function UnlockModeBadge(): React.ReactNode {
 export interface TgApiBotListItem {
   id: string;
   name: string;
+  /** v3.0.4 编辑弹窗（BotFormDialog）回显用；实际编辑留空保留原 Token */
+  token: string;
   username: string | null;
   enabled: boolean;
   config: string;
@@ -298,6 +301,20 @@ export function TgApiPageClient({
                             defaultTab={cfg.customKeyboard ? "keyboard" : "inline"}
                             trigger="⚙️ 菜单和键盘"
                             triggerClassName="inline-flex h-8 items-center rounded-md border border-primary/50 px-3 text-sm font-medium text-primary hover:bg-primary/10"
+                          />
+                          {/* v3.0.4 编辑（与机器人管理列表同一编辑弹窗/保存链路；保存后回跳本页） */}
+                          <BotFormDialog
+                            bot={{
+                              id: bot.id,
+                              name: bot.name,
+                              token: bot.token,
+                              username: bot.username,
+                              enabled: bot.enabled,
+                              config: bot.config,
+                            }}
+                            redirectTo="/admin/tgapi"
+                            trigger="✏️ 编辑"
+                            triggerClassName="inline-flex h-8 items-center rounded-md border px-3 text-sm font-medium hover:bg-accent"
                           />
                           <a
                             href={`/admin/tgapi?bot=${bot.id}`}

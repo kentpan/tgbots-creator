@@ -73,17 +73,23 @@ export async function saveBotAction(formData: FormData): Promise<void> {
   const commandsRaw = String(formData.get("commands") ?? "");
 
   if (!name) redirect(botPath({ error: "name-required" }));
+  // v3.0.4 编辑回跳：TGAPI 申请页等宿主通过 redirect_to 指定保存后的落点
+  // （只允许站内 /admin 前缀路径，防开放重定向）；缺省回落 /admin/bots。
+  const redirectToRaw = String(formData.get("redirect_to") ?? "").trim();
+  const redirectTo = redirectToRaw.startsWith("/admin/") ? redirectToRaw : null;
+  const failPath = (error: string): never =>
+    redirect(redirectTo ? `${redirectTo}?error=${error}` : botPath({ error }));
   const isEdit = Boolean(idRaw && /^\d+$/.test(idRaw));
   if (token && !/^\d{6,}:[\w-]{30,}$/.test(token)) {
-    redirect(botPath({ error: "invalid-token" }));
+    redirect(failPath("invalid-token"));
   }
   if (!token && !isEdit) {
-    redirect(botPath({ error: "invalid-token" }));
+    redirect(failPath("invalid-token"));
   }
 
   const requestHeaders = await headers();
   const existingForEdit = isEdit ? await getBot(BigInt(idRaw)) : null;
-  if (isEdit && !existingForEdit) redirect(botPath({ error: "invalid-id" }));
+  if (isEdit && !existingForEdit) redirect(failPath("invalid-id"));
   // 编辑时保留指令菜单/隐私模式等由其他弹窗维护的字段，避免被表单覆盖
   const profile = parseBotProfile(existingForEdit?.config ?? "{}");
   profile.my_name = myName || undefined;
@@ -227,7 +233,8 @@ export async function saveBotAction(formData: FormData): Promise<void> {
     });
   }
   revalidatePath("/admin/bots");
-  redirect(botPath({ saved: "1" }));
+  if (redirectTo) revalidatePath(redirectTo);
+  redirect(redirectTo ? `${redirectTo}?saved=1` : botPath({ saved: "1" }));
 }
 
 /** 保存后自动调用 getMe 回写机器人 @用户名（失败不阻塞保存，但错误全量输出到日志） */
