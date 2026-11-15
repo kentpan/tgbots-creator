@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentAdmin, hasPermission, logOperation } from "@/lib/auth";
 import { headers } from "next/headers";
-import { getBot, getGroupSettings, listInviteLinks, deleteInviteLink, markInviteLinkRevoked, updateInviteLinkRemark, upsertInviteLink } from "@/database/operations";
+import { getBot, getGroupSettings, listInviteLinks, deleteInviteLink, markInviteLinkRevoked, updateInviteLinkRemark, updateInviteLinkConfig, upsertInviteLink } from "@/database/operations";
 import { botByToken, describeSyncError } from "@/services/telegram-sync";
 
 /**
@@ -32,6 +32,31 @@ function parseChatId(raw: string): bigint | null {
   }
 }
 
+/** v3.0.4 解析分享时长（秒）：null/0 = 不限时长；上限 1 年，防误填 */
+function parseExpireSeconds(raw: unknown): number | null | "invalid" {
+  if (raw === null || raw === undefined || raw === 0 || raw === "0") return null;
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return "invalid";
+  if (raw > 60 * 60 * 24 * 365) return "invalid";
+  return Math.floor(raw);
+}
+
+/** v3.0.4 解析分享次数：null = 不限次数；Telegram 限制 1-99999 */
+function parseMemberLimit(raw: unknown): number | null | "invalid" {
+  if (raw === null || raw === undefined || raw === 0 || raw === "0") return null;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > 99999) return "invalid";
+  return raw;
+}
+
+/** v3.0.4 当前群组私密/公开（公开群有 username）；失败返回 null（未知） */
+async function resolveChatIsPrivate(api: ReturnType<typeof botByToken>["api"], chatId: bigint): Promise<boolean | null> {
+  try {
+    const chatInfo = await api.getChat(Number(chatId));
+    return !("username" in chatInfo && chatInfo.username);
+  } catch {
+    return null;
+  }
+}
+
 export async function GET(request: Request): Promise<NextResponse> {
   const admin = await getCurrentAdmin();
   if (!admin) {
@@ -50,9 +75,37 @@ export async function GET(request: Request): Promise<NextResponse> {
   const botId = botIdRaw && /^\d+$/.test(botIdRaw) ? BigInt(botIdRaw) : null;
 
   const links = await listInviteLinks(chatId, botId);
+
+  // v3.0.4 当前群组信息（创建/编辑弹窗展示用）：
+  // - 私密/公开：优先用 bot token 实时 getChat（公开群有 username），
+  //   失败/无 token 时回退台账最新快照；
+  // - 新成员审核：group_settings.requireApproval（群级总开关）。
+  const groupSettings = await getGroupSettings(chatId);
+  const requireApproval = groupSettings?.requireApproval ?? false;
+  let chatIsPrivate: boolean | null = null;
+  if (botId !== null) {
+    try {
+      const bot = await getBot(botId);
+      if (bot?.token) {
+        const chatInfo = await botByToken(bot.token).api.getChat(Number(chatId));
+        chatIsPrivate = !("username" in chatInfo && chatInfo.username);
+      }
+    } catch {
+      /* getChat 失败回退台账快照 */
+    }
+  }
+  if (chatIsPrivate === null) {
+    const snapshot = links.find((link) => link.chatIsPrivate !== null);
+    chatIsPrivate = snapshot?.chatIsPrivate ?? null;
+  }
+
   return NextResponse.json({
     ok: true,
     data: {
+      chat_info: {
+        is_private: chatIsPrivate,
+        require_approval: requireApproval,
+      },
       links: links.map((link) => ({
         id: String(link.id),
         bot_id: link.botId === null ? null : String(link.botId),
@@ -63,6 +116,9 @@ export async function GET(request: Request): Promise<NextResponse> {
         creates_join_request: link.createsJoinRequest,
         is_revoked: link.isRevoked,
         source: link.source,
+        expire_date: link.expireDate ? link.expireDate.toISOString() : null,
+        member_limit: link.memberLimit,
+        chat_is_private: link.chatIsPrivate,
         created_time: link.createdTime.toISOString(),
         updated_time: link.updatedTime.toISOString(),
       })),
@@ -82,12 +138,16 @@ export async function POST(request: Request): Promise<NextResponse> {
   let payload: {
     chat_id?: string;
     bot_id?: string;
-    action?: "create" | "revoke" | "delete" | "add" | "update_remark";
+    action?: "create" | "revoke" | "delete" | "add" | "update_remark" | "edit";
     link_id?: string;
     link?: string;
     name?: string;
     /** v3.0.2 渠道备注（create/add 时填写；update_remark 时编辑，用于区分来源渠道） */
     remark?: string;
+    /** v3.0.4 分享时长（秒；null/0 = 不限时长） */
+    expire_seconds?: number | null;
+    /** v3.0.4 分享次数上限（null/0 = 不限次数；Telegram 限制 1-99999） */
+    member_limit?: number | null;
   };
   try {
     payload = (await request.json()) as typeof payload;
@@ -115,6 +175,15 @@ export async function POST(request: Request): Promise<NextResponse> {
       return NextResponse.json({ ok: false, error: "机器人不存在或 Token 缺失" }, { status: 404 });
     }
     const remark = (payload.remark ?? "").trim();
+    const expireSeconds = parseExpireSeconds(payload.expire_seconds);
+    if (expireSeconds === "invalid") {
+      return NextResponse.json({ ok: false, error: "分享时长不合法（0 = 不限，最长 1 年）" }, { status: 400 });
+    }
+    const memberLimit = parseMemberLimit(payload.member_limit);
+    if (memberLimit === "invalid") {
+      return NextResponse.json({ ok: false, error: "分享次数不合法（0 = 不限，1-99999）" }, { status: 400 });
+    }
+    const expireDate = expireSeconds !== null ? new Date(Date.now() + expireSeconds * 1000) : null;
     try {
       const api = botByToken(bot.token).api;
       // 申请制形态跟随群组「新成员审核」开关；群组未登记时默认普通链接
@@ -123,7 +192,11 @@ export async function POST(request: Request): Promise<NextResponse> {
       const invite = await api.createChatInviteLink(Number(chatId), {
         ...(requireApproval ? { creates_join_request: true } : {}),
         ...(remark ? { name: remark } : {}),
+        // Bot API expire_date 为 Unix 时间戳（秒）
+        ...(expireDate ? { expire_date: Math.floor(expireDate.getTime() / 1000) } : {}),
+        ...(memberLimit !== null ? { member_limit: memberLimit } : {}),
       });
+      const chatIsPrivate = await resolveChatIsPrivate(api, chatId);
       await upsertInviteLink({
         botId,
         chatId,
@@ -132,11 +205,17 @@ export async function POST(request: Request): Promise<NextResponse> {
         remark: remark || null,
         createsJoinRequest: invite.creates_join_request === true,
         source: "manual",
+        expireDate: invite.expire_date ? new Date(invite.expire_date * 1000) : expireDate,
+        memberLimit: invite.member_limit ?? memberLimit,
+        chatIsPrivate,
       });
       await logOperation(admin, {
         action: "创建邀请链接",
         target: `chat=${chatId} bot=${botId}`,
-        detail: `${invite.invite_link}${remark ? `（备注：${remark}）` : ""}`,
+        detail:
+          `${invite.invite_link}${remark ? `（备注：${remark}）` : ""}` +
+          `${expireDate ? `（时长：至 ${expireDate.toLocaleString()}）` : "（不限时长）"}` +
+          `${memberLimit !== null ? `（次数：${memberLimit}）` : "（不限次数）"}`,
         headers: requestHeaders,
       });
       return NextResponse.json({
@@ -146,6 +225,67 @@ export async function POST(request: Request): Promise<NextResponse> {
     } catch (error) {
       return NextResponse.json(
         { ok: false, error: `创建邀请链接失败：${describeSyncError(error)}` },
+        { status: 502 },
+      );
+    }
+  }
+
+  // —— v3.0.4 编辑已有链接的分享配置（备注/时长/次数；Telegram editChatInviteLink）——
+  // 注意：Telegram 限制已设置的到期时间/次数只能改值，无法清除（选「不限」不会生效）。
+  if (action === "edit") {
+    const linkIdRaw = (payload.link_id ?? "").trim();
+    if (!linkIdRaw || !/^\d+$/.test(linkIdRaw)) {
+      return NextResponse.json({ ok: false, error: "链接记录 ID 不合法" }, { status: 400 });
+    }
+    const links = await listInviteLinks(chatId, botId);
+    const target = links.find((item) => String(item.id) === linkIdRaw);
+    if (!target) {
+      return NextResponse.json({ ok: false, error: "链接记录不存在（可能已被删除）" }, { status: 404 });
+    }
+    const bot = await getBot(botId);
+    if (!bot || !bot.token) {
+      return NextResponse.json({ ok: false, error: "机器人不存在或 Token 缺失" }, { status: 404 });
+    }
+    const remark = (payload.remark ?? "").trim();
+    const expireSeconds = parseExpireSeconds(payload.expire_seconds);
+    if (expireSeconds === "invalid") {
+      return NextResponse.json({ ok: false, error: "分享时长不合法（最长 1 年）" }, { status: 400 });
+    }
+    const memberLimit = parseMemberLimit(payload.member_limit);
+    if (memberLimit === "invalid") {
+      return NextResponse.json({ ok: false, error: "分享次数不合法（1-99999）" }, { status: 400 });
+    }
+    const expireDate = expireSeconds !== null ? new Date(Date.now() + expireSeconds * 1000) : null;
+    try {
+      const api = botByToken(bot.token).api;
+      const edited = await api.editChatInviteLink(Number(chatId), target.link, {
+        ...(remark ? { name: remark } : {}),
+        ...(expireDate ? { expire_date: Math.floor(expireDate.getTime() / 1000) } : {}),
+        ...(memberLimit !== null ? { member_limit: memberLimit } : {}),
+      });
+      const chatIsPrivate = await resolveChatIsPrivate(api, chatId);
+      await updateInviteLinkConfig(target.id, {
+        remark,
+        expireDate: edited.expire_date ? new Date(edited.expire_date * 1000) : expireDate,
+        memberLimit: edited.member_limit ?? memberLimit,
+        name: remark || null,
+      });
+      await logOperation(admin, {
+        action: "编辑邀请链接",
+        target: `chat=${chatId} bot=${botId}`,
+        detail:
+          `${target.link}${remark ? `（备注：${remark}）` : ""}` +
+          `${expireDate ? `（时长：至 ${expireDate.toLocaleString()}）` : ""}` +
+          `${memberLimit !== null ? `（次数：${memberLimit}）` : ""}`,
+        headers: requestHeaders,
+      });
+      return NextResponse.json({
+        ok: true,
+        data: { message: "邀请链接配置已更新", link: target.link, remark: remark || null },
+      });
+    } catch (error) {
+      return NextResponse.json(
+        { ok: false, error: `编辑邀请链接失败：${describeSyncError(error)}（Telegram 限制：已设置的时长/次数只能改值，无法清除）` },
         { status: 502 },
       );
     }

@@ -12,6 +12,7 @@ import {
 import { escapeMarkdownV2 } from "@/utils/markdown";
 import { htmlEscape, userMentionHTML } from "@/utils/html";
 import { BOT_TEXT_DEFAULTS, renderBotTextVars, type BotTextVars } from "./bot-messages";
+import { resolveJoinVerifyChannel } from "@/services/join-verify";
 
 const TELEGRAM_ERRORS: Record<string, string> = {
   user_not_found: "用户不存在",
@@ -795,5 +796,68 @@ export async function completeGroupVerification(
   } catch (error) {
     console.error("Unexpected error during group completion:", error);
     return new ApprovalResult(false, `群内验证完成失败：${String(error)}`);
+  }
+}
+
+/** settleCompletedVerification 的结果：ok=false 时 error 携带原因（仅日志与自愈判断用） */
+export interface SettleResult {
+  ok: boolean;
+  error: string | null;
+}
+
+/**
+ * v3.0.4 验证完成后的统一「结算」入口：
+ * 会话 captcha_completed=1 后，把对应的加群申请推进到最终状态。渠道判定与
+ * POST /api/v1/verify 的完成分支保持同源语义（resolveJoinVerifyChannel + "direct"）：
+ * - 群内验证渠道 → completeGroupVerification（落库批准 + 解禁 + 删群内提示 + 群内欢迎）；
+ * - 其余（私聊验证/直连入群）→ autoApproveUser（Telegram 侧批准 + 落库 + 私聊欢迎）；
+ * - API 请求（无群）→ 仅落库批准。
+ *
+ * 两个调用方：
+ * 1. POST /api/v1/verify（验证提交后的首次结算，容错语义不变）；
+ * 2. GET /api/v1/verification-status/[token]（验证页轮询自愈：首次结算曾因
+ *    Telegram 瞬时故障/无事件 bot 上下文失败时，重新推进，消除「一直卡在等待处理」）。
+ * 幂等：申请已 approved 时 completeGroupVerification/autoApproveUser 均按已处理安全返回。
+ */
+export async function settleCompletedVerification(token: string): Promise<SettleResult> {
+  try {
+    const session = await getVerificationSession(token);
+    if (!session) {
+      return { ok: false, error: "验证会话不存在" };
+    }
+    const joinRequest = await getJoinRequestByToken(token);
+    const isApiRequest =
+      session.chatId === 0n || (joinRequest !== null && joinRequest.requestType === "api");
+
+    // 与 POST /api/v1/verify 一致：API 请求（无真实群组）仅落库批准
+    if (isApiRequest && (joinRequest === null || joinRequest.chatId === 0n)) {
+      if (joinRequest !== null && joinRequest.status !== "approved") {
+        const ok = await approveJoinRequest(token);
+        return { ok, error: ok ? null : "数据库更新失败" };
+      }
+      return { ok: true, error: null };
+    }
+
+    const groupSettings = session.chatId !== 0n ? await getGroupSettings(session.chatId) : null;
+    const groupChannel =
+      groupSettings !== null &&
+      resolveJoinVerifyChannel(groupSettings, session.chatId, "direct") === "group";
+
+    if (groupChannel) {
+      const completion = await completeGroupVerification(token);
+      return {
+        ok: completion.success,
+        error: completion.success ? null : (completion.error ?? "群内验证完成失败"),
+      };
+    }
+
+    const approvalResult = await autoApproveUser(token);
+    return {
+      ok: approvalResult.success,
+      error: approvalResult.success ? null : (approvalResult.error ?? "自动审批失败"),
+    };
+  } catch (error) {
+    console.error(`Unexpected error during verification settle (${token.slice(0, 8)}...):`, error);
+    return { ok: false, error: `结算异常：${String(error)}` };
   }
 }

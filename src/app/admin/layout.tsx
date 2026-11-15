@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { logoutAction } from "@/app/login/actions";
 import { SubmitButton } from "@/components/admin/submit-button";
 import { AdminSidebar, type SidebarMenuLink } from "@/components/admin/sidebar";
+import { Toaster } from "@/components/ui/sonner";
 import { loadAuthorizedMenus, requireAuth } from "@/lib/auth";
 import { getDatabaseInfo } from "@/database/client";
 import { APP_VERSION } from "@/lib/app-version";
@@ -62,6 +63,8 @@ export default async function AdminLayout({
         </header>
         <main className="flex-1 overflow-y-auto p-6">{children}</main>
       </div>
+      {/* v3.0.4：全局 toast（sonner）—— 部署结果等关键操作反馈醒目展示 */}
+      <Toaster richColors position="top-center" closeButton />
     </div>
   );
 }

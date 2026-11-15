@@ -1,7 +1,8 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { getCaptchaProvider } from "@/captcha/factory";
-import { getVerificationSession, isSessionExpired } from "@/database/operations";
+import { getJoinRequestByToken, getVerificationSession, isSessionExpired } from "@/database/operations";
+import { settleCompletedVerification } from "@/services/approval";
 import { WebAppLoader } from "@/components/tg/web-app-loader";
 import { VerifyClient, type CaptchaConfig } from "./verify-client";
 import { CompletedState, ErrorState, ExpiredState } from "./states";
@@ -19,7 +20,7 @@ interface VerifyPageProps {
 type VerifyView =
   | { kind: "notfound" }
   | { kind: "expired" }
-  | { kind: "completed" }
+  | { kind: "completed"; approved: boolean }
   | {
       kind: "verify";
       token: string;
@@ -42,7 +43,16 @@ export default async function VerifyPage({ searchParams }: VerifyPageProps) {
       } else if (isSessionExpired(session)) {
         view = { kind: "expired" };
       } else if (session.captchaCompleted) {
-        view = { kind: "completed" };
+        // v3.0.4：每次进入验证页查一次审批结果（无前端轮询）——
+        // 人机验证已完成但申请仍 pending（首次结算曾失败）时，在服务端就地结算一次
+        // （settleCompletedVerification 与 POST /api/v1/verify 完成分支同源且幂等），
+        // 成功则直接展示「验证成功」，失败则展示「等待处理」（用户刷新页面可再次触发）。
+        let joinRequest = await getJoinRequestByToken(token);
+        if (joinRequest?.status === "pending") {
+          await settleCompletedVerification(token);
+          joinRequest = await getJoinRequestByToken(token);
+        }
+        view = { kind: "completed", approved: joinRequest?.status === "approved" };
       } else {
         // v2.1.4 修复验证页整体报错：验证码 provider 仅在会话真正需要人机验证组件时
         // 初始化（method=captcha），与 POST /api/v1/verify 的会话方式分支同源。
@@ -83,7 +93,10 @@ export default async function VerifyPage({ searchParams }: VerifyPageProps) {
       return (
         <>
           <WebAppLoader />
-          <CompletedState message="您已完成验证，请等待管理员审核" />
+          <CompletedState
+            message="您已完成验证，请等待管理员审核"
+            approved={view.approved}
+          />
         </>
       );
     case "verify":

@@ -13,6 +13,7 @@ import {
   Link2,
   ListTree,
   Loader2,
+  Clock,
   MessageCircle,
   MessageSquareText,
   Paintbrush,
@@ -42,7 +43,7 @@ import { TgProxyPanel } from "@/components/admin/tg-proxy-panel";
 import { TgNewGroupPanel } from "@/components/admin/tg-new-group-panel";
 import { IosStatusBar } from "@/components/admin/ios-status-bar";
 import { TgApiUnlockMethodBinding } from "@/components/admin/tgapi-unlock-api-config";
-import { GroupDeployButton } from "@/components/admin/tg-app-simulator-group-deploy";
+import { GroupInviteLinkButton } from "@/components/admin/group-invite-link-button";
 import {
   ADMIN_RIGHTS,
   type AppSimGroup,
@@ -130,8 +131,6 @@ export function TgAppSimulator({
   onBackToList,
   onSyncGroups,
   syncing,
-  onDeployGroup,
-  deployingChatId,
   onSimulateJoinForGroup,
   onSettingsSaved,
   bots,
@@ -291,47 +290,6 @@ export function TgAppSimulator({
 
   /** 上滑面板唯一待处理申请（1 条时直接展示用户卡片 + 通过/拒绝两个按钮，与真实 APP 一致） */
   const singleJoinRequest = joinRequests.length === 1 ? joinRequests[0] : null;
-
-  // —— 一键部署 ——
-  const [deployResult, setDeployResult] = useState<{
-    stage?: string;
-    message: string;
-    guide?: string[];
-    invite_link?: string | null;
-    chat_title?: string;
-    bot_username?: string | null;
-    reused?: boolean;
-    migrated_from_chat_id?: string | null;
-  } | null>(null);
-  const [deployLinkCopied, setDeployLinkCopied] = useState(false);
-
-  const handleDeploy = useCallback(async (chatId: string): Promise<void> => {
-    const result = await onDeployGroup(chatId);
-    if (!result) return;
-    if (result.ok && result.stage === "deployed") {
-      showFlash(
-        true,
-        result.reused
-          ? "部署完成：复用已生成的有效邀请链接"
-          : "部署完成：申请制入群链接已生成并保存",
-      );
-    } else {
-      showFlash(false, result.message || "部署校验未通过，请按指引操作");
-    }
-    // 详情（含喂饭级 guide / 链接）以浮层展示；
-    // chat_title 优先用服务端返回（迁移后新群的标题，本地列表可能还是旧数据）
-    setDeployLinkCopied(false);
-    setDeployResult({
-      stage: result.stage,
-      message: result.message,
-      guide: result.guide,
-      invite_link: result.invite_link,
-      chat_title: result.chat_title ?? groups.find((group) => group.chatId === chatId)?.chatTitle,
-      bot_username: botUsername,
-      reused: result.reused,
-      migrated_from_chat_id: result.migrated_from_chat_id ?? null,
-    });
-  }, [onDeployGroup, showFlash, groups, botUsername]);
 
   // —— 群组设置页状态 ——
   const [settingsLoading, setSettingsLoading] = useState(false);
@@ -2652,13 +2610,13 @@ export function TgAppSimulator({
                         </div>
                       </div>
                     </button>
-                    {/* 每个群组底部的操作行：分体部署按钮（主点击=部署该群全部机器人管理员；▾=单选，已部署绿√） */}
+                    {/* 每个群组底部的操作行：生成邀请链接按钮（当前群组 × 当前选中机器人，弹窗内生成/复制） */}
                     <div className="flex px-3 pb-2.5">
-                      <GroupDeployButton
+                      <GroupInviteLinkButton
                         chatId={group.chatId}
-                        fallbackDeployed={group.deployed}
-                        fallbackBusy={deployingChatId === group.chatId}
-                        onDeployChat={handleDeploy}
+                        chatTitle={group.chatTitle}
+                        botId={selectedBotId}
+                        botName={botName}
                         showFlash={showFlash}
                       />
                     </div>
@@ -2764,105 +2722,6 @@ export function TgAppSimulator({
             className="absolute inset-0 z-50"
           >
             {joinPanelOverlay}
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
-
-      {/* 一键部署结果详情（喂饭级指引 + 链接复制） */}
-      <AnimatePresence>
-        {deployResult ? (
-          <motion.div
-            key="deploy-sheet"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="absolute inset-0 z-50 flex items-end justify-center bg-black/40"
-            onClick={() => setDeployResult(null)}
-          >
-            <motion.div
-              initial={{ y: "100%" }}
-              animate={{ y: 0 }}
-              exit={{ y: "100%" }}
-              transition={{ type: "tween", duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
-              className="max-h-[80%] w-full overflow-y-auto rounded-t-2xl bg-white px-5 pb-6 pt-4"
-              onClick={(event) => event.stopPropagation()}
-              role="dialog"
-              aria-label="一键部署结果"
-            >
-              <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-black/15" aria-hidden />
-              <div className="mb-2 flex items-center gap-2">
-                <span
-                  className="rounded-full px-2.5 py-1 text-[12px] font-semibold text-white"
-                  style={{
-                    backgroundColor:
-                      deployResult.stage === "deployed" ? IOS_GREEN : "#f5a623",
-                  }}
-                >
-                  {deployResult.stage === "deployed"
-                    ? "✓ 部署成功"
-                    : deployResult.stage === "add_bot"
-                      ? "缺步骤：机器人不在群里"
-                      : deployResult.stage === "promote_admin"
-                        ? "缺步骤：还不是管理员"
-                        : deployResult.stage === "grant_permission"
-                          ? "缺权限：未开启「邀请用户」"
-                          : "部署结果"}
-                </span>
-                <span className="truncate text-[13px] text-[#8e8e93]">
-                  {deployResult.chat_title ?? ""}
-                  {deployResult.bot_username ? ` · @${deployResult.bot_username}` : ""}
-                </span>
-              </div>
-              <p className="mb-3 text-[14px] leading-relaxed text-[#3b4a54]">{deployResult.message}</p>
-              {deployResult.stage === "deployed" && deployResult.invite_link ? (
-                <div className="mb-3 rounded-xl p-3" style={{ backgroundColor: "rgba(52,199,89,0.1)" }}>
-                  <p className="mb-1.5 text-[12px] font-medium text-[#1e8e3e]">
-                    {deployResult.reused
-                      ? "入群申请链接（复用已有链接，未生成新链接）"
-                      : "入群申请链接（发给买家 / 配置到闲鱼自动发货）"}
-                  </p>
-                  {deployResult.migrated_from_chat_id ? (
-                    <p className="mb-1.5 text-[12px] leading-relaxed text-[#c2410c]">
-                      ⚠️ 该群已升级为超级群（{deployResult.migrated_from_chat_id} → 新群 ID），旧链接已全部作废，请以此链接为准
-                    </p>
-                  ) : null}
-                  <div className="flex items-center gap-2">
-                    <code className="min-w-0 flex-1 truncate rounded bg-white px-2 py-1.5 font-mono text-[12px] text-black">
-                      {deployResult.invite_link}
-                    </code>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        void navigator.clipboard.writeText(deployResult.invite_link ?? "");
-                        setDeployLinkCopied(true);
-                        window.setTimeout(() => setDeployLinkCopied(false), 2000);
-                      }}
-                      className="shrink-0 rounded-full px-3 py-1.5 text-[12px] font-medium text-white"
-                      style={{ backgroundColor: IOS_BLUE }}
-                    >
-                      {deployLinkCopied ? "已复制" : "复制"}
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-              {deployResult.guide && deployResult.guide.length > 0 ? (
-                <div className="rounded-xl bg-black/[0.04] p-3">
-                  <p className="mb-1.5 text-[12px] font-medium text-black">下一步操作</p>
-                  <ol className="list-decimal space-y-1 pl-4 text-[12px] leading-relaxed text-[#3b4a54]">
-                    {deployResult.guide.map((step, index) => (
-                      <li key={index}>{step}</li>
-                    ))}
-                  </ol>
-                </div>
-              ) : null}
-              <button
-                type="button"
-                onClick={() => setDeployResult(null)}
-                className="mt-4 w-full cursor-pointer rounded-full bg-black/[0.06] py-3 text-[16px] font-semibold text-black"
-              >
-                知道了
-              </button>
-            </motion.div>
           </motion.div>
         ) : null}
       </AnimatePresence>
@@ -3008,6 +2867,10 @@ export function TgAppSimulator({
                               key={entry.id}
                               className="rounded-xl border border-black/[0.06] bg-black/[0.02] px-3 py-2.5"
                             >
+                              {/* v3.0.4：备注醒目标题行 + 时长/次数/私密公开/审核标签 */}
+                              <p className="mb-1 truncate text-[13px] font-semibold text-[#3390ec]">
+                                {entry.remark || entry.name || "未命名链接"}
+                              </p>
                               <p className="truncate font-mono text-[13px] text-black" title={entry.link}>
                                 {entry.link}
                               </p>
@@ -3016,8 +2879,29 @@ export function TgAppSimulator({
                                 {" · "}
                                 {entry.is_revoked ? "已撤销/失效" : entry.creates_join_request ? "有效 · 申请制" : "有效"}
                                 {entry.source === "deploy" ? " · 部署生成" : entry.source === "manual" ? " · 手动登记" : ""}
-                                {entry.remark ? ` · 备注：${entry.remark}` : entry.name ? ` · ${entry.name}` : ""}
                               </p>
+                              <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                                <span className="rounded-full bg-black/[0.06] px-2 py-0.5 text-[11px] font-medium text-[#5e5e63]">
+                                  {entry.chat_is_private === null || entry.chat_is_private === undefined
+                                    ? "群组类型未知"
+                                    : entry.chat_is_private
+                                      ? "🔒 私密"
+                                      : "🌐 公开"}
+                                </span>
+                                <span className="rounded-full bg-black/[0.06] px-2 py-0.5 text-[11px] font-medium text-[#5e5e63]">
+                                  {entry.creates_join_request ? "需审核" : "免审核"}
+                                </span>
+                                <span className="rounded-full bg-black/[0.06] px-2 py-0.5 text-[11px] font-medium text-[#5e5e63]">
+                                  <Clock className="mr-0.5 inline h-3 w-3" />
+                                  {entry.expire_date
+                                    ? `至 ${new Date(entry.expire_date).toLocaleString()}`
+                                    : "不限时长"}
+                                </span>
+                                <span className="rounded-full bg-black/[0.06] px-2 py-0.5 text-[11px] font-medium text-[#5e5e63]">
+                                  <Users className="mr-0.5 inline h-3 w-3" />
+                                  {entry.member_limit ? `限 ${entry.member_limit} 人` : "不限次数"}
+                                </span>
+                              </div>
                               <div className="mt-2 flex items-center gap-2">
                                 <button
                                   type="button"

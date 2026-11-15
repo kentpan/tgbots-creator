@@ -142,6 +142,24 @@ async function bootstrapGroupVerification(
     };
   }
 
+  // v3.0.4 已批准守卫（2026-11-15 线上第 4 次反馈的根因）：私聊验证通过后用户经
+  // 「🚀 前往群组」公开链接（t.me/<username>，不携带 via_join_request）或个别客户端
+  // 标志缺失场景进群时，直连防线曾把已批准成员误判为新直连入群 → 重新建会话 + 禁言 +
+  // 重发「请在 5 分钟内完成验证」群内提示。与 bootstrapDmVerification 的
+  // recentlyApproved 守卫同源：近 30 分钟内该用户在该群已有 approved 记录 =
+  // 验证已完成，直接跳过（不建会话、不禁言、不发提示）。
+  const recentlyApproved = await wasRecentlyApprovedForUserChat(
+    BigInt(user.id),
+    BigInt(chat.id),
+    1800,
+  );
+  if (recentlyApproved) {
+    console.log(
+      `Recently approved member rejoined: user ${user.id} chat ${chat.id} — skip duplicate group bootstrap`,
+    );
+    return { created: false, promptDelivered: true, method: "none" };
+  }
+
   const verificationToken = generateVerificationToken();
 
   const dbJoinRequest = await createJoinRequest({

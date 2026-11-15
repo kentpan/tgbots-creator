@@ -260,6 +260,9 @@ CREATE TABLE "invite_links" (
   "creates_join_request" BOOLEAN NOT NULL DEFAULT false,
   "is_revoked" BOOLEAN NOT NULL DEFAULT false,
   "source" TEXT NOT NULL DEFAULT 'api',
+  "expire_date" TEXT,
+  "member_limit" INTEGER,
+  "chat_is_private" INTEGER,
   "created_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updated_time" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

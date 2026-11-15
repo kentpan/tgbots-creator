@@ -30,7 +30,6 @@ export default function NotFound() {
 
             <div className="mt-6 text-sm text-gray-500">
               <p>📞 如需帮助，请联系管理员</p>
-              <p>⚡ 由 TGuard 提供技术支持</p>
             </div>
           </div>
         </div>

@@ -77,6 +77,12 @@ export interface SimInviteLinkEntry {
   creates_join_request: boolean;
   is_revoked: boolean;
   source: string;
+  /** v3.0.4 分享时长到期时间（ISO 文本，null=不限时长） */
+  expire_date?: string | null;
+  /** v3.0.4 分享次数上限（null=不限次数） */
+  member_limit?: number | null;
+  /** v3.0.4 创建/编辑时群组私密/公开快照（null=旧数据未知） */
+  chat_is_private?: boolean | null;
   created_time: string;
   updated_time: string;
 }
@@ -188,19 +194,6 @@ export type TgAppSimulatorProps = {
   onBackToList?: () => void;
   onSyncGroups: () => void;
   syncing: boolean;
-  /** 一键部署：父组件调用 deploy API，返回校验结果（stage/guide 由部署面板展示） */
-  onDeployGroup: (chatId: string) => Promise<{
-    ok: boolean;
-    message: string;
-    stage?: string;
-    guide?: string[];
-    invite_link?: string | null;
-    chat_title?: string | null;
-    reused?: boolean;
-    chat_id?: string | null;
-    migrated_from_chat_id?: string | null;
-  } | null>;
-  deployingChatId: string | null;
   /** 从列表/加群确认面板发起模拟加群申请（父组件创建验证会话并切换视图） */
   onSimulateJoinForGroup: (chatId: string) => Promise<{ ok: boolean; message: string }>;
   /** 群组设置保存成功后由父组件刷新列表数据（router.refresh + realGroups 重载） */

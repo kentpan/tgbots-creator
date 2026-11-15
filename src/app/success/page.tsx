@@ -34,7 +34,6 @@ export default function SuccessPage() {
 
             <div className="mt-6 text-sm text-gray-500">
               <p>🔒 本次验证受到加密保护</p>
-              <p>⚡ 由 TGuard 提供技术支持</p>
             </div>
           </div>
         </div>

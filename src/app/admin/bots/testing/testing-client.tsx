@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 import { opsFetch } from "@/lib/remote-ops";
 import { AlertTriangle, Check, Loader2, RefreshCw, Rocket } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -718,7 +719,9 @@ export function TestingClient({
     if (!selectedBotId || deployAllGroupsBusy) return;
     const targets = realGroups.groups;
     if (targets.length === 0) {
-      alert("该机器人还没有已登记的群组：先把机器人拉进群，再点「同步真实群组」登记后部署。");
+      toast.error("该机器人还没有已登记的群组：先把机器人拉进群，再点「同步真实群组」登记后部署。", {
+        duration: 8000,
+      });
       return;
     }
     const confirmed = window.confirm(
@@ -732,11 +735,27 @@ export function TestingClient({
     setDeployAllGroupsBusy(true);
     try {
       let okCount = 0;
+      const failed: string[] = [];
       for (const group of targets) {
         const result = await handleDeployForGroup(group.chatId, { skipConfirm: true, chatTitle: group.chatTitle });
-        if (result?.ok && result.stage === "deployed") okCount += 1;
+        if (result?.ok && result.stage === "deployed") {
+          okCount += 1;
+        } else {
+          failed.push(`${group.chatTitle || group.chatId}：${result?.message ?? "部署校验失败"}`);
+        }
       }
-      alert(`全量部署完成：${okCount}/${targets.length} 个群组成功（详情见各群部署面板/徽章）`);
+      // v3.0.4：部署结果醒目 toast（顶部居中，成功 8s / 失败 12s 不自动消失太快）
+      if (okCount === targets.length) {
+        toast.success(`✅ 全量部署完成：${okCount}/${targets.length} 个群组全部成功`, {
+          description: "机器人已上线并保存部署状态（未生成新邀请链接）",
+          duration: 8000,
+        });
+      } else {
+        toast.error(`⚠️ 全量部署完成：${okCount}/${targets.length} 个群组成功`, {
+          description: failed.join("\n"),
+          duration: 12000,
+        });
+      }
       realGroups.reload();
       router.refresh();
     } finally {
@@ -809,7 +828,23 @@ export function TestingClient({
                 deployed: group.deployed === true,
               }))}
               onSelectItem={(chatId) => {
-                void handleDeployForGroup(chatId).then(() => realGroups.reload());
+                const target = realGroups.groups.find((group) => group.chatId === chatId);
+                void handleDeployForGroup(chatId)
+                  .then((result) => {
+                    // v3.0.4：单群部署结果醒目 toast（此前下拉部署完全无反馈）
+                    if (result?.ok && result.stage === "deployed") {
+                      toast.success(`✅ 部署成功：${target?.chatTitle || chatId}`, {
+                        description: result.invite_link ? result.invite_link : "机器人已上线并保存部署状态",
+                        duration: 8000,
+                      });
+                    } else {
+                      toast.error(`❌ 部署失败：${target?.chatTitle || chatId}`, {
+                        description: result?.message ?? "部署校验失败",
+                        duration: 12000,
+                      });
+                    }
+                  })
+                  .then(() => realGroups.reload());
               }}
               onLoadItems={() => realGroups.reload()}
               emptyHint="该机器人还没有已登记的群组：先把机器人拉进群并点「同步真实群组」"
@@ -933,8 +968,6 @@ export function TestingClient({
               onBackToList={() => setSelectedChatId("")}
               onSyncGroups={() => void realGroups.sync()}
               syncing={syncing}
-              onDeployGroup={handleDeployForGroup}
-              deployingChatId={deployingChatId}
               onSimulateJoinForGroup={handleRequestJoinForGroup}
               onSettingsSaved={refreshPageData}
               realMessages={realMessages}

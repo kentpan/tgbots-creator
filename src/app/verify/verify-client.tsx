@@ -410,7 +410,6 @@ export function VerifyClient({ token, expectedUserId, captchaConfig, apiBaseUrl,
           <div className="mt-6 text-center">
             <div className="text-sm text-fg-hint">
               <p>💡 完成人机验证后页面会自动刷新，请稍等</p>
-              <p>⚡ 由 TGuard 提供技术支持</p>
             </div>
           </div>
         </div>

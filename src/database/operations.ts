@@ -33,6 +33,10 @@ export function ensureAppSchema(): Promise<void> {
       await ensureColumn("verification_sessions", "max_attempts", "INTEGER");
       // v3.0.2 邀请链接渠道备注（管理端创建/登记邀请链接时填写）
       await ensureColumn("invite_links", "remark", "TEXT");
+      // v3.0.4 邀请链接分享时长/次数 + 创建时群组私密/公开快照
+      await ensureColumn("invite_links", "expire_date", "TEXT");
+      await ensureColumn("invite_links", "member_limit", "INTEGER");
+      await ensureColumn("invite_links", "chat_is_private", "INTEGER");
     })().catch((error: unknown) => {
       // 失败清空缓存：下次调用重试（例如首次部署 D1 偶发抖动）
       appSchemaReady = null;
@@ -2704,6 +2708,12 @@ export interface InviteLinkRow {
   isRevoked: boolean;
   /** api=bot 运行时创建自动落库 / manual=管理后台手动登记 */
   source: string;
+  /** v3.0.4 分享时长：到期时间（null=不限时长） */
+  expireDate: Date | null;
+  /** v3.0.4 分享次数：可使用人数上限（null=不限次数） */
+  memberLimit: number | null;
+  /** v3.0.4 创建/编辑时群组私密/公开快照（true=私密，null=旧数据未知） */
+  chatIsPrivate: boolean | null;
   createdTime: Date;
   updatedTime: Date;
 }
@@ -2719,6 +2729,12 @@ function mapInviteLink(row: Record<string, unknown>): InviteLinkRow {
     createsJoinRequest: Number(row.creates_join_request ?? 0) === 1,
     isRevoked: Number(row.is_revoked ?? 0) === 1,
     source: (row.source as string) ?? "api",
+    expireDate: row.expire_date ? toDate(row.expire_date) : null,
+    memberLimit: row.member_limit === null || row.member_limit === undefined ? null : toNumber(row.member_limit),
+    chatIsPrivate:
+      row.chat_is_private === null || row.chat_is_private === undefined
+        ? null
+        : Number(row.chat_is_private) === 1,
     createdTime: toDate(row.created_time),
     updatedTime: toDate(row.updated_time),
   };
@@ -2738,17 +2754,26 @@ export async function upsertInviteLink(input: {
   remark?: string | null;
   createsJoinRequest?: boolean;
   source?: string;
+  /** v3.0.4 分享时长到期时间（null/省略=不限时长） */
+  expireDate?: Date | null;
+  /** v3.0.4 分享次数上限（null/省略=不限次数） */
+  memberLimit?: number | null;
+  /** v3.0.4 创建时群组私密/公开快照（null/省略=未知） */
+  chatIsPrivate?: boolean | null;
 }): Promise<void> {
   const now = dateText(new Date());
   await executeRun(
-    `INSERT INTO invite_links (bot_id, chat_id, link, name, remark, creates_join_request, is_revoked, source, created_time, updated_time)
-     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+    `INSERT INTO invite_links (bot_id, chat_id, link, name, remark, creates_join_request, is_revoked, source, expire_date, member_limit, chat_is_private, created_time, updated_time)
+     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(link) DO UPDATE SET
        bot_id = COALESCE(excluded.bot_id, invite_links.bot_id),
        chat_id = excluded.chat_id,
        name = COALESCE(excluded.name, invite_links.name),
        remark = COALESCE(excluded.remark, invite_links.remark),
        creates_join_request = excluded.creates_join_request,
+       expire_date = COALESCE(excluded.expire_date, invite_links.expire_date),
+       member_limit = COALESCE(excluded.member_limit, invite_links.member_limit),
+       chat_is_private = COALESCE(excluded.chat_is_private, invite_links.chat_is_private),
        updated_time = excluded.updated_time`,
     [
       input.botId === null ? null : Number(input.botId),
@@ -2758,6 +2783,13 @@ export async function upsertInviteLink(input: {
       input.remark ?? null,
       input.createsJoinRequest ? 1 : 0,
       input.source ?? "api",
+      input.expireDate ? dateText(input.expireDate) : null,
+      input.memberLimit ?? null,
+      input.chatIsPrivate === null || input.chatIsPrivate === undefined
+        ? null
+        : input.chatIsPrivate
+          ? 1
+          : 0,
       now,
       now,
     ],
@@ -2809,6 +2841,43 @@ export async function updateInviteLinkRemark(id: bigint, remark: string): Promis
   const result = await executeRun(
     `UPDATE invite_links SET remark = ?, updated_time = ? WHERE id = ?`,
     [remark, dateText(new Date()), Number(id)],
+  );
+  return result.changes > 0;
+}
+
+/**
+ * v3.0.4 更新台账链接的分享配置（编辑备注/时长/次数后同步台账）：
+ * expireDate=null 且明确传入 clearExpire=true 时清除到期时间；memberLimit=null 同理。
+ */
+export async function updateInviteLinkConfig(
+  id: bigint,
+  config: {
+    remark?: string;
+    expireDate?: Date | null;
+    clearExpire?: boolean;
+    memberLimit?: number | null;
+    clearMemberLimit?: boolean;
+    name?: string | null;
+  },
+): Promise<boolean> {
+  const result = await executeRun(
+    `UPDATE invite_links SET
+       remark = ?,
+       expire_date = CASE WHEN ? THEN NULL ELSE ? END,
+       member_limit = CASE WHEN ? THEN NULL ELSE ? END,
+       name = COALESCE(?, name),
+       updated_time = ?
+     WHERE id = ?`,
+    [
+      config.remark ?? null,
+      config.clearExpire ? 1 : 0,
+      config.expireDate ? dateText(config.expireDate) : null,
+      config.clearMemberLimit ? 1 : 0,
+      config.memberLimit ?? null,
+      config.name ?? null,
+      dateText(new Date()),
+      Number(id),
+    ],
   );
   return result.changes > 0;
 }
